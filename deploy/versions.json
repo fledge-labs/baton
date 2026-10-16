@@ -1,7 +1,9 @@
 {
   "_license": "SPDX-License-Identifier: Apache-2.0",
   "agentgateway": "ghcr.io/agentgateway/agentgateway:v1.6.0@sha256:9d3e6044ddcdc0878b1787f77bd401252b95e22684203fb5e874c4c42d2ed90c",
-  "agent_mail_commit": "fd9c518458daa1ac7cf74500aa37ed7bd72b8dd0",
+  "postgres": "postgres:17.11-bookworm@sha256:3645570cccdfa447589da9f57dd740faa29b30938e861289a5574b6ca6b03826",
+  "psycopg": "3.3.6",
+  "psycopg_binary": "3.3.6",
   "a2a_sdk": "1.2.2",
   "mcp_sdk": "1.30.0",
   "codex_cli": "0.154.0",

@@ -87,6 +87,10 @@ protobuf==7.36.2
     #   google-api-core
     #   googleapis-common-protos
     #   proto-plus
+psycopg[binary]==3.3.6
+    # Baton PostgreSQL storage and the short-lived schema migration service.
+psycopg-binary==3.3.6
+    # Explicitly lock the binary distribution selected by psycopg[binary].
 pyasn1==0.6.4
     # via pyasn1-modules
 pyasn1-modules==0.4.2

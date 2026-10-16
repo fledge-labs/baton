@@ -12,6 +12,7 @@ WORKDIR /app
 COPY bridge /app/bridge
 COPY scripts /app/scripts
 COPY deploy/gateway.template.json /app/deploy/gateway.template.json
+COPY deploy/migrate.py /app/deploy/migrate.py
 RUN mkdir -p /data /work /home/agent/.codex && chown -R agent:agent /data /work /home/agent
 # The pinned CLI bundles a newer bubblewrap with argv0 support.
 # Remove the distro helper so the CLI selects its own pinned implementation.

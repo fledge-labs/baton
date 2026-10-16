@@ -13,6 +13,8 @@ from pathlib import Path
 
 SERVICE_UID=10001
 SERVICE_GID=10001
+POSTGRES_UID=999
+POSTGRES_GID=999
 
 def atomic_write(path, data, mode=0o600, owner=None):
     path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
@@ -32,30 +34,53 @@ def atomic_write(path, data, mode=0o600, owner=None):
 def secret_path(root,agent,role):
     return root/'secrets/bridge/dispatcher.token' if role=='dispatcher' else root/'secrets/clients'/f'{agent}.token'
 
-def provision(root,identities,agent,role):
+def provision(root,identities,agent,role,kind=None,account=None):
     token=secrets.token_urlsafe(48)
-    identities[agent]={'agent':agent,'role':role,'hash':hashlib.sha256(token.encode()).hexdigest(),'active':True}
+    prior=identities.get(agent,{})
+    kind=kind or prior.get('kind') or ('service' if role=='dispatcher' else 'agent')
+    account=account or prior.get('account') or agent
+    identities[agent]={'agent':agent,'role':role,'kind':kind,'account':account,'hash':hashlib.sha256(token.encode()).hexdigest(),'active':True}
     owner=(SERVICE_UID,SERVICE_GID) if role=='dispatcher' else None
     atomic_write(secret_path(root,agent,role),token+'\n',owner=owner)
 
 def render_gateway(identities):
     template=Path(__file__).resolve().parents[1]/'deploy/gateway.template.json'
     config=json.loads(template.read_text());config.pop('_license',None)
-    keys=[{'keyHash':'sha256:'+v['hash'],'metadata':{'agent':v['agent'],'role':v['role']}} for v in identities.values() if v['active']]
+    keys=[{'keyHash':'sha256:'+v['hash'],'metadata':{k:v[k] for k in ('agent','role','kind','account')}} for v in identities.values() if v['active']]
     for bind in config['binds']:
         for listener in bind['listeners']:
             for route in listener['routes']:route['policies']['apiKey']['keys']=keys
     return config
 
+def initialize_database(root):
+    """Keep database credentials stable across repeated initialization."""
+    admin=root/'secrets/database-admin'
+    app_config=root/'secrets/database-app/database.json'
+    initialized=(root/'data/postgres/pgdata/PG_VERSION').exists()
+    passwords={}
+    for name in ('postgres','app'):
+        path=admin/(name+'.password')
+        if not path.exists():
+            if initialized or (name=='app' and app_config.exists()):
+                raise ValueError('Database credentials missing; restore them before restarting')
+            atomic_write(path,secrets.token_urlsafe(48)+'\n',owner=(POSTGRES_UID,POSTGRES_GID))
+        value=path.read_text().strip()
+        if len(value)<32 or any(c.isspace() for c in value):
+            raise ValueError('Invalid database credential file')
+        passwords[name]=value
+    config={'host':'database','port':5432,'dbname':'baton','user':'baton_app','password':passwords['app']}
+    if app_config.exists() and json.loads(app_config.read_text())!=config:
+        raise ValueError('Database configuration differs; restore the matching credential files')
+    atomic_write(app_config,json.dumps(config)+'\n',owner=(SERVICE_UID,SERVICE_GID))
+
 def initialize(root,identities):
-    for name in ['config','secrets/clients','secrets/bridge','secrets/mail','secrets/codex-home','data/bridge','data/codex','data/mail']:
+    for name in ['config','secrets/clients','secrets/bridge','secrets/codex-home','secrets/database-admin','secrets/database-app','data/bridge','data/codex','data/postgres']:
         p=root/name;p.mkdir(parents=True,exist_ok=True,mode=0o700)
         if name=='config':os.chmod(p,0o755)
         elif os.geteuid()==0 and name!='secrets/clients':
-            os.chown(p,SERVICE_UID,SERVICE_GID);os.chmod(p,0o700)
-    mail=root/'secrets/mail/mail.token'
-    if not mail.exists():atomic_write(mail,secrets.token_urlsafe(48)+'\n',owner=(SERVICE_UID,SERVICE_GID))
-    atomic_write(root/'secrets/bridge/mail.token',mail.read_text(),owner=(SERVICE_UID,SERVICE_GID))
+            uid,gid=(POSTGRES_UID,POSTGRES_GID) if name in ('secrets/database-admin','data/postgres') else (SERVICE_UID,SERVICE_GID)
+            os.chown(p,uid,gid);os.chmod(p,0o700)
+    initialize_database(root)
     worker='codex-worker'
     if worker not in identities:provision(root,identities,worker,'dispatcher')
     elif not secret_path(root,worker,'dispatcher').exists():
@@ -80,15 +105,25 @@ def main(argv=None):
     parser.add_argument('--operation-id')
     parser.add_argument('--uid',type=int)
     parser.add_argument('--gid',type=int)
+    parser.add_argument('--kind',choices=['human','agent'])
+    parser.add_argument('--account')
     args=parser.parse_args(argv);root=args.runtime.resolve()
     if args.agent and not re.fullmatch(r'[a-z][a-z0-9-]{0,40}',args.agent):parser.error('Invalid agent identifier')
     if args.operation_id and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,95}',args.operation_id):parser.error('Invalid operation identifier')
+    if args.account is not None and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,95}',args.account):parser.error('Invalid account identifier')
+    if (args.kind is not None or args.account is not None) and args.action not in ('issue','rotate'):
+        parser.error('--kind and --account only apply to issue or rotate')
     root.mkdir(parents=True,exist_ok=True,mode=0o700);(root/'config').mkdir(exist_ok=True,mode=0o755)
     with (root/'config/.tokens.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
         registry=root/'config/identities.json';ids=json.loads(registry.read_text()) if registry.exists() else {}
+        # The offline administrator explicitly upgrades legacy identity records.
+        # Runtime authentication must never infer or accept caller-supplied mapping.
+        for agent,entry in ids.items():
+            entry.setdefault('kind','service' if entry['role']=='dispatcher' else 'agent')
+            entry.setdefault('account',agent)
         if args.action=='list':
-            print(json.dumps([{k:v[k] for k in ['agent','role','active']} for v in ids.values()]));return
+            print(json.dumps([{k:v[k] for k in ['agent','role','kind','account','active']} for v in ids.values()]));return
         if args.action=='init':initialize(root,ids)
         elif args.action in ('import-auth','import-api-key'):
             if not args.source:parser.error('--source is required')
@@ -104,18 +139,22 @@ def main(argv=None):
         elif args.action=='issue':
             if not args.agent:parser.error('Agent identifier required')
             if args.agent in ids:parser.error('Identity already exists; use explicit rotate to replace its credential')
-            provision(root,ids,args.agent,'client')
+            provision(root,ids,args.agent,'client',args.kind,args.account)
         elif args.action in ('rotate','revoke','export'):
             if args.agent not in ids:parser.error('Unknown identity')
             if args.action=='revoke':ids[args.agent]['active']=False
             elif args.action=='rotate':
                 if not args.operation_id:parser.error('rotate requires a stable --operation-id')
+                if ids[args.agent]['role']!='client' and (args.kind is not None or args.account is not None):
+                    parser.error('Internal service principal mapping cannot be changed')
                 journal=root/'config/credential-operations.json';ops=json.loads(journal.read_text()) if journal.exists() else {}
                 op=args.agent+'/'+args.operation_id
                 if op in ops:
                     if ops[op]!=ids[args.agent]['hash'] or not ids[args.agent]['active']:parser.error('This rotation was superseded; nothing changed')
+                    if (args.kind is not None and args.kind!=ids[args.agent]['kind']) or (args.account is not None and args.account!=ids[args.agent]['account']):
+                        parser.error('Rotation operation already used for different principal mapping')
                 else:
-                    role=ids[args.agent]['role'];provision(root,ids,args.agent,role)
+                    role=ids[args.agent]['role'];provision(root,ids,args.agent,role,args.kind,args.account)
                     ops[op]=ids[args.agent]['hash'];atomic_write(journal,json.dumps(ops)+'\n')
             elif not args.output:parser.error('export requires --output')
         atomic_write(registry,json.dumps(ids,indent=2)+'\n',0o644)
