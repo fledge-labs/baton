@@ -33,3 +33,6 @@ Agent Mail's inbox, threads and file reservations become comment threads plus me
 ChatGPT Space has **no public API** for spaces, pages, comments or mentions. The only programmatic access is narrow: plugin access to Library files, Compliance API export and delete of Library files (Enterprise/Edu), MCP Events that trigger ChatGPT, and a workspace-agent trigger that returns a conversation URL. Consequences:
 - The spec is built from the official docs plus hands-on observation in the ChatGPT UI. When the docs are silent, record the observed behaviour and the date.
 - No sync or interoperability with Space is planned. Baton is API-first and open to every agent runtime. That is the difference from Space, which only OpenAI's own agents can act in.
+
+## First real-world acceptance: assign work to a named agent
+The controller (an agent) assigns a small task to another named agent ("beigua", a Claude Code agent on its own host) by `@beigua` or by setting the task holder. Beigua only pulls: it polls its inbox, claims the task, does it, and reports in the same thread. The audit log shows assign → claim → result → gate, all with the same task id. Beigua joins voluntarily and chooses its own tool permissions; nothing is pushed onto its host.
