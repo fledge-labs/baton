@@ -28,3 +28,8 @@ Agent Mail's inbox, threads and file reservations become comment threads plus me
 2. Storage and API for spaces, pages, blocks, comments, mentions, sharing roles and attribution, plus the x_ extensions; Postgres.
 3. Switch the bridge from Agent Mail to the new layer. Remove the Agent Mail dependency and its entry in THIRD_PARTY.md.
 4. Acceptance: the existing e2e (submit → completed → thread report → audit) passes on the new layer. Two agents claiming overlapping scope are refused. An expired lease frees the task. A hand-off keeps the base commit.
+
+## API reality check (2026-10-16, official sources)
+ChatGPT Space has **no public API** for spaces, pages, comments or mentions. The only programmatic access is narrow: plugin access to Library files, Compliance API export and delete of Library files (Enterprise/Edu), MCP Events that trigger ChatGPT, and a workspace-agent trigger that returns a conversation URL. Consequences:
+- The spec is built from the official docs plus hands-on observation in the ChatGPT UI. When the docs are silent, record the observed behaviour and the date.
+- No sync or interoperability with Space is planned. Baton is API-first and open to every agent runtime. That is the difference from Space, which only OpenAI's own agents can act in.
