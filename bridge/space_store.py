@@ -465,12 +465,16 @@ class SpaceStore:
                 raise StoreError("not_found")
             row = self._comment(conn, actor, operation_id, page_id, body, thread_id, selection)
             page = self._row(conn, "pages", page_id)
-            self._audit(conn, actor, operation_id, "comment.created", space_id=page["space_id"], page_id=page_id, thread_id=row["thread_id"])
+            task = conn.execute("SELECT id FROM baton.tasks WHERE id=%s AND page_id=%s", (row["thread_id"], page_id)).fetchone()
+            self._audit(conn, actor, operation_id, "comment.created", space_id=page["space_id"], task_id=task["id"] if task else None,
+                        page_id=page_id, thread_id=row["thread_id"])
             return row
         return self._mutate(actor, operation_id, "comment", {"page_id": page_id, "body": body, "thread_id": thread_id, "selection": selection},
                             lambda conn: self._require(conn, actor, "page", page_id, "comment"), effect)
 
     def list_comments(self, actor, page_id, thread_id=None):
+        if thread_id:
+            _uuid(thread_id)
         def read(conn):
             self._require(conn, actor, "page", page_id)
             return conn.execute("SELECT * FROM baton.comments WHERE page_id=%s AND (%s::uuid IS NULL OR thread_id=%s::uuid) ORDER BY created_at,id", (page_id, thread_id, thread_id)).fetchall()
@@ -489,7 +493,9 @@ class SpaceStore:
                 ON CONFLICT(comment_id,target_type,target_id) DO UPDATE SET target_id=EXCLUDED.target_id RETURNING *""",
                 (uuid.uuid4(), comment_id, target_type, target_id, target_type == "agent", actor.principal)).fetchone()
             page = self._row(conn, "pages", str(comment["page_id"]))
-            self._audit(conn, actor, operation_id, "mention.created", space_id=page["space_id"], thread_id=comment["thread_id"], target_type=target_type)
+            task = conn.execute("SELECT id FROM baton.tasks WHERE id=%s AND page_id=%s", (comment["thread_id"], comment["page_id"])).fetchone()
+            self._audit(conn, actor, operation_id, "mention.created", space_id=page["space_id"], task_id=task["id"] if task else None,
+                        thread_id=comment["thread_id"], target_type=target_type)
             return row
         return self._mutate(actor, operation_id, "mention", {"comment_id": comment_id, "target_type": target_type, "target_id": target_id}, authorize, effect)
 
@@ -513,7 +519,7 @@ class SpaceStore:
                 identity = str(task["id"])
                 message = threads.setdefault(identity, {"id": identity, "thread_id": identity, "subject": "[assigned] " + identity,
                     "from": task["owner"], "to": [actor.principal], "created_ts": task["created_at"], "body_md": task["prompt"]})
-                message.update(task_id=identity, assignee=task["assignee"], state=self._task_view(conn, identity)["state"], kind="assignment")
+                message.update(task_id=identity, assignee=task["assignee"], prompt=task["prompt"], state=self._task_view(conn, identity)["state"], kind="assignment")
             for identity, message in threads.items():
                 if "task_id" not in message:
                     task = conn.execute("SELECT assignee FROM baton.tasks WHERE id=%s", (identity,)).fetchone()
@@ -608,7 +614,7 @@ class SpaceStore:
         row = dict(self._row(conn, "tasks", task_id))
         row.pop("input_hash")
         row.pop("idempotency_key")
-        if not include_prompt:
+        if not include_prompt and row["execution_mode"] != "manual":
             row.pop("prompt")
         claim = conn.execute("SELECT *,lease_expires_at>clock_timestamp() AS lease_valid FROM baton.x_claim WHERE task_id=%s", (task_id,)).fetchone()
         row.update(task_id=row["id"], thread_id=row["id"], holder=None, holder_account=None, lease_expires_at=None, lease_valid=False)
@@ -700,7 +706,9 @@ class SpaceStore:
             chosen = page_id or self._default_page(conn, actor, operation_id)
             return self._new_task(conn, actor, operation_id, chosen, prompt, normalized, "manual" if assignee else "codex",
                                   [actor.principal] if assignee else [], digest, idempotency_key=idempotency_key, assignee=assignee)
-        return self._mutate(actor, operation_id, "submit_task", args, authorize, effect)
+        def replay(conn, old):
+            return self._task_view(conn, old["task_id"])
+        return self._mutate(actor, operation_id, "submit_task", args, authorize, effect, replay)
 
     def create_task_block(self, actor, operation_id, page_id, prompt, scopes, reviewers, base_commit=None, context=None, evidence=None, assignee=None):
         _text(prompt)
