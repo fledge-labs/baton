@@ -591,12 +591,16 @@ class SpaceStore:
                 message = threads.setdefault(identity, {"id": identity, "thread_id": identity, "subject": "[assigned] " + identity,
                     "from": task["owner"], "to": [actor.principal], "created_ts": task["created_at"], "body_md": task["prompt"],
                     "requested_by": task["owner"], "action_requested": True, "requests": []})
-                message.update(task_id=identity, assignee=task["assignee"], prompt=task["prompt"], state=self._task_view(conn, identity)["state"], kind="assignment")
+                view = self._task_view(conn, actor, identity)
+                message.update(task_id=identity, assignee=task["assignee"], prompt=task["prompt"], state=view["state"], kind="assignment",
+                               depends_on=view["depends_on"], has_hidden_dependencies=view["has_hidden_dependencies"])
             for identity, message in threads.items():
                 if "task_id" not in message:
-                    task = conn.execute("SELECT assignee FROM baton.tasks WHERE id=%s", (identity,)).fetchone()
-                    if task:
-                        message.update(task_id=identity, assignee=task["assignee"], state=self._task_view(conn, identity)["state"], kind="mention")
+                    task = conn.execute("SELECT assignee,page_id FROM baton.tasks WHERE id=%s", (identity,)).fetchone()
+                    if task and self._role(conn, actor, "page", str(task["page_id"])):
+                        view = self._task_view(conn, actor, identity)
+                        message.update(task_id=identity, assignee=task["assignee"], state=view["state"], kind="mention",
+                                       depends_on=view["depends_on"], has_hidden_dependencies=view["has_hidden_dependencies"])
             return {"agent_name": actor.principal, "messages": sorted(threads.values(), key=lambda item: item["created_ts"], reverse=True)[:limit]}
         return self._read(actor, read)
 
@@ -682,7 +686,7 @@ class SpaceStore:
             return self._update_block(conn, actor, operation_id, block_id, expected_revision, target["content"])
         return self._mutate(actor, operation_id, "revert_block", {"block_id": block_id, "expected_revision": expected_revision, "target_revision": target_revision}, authorize, effect)
 
-    def _task_view(self, conn, task_id, include_prompt=False):
+    def _task_view(self, conn, actor, task_id, include_prompt=False):
         row = dict(self._row(conn, "tasks", task_id))
         row.pop("input_hash")
         row.pop("idempotency_key")
@@ -698,17 +702,47 @@ class SpaceStore:
         row["status"] = {"claimed": "working", "done": "completed"}.get(row["state"], row["state"])
         row.update(submission_mail_status="sent", mail_status="sent" if row["state"] == "done" else "not_ready", mail_error=None)
         row.update(submission_thread_status="sent", report_status="sent" if row["state"] == "done" else "not_ready")
-        # Edges expose identifiers only, never a dependency's private content or state.
-        row["depends_on"] = self._dependencies(conn, task_id)
+        authority = self._authorization_context(actor, row)
+        row["depends_on"], row["has_hidden_dependencies"] = self._visible_dependencies(conn, authority, task_id)
         return row
+
+    @staticmethod
+    def _authorization_context(actor, task):
+        # This is an authorization context, never the mutation/audit actor.
+        # Service effects remain attributed to SERVICE_ACTOR throughout.
+        if actor == SERVICE_ACTOR:
+            if task["execution_mode"] != "codex":
+                raise StoreError("forbidden")
+            return Actor(task["owner"], task["owner_account"], task["owner_kind"])
+        return actor
 
     @staticmethod
     def _dependencies(conn, task_id):
         return [str(row["depends_on"]) for row in conn.execute(
             "SELECT depends_on FROM baton.task_dependencies WHERE task_id=%s ORDER BY depends_on", (task_id,))]
 
-    @staticmethod
-    def _dependencies_satisfied(conn, task_id):
+    def _visible_dependencies(self, conn, actor, task_id):
+        visible, hidden = [], False
+        for dependency in self._dependencies(conn, task_id):
+            try:
+                self._task_for(conn, actor, dependency)
+            except StoreError as exc:
+                if exc.code not in {"forbidden", "not_found"}:
+                    raise
+                hidden = True
+            else:
+                visible.append(dependency)
+        return visible, hidden
+
+    def _require_dependency_access(self, conn, actor, task_id):
+        _, hidden = self._visible_dependencies(conn, actor, task_id)
+        if hidden:
+            raise StoreError("forbidden")
+
+    def _dependencies_satisfied(self, conn, actor, task_id):
+        task = self._row(conn, "tasks", task_id)
+        authority = self._authorization_context(actor, task)
+        self._require_dependency_access(conn, authority, task_id)
         blocked = conn.execute("""SELECT 1 FROM baton.task_dependencies e JOIN baton.tasks d ON d.id=e.depends_on
             WHERE e.task_id=%s AND (d.state<>'done' OR d.result_epoch IS DISTINCT FROM d.epoch OR NOT EXISTS (
                 SELECT 1 FROM baton.x_gate g WHERE g.task_id=d.id AND g.epoch=d.epoch AND g.decision='pass')) LIMIT 1""",
@@ -740,16 +774,17 @@ class SpaceStore:
         def authorize(conn):
             for entry in entries:
                 self._task_for(conn, actor, entry["task_id"], "edit")
+                self._require_dependency_access(conn, actor, entry["task_id"])
                 for dependency in entry["depends_on"]:
                     self._task_for(conn, actor, dependency)
         def view(conn):
             return {"graph": [{"task_id": entry["task_id"], "depends_on": self._dependencies(conn, entry["task_id"])} for entry in entries]}
         def effect(conn):
-            self._expire(conn, operation_id)
             tasks = {}
             for entry in entries:
                 task = self._row(conn, "tasks", entry["task_id"])
-                if task["state"] != "queued" or task["dispatch_started_at"] is not None:
+                execution_fields = ("dispatch_started_at", "result_epoch", "result", "result_author", "result_author_account", "a2a_id", "backend")
+                if task["state"] != "queued" or task["epoch"] != 0 or any(task[field] is not None for field in execution_fields):
                     raise StoreError("stale_claim")
                 tasks[entry["task_id"]] = task
             additions = {entry["task_id"]: self._add_dependencies(conn, entry["task_id"], entry["depends_on"]) for entry in entries}
@@ -778,10 +813,16 @@ class SpaceStore:
                     continue
                 if self._role(conn, actor, "page", str(task["page_id"])) != "edit":
                     continue
-                view = self._task_view(conn, str(task["id"]))
+                view = self._task_view(conn, actor, str(task["id"]))
                 if view["state"] != "queued" or task["dispatch_started_at"] is not None:
                     continue
-                if not self._dependencies_satisfied(conn, str(task["id"])):
+                try:
+                    satisfied = self._dependencies_satisfied(conn, actor, str(task["id"]))
+                except StoreError as exc:
+                    if exc.code == "forbidden":
+                        continue
+                    raise
+                if not satisfied:
                     continue
                 if any(scopes_overlap(task["scopes"], scopes) for scopes in live_scopes):
                     continue
@@ -844,7 +885,7 @@ class SpaceStore:
         self._notify_task(conn, actor, operation_id, task, "submitted", prompt, assignee.principal if assignee else None)
         if assignee:
             self._task_audit(conn, actor, operation_id, "task.assigned", task)
-        return self._task_view(conn, str(task_id))
+        return self._task_view(conn, actor, str(task_id))
 
     def submit_task(self, actor, operation_id, idempotency_key, prompt, page_id=None, scopes=None, assignee=None, depends_on=None):
         _identifier(idempotency_key)
@@ -875,12 +916,12 @@ class SpaceStore:
             if prior:
                 if prior["input_hash"] != digest:
                     raise StoreError("operation_conflict")
-                return {**self._task_view(conn, str(prior["id"])), "_business_replay": True}
+                return {**self._task_view(conn, actor, str(prior["id"])), "_business_replay": True}
             chosen = page_id or self._default_page(conn, actor, operation_id)
             return self._new_task(conn, actor, operation_id, chosen, prompt, normalized, "manual" if assignee else "codex",
                                   [actor.principal] if assignee else [], digest, idempotency_key=idempotency_key, assignee=assignee, depends_on=dependencies)
         def replay(conn, old):
-            return self._task_view(conn, old["task_id"])
+            return self._task_view(conn, actor, old["task_id"])
         return self._mutate(actor, operation_id, "submit_task", args, authorize, effect, replay)
 
     def create_task_block(self, actor, operation_id, page_id, prompt, scopes, reviewers, base_commit=None, context=None, evidence=None, assignee=None, depends_on=None):
@@ -910,12 +951,12 @@ class SpaceStore:
                             authorize,
                             lambda conn: self._new_task(conn, actor, operation_id, page_id, prompt, normalized, "manual", reviewers, digest,
                                                         base_commit=base_commit, context=context, evidence=evidence, assignee=assignee, depends_on=dependencies),
-                            lambda conn, old: self._task_view(conn, old["task_id"]))
+                            lambda conn, old: self._task_view(conn, actor, old["task_id"]))
 
     def get_task(self, actor, task_id):
         def read(conn):
             self._task_for(conn, actor, task_id)
-            return self._task_view(conn, task_id)
+            return self._task_view(conn, actor, task_id)
         return self._read(actor, read)
 
     def list_tasks(self, actor, limit=50):
@@ -923,7 +964,7 @@ class SpaceStore:
         _integer(limit, 1, 100)
         def read(conn):
             rows = conn.execute("SELECT * FROM baton.tasks WHERE owner=%s ORDER BY created_at DESC,id DESC", (actor.principal,)).fetchall()
-            return [self._task_view(conn, str(row["id"])) for row in rows if self._role(conn, actor, "page", str(row["page_id"]))][:limit]
+            return [self._task_view(conn, actor, str(row["id"])) for row in rows if self._role(conn, actor, "page", str(row["page_id"]))][:limit]
         return self._read(actor, read)
 
     def _expire(self, conn, operation_id, auto_only=False):
@@ -959,17 +1000,23 @@ class SpaceStore:
             raise StoreError("forbidden")
         return task
 
-    def _auto(self, conn, actor, task_id):
+    def _auto(self, conn, actor, task_id, require_owner=True):
         self._service(actor)
         task = self._row(conn, "tasks", task_id)
         if task["execution_mode"] != "codex" or task["gate_mode"] != "worker_success":
             raise StoreError("forbidden")
+        if require_owner:
+            authority = self._authorization_context(actor, task)
+            self._require(conn, authority, "page", str(task["page_id"]), "edit")
+            self._require_dependency_access(conn, authority, task_id)
         return task
 
     def _take_claim(self, conn, actor, operation_id, task, lease_seconds):
+        if actor == SERVICE_ACTOR:
+            self._auto(conn, actor, str(task["id"]))
         if task["state"] != "queued" or conn.execute("SELECT 1 FROM baton.x_claim WHERE task_id=%s AND lease_expires_at>clock_timestamp()", (task["id"],)).fetchone():
             raise StoreError("scope_conflict")
-        if not self._dependencies_satisfied(conn, str(task["id"])):
+        if not self._dependencies_satisfied(conn, actor, str(task["id"])):
             raise StoreError("dependency_blocked")
         for other in conn.execute("SELECT scopes FROM baton.x_claim WHERE lease_expires_at>clock_timestamp()"):
             if scopes_overlap(task["scopes"], other["scopes"]):
@@ -980,12 +1027,13 @@ class SpaceStore:
             (task["id"], actor.principal, actor.account, actor.kind, epoch, lease_seconds, Jsonb(task["scopes"])))
         conn.execute("UPDATE baton.tasks SET state='claimed',epoch=%s,result_epoch=NULL,error=NULL WHERE id=%s", (epoch, task["id"]))
         self._task_audit(conn, actor, operation_id, "worker.claimed" if task["execution_mode"] == "codex" else "task.claimed", task, epoch=epoch)
-        return self._task_view(conn, str(task["id"]), include_prompt=True)
+        return self._task_view(conn, actor, str(task["id"]), include_prompt=True)
 
     def claim(self, actor, operation_id, task_id, lease_seconds=300):
         _integer(lease_seconds)
         def authorize(conn):
             task = self._manual(conn, actor, task_id)
+            self._require_dependency_access(conn, actor, task_id)
             if task["assignee"] is not None and task["assignee"] != actor.principal:
                 raise StoreError("forbidden")
         def effect(conn):
@@ -993,7 +1041,9 @@ class SpaceStore:
             return self._take_claim(conn, actor, operation_id, self._row(conn, "tasks", task_id), lease_seconds)
         def replay(conn, old):
             self._live(conn, actor, task_id, old["epoch"])
-            return self._task_view(conn, task_id, include_prompt=True)
+            if not self._dependencies_satisfied(conn, actor, task_id):
+                raise StoreError("dependency_blocked")
+            return self._task_view(conn, actor, task_id, include_prompt=True)
         return self._mutate(actor, operation_id, "claim", {"task_id": task_id, "lease_seconds": lease_seconds}, authorize, effect, replay)
 
     def claim_next(self, actor, operation_id, lease_seconds=300):
@@ -1001,7 +1051,14 @@ class SpaceStore:
         def effect(conn):
             self._expire(conn, operation_id)
             for task in conn.execute("SELECT * FROM baton.tasks WHERE execution_mode='codex' AND state='queued' ORDER BY created_at,id").fetchall():
-                if not self._dependencies_satisfied(conn, str(task["id"])):
+                try:
+                    self._auto(conn, actor, str(task["id"]))
+                    satisfied = self._dependencies_satisfied(conn, actor, str(task["id"]))
+                except StoreError as exc:
+                    if exc.code == "forbidden":
+                        continue
+                    raise
+                if not satisfied:
                     continue
                 conflicts = any(scopes_overlap(task["scopes"], row["scopes"]) for row in conn.execute("SELECT scopes FROM baton.x_claim WHERE lease_expires_at>clock_timestamp()"))
                 if not conflicts:
@@ -1009,8 +1066,11 @@ class SpaceStore:
             return None
         def replay(conn, old):
             if old is not None:
+                self._auto(conn, actor, old["task_id"])
                 self._live(conn, actor, old["task_id"], old["epoch"])
-                return self._task_view(conn, old["task_id"], include_prompt=True)
+                if not self._dependencies_satisfied(conn, actor, old["task_id"]):
+                    raise StoreError("dependency_blocked")
+                return self._task_view(conn, actor, old["task_id"], include_prompt=True)
         return self._mutate(actor, operation_id, "claim_next", {"lease_seconds": lease_seconds}, lambda conn: self._service(actor), effect, replay)
 
     def _renew(self, actor, operation_id, task_id, epoch, lease_seconds, automatic):
@@ -1021,10 +1081,10 @@ class SpaceStore:
             self._live(conn, actor, task_id, epoch)
             conn.execute("UPDATE baton.x_claim SET lease_expires_at=clock_timestamp()+%s*interval '1 second' WHERE task_id=%s", (lease_seconds, task_id))
             self._task_audit(conn, actor, operation_id, "claim.renewed", self._row(conn, "tasks", task_id), epoch=epoch)
-            return self._task_view(conn, task_id)
+            return self._task_view(conn, actor, task_id)
         def replay(conn, old):
             self._live(conn, actor, task_id, epoch)
-            return self._task_view(conn, task_id)
+            return self._task_view(conn, actor, task_id)
         return self._mutate(actor, operation_id, method, {"task_id": task_id, "epoch": epoch, "lease_seconds": lease_seconds}, authorize, effect, replay)
 
     def renew(self, actor, operation_id, task_id, epoch, lease_seconds=300):
@@ -1041,10 +1101,10 @@ class SpaceStore:
                 raise StoreError("operation_conflict")
             conn.execute("UPDATE baton.tasks SET dispatch_started_at=clock_timestamp() WHERE id=%s", (task_id,))
             self._task_audit(conn, actor, operation_id, "task.dispatched", task, epoch=epoch)
-            return self._task_view(conn, task_id)
+            return self._task_view(conn, actor, task_id)
         def replay(conn, old):
             self._live(conn, actor, task_id, epoch)
-            return self._task_view(conn, task_id)
+            return self._task_view(conn, actor, task_id)
         return self._mutate(actor, operation_id, "mark_dispatched", {"task_id": task_id, "epoch": epoch}, lambda conn: self._auto(conn, actor, task_id), effect, replay)
 
     def handoff(self, actor, operation_id, task_id, epoch, target, base_commit=None, context=None, evidence=None, lease_seconds=300):
@@ -1058,6 +1118,7 @@ class SpaceStore:
         def authorize(conn):
             task = self._manual(conn, actor, task_id)
             self._require(conn, target, "page", str(task["page_id"]), "edit")
+            self._require_dependency_access(conn, target, task_id)
         def effect(conn):
             self._live(conn, actor, task_id, epoch)
             task = self._row(conn, "tasks", task_id)
@@ -1073,10 +1134,10 @@ class SpaceStore:
                          (uuid.uuid4(), task_id, actor.principal, target.principal, epoch, epoch + 1, base, Jsonb(contexts), Jsonb(evidence_items)))
             self._task_audit(conn, actor, operation_id, "task.handed_off", task, old_epoch=epoch, epoch=epoch + 1)
             self._notify_task(conn, actor, operation_id, task, "assigned", "Task handed off", target.principal)
-            return self._task_view(conn, task_id, include_prompt=True)
+            return self._task_view(conn, actor, task_id, include_prompt=True)
         def replay(conn, old):
             self._live(conn, target, task_id, epoch + 1)
-            return self._task_view(conn, task_id, include_prompt=True)
+            return self._task_view(conn, actor, task_id, include_prompt=True)
         return self._mutate(actor, operation_id, "handoff", {"task_id": task_id, "epoch": epoch, "target": asdict(target), "base_commit": base_commit,
                             "context": context, "evidence": evidence, "lease_seconds": lease_seconds}, authorize, effect, replay)
 
@@ -1095,12 +1156,12 @@ class SpaceStore:
             conn.execute("UPDATE baton.tasks SET assignee=%s,execution_mode='manual',gate_mode='reviewer',reviewers=%s WHERE id=%s", (target.principal, Jsonb(reviewers), task_id))
             self._task_audit(conn, actor, operation_id, "task.assigned", task)
             self._notify_task(conn, actor, operation_id, task, "assigned", "Task assigned", target.principal)
-            return self._task_view(conn, task_id)
+            return self._task_view(conn, actor, task_id)
         def replay(conn, old):
             task = self._row(conn, "tasks", task_id)
             if task["assignee"] != target.principal:
                 raise StoreError("stale_claim")
-            return self._task_view(conn, task_id)
+            return self._task_view(conn, actor, task_id)
         return self._mutate(actor, operation_id, "assign_task", {"task_id": task_id, "target": asdict(target)}, authorize, effect, replay)
 
     def submit_result(self, actor, operation_id, task_id, epoch, result, evidence=None):
@@ -1116,12 +1177,12 @@ class SpaceStore:
             # This is the holder's reply in the original thread, explicitly a
             # candidate rather than a completed/gate-approved notification.
             self._notify_task(conn, actor, operation_id, task, "result_submitted", result)
-            return self._task_view(conn, task_id)
+            return self._task_view(conn, actor, task_id)
         def replay(conn, old):
             task = self._row(conn, "tasks", task_id)
             if task["epoch"] != epoch or task["result_epoch"] != epoch or task["state"] not in {"awaiting_gate", "done"}:
                 raise StoreError("stale_claim")
-            return self._task_view(conn, task_id)
+            return self._task_view(conn, actor, task_id)
         return self._mutate(actor, operation_id, "submit_result", {"task_id": task_id, "epoch": epoch, "result": result, "evidence": evidence},
                             lambda conn: self._manual(conn, actor, task_id), effect, replay)
 
@@ -1145,12 +1206,12 @@ class SpaceStore:
             if decision == "pass":
                 self._task_audit(conn, actor, operation_id, "task.completed", task, epoch=expected_epoch)
                 self._notify_task(conn, actor, operation_id, task, "completed", task["result"])
-            return self._task_view(conn, task_id)
+            return self._task_view(conn, actor, task_id)
         def replay(conn, old):
             task = self._row(conn, "tasks", task_id)
             if task["epoch"] != expected_epoch or task["result_epoch"] != expected_epoch:
                 raise StoreError("stale_claim")
-            return self._task_view(conn, task_id)
+            return self._task_view(conn, actor, task_id)
         return self._mutate(actor, operation_id, "gate", {"task_id": task_id, "expected_epoch": expected_epoch, "decision": decision, "evidence": evidence}, authorize, effect, replay)
 
     def finish_auto(self, actor, operation_id, task_id, epoch, result, a2a_id, backend, a2a_state="completed"):
@@ -1172,12 +1233,12 @@ class SpaceStore:
             self._task_audit(conn, actor, operation_id, "worker.completed", task, epoch=epoch, backend=backend, a2a_task_id=a2a_id, output_sha256=digest)
             self._task_audit(conn, actor, operation_id, "task.completed", task, epoch=epoch, backend=backend, a2a_task_id=a2a_id, output_sha256=digest)
             self._notify_task(conn, actor, operation_id, task, "completed", result)
-            return self._task_view(conn, task_id)
+            return self._task_view(conn, actor, task_id)
         def replay(conn, old):
             task = self._row(conn, "tasks", task_id)
             if task["epoch"] != epoch or task["state"] != "done":
                 raise StoreError("stale_claim")
-            return self._task_view(conn, task_id)
+            return self._task_view(conn, actor, task_id)
         return self._mutate(actor, operation_id, "finish_auto", {"task_id": task_id, "epoch": epoch, "result": result, "a2a_id": a2a_id, "backend": backend, "a2a_state": a2a_state},
                             lambda conn: self._auto(conn, actor, task_id), effect, replay)
 
@@ -1191,14 +1252,14 @@ class SpaceStore:
             conn.execute("UPDATE baton.tasks SET state=%s,error=%s WHERE id=%s", (state, error_code, task_id))
             conn.execute("DELETE FROM baton.x_claim WHERE task_id=%s", (task_id,))
             self._task_audit(conn, actor, operation_id, "task." + state, task, epoch=epoch, error_code=error_code)
-            return self._task_view(conn, task_id)
+            return self._task_view(conn, actor, task_id)
         def replay(conn, old):
             task = self._row(conn, "tasks", task_id)
             if task["epoch"] != epoch or task["state"] not in {"failed", "interrupted"}:
                 raise StoreError("stale_claim")
-            return self._task_view(conn, task_id)
+            return self._task_view(conn, actor, task_id)
         return self._mutate(actor, operation_id, "interrupt_auto", {"task_id": task_id, "epoch": epoch, "error_code": error_code},
-                            lambda conn: self._auto(conn, actor, task_id), effect, replay)
+                            lambda conn: self._auto(conn, actor, task_id, require_owner=False), effect, replay)
 
     def get_claim(self, actor, task_id):
         return self.get_task(actor, task_id)
@@ -1213,7 +1274,7 @@ class SpaceStore:
         self._user(actor)
         def read(conn):
             tasks = conn.execute("SELECT t.* FROM baton.tasks t JOIN baton.x_claim c ON t.id=c.task_id WHERE c.lease_expires_at>clock_timestamp() ORDER BY t.id").fetchall()
-            return [self._task_view(conn, str(task["id"])) for task in tasks if self._role(conn, actor, "page", str(task["page_id"]))]
+            return [self._task_view(conn, actor, str(task["id"])) for task in tasks if self._role(conn, actor, "page", str(task["page_id"]))]
         return self._read(actor, read)
 
     def list_audit(self, actor, task_id=None, space_id=None, limit=100):
