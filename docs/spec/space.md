@@ -67,15 +67,15 @@
 
 **X9 · x_scope 锁域。** 第一版所有 Space 强制使用 `global` repository namespace；`create_space` 不提供可变 namespace，若实现保留 `scope_repository` 字段则只接受 `global`。排斥范围是同一 Baton 实例或共用 PostgreSQL 权威内的跨 Space 领取，不能声称独立数据库之间有分布式互斥。新 namespace 仅能通过未来管理员契约扩展，不能由请求自由指定以绕过冲突。领取事务须串行化该 namespace 的“查重叠 → 占用”步骤，防止并发检查同时为空。[官方背景仅为分工：S4](https://learn.chatgpt.com/docs/space/agents#work-with-others)。
 
-**X10 · x_scope 规范化与重叠。** 文件和模块都转换到同一仓库相对路径域。采用 `/` 分隔符，去除重复分隔符与 `.` 段，拒绝绝对路径、驱动器前缀及 `..` 越界段；空/根范围规范化为仓库根。路径相等，或一方是另一方的完整路径段前缀，即重叠；`src/a` 与 `src/ab` 不因字符串前缀而冲突。模块只能经管理员定义的模块→路径根映射展开，未知模块保守映射到仓库根，不能把未知模块名当成独立锁域。大小写、符号链接或别名无法可靠规范化时必须保守扩大范围或拒绝，不能声称无冲突。migration scope 使用规范化后的完整 migration 标识精确相等比较，不做路径前缀匹配。文件范围与 migration 范围均需保护时，任务必须同时声明两种范围。对外返回的冲突信息仍受 X2 权限限制。[官方背景仅为分工：S4](https://learn.chatgpt.com/docs/space/agents#work-with-others)。
+**X10 · x_scope 规范化与重叠。** 文件和模块都转换到同一仓库相对路径域。采用 `/` 分隔符，去除重复分隔符与 `.` 段，拒绝绝对路径、驱动器前缀及 `..` 越界段；空/根范围规范化为仓库根。路径相等，或一方是另一方的完整路径段前缀，即重叠；`src/a` 与 `src/ab` 不因字符串前缀而冲突。模块只能经管理员定义的模块→路径根映射展开；没有管理员映射或模块未知时，保守覆盖整个 global 仓库根。客户端提交的模块映射不得改变此规则，不能把未知模块名当成独立锁域。大小写、符号链接或别名无法可靠规范化时必须保守扩大范围或拒绝，不能声称无冲突。migration scope 使用规范化后的完整 migration 标识精确相等比较，不做路径前缀匹配。文件范围与 migration 范围均需保护时，任务必须同时声明两种范围。对外返回的冲突信息仍受 X2 权限限制。[官方背景仅为分工：S4](https://learn.chatgpt.com/docs/space/agents#work-with-others)。
 
-**X11 · x_handoff。** 交接必须在同一事务内校验原持有人、未过期租约、旧 fence 和接收者资格，然后保留任务的 base commit、上下文、证据引用和线程，切换持有人并提升 fence。交接请求未携带新值时保留原值，禁止用空缺字段清空上下文；变更基线必须是显式、可审计动作。作用域不得在交接时无检查地扩大，扩大必须重新检查重叠。原持有人在提交后不能继续使用旧 fence 写入。失败交接不改变所有权或丢失材料。[官方背景仅为协作上下文：S3](https://learn.chatgpt.com/docs/space/collaboration#review-together)。
+**X11 · x_handoff。** 交接必须在同一事务内校验原持有人、未过期租约、旧 fence 和接收者资格，然后保留任务的 base commit、上下文、证据引用和线程，切换持有人并提升 fence。base commit 在交接中不可变；context/evidence 仅追加，不覆盖、删除或因空缺字段清空旧材料。作用域不得在交接时无检查地扩大，扩大必须重新检查重叠。原持有人在提交后不能继续使用旧 fence 写入。失败交接不改变所有权或丢失材料，幂等重放不得重复追加上下文或证据。[官方背景仅为协作上下文：S3](https://learn.chatgpt.com/docs/space/collaboration#review-together)。
 
 ## x_gate、任务兼容层与 x_audit
 
-**X12 · 状态与自动执行。** Baton canonical task state 为 `queued / claimed / awaiting_gate / done / failed / interrupted`。正常路径为 queued → claimed → awaiting_gate → done；执行失败与执行结果不确定分别为 failed、interrupted。lease 过期释放领取权，不能依赖旧行的 claimed 文本继续阻塞或授予写权。旧 MCP `get_task` 兼容视图将 claimed 映射为 working、done 映射为 completed；兼容映射不能隐藏 failed/interrupted，也不能把 awaiting_gate 提前映射为 completed。`submit_task` 创建的自动任务可以进入 Codex worker 队列；手工创建/领取的任务不自动 dispatch。任务线程 UUID 保持不变。[官方背景仅为任务请求：S2](https://learn.chatgpt.com/docs/space/pages#add-content-with-the-insert-menu)、[S4](https://learn.chatgpt.com/docs/space/agents#choose-how-to-ask-for-help)。
+**X12 · 状态与自动执行。** Baton canonical task state 为 `queued / claimed / awaiting_gate / done / failed / interrupted`。正常路径为 queued → claimed → awaiting_gate → done；执行失败与执行结果不确定分别为 failed、interrupted。手工候选结果被 gate 拒绝后返回 queued，之后新领取取得新的 epoch。lease 过期释放领取权，不能依赖旧行的 claimed 文本继续阻塞或授予写权。旧 MCP `get_task` 兼容视图将 claimed 映射为 working、done 映射为 completed；兼容映射不能隐藏 failed/interrupted，也不能把 awaiting_gate 提前映射为 completed。`submit_task` 创建的自动任务可以进入 Codex worker 队列；手工创建/领取的任务不自动 dispatch。任务线程 UUID 保持不变。[官方背景仅为任务请求：S2](https://learn.chatgpt.com/docs/space/pages#add-content-with-the-insert-menu)、[S4](https://learn.chatgpt.com/docs/space/agents#choose-how-to-ask-for-help)。
 
-**X13 · x_gate。** 提交结果先形成带基线、fence、证据引用的候选结果；客户端不能直接把 canonical state 写成 done。手工任务必须由配置的 reviewer 对该确切候选批准，持有人不得自批；旧候选被新领取/结果取代后，旧批准不得完成新一代任务。默认自动 `submit_task` 明确使用 `worker_success` gate，只有已授权 worker 的成功结果能满足它。这个自动 gate 是 Baton 自有最小验收，不等同人工 review、代码质量保证或生产发布批准。失败/不确定 worker 结果不能过 gate。[官方审阅背景：S4](https://learn.chatgpt.com/docs/space/agents#revise-a-launch-brief)。
+**X13 · x_gate。** 手工 `submit_result` 必须持有 live lease，在同一事务中冻结候选结果的 `result_epoch`（对应当次 claim 的 epoch/fence）、基线与证据，释放 claim/scopes 并进入 awaiting_gate；之后审阅不依赖仍在续租的 claim。gate 请求携带固定 `expected_epoch`，必须匹配当前待审候选。只有配置的 reviewer 可以批准，且 reviewer 不能是该候选的持有人；客户端不能直接把 canonical state 写成 done。批准后才 done；拒绝后回到 queued，旧候选及决定作为历史保留，下次 claim 使用新 epoch，旧批准不能完成新一代任务。默认自动 `submit_task` 明确使用 `worker_success` gate，只有已授权 worker 的成功结果能满足它。这个自动 gate 是 Baton 自有最小验收，不等同人工 review、代码质量保证或生产发布批准。失败/不确定 worker 结果不能过 gate。[官方审阅背景：S4](https://learn.chatgpt.com/docs/space/agents#revise-a-launch-brief)。
 
 **X14 · 提案审阅。** 页面修改提案与任务 gate 是不同对象。Baton 可以保存拟议修改、目标版本、发起者及审阅决定；接受时重新检查权限和目标版本，在同一事务中应用修改并记录决定。拒绝或继续修订不得被记录成接受。Baton 的原子接受和版本冲突策略属于 x_扩展；Space 的精确 undo 行为仍待界面实测，不用自身实现冒充已对齐。[官方背景：S2](https://learn.chatgpt.com/docs/space/pages#draft-content-with-generate)、[S4](https://learn.chatgpt.com/docs/space/agents#revise-a-launch-brief)。
 
@@ -96,8 +96,8 @@
 | A5 | 幂等并发与异载荷重放 | 相同 actor/key 或 operation_id 仅产生一次效果；不同有效载荷冲突；事务失败无半成品。 |
 | A6 | 两个 Space 同时领取重叠 scope | 同一 PG/global namespace 内最多一个成功；非重叠路径可并行；未知模块与仓库根冲突；migration 标识仅精确相等冲突。 |
 | A7 | 租约过期及进程恢复 | 无清理器也可重新领取；新 fence 增长；旧持有人续租、提交、交接全部被拒绝。 |
-| A8 | 交接及重放 | base/context/evidence/thread 保留；新持有人获得更高 fence；重放不再提升 fence；失败不切换持有人。 |
-| A9 | 手工 gate 与自动 gate | 持有人自批失败；正确 reviewer 批准确切候选后才 done；默认 worker_success 只接受真实自动 worker 成功，demo 必须继续显式标注。 |
+| A8 | 交接及重放 | base 不可改；context/evidence 仅追加；thread 保留；新持有人获得更高 fence；重放不再提升 fence 或追加材料；失败不切换持有人。 |
+| A9 | 手工 gate 与自动 gate | live lease 提交后冻结 result_epoch、释放 scope 并待审；持有人自批失败；正确 reviewer + expected_epoch 才能批准为 done；拒绝回 queued 后新 claim 提高 epoch；旧批准失败。默认 worker_success 仅接受自动 worker 成功，demo 继续显式标注。 |
 | A10 | 手工领取与兼容层 | 手工领取不触发自动 dispatch；claimed→working、done→completed；awaiting_gate 不提前 completed；同一任务/线程 UUID。 |
 | A11 | 真实 PostgreSQL 审计约束 | 应用角色尝试修改/删除审计行失败；每个已提交效果有审计；失败事务无成功事件；不含凭据或正文。 |
 | A12 | 既有链路回归 | submit → gate 后 completed → 同线程报告 → request/task/worker 审计关联仍可验证；demo 结果不能被当作真实 Codex 通过。 |
