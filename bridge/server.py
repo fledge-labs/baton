@@ -304,8 +304,35 @@ def operation_id(task_id, epoch, phase):
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"baton/dispatch/{task_id}/{epoch}/{phase}"))
 
 
+def dispatch_owner_current(task):
+    """Recheck the saved submitting identity at the external-effect boundary."""
+    who = common.resolve_principal(task.get("owner"))
+    return bool(who and who.get("role") == "client" and who.get("agent") == task.get("owner")
+                and who.get("account") == task.get("owner_account")
+                and who.get("kind") == task.get("owner_kind"))
+
+
+async def cancel_dispatch(task):
+    """Persist cancellation under the current fence without sending to A2A."""
+    try:
+        stopped = await store_call("interrupt_auto", SERVICE,
+                                   operation_id(task["id"], task["epoch"], "cancelled"),
+                                   task["id"], task["epoch"], error_code="cancelled")
+    except BridgeError as exc:
+        audit("task.dispatch_unresolved", task_id=task["id"], agent=task["owner"],
+              epoch=task["epoch"], error_code=exc.code)
+        return None
+    audit("task.cancelled", task_id=task["id"], agent=task["owner"],
+          epoch=task["epoch"], error_code="cancelled")
+    return stopped
+
+
 async def dispatch(task):
     task_id, epoch = task["id"], task["epoch"]
+    # Registry revocation/account changes must not inherit the service actor's
+    # authority. Page and dependency ACL checks remain solely in the store.
+    if not dispatch_owner_current(task):
+        return await cancel_dispatch(task)
     # Commit the ambiguity boundary before sending a request to another process.
     await store_call("mark_dispatched", SERVICE, operation_id(task_id, epoch, "start"), task_id, epoch)
     audit("task.dispatched", task_id=task_id, agent=task["owner"], epoch=epoch)

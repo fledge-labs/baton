@@ -199,9 +199,11 @@ def test_storage_failure_is_metadata_only(api, modules, pg_store, monkeypatch, c
 
 
 @pytest.mark.asyncio
-async def test_unknown_dispatch_is_durable_and_not_automatically_retried(modules, pg_store, make_context, monkeypatch):
+async def test_unknown_dispatch_is_durable_and_not_automatically_retried(modules, pg_store, make_context, register_identity, monkeypatch):
     common, server, _ = modules
-    task = await server.submit_task("ambiguous", "Synthetic dispatch", make_context())
+    context = make_context()
+    register_identity(context.request_context.request.state.identity)
+    task = await server.submit_task("ambiguous", "Synthetic dispatch", context)
     calls = []
     class FailedHttp:
         def __init__(self, **kwargs):
@@ -222,9 +224,11 @@ async def test_unknown_dispatch_is_durable_and_not_automatically_retried(modules
 
 
 @pytest.mark.asyncio
-async def test_expired_dispatch_cannot_commit_success_or_thread_report(modules, pg_store, make_context, monkeypatch):
+async def test_expired_dispatch_cannot_commit_success_or_thread_report(modules, pg_store, make_context, register_identity, monkeypatch):
     _, server, _ = modules
-    task = await server.submit_task("late-result", "Synthetic dispatch", make_context())
+    context = make_context()
+    register_identity(context.request_context.request.state.identity)
+    task = await server.submit_task("late-result", "Synthetic dispatch", context)
     claim = pg_store.claim_next(server.SERVICE, op(), lease_seconds=1)
     class Response:
         def raise_for_status(self):
@@ -349,3 +353,72 @@ def test_atomic_dependencies_block_auto_dispatch_until_current_gate_passes(api, 
     dispatchable = pg_store.claim_next(modules[1].SERVICE, op())
     assert dispatchable["task_id"] == child["task_id"]
     assert call("owner", "submit_task", 409, operation_id=op(), **{**arguments, "depends_on": []})["code"] == "operation_conflict"
+
+
+@pytest.fixture
+def no_a2a(modules, monkeypatch):
+    calls = []
+    class ForbiddenHttp:
+        def __init__(self, **kwargs):
+            calls.append("client_created")
+            raise AssertionError("A2A must not be reached after identity revocation")
+    monkeypatch.setattr(modules[1].httpx, "AsyncClient", ForbiddenHttp)
+    return calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["revoked", "account", "kind", "role", "removed"])
+async def test_queued_auto_task_rechecks_registered_owner_before_dispatch(
+        modules, pg_store, make_context, register_identity, no_a2a, change):
+    common, server, _ = modules
+    context = make_context()
+    who = context.request_context.request.state.identity
+    token = register_identity(who)
+    private = "synthetic-private-queued-instructions"
+    task = await server.submit_task("revocation-" + change, private, context)
+    registry = common.CONFIG / "identities.json"
+    records = json.loads(registry.read_text())
+    if change == "revoked":
+        records[who["agent"]]["active"] = False
+    elif change == "account":
+        records[who["agent"]]["account"] = who["account"] + "-remapped"
+    elif change == "kind":
+        records[who["agent"]]["kind"] = "human"
+    elif change == "role":
+        records[who["agent"]].update(role="dispatcher", kind="service")
+    else:
+        del records[who["agent"]]
+    registry.write_text(json.dumps(records))
+    assert await server.process_next()
+    # Inspect synthetic storage using the original saved owner, independent of
+    # the now-revoked public token. This is not a public authentication bypass.
+    actor = server.Actor(who["agent"], who["account"], who["kind"])
+    view = pg_store.get_task(actor, task["task_id"])
+    assert view["status"] in {"failed", "interrupted"} and view["error"] == "cancelled"
+    assert view["dispatch_started_at"] is None and no_a2a == []
+    assert not await server.process_next()
+    events = pg_store.list_audit(actor, task_id=task["task_id"])
+    assert any(row["metadata"].get("error_code") == "cancelled" for row in events)
+    log = (common.STATE / "audit.jsonl").read_text()
+    assert token not in log and private not in log
+    assert not any(json.loads(line)["event"] == "task.dispatched" for line in log.splitlines())
+
+
+@pytest.mark.asyncio
+async def test_dispatch_direct_entry_rechecks_identity_changed_after_claim(
+        modules, pg_store, make_context, register_identity, no_a2a):
+    common, server, _ = modules
+    context = make_context()
+    who = context.request_context.request.state.identity
+    register_identity(who)
+    task = await server.submit_task("revoked-after-claim", "Synthetic task", context)
+    claim = await server.claim_next()
+    assert claim["task_id"] == task["task_id"] and server.dispatch_owner_current(claim)
+    registry = common.CONFIG / "identities.json"
+    records = json.loads(registry.read_text())
+    records[who["agent"]]["active"] = False
+    registry.write_text(json.dumps(records))
+    assert not server.dispatch_owner_current(claim)
+    stopped = await server.dispatch(claim)
+    assert stopped["error"] == "cancelled" and stopped["dispatch_started_at"] is None
+    assert no_a2a == []

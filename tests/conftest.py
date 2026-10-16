@@ -2,6 +2,7 @@
 """Synthetic identities and isolated PostgreSQL databases; never real accounts."""
 
 import importlib
+import hashlib
 import json
 import os
 import uuid
@@ -61,6 +62,21 @@ def make_context(identity_prefix):
             headers={"x-request-id": request_id},
         )))
     return make
+
+
+@pytest.fixture
+def register_identity(modules):
+    """Register synthetic actors explicitly for dispatch-time authorization."""
+    common = modules[0]
+    def register(who):
+        path = common.CONFIG / "identities.json"
+        records = json.loads(path.read_text()) if path.exists() else {}
+        token = "synthetic-" + uuid.uuid4().hex
+        records[who["agent"]] = {**who, "active": True, "hash": hashlib.sha256(token.encode()).hexdigest()}
+        path.write_text(json.dumps(records))
+        assert common.identity("Bearer " + token) == who
+        return token
+    return register
 
 
 @pytest.fixture
