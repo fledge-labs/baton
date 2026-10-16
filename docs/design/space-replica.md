@@ -19,9 +19,10 @@ Follow the official semantics of OpenAI's **ChatGPT Space**, the same way WAG re
 - `x_handoff`: a task moves to a new holder with its context, base commit and evidence attached.
 - `x_gate`: a result becomes "done" only after a configured gate (e.g. CI) passes.
 - `x_audit`: an append-only log of claims, hand-offs, edits, approvals and gate results.
+- `x_graph`: tasks form a dependency graph (`depends_on`). A task becomes claimable only when every dependency has passed its gate. Progress is read from task states, so there is no separate tracker. Space documents no task dependencies; this is the gap Baton fills. Who builds the graph (a human, or a planning agent such as a CEO agent) is outside Baton; Baton stores and enforces it.
 
 ## What it replaces
-Agent Mail's inbox, threads and file reservations become comment threads plus mentions (the inbox is "mentions and assignments for me") plus `x_claim`/`x_scope`. The MCP tools stay: `submit_task`, `get_task`, `list_tasks`, `fetch_inbox`. They gain `claim`, `renew`, `handoff`, `comment`, `mention`.
+Agent Mail's inbox, threads and file reservations become comment threads plus mentions (the inbox is "mentions and assignments for me") plus `x_claim`/`x_scope`. The MCP tools stay: `submit_task`, `get_task`, `list_tasks`, `fetch_inbox`. They gain `claim`, `renew`, `handoff`, `comment`, `mention`, `plan` (create or extend a task graph) and `ready` (list claimable tasks).
 
 ## Order of work
 1. `docs/spec/space.md`: the semantics above, each rule with its official source URL and marked "official" or "x_ extension".
