@@ -3,6 +3,7 @@
 import json
 import tomllib
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -69,6 +70,45 @@ async def test_running_worker_becomes_interrupted_and_never_reexecutes(modules, 
     assert queue.events[-1].status.state == TaskState.TASK_STATE_FAILED
     with common.database("executions.sqlite3") as db:
         assert db.execute("SELECT status FROM executions WHERE id=?", (task_id,)).fetchone()[0] == "interrupted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("returncode", [0, 7])
+async def test_harness_result_cannot_follow_a_task_created_symlink(modules, monkeypatch, returncode):
+    common, _, worker = modules
+    protected = common.STATE / "synthetic-protected-state"
+    protected.write_text("must remain unchanged")
+    captured = {}
+
+    async def spawn(*command, **options):
+        if command == ("codex", "--version"):
+            async def version_output():
+                return ("codex-cli " + worker.CODEX_VERSION).encode(), None
+            return SimpleNamespace(returncode=0, communicate=version_output)
+        wd = Path(options["cwd"])
+        final = Path(command[command.index("--output-last-message") + 1])
+        captured.update(wd=wd, final=final)
+        # A tool may create a symlink in its own writable directory even when
+        # it cannot read or write the destination. The harness must ignore it.
+        (wd / "result.txt").symlink_to(protected)
+
+        async def complete(_input):
+            final.write_text("synthetic model result")
+            return None, None
+        return SimpleNamespace(returncode=returncode, communicate=complete)
+
+    monkeypatch.setattr(worker.asyncio, "create_subprocess_exec", spawn)
+    executor = worker.CodexExecutor("codex")
+    if returncode:
+        with pytest.raises(RuntimeError, match="Codex execution failed"):
+            await executor.run_codex("synthetic task", str(uuid.uuid4()))
+    else:
+        assert await executor.run_codex("synthetic task", str(uuid.uuid4())) == "synthetic model result"
+    assert protected.read_text() == "must remain unchanged"
+    assert captured["final"].parent.parent == common.STATE
+    assert not captured["final"].is_relative_to(captured["wd"])
+    assert not captured["final"].parent.exists()
+    assert not captured["wd"].exists()
 
 
 def test_codex_command_denies_credentials_and_only_writes_task_directory(modules, monkeypatch, tmp_path):

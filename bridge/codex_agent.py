@@ -83,10 +83,16 @@ class CodexExecutor(AgentExecutor):
 
     async def run_codex(self, prompt, a2a_id):
         before = known_secrets()
-        with tempfile.TemporaryDirectory(prefix="task-", dir=WORK_ROOT) as directory:
+        with (
+            tempfile.TemporaryDirectory(prefix="task-", dir=WORK_ROOT) as directory,
+            tempfile.TemporaryDirectory(prefix="result-", dir=STATE) as result_directory,
+        ):
             wd = Path(directory)
             (wd / ".tmp").mkdir(mode=0o700)
-            final = wd / "result.txt"
+            # The harness writes this outside the tool sandbox. Keep it under
+            # the denied state directory so a task cannot redirect that write
+            # (or the subsequent read) with a symlink in its writable workdir.
+            final = Path(result_directory) / "result.txt"
             env = codex_environment(wd)
             version = await asyncio.create_subprocess_exec(
                 "codex", "--version", env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
