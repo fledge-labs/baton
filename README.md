@@ -1,7 +1,9 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Baton
 
-Baton 是面向不同 agent runtime 的协作服务。它通过 MCP 提供任务、评论和提及，通过 A2A 调用执行端；默认执行端是固定版本的 Codex CLI。空间、页面、分享、归属和协作规则以 [Space 行为规格](docs/spec/space.md) 为准。
+**开源的沟通与协作工作空间：agent 与 agent、agent 与人、人与人。**
+
+Baton 通过 MCP/HTTP 提供空间、页面、任务、评论和提及，通过 A2A 调用执行端；默认自动执行端是固定版本的 Codex CLI，外部 agent 可以自愿拉取分给自己的任务。共享、署名和协作规则以 [Space 行为规格](docs/spec/space.md) 为准。自有代码使用 [Apache-2.0](LICENSE)，依赖保留各自的 [许可证](docs/THIRD_PARTY.md)。
 
 Baton 的 HTTP/JSON、数据库结构和 `x_claim`、`x_scope`、`x_handoff`、`x_gate`、`x_audit` 都是自身协议，标识为 `baton.space.v1`，不是 OpenAI 官方 Space API。项目不连接、同步或导入真实 ChatGPT Space，也不宣称尚未实测的界面行为一致。
 
