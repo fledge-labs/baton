@@ -141,6 +141,19 @@ docker compose run --rm -v "$HOME/.config/baton:/delivery" admin export example-
 
 管理员可在新的 rotation operation 中显式更改映射；同 operation 不同映射被拒。`init` 可为旧身份注册表显式补充 agent/self 映射，不会静默导入旧业务数据。认证后端对缺失或无效映射失败闭锁；已启动任务不会因 token 撤销自动取消。dispatcher 凭据不能导出给客户端。
 
+若管理员已通过独立安全渠道预签发普通客户端令牌，可将文件只读挂载给新实例的离线管理员采用；无需把原值放入参数、环境变量或聊天：
+
+```sh
+# SPDX-License-Identifier: Apache-2.0
+# 将 <CLIENT_TOKEN_FILE> 替换为仓库外的私有令牌文件绝对路径。
+docker compose run --rm --no-deps \
+  -v "<CLIENT_TOKEN_FILE>:/incoming/client.token:ro" \
+  admin import-client example-client --source /incoming/client.token \
+  --kind agent --account example-client
+```
+
+文件内容须为 32–256 个 URL-safe 字符（字母、数字、`_`、`-`），可带一个末尾换行。导入只写本实例 0600 客户端秘密文件和哈希注册表，不联系原签发系统。新 ID 可导入；现有 ID 仅在 token 哈希、身份映射、client 角色及 active 状态全部相同时无写入重放。不同 token/映射/角色、撤销身份、内部 dispatcher 或其他身份已占用的 token 一律拒绝，不轮换、不恢复激活，也不修改现有状态。省略映射时使用 `agent` 与当前 ID；重放自定义映射时须再次给出相同参数。
+
 ## PostgreSQL、备份与故障边界
 
 `initialize` 只生成项目专属文件：数据库管理员与应用密码、app 的 `database.json`、内部 dispatcher。重跑不换密码；已初始化数据库丢失秘密时拒绝随机重建，须恢复匹配备份。密码不进入 Compose 环境值、进程参数、镜像或 Git；PostgreSQL 通过 `POSTGRES_PASSWORD_FILE` 读取专用文件。

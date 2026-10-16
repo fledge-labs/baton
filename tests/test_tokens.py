@@ -120,3 +120,87 @@ def test_admin_init_explicitly_upgrades_legacy_mapping_without_rotating(tmp_path
     invoke(root,'init')
     entry=json.loads(registry.read_text())['legacy-client']
     assert (entry['kind'],entry['account'],entry['hash'])==('agent','legacy-client',before)
+
+
+def runtime_snapshot(root):
+    return {str(path.relative_to(root)):(path.read_bytes(),path.stat().st_mode,path.stat().st_mtime_ns)
+            for path in root.rglob('*') if path.is_file()}
+
+
+@pytest.mark.parametrize('size,ending',[(32,b''),(64,b'\n'),(256,b'\r\n')])
+def test_import_client_stores_private_file_and_replays_without_changes(tmp_path,capsys,size,ending):
+    root=tmp_path/'runtime';invoke(root,'init');capsys.readouterr()
+    raw=('_-'+'A'*(size-2)).encode();source=tmp_path/'incoming.token';source.write_bytes(raw+ending)
+    args=('import-client','example-client','--source',str(source),'--kind','human','--account','example-person')
+    invoke(root,*args)
+    first=json.loads(capsys.readouterr().out)
+    assert first['replay'] is False
+    saved=root/'secrets/clients/example-client.token'
+    assert saved.read_bytes()==raw+b'\n'
+    assert saved.stat().st_mode & 0o777==0o600
+    entry=json.loads((root/'config/identities.json').read_text())['example-client']
+    digest=hashlib.sha256(raw).hexdigest()
+    assert entry=={'agent':'example-client','role':'client','kind':'human','account':'example-person','hash':digest,'active':True}
+    before=runtime_snapshot(root)
+    invoke(root,*args)
+    replay=json.loads(capsys.readouterr().out)
+    assert replay['replay'] is True
+    assert runtime_snapshot(root)==before
+    logs=json.dumps(first)+json.dumps(replay)
+    assert raw.decode() not in logs and digest not in logs
+    assert raw.decode() not in (root/'config/identities.json').read_text()
+    assert raw.decode() not in (root/'config/gateway.json').read_text()
+
+
+@pytest.mark.parametrize('conflict',['token','kind','account','revoked','missing-mapping','role'])
+def test_import_client_conflict_leaves_all_runtime_state_unchanged(tmp_path,capsys,conflict):
+    root=tmp_path/'runtime';invoke(root,'init')
+    source=tmp_path/'incoming.token';source.write_text('A'*48+'\n')
+    invoke(root,'import-client','example-client','--source',str(source))
+    args=['import-client','example-client','--source',str(source)]
+    if conflict=='token':source.write_text('B'*48+'\n')
+    elif conflict=='kind':args+=['--kind','human']
+    elif conflict=='account':args+=['--account','different-account']
+    elif conflict=='revoked':invoke(root,'revoke','example-client')
+    else:
+        registry=root/'config/identities.json';entries=json.loads(registry.read_text())
+        if conflict=='missing-mapping':entries['example-client'].pop('account')
+        else:entries['example-client']['role']='dispatcher'
+        registry.write_text(json.dumps(entries))
+    capsys.readouterr();before=runtime_snapshot(root)
+    with pytest.raises(SystemExit):invoke(root,*args)
+    assert runtime_snapshot(root)==before
+    captured=capsys.readouterr();logs=captured.out+captured.err
+    assert 'A'*48 not in logs and 'B'*48 not in logs
+    assert hashlib.sha256(('A'*48).encode()).hexdigest() not in logs
+
+
+def test_import_client_cannot_reuse_another_identity_or_import_dispatcher(tmp_path):
+    root=tmp_path/'runtime';invoke(root,'init');invoke(root,'issue','existing-client')
+    source=root/'secrets/clients/existing-client.token';before=runtime_snapshot(root)
+    with pytest.raises(SystemExit):invoke(root,'import-client','another-client','--source',str(source))
+    assert runtime_snapshot(root)==before
+    worker=root/'secrets/bridge/dispatcher.token'
+    with pytest.raises(SystemExit):invoke(root,'import-client','codex-worker','--source',str(worker))
+    assert runtime_snapshot(root)==before
+
+
+@pytest.mark.parametrize('raw',[
+    b'A'*31,b'A'*257,b'A'*32+b'=',b'A'*16+b'/'+b'A'*16,
+    b'A'*16+b' '+b'A'*16,b' '+b'A'*32,b'A'*32+b' ',
+    b'A'*32+b'\n\n',b'A'*16+b'\n'+b'A'*16,b'\xff'*32,b'A'*10000,
+])
+def test_import_client_rejects_invalid_file_before_creating_runtime(tmp_path,capsys,raw):
+    source=tmp_path/'incoming.token';source.write_bytes(raw);root=tmp_path/'runtime'
+    with pytest.raises(ValueError,match='Invalid client credential file'):
+        invoke(root,'import-client','example-client','--source',str(source))
+    assert not root.exists()
+    captured=capsys.readouterr();assert captured.out=='' and captured.err==''
+
+
+@pytest.mark.parametrize('extra',[['--output','unused'],['--operation-id','unused'],['--uid','1000']])
+def test_import_client_rejects_unrelated_operations_without_writes(tmp_path,extra):
+    source=tmp_path/'incoming.token';source.write_text('A'*48);root=tmp_path/'runtime'
+    with pytest.raises(SystemExit):
+        invoke(root,'import-client','example-client','--source',str(source),*extra)
+    assert not root.exists()

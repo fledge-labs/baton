@@ -34,8 +34,8 @@ def atomic_write(path, data, mode=0o600, owner=None):
 def secret_path(root,agent,role):
     return root/'secrets/bridge/dispatcher.token' if role=='dispatcher' else root/'secrets/clients'/f'{agent}.token'
 
-def provision(root,identities,agent,role,kind=None,account=None):
-    token=secrets.token_urlsafe(48)
+def provision(root,identities,agent,role,kind=None,account=None,*,token=None):
+    token=secrets.token_urlsafe(48) if token is None else token
     prior=identities.get(agent,{})
     kind=kind or prior.get('kind') or ('service' if role=='dispatcher' else 'agent')
     account=account or prior.get('account') or agent
@@ -95,10 +95,18 @@ def deliver(root,identities,agent,path,uid,gid):
     owner=(uid,gid) if uid is not None and gid is not None else None
     atomic_write(path,raw,owner=owner)
 
+def read_client_token(path):
+    # Bound the read and allow only one conventional file-ending newline.
+    with path.open('rb') as source:
+        raw=source.read(259)
+    if not re.fullmatch(rb'[A-Za-z0-9_-]{32,256}(?:\r?\n)?',raw):
+        raise ValueError('Invalid client credential file')
+    return raw.rstrip(b'\r\n').decode('ascii')
+
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--runtime',type=Path,default=Path('/runtime'))
-    parser.add_argument('action',choices=['init','issue','revoke','rotate','export','list','import-auth','import-api-key'])
+    parser.add_argument('action',choices=['init','issue','revoke','rotate','export','list','import-auth','import-api-key','import-client'])
     parser.add_argument('agent',nargs='?')
     parser.add_argument('--output',type=Path)
     parser.add_argument('--source',type=Path)
@@ -111,12 +119,33 @@ def main(argv=None):
     if args.agent and not re.fullmatch(r'[a-z][a-z0-9-]{0,40}',args.agent):parser.error('Invalid agent identifier')
     if args.operation_id and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,95}',args.operation_id):parser.error('Invalid operation identifier')
     if args.account is not None and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,95}',args.account):parser.error('Invalid account identifier')
-    if (args.kind is not None or args.account is not None) and args.action not in ('issue','rotate'):
-        parser.error('--kind and --account only apply to issue or rotate')
+    if (args.kind is not None or args.account is not None) and args.action not in ('issue','rotate','import-client'):
+        parser.error('--kind and --account only apply to issue, rotate or import-client')
+    imported_token=None
+    if args.action=='import-client':
+        if not args.agent or not args.source:parser.error('import-client requires an agent identifier and --source')
+        if args.agent=='codex-worker':parser.error('Reserved internal identity cannot be imported')
+        if args.output is not None or args.operation_id is not None or args.uid is not None or args.gid is not None:
+            parser.error('import-client does not accept export or rotation options')
+        imported_token=read_client_token(args.source)
     root.mkdir(parents=True,exist_ok=True,mode=0o700);(root/'config').mkdir(exist_ok=True,mode=0o755)
     with (root/'config/.tokens.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
         registry=root/'config/identities.json';ids=json.loads(registry.read_text()) if registry.exists() else {}
+        if args.action=='import-client':
+            digest=hashlib.sha256(imported_token.encode()).hexdigest()
+            kind=args.kind or 'agent';account=args.account or args.agent
+            if any(name!=args.agent and entry.get('hash')==digest for name,entry in ids.items()):
+                parser.error('Client credential is already assigned to another identity')
+            if args.agent in ids:
+                entry=ids[args.agent]
+                expected={'agent':args.agent,'role':'client','kind':kind,'account':account,'hash':digest,'active':True}
+                if any(entry.get(key)!=value for key,value in expected.items()) or entry.get('active') is not True:
+                    parser.error('Existing identity differs or is inactive; import made no changes')
+                # A replay does not rotate, reactivate, normalize other identities,
+                # replace files or update either public configuration file.
+                print(json.dumps({'action':'import-client','agent':args.agent,'status':'ok','replay':True,'secret_values_displayed':False}))
+                return
         # The offline administrator explicitly upgrades legacy identity records.
         # Runtime authentication must never infer or accept caller-supplied mapping.
         for agent,entry in ids.items():
@@ -140,6 +169,8 @@ def main(argv=None):
             if not args.agent:parser.error('Agent identifier required')
             if args.agent in ids:parser.error('Identity already exists; use explicit rotate to replace its credential')
             provision(root,ids,args.agent,'client',args.kind,args.account)
+        elif args.action=='import-client':
+            provision(root,ids,args.agent,'client',args.kind or 'agent',args.account or args.agent,token=imported_token)
         elif args.action in ('rotate','revoke','export'):
             if args.agent not in ids:parser.error('Unknown identity')
             if args.action=='revoke':ids[args.agent]['active']=False
@@ -162,7 +193,9 @@ def main(argv=None):
         if args.output:
             if args.action not in ('issue','rotate','export'):parser.error('--output only applies to client credential operations')
             deliver(root,ids,args.agent,args.output,args.uid,args.gid)
-        print(json.dumps({'action':args.action,'agent':args.agent,'status':'ok','secret_values_displayed':False}))
+        result={'action':args.action,'agent':args.agent,'status':'ok','secret_values_displayed':False}
+        if args.action=='import-client':result['replay']=False
+        print(json.dumps(result))
 
 if __name__=='__main__':
     try:main()
