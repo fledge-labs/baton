@@ -18,8 +18,9 @@
 - [S4：Agents](https://learn.chatgpt.com/docs/space/agents)。
 - [S5：Getting started](https://learn.chatgpt.com/docs/space/getting-started)。
 - [S6：DevDay 2026 回顾](https://learn.chatgpt.com/docs/whats-new/devday-2026#chatgpt-space)。
+- [S7：OpenAI DevDay 2026 Recap](https://openai.com/index/devday-2026-recap/)。
 
-按任务要求另启动独立 Codex CLI 研究：全局 `--search`，`exec --ignore-user-config --ignore-rules --ephemeral --sandbox read-only`，禁止读取凭据、个人配置或真实空间，输出保存在仓库外。本版正文以作者已核验的上述原文为依据；CLI 完成报告尚待收齐后交叉核对，不能预先标成研究完成。
+按任务要求已完成独立 Codex CLI 研究：全局 `--search`，`exec --ignore-user-config --ignore-rules --ephemeral --sandbox read-only`，禁止读取凭据、个人配置或真实空间。研究正常退出并返回 `OFFICIAL_RESEARCH_READY`；报告保存在仓库外，不混入公开源码。作者随后逐条核对允许的官方原文，结论与下述官方/扩展/未知边界一致；此研究不包含真实界面实测或实现验收。
 
 这些产品页面没有给出可据以实现的 Space CRUD HTTP API、数据库模型或 wire schema。本规格不把这一检索范围内的缺失推断成“任何地方都不存在 API”；所有下述 HTTP、JSON、数据库、状态机与 MCP 映射均属于 **x_扩展**。概览及 DevDay 中的其他产品链接不构成 Space API 证据。[官方来源范围：S1](https://learn.chatgpt.com/docs/space/)、[S6](https://learn.chatgpt.com/docs/whats-new/devday-2026#chatgpt-space)。
 
@@ -49,11 +50,11 @@
 
 **X1 · x_protocol。** HTTP 统一采用 `POST /v1/space/{operation}`，协议标识为 `x_protocol: "baton.space.v1"`。URL 不必逐段含 `x_`，但文档、响应和客户端不得把它称作官方 Space API。操作名及方法参数由同期实现 contract 明列允许列表；禁止按输入反射调用任意存储方法。未实现操作必须明确拒绝，不能伪装成成功。[官方背景：S1](https://learn.chatgpt.com/docs/space/)。
 
-**X2 · 主体与授权。** 认证层确定 `principal`，区分 human、agent、service；请求体不能覆盖真实 actor。内容写入、评论、分享、任务提交、领取及审阅必须在服务端重新检查当前有效权限。`codex-worker` 是 Baton 服务主体，只能使用自动任务所需的窄接口；它不是用户的 connected account，不能借此获得任意页面编辑或分享权。`requested_by` 与 `performed_by` 必须分别保留，服务执行不能冒充用户署名。[官方背景：S3](https://learn.chatgpt.com/docs/space/collaboration#choose-an-access-level)、[S4](https://learn.chatgpt.com/docs/space/agents#work-with-others)。
+**X2 · 主体与授权。** 认证层确定 `principal`，区分 human、agent、service；principal kind/account 仅由 token 管理员指定，API 请求不能修改它们或覆盖真实 actor。内容写入、评论、分享、任务提交、领取及审阅必须在服务端重新检查当前有效权限。`codex-worker` 是 Baton 服务主体，只能使用自动任务所需的窄接口；它不是用户的 connected account，不能借此获得任意页面编辑或分享权。`requested_by` 与 `performed_by` 必须分别保留，服务执行不能冒充用户署名。[官方背景：S3](https://learn.chatgpt.com/docs/space/collaboration#choose-an-access-level)、[S4](https://learn.chatgpt.com/docs/space/agents#work-with-others)。
 
-**X3 · 授权存储。** 直接授权记录资源、接收主体及 view/comment/edit；继承权由 Space/父页面的当前有效授权计算，不能复制成不会失效的直接邀请。Baton 自定义有效权限为可用授权的最高级别，`view < comment < edit`；这是自身的冲突规则，不是官方已公开算法。分享管理权限独立检查。首版不默认为每个 Team 提供 comment；未知接收者类型应拒绝或声明不支持。[官方背景：S3](https://learn.chatgpt.com/docs/space/collaboration#understand-inherited-access)。
+**X3 · 授权存储。** 直接授权记录资源、接收主体及 view/comment/edit；继承权由 Space/父页面的当前有效授权计算，不能复制成不会失效的直接邀请。Baton 自定义有效权限为可用授权的最高级别，`view < comment < edit`；这是自身的冲突规则，不是官方已公开算法。页面管理分享的 owner 取所属 Space 的 owner，页面创建者只记归属，不因创建行为获得隐式独立 owner 权；临时 edit 被撤销后不能凭创建者身份保留访问或分享权。分享管理权限仍与内容 edit 分开检查。Baton 首版 Team 仅支持 view/edit，comment 授权给人；未知接收者类型拒绝或明确声明不支持。这个首版角色矩阵是 x_选择，不是所有官方账户的普遍矩阵。[官方背景：S3](https://learn.chatgpt.com/docs/space/collaboration#understand-inherited-access)。
 
-**X4 · 页面、块与归属。** PostgreSQL 保存稳定的 Space、Page、Block 标识和父子关系；拒绝循环父子关系。页面内容版本单调递增，归属至少保留实际 actor、提交版本和数据库时间。块 payload、顺序表示、版本比较及历史保留是 Baton 自有格式。内容变更必须携带实现 contract 定义的基线版本；陈旧基线返回冲突，不静默覆盖。首版不声称 CRDT、实时协同光标或自动合并与 Space 一致。[官方背景：S2](https://learn.chatgpt.com/docs/space/pages#rearrange-blocks)、[S2 归属](https://learn.chatgpt.com/docs/space/pages#comment-and-collaborate)。
+**X4 · 页面、块与归属。** PostgreSQL 保存稳定的 Space、Page、Block 标识和父子关系；拒绝循环父子关系。Baton 存储中所有页面归属一个 Space，独立页面可用私有 home Space 表示；这是内部存储选择，不能据此声称官方页面必须先属于一个 space。页面内容版本单调递增，归属至少保留实际 actor、提交版本和数据库时间。块 payload、顺序表示、版本比较及历史保留是 Baton 自有格式。内容变更必须携带实现 contract 定义的基线版本；陈旧基线返回冲突，不静默覆盖。首版不声称 CRDT、实时协同光标或自动合并与 Space 一致。[官方背景：S1](https://learn.chatgpt.com/docs/space/)、[S2](https://learn.chatgpt.com/docs/space/pages#rearrange-blocks)、[S2 归属](https://learn.chatgpt.com/docs/space/pages#comment-and-collaborate)。
 
 **X5 · 评论、提及与 inbox。** 评论线程绑定页面或任务；任务与其报告线程使用同一个 UUID。提及保存显式目标 principal，而不是把显示名称当授权身份。对 agent 的执行请求与普通提及应明确区分，保存请求者、接收者和上下文；接收者无有效权限时不得执行。`fetch_inbox` 是 Baton 对“发给当前接收账户/principal 的 mentions + assignments”的查询视图，不是官方 Inbox API，不返回该 Space 内所有评论。结果在读取时过滤当前访问权；不会仅凭知道接收者 ID 就允许读取他人的 inbox。是否触发执行必须遵守 X2、X12，而非由前端 @ 文本直接决定。[官方背景：S4](https://learn.chatgpt.com/docs/space/agents#choose-how-to-ask-for-help)。
 
@@ -89,8 +90,8 @@
 
 | 编号 | 红线/触发 | 可执行验收结果 |
 | --- | --- | --- |
-| A1 | Space、父页面及直接授权并存 | 移除直接邀请后继承权仍在；移除继承来源后再次请求重新计算，不能凭旧缓存继续访问。 |
-| A2 | view/comment/edit 与分享管理 | view 不能写评论或内容；comment 能反馈不能改内容；edit 不自动获得管理分享权；伪造 actor 无效。 |
+| A1 | Space、父页面及直接授权并存 | 移除直接邀请后继承权仍在；移除继承来源后再次请求重新计算，不能凭旧缓存继续访问；临时编辑者创建页面后被撤权，不残留隐式 owner 权。 |
+| A2 | view/comment/edit 与分享管理 | view 不能写评论或内容；人的 comment 能反馈不能改内容；Team comment 被拒绝；edit 不自动获得管理分享权；请求伪造 actor/kind/account 无效。 |
 | A3 | 并发页面变更 | 相同基线的冲突更新仅有一个生效，另一方返回明确冲突；归属记录真实操作者。 |
 | A4 | 提及人与 agent | 人类反馈不会自动派活；agent 请求有请求者和接收者；他人 inbox 不可读，失权后不泄漏旧提及。 |
 | A5 | 幂等并发与异载荷重放 | 相同 actor/key 或 operation_id 仅产生一次效果；不同有效载荷冲突；事务失败无半成品。 |
