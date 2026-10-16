@@ -515,9 +515,14 @@ class SpaceStore:
             self._require(conn, actor, "page", str(comment["page_id"]), "comment")
         def effect(conn):
             comment = self._row(conn, "comments", comment_id)
-            row = conn.execute("""INSERT INTO baton.mentions(id,comment_id,target_type,target_id,action_requested,requested_by) VALUES (%s,%s,%s,%s,%s,%s)
-                ON CONFLICT(comment_id,target_type,target_id,requested_by) DO UPDATE SET target_id=EXCLUDED.target_id RETURNING *""",
+            row = conn.execute("""INSERT INTO baton.mentions AS saved(id,comment_id,target_type,target_id,action_requested,requested_by) VALUES (%s,%s,%s,%s,%s,%s)
+                ON CONFLICT(comment_id,target_type,target_id,requested_by) DO UPDATE SET action_requested=true,created_at=clock_timestamp()
+                WHERE EXCLUDED.action_requested AND NOT saved.action_requested RETURNING *""",
                 (uuid.uuid4(), comment_id, target_type, target_id, target_type == "agent", actor.principal)).fetchone()
+            if row is None:
+                row = conn.execute("SELECT * FROM baton.mentions WHERE comment_id=%s AND target_type=%s AND target_id=%s AND requested_by=%s",
+                                   (comment_id, target_type, target_id, actor.principal)).fetchone()
+                return {**row, "_business_replay": True}
             page = self._row(conn, "pages", str(comment["page_id"]))
             task = conn.execute("SELECT id FROM baton.tasks WHERE id=%s AND page_id=%s", (comment["thread_id"], comment["page_id"])).fetchone()
             self._audit(conn, actor, operation_id, "mention.created", space_id=page["space_id"], task_id=task["id"] if task else None,
@@ -530,10 +535,11 @@ class SpaceStore:
         self._user(actor)
         def read(conn):
             rows = conn.execute("""SELECT c.*,m.id AS mention_id,m.action_requested AS mention_action_requested,
-                m.requested_by AS mention_requested_by,m.target_type,m.target_id,m.created_at AS requested_at
+                m.requested_by AS mention_requested_by,m.target_type,m.target_id,m.created_at AS requested_at,
+                GREATEST(c.created_at,m.created_at) AS activity_at
                 FROM baton.comments c JOIN baton.mentions m ON m.comment_id=c.id
                 WHERE m.target_id=%s AND m.target_type IN ('person','agent')
-                ORDER BY m.created_at DESC,m.id DESC""", (actor.principal,)).fetchall()
+                ORDER BY activity_at DESC,m.id DESC""", (actor.principal,)).fetchall()
             threads = {}
             for row in rows:
                 if not self._role(conn, actor, "page", str(row["page_id"])):
@@ -542,7 +548,8 @@ class SpaceStore:
                            "requested_by": row["mention_requested_by"], "action_requested": row["mention_action_requested"],
                            "target_principal": row["target_id"], "target_type": row["target_type"], "created_ts": row["requested_at"]}
                 message = {"id": str(row["id"]), "thread_id": str(row["thread_id"]), "subject": row["subject"],
-                           "from": row["author_principal"], "to": [actor.principal], "created_ts": row["requested_at"], "body_md": row["body"],
+                           "from": row["author_principal"], "to": [actor.principal], "created_ts": row["activity_at"],
+                           "comment_created_at": row["created_at"], "body_md": row["body"],
                            "requested_by": request["requested_by"], "action_requested": request["action_requested"], "requests": []}
                 threads.setdefault(message["thread_id"], message)["requests"].append(request)
             assigned = conn.execute("SELECT * FROM baton.tasks WHERE assignee=%s ORDER BY created_at DESC", (actor.principal,)).fetchall()

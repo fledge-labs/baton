@@ -535,3 +535,22 @@ def test_invalid_json_enum_shapes_have_safe_validation_errors():
     expect("invalid", lambda: store.create_block(actor, operation(), operation(), [], "content"))
     expect("invalid", lambda: store.share(actor, operation(), "space", operation(), "person", "reader", []))
     expect("invalid", lambda: store.gate(actor, operation(), operation(), 1, []))
+
+
+def test_explicit_request_promotes_assignment_notice_and_sorts_by_latest_activity(pg):
+    s = pg.store
+    task = s.submit_task(pg.owner, operation(), "promote-notice", "Assigned instructions", page_id=pg.page["id"], assignee=pg.editor)
+    submitted = s.list_comments(pg.owner, pg.page["id"], task["id"])[0]
+    later = s.comment(pg.owner, operation(), pg.page["id"], "Another thread")
+    s.mention(pg.owner, operation(), later["id"], "agent", pg.editor.principal)
+    assert s.fetch_inbox(pg.editor, limit=1)["messages"][0]["thread_id"] == later["thread_id"]
+    promoted = s.mention(pg.owner, operation(), submitted["id"], "agent", pg.editor.principal)
+    assert promoted["action_requested"] is True
+    message = s.fetch_inbox(pg.editor, limit=1)["messages"][0]
+    assert message["thread_id"] == task["id"] and message["action_requested"] is True
+    assert message["requested_by"] == pg.owner.principal
+    assert message["created_ts"] > message["comment_created_at"]
+    before = s.list_audit(pg.owner, task_id=task["id"])
+    repeated = s.mention(pg.owner, operation(), submitted["id"], "agent", pg.editor.principal)
+    assert repeated["created_at"] == promoted["created_at"] and repeated["replay"]
+    assert len(s.list_audit(pg.owner, task_id=task["id"])) == len(before)
