@@ -19,6 +19,7 @@ Follow the official semantics of OpenAI's **ChatGPT Space**, the same way WAG re
 - `x_handoff`: a task moves to a new holder with its context, base commit and evidence attached.
 - `x_gate`: a result becomes "done" only after a configured gate (e.g. CI) passes.
 - `x_audit`: an append-only log of claims, hand-offs, edits, approvals and gate results.
+- `x_ready`: a task carries its work-face checklist: base commit, declared scope, environment and fixtures, constraints, and the acceptance gate command. A preparation task (done by a human or a prep agent) must pass before construction tasks become claimable. Most failed hand-offs come from an unprepared site, not from bad work.
 - `x_graph`: tasks form a dependency graph (`depends_on`). A task becomes claimable only when every dependency has passed its gate. Progress is read from task states, so there is no separate tracker. Space documents no task dependencies; this is the gap Baton fills. Who builds the graph (a human, or a planning agent such as a CEO agent) is outside Baton; Baton stores and enforces it.
 
 ## What it replaces
