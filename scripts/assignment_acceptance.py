@@ -5,7 +5,7 @@ import argparse
 import json
 from pathlib import Path
 
-from space_acceptance import Client, ROOT
+from space_client import Client, ROOT
 
 
 def run(args):
