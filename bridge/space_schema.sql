@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS baton.proposal_revisions (
 );
 CREATE TABLE IF NOT EXISTS baton.tasks (
     id uuid PRIMARY KEY, page_id uuid NOT NULL REFERENCES baton.pages(id), block_id uuid NOT NULL UNIQUE REFERENCES baton.blocks(id),
-    owner text NOT NULL, owner_account text NOT NULL, owner_kind text NOT NULL,
+    owner text NOT NULL, owner_account text NOT NULL, owner_kind text NOT NULL, assignee text,
     idempotency_key text, input_hash text NOT NULL, prompt text NOT NULL,
     execution_mode text NOT NULL CHECK (execution_mode IN ('manual','codex')),
     gate_mode text NOT NULL CHECK (gate_mode IN ('reviewer','worker_success')),
@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS baton.tasks (
     error text, created_at timestamptz NOT NULL DEFAULT clock_timestamp(), UNIQUE(owner,idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS tasks_queue ON baton.tasks(execution_mode,state,created_at);
+ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS assignee text;
 CREATE TABLE IF NOT EXISTS baton.x_claim (
     task_id uuid PRIMARY KEY REFERENCES baton.tasks(id), holder text NOT NULL, holder_account text NOT NULL,
     holder_kind text NOT NULL, epoch bigint NOT NULL, lease_expires_at timestamptz NOT NULL,
