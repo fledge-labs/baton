@@ -66,6 +66,8 @@
         const node = textElement('div', '', 'task');
         node.append(textElement('strong', message.subject || 'Comment'));
         node.append(textElement('p', (message.from || 'Worker') + ' · ' + (message.created_ts || '') + ' · Thread: ' + (message.thread_id || ''), 'meta'));
+        if (message.task_id) node.append(textElement('p', 'Task: ' + message.state + ' · Assigned to: ' + (message.assignee || 'Unassigned'), 'meta'));
+        if (message.action_requested) node.append(textElement('p', 'Action requested by: ' + message.requested_by, 'meta'));
         node.append(textElement('pre', message.body_md || ''));
         $('inbox').append(node);
       }
