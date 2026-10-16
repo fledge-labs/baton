@@ -2,7 +2,7 @@
 
 # Baton Space 行为规格
 
-状态：`SPEC_ASSIGNMENT_READY`。本版冻结已核实的产品语义和 Baton 存储/API 不变量，含命名派单补充，供实现与独立验收使用；不代表实现已通过，也不代表 ChatGPT Space 界面等价性已验收。核验日期：2026-10-17。
+状态：`SPEC_GRAPH_READY`。本版冻结已核实的产品语义和 Baton 存储/API 不变量，含命名派单、依赖图及首版保守 scope 判定，供实现与独立验收使用；不代表实现已通过，也不代表 ChatGPT Space 界面等价性已验收。核验日期：2026-10-17。
 
 范围：替换 Agent Mail 为 Baton 自有的空间、页面、评论、提及、任务与协作协议。采用 PostgreSQL，优先实现数据库与 HTTP 行为；不连接真实 ChatGPT 空间，不做同步、导入既有账户或协议互操作。
 
@@ -56,7 +56,7 @@
 
 **X4 · 页面、块与归属。** PostgreSQL 保存稳定的 Space、Page、Block 标识和父子关系；拒绝循环父子关系。Baton 存储中所有页面归属一个 Space，独立页面可用私有 home Space 表示；这是内部存储选择，不能据此声称官方页面必须先属于一个 space。页面内容版本单调递增，归属至少保留实际 actor、提交版本和数据库时间。块 payload、顺序表示、版本比较及历史保留是 Baton 自有格式。内容变更必须携带实现 contract 定义的基线版本；陈旧基线返回冲突，不静默覆盖。首版不声称 CRDT、实时协同光标或自动合并与 Space 一致。[官方背景：S1](https://learn.chatgpt.com/docs/space/)、[S2](https://learn.chatgpt.com/docs/space/pages#rearrange-blocks)、[S2 归属](https://learn.chatgpt.com/docs/space/pages#comment-and-collaborate)。
 
-**X5 · 评论、提及与 inbox。** 评论线程绑定页面或任务；任务与其报告线程使用同一个 UUID。提及保存显式目标 principal，而不是把显示名称当授权身份。任务上下文中的 `@agent` 请求产生发给目标的 inbox `action_request`，保留请求者、接收者、上下文及 task ID；普通反馈与行动请求区分。提及不直接设置 holder，不暗改 assignee 或授予权限，exclusive claim 以 X12 的显式派单为准。`fetch_inbox` 是 Baton 自有的 mentions + assignments 查询，不是官方 Inbox API：mentions 按记录的显式接收主体匹配，assignments 只把 `assignee_principal` 等于当前 principal 的任务作为其派单。访问检查仍使用该主体所属账户的当前有效权限；共享 account 不会让另一 principal 自动成为收件人或可领取者。结果应包含关联 task ID、当前状态、`assignee_principal` 及当前是否可领取的提示，失权后不得泄漏任务；可领取提示不是保留席位，实际 claim 仍须重新验证权限、租约、fence 与 scope。接收者自愿 poll/claim/report，通知不会向其主机推送进程、修改配置或选择工具权限。[官方背景：S4](https://learn.chatgpt.com/docs/space/agents#choose-how-to-ask-for-help)。
+**X5 · 评论、提及与 inbox。** 评论线程绑定页面或任务；任务与其报告线程使用同一个 UUID。对 person 和 agent 的提及都保存显式目标 principal，而不是把显示名称或共享 account 当成该接收身份。任务上下文中的 `@agent` 请求产生发给目标的 inbox `action_request`，保留 `requested_by`、接收者、上下文及 task ID；普通反馈与行动请求区分。提及不直接设置 holder，不暗改 assignee 或授予权限，exclusive claim 以 X12 的显式派单为准。`fetch_inbox` 是 Baton 自有的 mentions + assignments 查询，不是官方 Inbox API：mentions 按记录的显式接收主体匹配，assignments 只把 `assignee_principal` 等于当前 principal 的任务作为其派单。访问检查仍使用该主体所属账户的当前有效权限；共享 account 不会让另一 principal 自动成为收件人或可领取者。结果应包含关联 task ID、当前状态、`assignee_principal` 及当前是否可领取的提示，失权后不得泄漏任务；可领取提示不是保留席位，实际 claim 仍须重新验证权限、租约、fence、scope 与 X17 的依赖 gate。接收者自愿 poll/claim/report，通知不会向其主机推送进程、修改配置或选择工具权限。[官方背景：S4](https://learn.chatgpt.com/docs/space/agents#choose-how-to-ask-for-help)。
 
 **X6 · 幂等与事务。** 普通 mutation 使用稳定 UUID `operation_id`；同一效果的重试复用它。PostgreSQL 在同一事务内按 actor + operation_id 记录规范化请求摘要、业务变更及可重放结果；同键同请求不再产生效果，同键异请求返回 `409`。`submit_task` 另保留现有稳定业务 `idempotency_key`，同 actor + key 不创建第二任务，不能用每次随机生成 operation_id 绕过提交去重。幂等请求摘要包含操作及所有影响效果的字段，不记录秘密原值。重放仍重新检查当前读/操作权限，失权后不得泄漏旧结果。[官方背景仅为产品协作：S3](https://learn.chatgpt.com/docs/space/collaboration#review-together)。
 
@@ -68,9 +68,9 @@
 
 **X9 · x_scope 锁域。** 第一版所有 Space 强制使用 `global` repository namespace；`create_space` 不提供可变 namespace，若实现保留 `scope_repository` 字段则只接受 `global`。排斥范围是同一 Baton 实例或共用 PostgreSQL 权威内的跨 Space 领取，不能声称独立数据库之间有分布式互斥。新 namespace 仅能通过未来管理员契约扩展，不能由请求自由指定以绕过冲突。领取事务须串行化该 namespace 的“查重叠 → 占用”步骤，防止并发检查同时为空。[官方背景仅为分工：S4](https://learn.chatgpt.com/docs/space/agents#work-with-others)。
 
-**X10 · x_scope 规范化与重叠。** 文件和模块都转换到同一仓库相对路径域。采用 `/` 分隔符，去除重复分隔符与 `.` 段，拒绝绝对路径、驱动器前缀及 `..` 越界段；空/根范围规范化为仓库根。路径相等，或一方是另一方的完整路径段前缀，即重叠；`src/a` 与 `src/ab` 不因字符串前缀而冲突。模块只能经管理员定义的模块→路径根映射展开；没有管理员映射或模块未知时，保守覆盖整个 global 仓库根。客户端提交的模块映射不得改变此规则，不能把未知模块名当成独立锁域。大小写、符号链接或别名无法可靠规范化时必须保守扩大范围或拒绝，不能声称无冲突。migration scope 使用规范化后的完整 migration 标识精确相等比较，不做路径前缀匹配。文件范围与 migration 范围均需保护时，任务必须同时声明两种范围。对外返回的冲突信息仍受 X2 权限限制。[官方背景仅为分工：S4](https://learn.chatgpt.com/docs/space/agents#work-with-others)。
+**X10 · x_scope 规范化与首版保守冲突域。** 声明路径仍采用仓库相对路径及 `/` 分隔符，去除重复分隔符与 `.` 段，拒绝绝对路径、驱动器前缀及 `..` 越界段；空/根范围规范化为仓库根。保留 declared path 供展示与审计，但文本规范化不能证明符号链接、大小写或其他别名指向不同文件。第一版没有可信文件拓扑 authority，因此任何 path 声明的实际锁范围都保守覆盖整个 global 仓库的 path 域：即使 `src/a` 与 `src/ab`、两个无文本前缀关系的路径或两个别名看似不重叠，也必须冲突。首版不得宣称非重叠 path 可以并行，也不得让客户端映射缩小实际锁域。path 与 migration 是两个独立的声明域；migration 只按完整标识精确相等互斥，相异 migration 可并行，path 声明不自动保护 migration。module 声明采用覆盖全部声明域的 whole-repository 范围，与 path、module 及任意 migration 均冲突，不接受客户端模块映射来绕过。任务需同时保护文件和 migration 时应同时声明两者。未来细粒度 path 并行须另行建立可信拓扑/别名映射和验收，不能把首版的展示路径当成已有 authority。对外冲突信息仍受 X2 权限限制。[官方背景仅为分工：S4](https://learn.chatgpt.com/docs/space/agents#work-with-others)。
 
-**X11 · x_handoff。** 交接必须在同一事务内校验原持有人、未过期租约、旧 fence 和接收者的现有 edit 权限等资格，然后保留任务的 base commit、上下文、证据引用和线程，将 holder 与 `assignee_principal` 一起切换为接收 principal 并提升 fence；不会自动授予接收者访问权限。base commit 在交接中不可变；context/evidence 仅追加，不覆盖、删除或因空缺字段清空旧材料。作用域不得在交接时无检查地扩大，扩大必须重新检查重叠。原持有人在提交后不能继续使用旧 fence 写入。失败交接不改变所有权、assignee 或材料，幂等重放不得重复追加上下文或证据；普通 assignment 不能代替有效 claim 的交接检查。[官方背景仅为协作上下文：S3](https://learn.chatgpt.com/docs/space/collaboration#review-together)。
+**X11 · x_handoff。** 交接必须在同一事务内校验原持有人、未过期租约、旧 fence 和接收者的现有 edit 权限等资格，然后保留任务的 base commit、上下文、证据引用和线程，将 holder 与 `assignee_principal` 一起切换为接收 principal 并提升 fence；不会自动授予接收者访问权限。base commit 在交接中不可变，包括原值为 `None/null` 时也不得借交接填入新值；context/evidence 仅追加，不覆盖、删除或因空缺字段清空旧材料。作用域不得在交接时无检查地扩大，扩大必须重新检查重叠。原持有人在提交后不能继续使用旧 fence 写入。失败交接不改变所有权、assignee 或材料，幂等重放不得重复追加上下文或证据；普通 assignment 不能代替有效 claim 的交接检查。[官方背景仅为协作上下文：S3](https://learn.chatgpt.com/docs/space/collaboration#review-together)。
 
 ## x_gate、任务兼容层与 x_audit
 
@@ -84,9 +84,18 @@
 
 **X16 · x_audit 不可变追加。** 业务事件在产生业务效果的同一 PostgreSQL 事务中追加，至少关联真实 actor、operation/task/thread 标识、数据库时间、结果状态和必要的 fence/版本；命名任务的 assign → claim → result → gate 必须能按同一 task ID 关联，并区分 requestor、assignee、result_author 与 reviewer 的 principal。幂等重放不能再追加一条代表同一效果的新事件。应用数据库角色不得 UPDATE/DELETE 审计行，迁移所有者与应用权限分离。凭据、完整 prompt/评论正文及证据秘密不进入审计，仅保存必要元数据和引用。该约束不声称能抵抗数据库超级用户或宿主失陷；也不是官方 attribution 的存储形式。[官方背景仅为归属：S2](https://learn.chatgpt.com/docs/space/pages#comment-and-collaborate)。
 
+**X17 · x_graph 依赖图、plan 与 ready。** 任务通过 `depends_on` 组成有向无环图；`A.depends_on=[B]` 表示 A 等待 B 通过 gate。任务依赖、图事务、claim_next、ready 与进度推导全部是 Baton 自有 x_协议，官方 Task 块说明不定义这些行为。图由人或外部 planning agent 创建；Baton 只存储、校验和执行约束，不内置 planner，不从任务正文自动推导依赖。[官方背景仅为任务块：S2](https://learn.chatgpt.com/docs/space/pages#add-content-with-the-insert-menu)。
+
+- **依赖可变性。** 追加依赖要求调用者当前可 edit 被修改任务，并且任务为尚无 execution 的 queued，或其 lease 已过期且仍无 execution。后者须在同一权威事务中确认可安全回收，再按 queued 变更，不能用过期时间字段越过状态检查。有效 claimed、awaiting_gate、done、failed、interrupted 均拒绝；曾经执行后重新 queued 的任务也不满足“尚无 execution”。执行已启动、已有持久执行记录或执行状态不确定时不得追加；没有结果不能单独证明没有执行。依赖追加不能重置现有结果、gate、assignee 或 fence 来伪造未执行任务。现阶段只规定追加，不开放删除依赖以绕过等待。[官方背景仅为协作审阅：S4](https://learn.chatgpt.com/docs/space/agents#work-with-others)。
+- **依赖权限。** 每个被引用的 dependency 都必须对调用者当前可见且至少具 view 权限；知道 task ID 不产生查看依赖状态的权利。plan、ready 及领取时均重新检查，不因建图时曾有访问权而永久放行。隐藏或失权 dependency 的错误、就绪说明及进度不能泄漏其状态、内容或身份；不通过自动授权来补齐权限。[官方背景仅为访问控制：S3](https://learn.chatgpt.com/docs/space/collaboration#choose-an-access-level)。
+- **plan 原子性。** `plan` 创建或扩展图，使用 X6 的稳定 operation_id。一个请求可以引用已存在 task ID 或本次请求内唯一的新 node key；后者解析为稳定任务标识，幂等重放返回同一映射，不再建节点或边。重复/无法解析的 node key、自依赖、循环、越权引用或任一节点不满足可变性时，整个事务回滚，包括节点、依赖边、幂等效果和成功审计。并发 plan 必须在共同 PostgreSQL 权威内维护 DAG，不能让两次各自通过的检查合成环；与 claim 并发时也必须重验可变性，不能向已经开始的任务补塞前置条件。具体存储方法签名随后与实现 contract 对齐，不视为官方 wire schema。[官方背景仅为共享工作：S3](https://learn.chatgpt.com/docs/space/collaboration#review-together)。
+- **依赖满足。** 每次 `claim` 和 `claim_next` 都必须在取得持有权前原子校验全部 dependency：canonical state 为 done，且存在对应其当前 epoch/result_epoch 的有效 gate pass。仅有历史 pass、旧 epoch 的批准、状态文本 done 而缺少当前 gate 证明，或者 awaiting_gate，均不满足。无依赖任务只跳过这一条件，其他权限、派单、租约、scope 与 fencing 检查不变。自动 worker 路径也不能绕过依赖 gate。[官方背景仅为审阅：S4](https://learn.chatgpt.com/docs/space/agents#revise-a-launch-brief)。
+- **ready 查询。** `ready` 仅返回调用者当前可 edit、assignee 允许该确切 principal 领取、状态与租约允许领取、依赖全部满足且按 X10 当前无 scope 冲突的任务。依赖及任务可见性不足时不返回泄漏性条目；不把同 account 的其他 assignee 当成当前 principal。ready 和 inbox 的可领取提示只是当前快照，不预留 claim；实际 claim/claim_next 必须在原子事务中重验全部条件，两个调用者看到同一候选不意味着都能获得它。[官方背景仅为访问与分工：S3](https://learn.chatgpt.com/docs/space/collaboration#choose-an-access-level)、[S4](https://learn.chatgpt.com/docs/space/agents#work-with-others)。
+- **进度。** 图进度从有权读取的任务 canonical state 及其当前 gate 结果派生，不维护可独立写入、与任务真相分叉的第二份 tracker。状态、结果与 x_audit 仍遵循既有事务及身份规则；依赖图不改变命名 agent 自愿 pull、原线程报告、reviewer 审阅和真实原生验收边界。[官方背景仅为审阅与归属：S4](https://learn.chatgpt.com/docs/space/agents#revise-a-launch-brief)、[S2](https://learn.chatgpt.com/docs/space/pages#comment-and-collaborate)。
+
 ## 红线与验收
 
-下表中官方语义验收对应 O1–O9 的原文链接；数据库与 HTTP 验收对应 X1–X16 的 x_契约。测试必须通过公开接口或实际 PostgreSQL 事务证明，不以函数返回“成功”、单进程内存锁或 SQLite 替身代替并发与权限结论。
+下表中官方语义验收对应 O1–O9 的原文链接；数据库与 HTTP 验收对应 X1–X17 的 x_契约。测试必须通过公开接口或实际 PostgreSQL 事务证明，不以函数返回“成功”、单进程内存锁或 SQLite 替身代替并发与权限结论。
 
 | 编号 | 红线/触发 | 可执行验收结果 |
 | --- | --- | --- |
@@ -95,9 +104,9 @@
 | A3 | 并发页面变更 | 相同基线的冲突更新仅有一个生效，另一方返回明确冲突；归属记录真实操作者。 |
 | A4 | 提及人与 agent | 任务 @agent 生成目标 inbox 的 action_request 及 task ID；不暗改 assignee/holder/grant，也不向主机 push；人类反馈不会自动派活；他人 inbox 不可读，失权后不泄漏旧提及。 |
 | A5 | 幂等并发与异载荷重放 | 相同 actor/key 或 operation_id 仅产生一次效果；不同有效载荷冲突；事务失败无半成品。 |
-| A6 | 两个 Space 同时领取重叠 scope | 同一 PG/global namespace 内最多一个成功；非重叠路径可并行；未知模块与仓库根冲突；migration 标识仅精确相等冲突。 |
+| A6 | 跨 Space 的首版保守 scope | 同一 PG/global namespace 内任意两份 path 声明均冲突，不承诺非重叠路径并行；module 与 path/module/migration 全域冲突；migration 同标识互斥、相异标识可并行；path 与 migration 的独立声明域不自动互相保护。 |
 | A7 | 租约过期及进程恢复 | 无清理器也可重新领取；assignee 保留，命名任务仅该 principal 可重新领取；新 fence 增长；旧持有人续租、提交、交接全部被拒绝。 |
-| A8 | 交接及重放 | 目标已有 edit 才可交接；holder/assignee 同事务切换且不自动 grant；base 不可改；context/evidence 仅追加；thread 保留；新持有人获得更高 fence；重放不重复提升或追加；失败不切换。 |
+| A8 | 交接及重放 | 目标已有 edit 才可交接；holder/assignee 同事务切换且不自动 grant；base 不可改，包括原值 None/null；context/evidence 仅追加；thread 保留；新持有人获得更高 fence；重放不重复提升或追加；失败不切换。 |
 | A9 | 手工 gate 与自动 gate | live lease 提交后冻结 result_epoch/result_author、释放 scope 并待审；result_author 的确切 principal 自批失败；正确 reviewer principal + expected_epoch 才能批准；拒绝回 queued 后新 claim 提高 epoch；旧批准失败。仅无 assignee 的自动兼容路径默认 worker_success，demo 继续显式标注。 |
 | A10 | 手工领取与兼容层 | 手工创建或带 assignee 的 submit_task 均不触发自动 dispatch；无 assignee 保留自动 Codex；claimed→working、done→completed；awaiting_gate 不提前 completed；同一任务/线程 UUID。 |
 | A11 | 真实 PostgreSQL 审计约束 | 应用角色尝试修改/删除审计行失败；每个已提交效果有审计；失败事务无成功事件；不含凭据或正文。 |
@@ -106,6 +115,12 @@
 | A14 | 默认 reviewer 与防自派自批 | 带 assignee 的 submit_task 固定默认为 requestor principal 审阅；requestor==assignee 被拒绝且不建任务。create_task_block 可显式配置另一 reviewer；普通 assignment 不绕过 live claim 的 handoff 检查。 |
 | A15 | 同账户多主体审阅 | reviewer 配置精确匹配 principal；仅共享 account 不能替代 reviewer 身份。已配置且有权限的 human principal 可审同 account 的 agent 结果；冻结 result_author 本人始终不能自批。 |
 | A16 | 自愿拉取的真实原生验证 | 本地不同 token 的 assign→poll→claim→report→gate 只证明协议；真实双机验收须由各自 agent 在自己的环境自愿通过原生客户端执行，保留同 task ID 的事件关联。控制器本地代发、伪造另一端调用或向主机推送执行均不能算通过。 |
+| A17 | 不同声明掩盖文件别名 | 两个没有字符串前缀关系、但可能通过 symlink/大小写/别名指向相同目标的 path 声明仍冲突；保留各自 declared path 供展示；客户端模块/path 映射不能缩小实际锁域。 |
+| A18 | plan 原子性、幂等与 DAG | 同次请求引用既有 task/new node key 成功解析；相同 operation_id 重放不新建；异载荷复用冲突。自环、跨新旧节点的环、并发 plan 合成环、未解析 key 或任一越权节点均拒绝且整批无部分提交。 |
+| A19 | dependency 当前 gate 与权限 | claim/claim_next 对每个 dependency 验证当前可 view、done 及当前 epoch gate pass；awaiting_gate、旧 pass、无 gate 证明的 done、失权 ID 均不能放行或泄漏状态。无依赖时既有派单与 scope 检查仍生效。 |
+| A20 | ready 快照与领取竞态 | 只列当前可 edit、assignee 匹配、lease 可领、依赖通过且无 scope 冲突的任务；ready 后权限撤销、别人先领取、scope 新冲突或依赖不再满足时，实际 claim/claim_next 拒绝，不信任旧快照。 |
+| A21 | 依赖追加可变性与 claim 竞态 | 仅未执行 queued 或已原子回收且未执行的 expired lease 可追加；有效 claimed、awaiting_gate、done、failed、interrupted、执行过再 queued 及执行状态不确定者均拒绝。追加与领取并发不得出现领取后才添加未完成依赖。 |
+| A22 | 派生进度及无内置 planner | 进度随有权读取的真实任务/gate 状态变化；不能通过写入独立 tracker 使图看似完成；plan/ready 不启动 planning agent、模型或远端主机进程，命名 agent 仍自愿 pull。 |
 
 验收完成前不得声称已复刻 Space 全部行为、已提供官方 Space API、已有跨独立数据库分布锁，或已完成真实账户/界面兼容测试。共享数据库上线或旧数据迁移另走 shadow → enforce → bake；本规格本身不授权迁移真实数据。[官方能力边界背景：S3](https://learn.chatgpt.com/docs/space/collaboration)、[S4](https://learn.chatgpt.com/docs/space/agents)。
 
