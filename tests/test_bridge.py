@@ -422,3 +422,54 @@ async def test_dispatch_direct_entry_rechecks_identity_changed_after_claim(
     stopped = await server.dispatch(claim)
     assert stopped["error"] == "cancelled" and stopped["dispatch_started_at"] is None
     assert no_a2a == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identity_change", ["revoked", "account", "kind", "role"])
+async def test_dispatch_rechecks_revocation_while_mark_dispatched_waits(
+        modules, pg_store, make_context, register_identity, no_a2a, monkeypatch, identity_change):
+    common, server, _ = modules
+    context = make_context()
+    who = context.request_context.request.state.identity
+    register_identity(who)
+    task = await server.submit_task("revoked-during-mark", "Synthetic task", context)
+    claim = await server.claim_next()
+    assert claim["task_id"] == task["task_id"] and server.dispatch_owner_current(claim)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_store_call = server.store_call
+
+    async def held_store_call(method, *args, **kwargs):
+        if method == "mark_dispatched":
+            entered.set()
+            await release.wait()
+        return await original_store_call(method, *args, **kwargs)
+
+    monkeypatch.setattr(server, "store_call", held_store_call)
+    pending = asyncio.create_task(server.dispatch(claim))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        registry = common.CONFIG / "identities.json"
+        records = json.loads(registry.read_text())
+        record = records[who["agent"]]
+        if identity_change == "revoked":
+            record["active"] = False
+        elif identity_change == "account":
+            record["account"] = "synthetic-remapped-account"
+        elif identity_change == "kind":
+            record["kind"] = "human"
+        else:
+            record["role"] = "dispatcher"
+        registry.write_text(json.dumps(records))
+        release.set()
+        stopped = await asyncio.wait_for(pending, timeout=5)
+    finally:
+        release.set()
+        if not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+    assert stopped["status"] == "interrupted" and stopped["error"] == "cancelled"
+    assert stopped["dispatch_started_at"] is not None  # The real PG mark committed.
+    assert no_a2a == []
+    log = (common.STATE / "audit.jsonl").read_text()
+    assert not any(json.loads(line)["event"] == "task.dispatched" for line in log.splitlines())

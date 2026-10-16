@@ -335,6 +335,10 @@ async def dispatch(task):
         return await cancel_dispatch(task)
     # Commit the ambiguity boundary before sending a request to another process.
     await store_call("mark_dispatched", SERVICE, operation_id(task_id, epoch, "start"), task_id, epoch)
+    # The database await may have waited on a lock while the registry changed.
+    # Recheck before creating the HTTP client; this cannot recall a sent request.
+    if not dispatch_owner_current(task):
+        return await cancel_dispatch(task)
     audit("task.dispatched", task_id=task_id, agent=task["owner"], epoch=epoch)
     lease_lost = asyncio.Event()
 
