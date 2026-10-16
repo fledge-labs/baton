@@ -14,8 +14,11 @@
    ```sh
    # SPDX-License-Identifier: Apache-2.0
    python3.12 -m venv "$HOME/baton/.venv"
-   "$HOME/baton/.venv/bin/python" -m pip install 'mcp==1.30.0'
+   "$HOME/baton/.venv/bin/python" -m pip install --require-hashes --only-binary=:all: \
+     -r "$HOME/baton/deploy/requirements.txt"
    ```
+
+   适配器与应用使用同一哈希锁文件，包含固定版本的 MCP SDK 及其完整依赖；不要单独安装未带哈希的 SDK。
 
 3. 按 README 签发与 `<agent-id>` 对应的 token，将其保存在该主机上的 `<TOKEN_FILE>`，限制为该用户可读写，例如 `chmod 600 "<TOKEN_FILE>"`。配置只记录文件路径，不记录 token 内容。
 4. `<HOST>` 是运行适配器的 SSH 主机或已配置别名，不一定是 gateway 主机。先在终端完成 SSH 身份认证及主机指纹核验；客户端随后使用 `BatchMode=yes`，不会等待交互登录。

@@ -7,7 +7,7 @@ COPY --from=codex /usr/local/bin/node /usr/local/bin/node
 COPY --from=codex /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s /usr/local/lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex
 COPY deploy/requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt && useradd -m -u 10001 agent
+RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r /app/requirements.txt && useradd -m -u 10001 agent
 WORKDIR /app
 COPY bridge /app/bridge
 COPY scripts /app/scripts

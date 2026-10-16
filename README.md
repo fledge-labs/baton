@@ -106,7 +106,7 @@ WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --b
 ```sh
 # SPDX-License-Identifier: Apache-2.0
 python3.12 -m venv .venv
-.venv/bin/python -m pip install -r deploy/requirements.txt
+.venv/bin/python -m pip install --require-hashes --only-binary=:all: -r deploy/requirements.txt
 .venv/bin/python scripts/e2e.py --mode demo --key demo-acceptance-v1 \
   --token-file "$HOME/.config/baton/example-client.token"
 # 切换到真实 Codex 后运行：
@@ -115,6 +115,8 @@ python3.12 -m venv .venv
 ```
 
 验收应覆盖真实 MCP 初始化/调用、任务去重、gate 后完成、同线程评论回报，以及 request/task/A2A/backend 审计关联。demo 不等于真实 Codex 通过；单元测试也不能替代真实 PostgreSQL 的并发、fencing 和审计权限测试。重跑同一效果应保留业务键。
+
+应用与适配器统一使用带完整传递依赖和发行文件 SHA-256 的锁文件；安装时保留 `--require-hashes --only-binary=:all:`，只接受已锁定的 wheel，避免安装时另行解析构建依赖。版本约束位于 `deploy/requirements.in`，锁文件再生步骤见 [贡献规则](CONTRIBUTING.md#依赖锁文件)。
 
 自定义入口用 `--url`，自定义 Compose 项目用 `--project`，私有 CA 用 `--ca-file`；回执通过 `--artifact-dir` 保存到仓库外的私有目录。源码仓库不保存真实运行回执。
 
