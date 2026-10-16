@@ -5,7 +5,7 @@
 
 Baton 通过 MCP/HTTP 提供空间、页面、任务、评论和提及，通过 A2A 调用执行端；默认自动执行端是固定版本的 Codex CLI，外部 agent 可以自愿拉取分给自己的任务。共享、署名和协作规则以 [Space 行为规格](docs/spec/space.md) 为准。自有代码使用 [Apache-2.0](LICENSE)，依赖保留各自的 [许可证](docs/THIRD_PARTY.md)。
 
-Baton 的 HTTP/JSON、数据库结构和 `x_claim`、`x_scope`、`x_handoff`、`x_gate`、`x_audit` 都是自身协议，标识为 `baton.space.v1`，不是 OpenAI 官方 Space API。项目不连接、同步或导入真实 ChatGPT Space，也不宣称尚未实测的界面行为一致。
+Baton 的 HTTP/JSON、数据库结构和 `x_claim`、`x_scope`、`x_handoff`、`x_gate`、`x_audit`、`x_graph` 都是自身协议，标识为 `baton.space.v1`，不是 OpenAI 官方 Space API。项目不连接、同步或导入真实 ChatGPT Space，也不宣称尚未实测的界面行为一致。
 
 ```text
 MCP / HTTP 客户端 → nginx → agentgateway → 任务桥 → PostgreSQL
@@ -85,9 +85,19 @@ WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --b
 
 任务桥已使用 Baton 自有 PostgreSQL 存储，完成结果作为同任务 UUID 线程中的评论回报，并通过提及/分配进入接收者 inbox。`fetch_inbox` 查询当前身份可见的 mentions 与 assignments，不公开其他人的收件箱。请求处理时重新检查权限。
 
-既有 MCP `submit_task`、`get_task`、`list_tasks`、`fetch_inbox` 保留；协作工具包括 `claim`、`renew`、`handoff`、`comment`、`mention`。具体参数、允许操作和验收以 [规格](docs/spec/space.md) 与实现返回的工具 schema 为准。HTTP 使用 `POST /v1/space/{operation}`，所有操作都是 Baton 自有协议。
+既有 MCP `submit_task`、`get_task`、`list_tasks`、`fetch_inbox` 保留；协作工具包括 `claim`、`renew`、`handoff`、`comment`、`mention`、`plan`、`ready`。具体参数、允许操作和验收以 [规格](docs/spec/space.md) 与实现返回的工具 schema 为准。HTTP 使用 `POST /v1/space/{operation}`，所有操作都是 Baton 自有协议。
 
-自动 `submit_task` 使用明确的 `worker_success` gate；手工领取不自动启动 worker，手工 gate 必须由有资格的 reviewer 审批，持有人不能自批。`awaiting_gate` 不能提前显示为 completed。`x_scope` 首版锁域是同一 PostgreSQL 权威内的 `global`，不提供跨独立数据库的互斥保证。
+未指定接收人的兼容自动 `submit_task` 使用明确的 `worker_success` gate；指定接收人或手工领取不自动启动 worker，手工 gate 必须由有资格的 reviewer 审批，结果作者不能自批。`awaiting_gate` 不能提前显示为 completed。
+
+`x_scope` 首版锁域是同一 PostgreSQL 权威内跨 Space 的 `global`，不提供跨独立数据库的互斥保证。由于尚无可信的文件拓扑与别名映射，任意两个 `path` 声明都冲突，即使声明为 `src/a` 与 `docs/b` 也不能并行领取；展示路径不代表细粒度锁。`module` 覆盖整个仓库，与 path、module 和任意 migration 都冲突。`migration` 仅按规范化后的完整标识相等互斥，相异标识可并行；path 与 migration 是独立声明域，需要同时保护两者时必须同时声明。
+
+### 依赖图与就绪任务
+
+`x_graph` 用 `depends_on` 表示任务依赖：`A.depends_on=[B]` 表示 B 必须达到 `done`，并有当前 epoch 对应的 gate pass，A 才能领取。调用 `create_task_block` 或 `submit_task` 创建任务时可同时传入 `depends_on`，任务与初始依赖在同一事务中生效，自动 worker 也遵守这些依赖。
+
+`plan(operation_id, graph=[{task_id, depends_on}])` 只为已存在的任务 UUID 原子建立或追加依赖，使用稳定 UUID 操作键；任一无效引用、越权或循环都会整批回滚。只有从未领取或执行过的 `queued` 任务可追加，租约过期或结果被拒后也不能借此改图；不提供删除依赖。图由人或外部规划 agent 创建，Baton 负责存储与校验，不内置 planner。
+
+`ready(page_id=None, limit=50)` 返回当前调用者可 edit、符合指定接收人要求、租约允许、依赖通过且无 scope 冲突的候选任务。依赖访问权限在建图、查询和领取时重新检查；隐藏依赖不会泄漏其 UUID。ready 是即时快照，不保留领取名额；实际 `claim` 仍会原子重验全部条件，命名 agent 继续自愿拉取。
 
 ## 端到端验收
 
@@ -107,6 +117,44 @@ python3.12 -m venv .venv
 验收应覆盖真实 MCP 初始化/调用、任务去重、gate 后完成、同线程评论回报，以及 request/task/A2A/backend 审计关联。demo 不等于真实 Codex 通过；单元测试也不能替代真实 PostgreSQL 的并发、fencing 和审计权限测试。重跑同一效果应保留业务键。
 
 自定义入口用 `--url`，自定义 Compose 项目用 `--project`，私有 CA 用 `--ca-file`；回执通过 `--artifact-dir` 保存到仓库外的私有目录。源码仓库不保存真实运行回执。
+
+### Space HTTP 协作验收
+
+[`scripts/space_acceptance.py`](scripts/space_acceptance.py) 通过认证 HTTP API 验证共享与撤权、team、connected account 署名、人工审阅 agent 提案、提及与同线程回复、并发 scope 冲突、租约 fencing、handoff、gate，以及依赖图、ready、循环回滚和隐藏依赖。它会创建和修改测试数据，应在空闲的独立测试实例运行；首版 path 锁会与该 PostgreSQL 权威内其他任务竞争。
+
+先在 `deploy/` 目录为该测试实例准备四个独立客户端身份。名称必须保持如下；`space-owner`、`space-reviewer` 是各自账户的 human，`space-peer` 是独立账户的 agent，`space-agent` 是连接到 `space-owner` 账户的 agent。每个身份使用自己的令牌文件，不能共用令牌或授予 dispatcher 角色：
+
+```sh
+# SPDX-License-Identifier: Apache-2.0
+cd deploy
+mkdir -p "$HOME/.config/baton/space-acceptance"
+chmod 700 "$HOME/.config/baton/space-acceptance"
+docker compose run --rm --no-deps \
+  -v "$HOME/.config/baton/space-acceptance:/delivery" \
+  admin issue space-owner --kind human --account space-owner \
+  --output /delivery/space-owner.token --uid "$(id -u)" --gid "$(id -g)"
+docker compose run --rm --no-deps \
+  -v "$HOME/.config/baton/space-acceptance:/delivery" \
+  admin issue space-peer --kind agent --account space-peer \
+  --output /delivery/space-peer.token --uid "$(id -u)" --gid "$(id -g)"
+docker compose run --rm --no-deps \
+  -v "$HOME/.config/baton/space-acceptance:/delivery" \
+  admin issue space-reviewer --kind human --account space-reviewer \
+  --output /delivery/space-reviewer.token --uid "$(id -u)" --gid "$(id -g)"
+docker compose run --rm --no-deps \
+  -v "$HOME/.config/baton/space-acceptance:/delivery" \
+  admin issue space-agent --kind agent --account space-owner \
+  --output /delivery/space-agent.token --uid "$(id -u)" --gid "$(id -g)"
+cd ..
+.venv/bin/python scripts/space_acceptance.py --url http://localhost:8080 \
+  --credentials-dir "$HOME/.config/baton/space-acceptance" \
+  --key space-acceptance-v1 \
+  --artifact-dir "$HOME/.local/state/baton/space-acceptance-v1"
+```
+
+令牌目录保持 0700、四个文件保持 0600，并放在仓库外。身份已存在时，先用 `admin list` 确认 kind/account 与上述一致且 active，再按前述 `admin export` 方式导出；`issue` 不会覆盖既有身份。自定义实例需让管理员命令选中相同 Compose 项目，并为脚本设置对应 `--url`；私有 CA 使用 `--ca-file`。
+
+为每轮独立验收选择新的稳定 `--key`，同一业务动作的请求重试保留其操作键。成功回执为仓库外的 `space-acceptance.json`。此脚本的 PASS 仅覆盖本实例的上述 HTTP 协作检查；真实 Codex 执行仍须另跑 `e2e.py --mode codex`，真实跨主机的自愿拉取仍须由接收方参与验收。
 
 ## HTTPS 与客户端
 
