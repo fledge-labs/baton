@@ -72,6 +72,11 @@ def initialize_database(root):
     if app_config.exists() and json.loads(app_config.read_text())!=config:
         raise ValueError('Database configuration differs; restore the matching credential files')
     atomic_write(app_config,json.dumps(config)+'\n',owner=(SERVICE_UID,SERVICE_GID))
+    # runc cannot create a nested mountpoint once this parent volume is read-only.
+    bridge_mount=app_config.parent/'bridge'
+    bridge_mount.mkdir(exist_ok=True,mode=0o700)
+    os.chmod(bridge_mount,0o700)
+    if os.geteuid()==0:os.chown(bridge_mount,SERVICE_UID,SERVICE_GID)
 
 def initialize(root,identities):
     for name in ['config','secrets/clients','secrets/bridge','secrets/codex-home','secrets/database-admin','secrets/database-app','data/bridge','data/codex','data/postgres']:

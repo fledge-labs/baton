@@ -2,6 +2,7 @@
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -53,8 +54,15 @@ def test_database_files_are_private_stable_and_not_gateway_metadata(tmp_path,cap
     assert all(path.stat().st_mode & 0o777==0o600 for path in files)
     assert not (root/'secrets/mail').exists()
     assert not (root/'secrets/bridge/mail.token').exists()
+    mountpoint=root/'secrets/database-app/bridge'
+    assert mountpoint.is_dir() and not list(mountpoint.iterdir())
+    mountpoint.rmdir()  # Reproduce an already-initialized volume missing the mountpoint.
     invoke(root,'init')
     assert {path:path.read_bytes() for path in files}==first
+    assert mountpoint.is_dir() and not list(mountpoint.iterdir())
+    assert mountpoint.stat().st_mode & 0o777==0o700
+    if os.geteuid()==0:
+        assert (mountpoint.stat().st_uid,mountpoint.stat().st_gid)==(tokens.SERVICE_UID,tokens.SERVICE_GID)
     public=(root/'config/identities.json').read_text()+(root/'config/gateway.json').read_text()+capsys.readouterr().out
     assert files[0].read_text().strip() not in public
     assert config['password'] not in public
