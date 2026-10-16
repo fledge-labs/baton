@@ -60,7 +60,7 @@ class Actor:
     def __post_init__(self):
         _identifier(self.principal)
         _identifier(self.account)
-        if self.kind not in {"human", "agent"}:
+        if not isinstance(self.kind, str) or self.kind not in {"human", "agent"}:
             raise StoreError("invalid")
 
 
@@ -91,7 +91,7 @@ def _payload(value):
 
 
 def _text(value, maximum=16000):
-    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+    if not isinstance(value, str) or not value.strip() or len(value) > maximum or "\x00" in value:
         raise StoreError("invalid")
     return value
 
@@ -117,7 +117,7 @@ def normalize_scopes(scopes):
         if not isinstance(scope, dict) or set(scope) != {"kind", "value"}:
             raise StoreError("invalid")
         kind, value = scope["kind"], scope["value"]
-        if kind not in {"path", "module", "migration"} or not isinstance(value, str) or len(value) > 240:
+        if not isinstance(kind, str) or kind not in {"path", "module", "migration"} or not isinstance(value, str) or len(value) > 240:
             raise StoreError("invalid")
         if value.startswith("/") or not re.fullmatch(r"[A-Za-z0-9_./-]*", value) or ".." in value.split("/"):
             raise StoreError("invalid")
@@ -346,7 +346,7 @@ class SpaceStore:
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""", (block["id"], block["revision"], Jsonb(content), actor.principal, actor.account, actor.kind, operation_id, proposal_id))
 
     def create_block(self, actor, operation_id, page_id, kind, content, position=None):
-        if kind not in {"text", "file", "prompt", "agent_instructions"}:
+        if not isinstance(kind, str) or kind not in {"text", "file", "prompt", "agent_instructions"}:
             raise StoreError("invalid")
         _payload(content)
         if position is not None:
@@ -392,7 +392,9 @@ class SpaceStore:
                             lambda conn: self._update_block(conn, actor, operation_id, block_id, expected_revision, content))
 
     def share(self, actor, operation_id, resource_type, resource_id, subject_type, subject_id, role):
-        if resource_type not in {"space", "page"} or subject_type not in {"person", "team"} or role not in ROLES:
+        if (not isinstance(resource_type, str) or not isinstance(subject_type, str)
+                or (role is not None and not isinstance(role, str))
+                or resource_type not in {"space", "page"} or subject_type not in {"person", "team"} or role not in ROLES):
             raise StoreError("invalid")
         if subject_type == "team":
             _uuid(subject_id)
@@ -481,7 +483,7 @@ class SpaceStore:
         return self._read(actor, read)
 
     def mention(self, actor, operation_id, comment_id, target_type, target_id):
-        if target_type not in {"person", "agent"}:
+        if not isinstance(target_type, str) or target_type not in {"person", "agent"}:
             raise StoreError("invalid")
         _identifier(target_id)
         def authorize(conn):
@@ -568,7 +570,7 @@ class SpaceStore:
         return self._read(actor, read)
 
     def proposal_review(self, actor, operation_id, proposal_id, decision, content=None):
-        if decision not in {"accept", "reject", "revise"} or (decision == "revise" and content is None) or (decision != "revise" and content is not None):
+        if not isinstance(decision, str) or decision not in {"accept", "reject", "revise"} or (decision == "revise" and content is None) or (decision != "revise" and content is not None):
             raise StoreError("invalid")
         _payload(content)
         def authorize(conn):
@@ -928,6 +930,9 @@ class SpaceStore:
                 result_author_account=%s,evidence=%s WHERE id=%s""", (result, epoch, actor.principal, actor.account, Jsonb(task["evidence"] + _items(evidence)), task_id))
             conn.execute("DELETE FROM baton.x_claim WHERE task_id=%s", (task_id,))
             self._task_audit(conn, actor, operation_id, "task.result_submitted", task, epoch=epoch, output_sha256=hashlib.sha256(result.encode()).hexdigest())
+            # This is the holder's reply in the original thread, explicitly a
+            # candidate rather than a completed/gate-approved notification.
+            self._notify_task(conn, actor, operation_id, task, "result_submitted", result)
             return self._task_view(conn, task_id)
         def replay(conn, old):
             task = self._row(conn, "tasks", task_id)
@@ -939,7 +944,7 @@ class SpaceStore:
 
     def gate(self, actor, operation_id, task_id, expected_epoch, decision, evidence=None):
         _integer(expected_epoch, 1, 2**63 - 1)
-        if decision not in {"pass", "fail"}:
+        if not isinstance(decision, str) or decision not in {"pass", "fail"}:
             raise StoreError("invalid")
         _items(evidence)
         def authorize(conn):
@@ -968,7 +973,7 @@ class SpaceStore:
     def finish_auto(self, actor, operation_id, task_id, epoch, result, a2a_id, backend, a2a_state="completed"):
         _text(result, 32000)
         _uuid(a2a_id)
-        if backend not in {"demo", "codex"} or a2a_state != "completed":
+        if not isinstance(backend, str) or backend not in {"demo", "codex"} or a2a_state != "completed":
             raise StoreError("gate_required")
         def effect(conn):
             self._live(conn, actor, task_id, epoch)
@@ -994,7 +999,7 @@ class SpaceStore:
                             lambda conn: self._auto(conn, actor, task_id), effect, replay)
 
     def interrupt_auto(self, actor, operation_id, task_id, epoch, error_code="dispatch_uncertain"):
-        if error_code not in {"dispatch_uncertain", "worker_failed", "execution_failed", "lease_lost", "restart", "cancelled"}:
+        if not isinstance(error_code, str) or error_code not in {"dispatch_uncertain", "worker_failed", "execution_failed", "lease_lost", "restart", "cancelled"}:
             raise StoreError("invalid")
         def effect(conn):
             self._live(conn, actor, task_id, epoch)
