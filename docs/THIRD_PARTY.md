@@ -9,18 +9,16 @@ Baton 自有代码和原创配置示例使用 [Apache-2.0](../LICENSE)。第三�
 ## 固定依赖
 
 - **agentgateway `v1.6.0`**：MCP/A2A 网关；SPDX `Apache-2.0`。[该版本 LICENSE](https://github.com/agentgateway/agentgateway/blob/v1.6.0/LICENSE)。镜像固定为 `sha256:9d3e6044ddcdc0878b1787f77bd401252b95e22684203fb5e874c4c42d2ed90c`，完整镜像引用见版本清单。
-- **MCP Agent Mail `fd9c518458daa1ac7cf74500aa37ed7bd72b8dd0`**：消息与线程后端；使用自定义标识 `LicenseRef-MIT-OpenAI-Anthropic-Rider`。[该 commit 的 LICENSE](https://github.com/Dicklesworthstone/mcp_agent_mail/blob/fd9c518458daa1ac7cf74500aa37ed7bd72b8dd0/LICENSE)。详见下一节。
 - **A2A Python SDK `a2a-sdk==1.2.2`**：A2A 协议实现；SPDX `Apache-2.0`。[`v1.2.2` LICENSE](https://github.com/a2aproject/a2a-python/blob/v1.2.2/LICENSE)。这里列的是实际使用的 Python SDK，不是用其他 A2A 实现的许可证代替。
 - **OpenAI Codex CLI `0.154.0`**：工作进程；SPDX `Apache-2.0`。[`rust-v0.154.0` LICENSE](https://github.com/openai/codex/blob/rust-v0.154.0/LICENSE)。模型服务的访问权限和条款独立于 CLI 代码许可证。
 - **MCP Python SDK `mcp==1.30.0`**：stdio 适配器及 MCP 协议支持；SPDX `MIT`。[`v1.30.0` LICENSE](https://github.com/modelcontextprotocol/python-sdk/blob/v1.30.0/LICENSE)。
 
-## Agent Mail 的限制条款
+## PostgreSQL 与驱动
 
-固定 commit 的许可证标题是 “MIT License (with OpenAI/Anthropic Rider)”。其实际文本包含针对 OpenAI、Anthropic、关联方，以及代表这些主体或为其利益行事者的限制，并将托管、执行、测试等活动纳入条款范围；原文规定相关许可需权利人事先书面授权。
+- **PostgreSQL `17.11`**：数据库；SPDX `PostgreSQL`。采用 [PostgreSQL 官方许可证](https://www.postgresql.org/about/licence/)，对应源码的 [REL_17_11 COPYRIGHT](https://github.com/postgres/postgres/blob/REL_17_11/COPYRIGHT)。服务使用 Docker Official Images 的 `postgres:17.11-bookworm`，并固定多架构 index digest，完整引用见版本清单；[官方镜像构建来源](https://github.com/docker-library/postgres/tree/2603e26e245e558218728ee14e0a42dcb020dc7f/17/bookworm)。镜像脚本采用其自己的 [MIT LICENSE](https://github.com/docker-library/postgres/blob/2603e26e245e558218728ee14e0a42dcb020dc7f/LICENSE)。
+- **Psycopg `psycopg[binary]==3.3.6` 与 `psycopg-binary==3.3.6`**：PostgreSQL Python 驱动；包的 license expression 为 SPDX `LGPL-3.0-only`。[固定版本 LICENSE.txt](https://github.com/psycopg/psycopg/blob/3.3.6/LICENSE.txt)、[psycopg 包元数据](https://pypi.org/project/psycopg/3.3.6/)、[binary 包元数据](https://pypi.org/project/psycopg-binary/3.3.6/)。两者都在 requirements 中精确固定。二进制 wheel 内含 libpq 等库，它们保留各自许可证；再分发镜像需保留 wheel 的相关声明，不能将其重新许可为 Apache-2.0。
 
-因此本项目不把它标注为普通 `MIT`、`Apache-2.0`，也不将它描述为无使用对象限制的开源许可证。`LicenseRef-MIT-OpenAI-Anthropic-Rider` 是本清单用于指向这份定制文本的标识，不是 SPDX License List 中的标准许可证名称。上游包元数据里的 `MIT` 标签不能替代该 commit 的实际许可证。
-
-部署、提供访问或再分发之前，使用者需要阅读[完整原文](https://github.com/Dicklesworthstone/mcp_agent_mail/blob/fd9c518458daa1ac7cf74500aa37ed7bd72b8dd0/LICENSE)，核查其主体和用途是否符合条件，必要时向权利人确认。本清单记录原文事实，不判定某个使用者的法律适用结果。构建时下载依赖也不改变其许可条件。
+驱动按上游标准 Python 包方式动态加载，不 vendor 或修改其源码。Baton 使用 LGPL 组件不改变 Baton 自有代码的许可证，也不免除分发方遵守第三方条款的义务；上游 [安装文档](https://www.psycopg.org/psycopg3/docs/basic/install.html) 说明 binary 分发方式。
 
 ## 随仓库保存的派生配置
 

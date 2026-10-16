@@ -1,38 +1,44 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 安全模型
 
-## 凭据与身份
+## 凭据与认证主体
 
-客户端令牌使用系统随机数生成，只有独立文件保存原值；gateway 与应用注册表只保存 SHA-256。SHA-256 摘要也属于运行状态，不能提交。每个请求在 gateway 和应用两层校验，client 与内部 dispatcher 分角色授权。
+客户端 token 由系统随机数生成，原值只在 0600 秘密文件中；gateway 和注册表保存 SHA-256 及身份元数据。摘要也是运行状态，不能提交。gateway 和应用双层校验，client 与内部 dispatcher 分角色授权。
 
-管理员容器仅按需运行，离线、只读根，显式增加管理专属卷权限所需的 CHOWN、DAC_OVERRIDE、FOWNER。它能管理所有凭据，因此 Docker 管理员属于可信边界。导出默认 0600；`--uid/--gid` 只调整明确指定交付文件的所有权。内部 dispatcher 不能作为客户端令牌导出。
+仅离线管理员可设定 `kind=human|agent` 与 `account` 的认证映射。轮换默认保留映射，改变映射需要新的显式管理操作；业务请求不能自行声明真实 actor 或提升为 human。内部 dispatcher 使用 service 记录，不可作为用户 connected account，也不能导出给客户端。运行时对缺失映射失败闭锁；兼容旧注册表由管理员 `init` 显式补齐，不在 API 中猜测。
 
-token、model auth、邮件 registration token、私钥和任务库均在专属卷或仓库外的秘密目录。不要用环境变量展开把 token 原值塞进 CLI argv，不要在日志、聊天、URL 或项目配置中粘贴它。模型认证只由 worker harness 使用；模型工具的环境不继承任意宿主环境变量。
+`initialize`/ops `admin` 是离线、短生命周期的 root 管理进程，仅额外持 CHOWN、DAC_OVERRIDE、FOWNER 来初始化指定卷。Docker 管理员属于可信边界。导出文件默认 0600，`--uid/--gid` 仅调整明确指定的交付文件。多文件凭据轮换没有跨文件事务；进程中断须核对注册表、操作账本和秘密文件，不能假装原子成功。
 
-## 网络
+## 数据库角色与秘密文件
 
-默认 HTTP 仅绑定主机回环地址，用于本机演示。对外使用 TLS override 和有效证书；后端没有 published ports，处于 internal Docker network。只有 worker 的 harness 具有外网连接能力以调用模型服务；模型工具网络由内部沙箱禁止。
+数据库管理卷保存 `postgres.password`、`app.password`，仅 PostgreSQL 与一次性 migrate 服务挂载，文件及目录归 UID/GID 999。应用数据库卷单独保存 UID/GID 10001 的 `database.json`；bridge 通过 `BATON_DATABASE_CONFIG=/run/secrets/database.json` 读取，不持 bootstrap 凭据。dispatcher 在嵌套的 `/run/secrets/bridge/dispatcher.token`。worker 没有数据库秘密卷或数据库网络。
 
-真实外部 hostname 由 PUBLIC_URL 传入，MCP Host/Origin 白名单据此生成。认证成功不能绕过身份所有权检查。浏览器只在内存中持有 bearer，DOM 渲染使用 textContent，不存 localStorage，不记录请求体/Authorization。
+PostgreSQL 使用文件型 `POSTGRES_PASSWORD_FILE`，Compose 不注入密码环境值；迁移器在进程内从文件读取，通过 psycopg 传递，不把秘密放进 argv、URL、日志或 SQL 错误输出。重复 init 保留原密码，已初始化数据库缺失凭据时拒绝随机重建。管理工具不会自动把旧实例的 SQLite/消息状态移入 PostgreSQL。
 
-## 执行隔离及明确取舍
+DBA 登录是 `baton_bootstrap`；它只由数据库初始化与短期迁移服务使用。迁移持固定 advisory transaction lock，在单事务中创建/校验角色、以 `baton_owner NOLOGIN` 执行 schema，再设置授权。应用角色 `baton_app` 非 superuser、非 owner、无角色/数据库创建权、无 owner membership、无 schema CREATE。schema_version 对应用只读；普通业务表授予所需 DML，审计表仅 SELECT/INSERT。
 
-服务使用固定镜像或依赖；应用 UID/GID 为 10001；非 root、根文件系统只读、cap_drop=ALL、no-new-privileges。没有 privileged、host network 或 Docker socket。
+`x_audit` 的 owner 触发器拒绝 UPDATE/DELETE/TRUNCATE；应用没有这些表权限，也无法 DISABLE TRIGGER 或改变所有者。它保证应用角色下的追加约束，不抵抗 PostgreSQL 超级用户、Docker 管理员或宿主失陷。业务授权仍由服务端验证，不能以持有数据库应用密码代替用户权限模型。
 
-Codex 0.154.0 的工具沙箱拒绝读取 /data、/config、/run/secrets 和 /home/agent/.codex，只允许当前任务目录写入，禁用工具网络。最终结果在返回前按已知秘密值过滤；这只是额外措施，不能替代沙箱。
+## 网络与执行隔离
 
-基础配置只有 Codex 容器设为 apparmor=unconfined，并在 Moby seccomp 基线上允许嵌套 bubblewrap 所需的六个 syscall；其他容器保留默认 Docker profile。禁用这一层 AppArmor 限制会减少宿主 LSM 保护，不能等同于原始 Docker 默认安全配置。内层沙箱必须在目标主机验证；若无法建立隔离应失败，不得添加危险的 CLI bypass 参数来掩盖问题。
+默认 HTTP 仅绑定回环地址；外部访问必须启用 TLS override 与有效证书。后端没有 published ports。PostgreSQL 使用单独 internal network，仅 bridge 和 migrate 连接；worker 的 harness 通过自身 egress 调用模型，工具网络由内层沙箱禁止。页面 Host/Origin 白名单由 PUBLIC_URL 推导。
 
-这是独立、受信任操作者的测试环境，不是经验证的敌对多租户代码执行产品。不要接入生产系统、生产数据或敏感源代码。镜像与包还有各自许可证和安全更新责任，见 THIRD_PARTY。
+应用使用固定依赖、非 root、只读根、cap_drop=ALL、no-new-privileges；没有 privileged、host network 或 Docker socket。PostgreSQL 与 migrate 的 UID/GID 是 999，应用是 10001；管理初始化权限独立列出，不混入长期业务服务。
 
-## 撤销、故障与审计
+Codex 0.154.0 工具沙箱拒绝读取 `/data`、`/config`、`/run/secrets`、`/home/agent/.codex`，只允许当前任务目录写入，禁止工具联网。harness 的模型认证与沙箱工具分离。结果的已知秘密过滤只是额外措施，不能替代访问控制。
 
-撤销更新原子注册表文件；后端按请求读取，防止 gateway 配置刷新间隙继续接受旧 token。已运行任务不自动取消。轮换的稳定 operation-id 防止成功操作重放产生另一把新 token；若管理员进程在多文件更新期间崩溃，应核对注册表和秘密文件再恢复，不假装具有跨文件事务。
+基础配置仅 worker 使用 `apparmor=unconfined` 与 Moby 基线上六项 syscall 例外，以支持嵌套 bubblewrap。它减少外层 LSM 保护，不能当作原始 Docker 默认隔离。Ubuntu 的非特权 userns 限制可能仍阻止启动；可选 override 使用管理员预加载的 `baton-codex-userns-v1`，其 `flags=(unconfined)` 加 `userns` 是明确例外，不是完整 AppArmor 策略。项目不关闭全局限制或自动加载宿主策略。内层隔离必须由目标主机的 `scripts/sandbox_probe.py` 验证，不得用危险 bypass 获得成功。
 
-worker 只有一个执行记录；运行中进程退出后状态为 interrupted，不自动重新执行。Mail 的投递状态与执行结果独立；不确定的投递必须人工核对，不能通过盲目重试实现所谓 exactly-once。
+这是受信任操作者的独立实验，不是已验证的敌对多租户代码执行平台；不接生产系统、生产数据或敏感源代码。浏览器只在内存中保留 bearer，渲染使用 textContent，不保存 localStorage 或记录 Authorization。
 
-stdout 和审计只记录白名单元数据，错误文本固定化。Docker 日志轮转；业务 JSONL/SQLite 的备份、保留与访问控制由操作者负责。不能把可由管理员改写的本地日志当作防篡改审计证明。
+## 审计与诊断
 
-发布前运行 gitleaks 全历史扫描与私有信息扫描，检查源码 SPDX 和全部提交 Signed-off-by；运行回执一律保存到仓库外。详见 CONTRIBUTING。
+业务变更及 `x_audit` 在同一 PostgreSQL 事务提交。审计只保存真实主体、操作/任务/线程标识、数据库时间、状态、版本/fence 和必要引用；不保存完整 prompt、评论正文或凭据。业务 API 只返回稳定安全错误码，不返回 SQL 或连接串。
 
-Ubuntu 的非特权 userns 限制可能仍阻止基础配置启动内部沙箱。可选 `compose.apparmor.yaml` 使用管理员在 Engine 宿主预加载的 `baton-codex-userns-v1`；该 profile 是 `flags=(unconfined)` 加 `userns` 的显式例外，并非完整 AppArmor 策略。Baton 不关闭宿主的全局限制，也不自动创建拥有宿主策略修改权限的加载容器。原理见 [Ubuntu 官方说明](https://discourse.ubuntu.com/t/spec-unprivileged-user-namespace-restrictions-via-apparmor-in-ubuntu-23-10/37626)。实际隔离仍需 `scripts/sandbox_probe.py` 在目标主机通过。
+PostgreSQL 全局关闭 SQL、慢查询采样和错误参数日志，普通 SQL 错误不记录到服务器日志；`log_min_messages=fatal` 只保留 FATAL/PANIC 诊断，错误 verbosity 为 terse。此选择牺牲详细 SQL 排障信息以避免错误消息、失败行或参数带出正文；可用性由 pg_isready、迁移结果和业务健康检查核验。含角色密码的迁移会话进一步抑制普通日志，异常只输出固定失败说明。相关参数见 [PostgreSQL 17 日志文档](https://www.postgresql.org/docs/17/runtime-config-logging.html)。
+
+边缘与 worker 的白名单 JSONL 用于关联请求和执行，不是防篡改账本。Docker 日志轮转；数据库、worker 私有回执和秘密卷的备份、保留、访问控制由操作者负责。`x_audit` 不能替代受控备份，`down -v` 会删除项目命名卷，不能用于自动升级或修复。
+
+撤销 token 阻断新请求，不自动取消已经启动的 worker。外部执行结果不确定时保持 interrupted 并人工核对，不盲目重跑。演示结果不能冒充真实 Codex；手工 gate 与自动 worker_success 必须区分，不等同生产发布批准。
+
+发布前执行全历史秘密扫描、私有信息扫描、SPDX 与 Signed-off-by 检查。运行回执保存在仓库外；所有贡献提交遵守 [DCO](../CONTRIBUTING.md)。
