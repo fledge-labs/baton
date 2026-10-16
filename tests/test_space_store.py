@@ -174,6 +174,38 @@ def test_comment_mentions_inbox_are_recipient_and_permission_filtered(pg):
     assert s.claim_next(SERVICE_ACTOR, operation()) is None
 
 
+def test_person_mentions_target_principal_not_shared_account(pg):
+    s = pg.store
+    human = Actor(pg.prefix + "-human", pg.reader.account, "human")
+    bot = Actor(pg.prefix + "-bot", pg.reader.account, "agent")
+    s.share(pg.owner, operation(), "space", pg.space["id"], "person", human.account, "view")
+    comment = s.comment(pg.owner, operation(), pg.page["id"], "Feedback for one person")
+    s.mention(pg.owner, operation(), comment["id"], "person", human.principal)
+    messages = s.fetch_inbox(human)["messages"]
+    assert len(messages) == 1 and messages[0]["to"] == [human.principal]
+    assert messages[0]["action_requested"] is False
+    assert s.fetch_inbox(bot)["messages"] == []
+
+
+def test_inbox_preserves_actual_mention_requester_and_aggregated_requests(pg):
+    s = pg.store
+    recipient = Actor(pg.prefix + "-recipient", pg.reviewer.account, "agent")
+    comment = s.comment(pg.owner, operation(), pg.page["id"], "Original author's context")
+    s.mention(pg.owner, operation(), comment["id"], "agent", recipient.principal)
+    s.mention(pg.editor, operation(), comment["id"], "agent", recipient.principal)
+    message = s.fetch_inbox(recipient)["messages"][0]
+    assert message["from"] == pg.owner.principal
+    assert message["requested_by"] == pg.editor.principal and message["action_requested"] is True
+    assert {request["requested_by"] for request in message["requests"]} == {pg.owner.principal, pg.editor.principal}
+    later = s.comment(pg.owner, operation(), pg.page["id"], "Later context", thread_id=comment["thread_id"])
+    s.mention(pg.owner, operation(), later["id"], "agent", recipient.principal)
+    messages = s.fetch_inbox(recipient)["messages"]
+    assert len(messages) == 1 and messages[0]["body_md"] == "Later context"
+    assert len(messages[0]["requests"]) == 3
+    assert any(request["requested_by"] == pg.editor.principal and request["comment_id"] == comment["id"]
+               for request in messages[0]["requests"])
+
+
 def test_submit_business_key_and_operation_key_are_both_idempotent(pg):
     s = pg.store
     op = operation()
@@ -211,13 +243,15 @@ def test_concurrent_operation_and_business_retries_have_one_effect(pg):
     assert len([row for row in s.list_audit(pg.owner, task_id=tasks[0]["id"]) if row["event"] == "task.submitted"]) == 1
 
 
-def test_cross_space_scope_claim_race_is_serialized_in_postgres(pg):
+@pytest.mark.parametrize("alias", [False, True], ids=["same_declared_path", "unverified_alias"])
+def test_cross_space_scope_claim_race_is_serialized_in_postgres(pg, alias):
     s = pg.store
     other_space = s.create_space(pg.editor, operation(), "Other Space")
     other_page = s.create_page(pg.editor, operation(), other_space["id"], "Other page")
     scopes = [{"kind": "path", "value": pg.prefix + "/src"}]
     first = manual(pg, scopes=scopes)
-    second = s.create_task_block(pg.editor, operation(), other_page["id"], "Other work", scopes, [pg.reviewer.principal])
+    other_scopes = [{"kind": "path", "value": pg.prefix + "/unverified-link"}] if alias else scopes
+    second = s.create_task_block(pg.editor, operation(), other_page["id"], "Other work", other_scopes, [pg.reviewer.principal])
     barrier = threading.Barrier(2)
     def claim(pair):
         actor, task = pair
@@ -231,7 +265,7 @@ def test_cross_space_scope_claim_race_is_serialized_in_postgres(pg):
     assert sorted(results) == ["claimed", "scope_conflict"]
 
 
-def test_scope_paths_use_segment_prefix_and_modules_are_conservative(pg):
+def test_path_declarations_are_preserved_but_all_paths_and_modules_conflict(pg):
     s = pg.store
     first = manual(pg, "first", [{"kind": "path", "value": pg.prefix + "/src/a"}])
     sibling = manual(pg, "sibling", [{"kind": "path", "value": pg.prefix + "/src/ab"}])
@@ -239,9 +273,9 @@ def test_scope_paths_use_segment_prefix_and_modules_are_conservative(pg):
     unknown = manual(pg, "module", [{"kind": "module", "value": "unknown"}])
     root = manual(pg, "root", [])
     s.claim(pg.owner, operation(), first["id"])
-    s.claim(pg.owner, operation(), sibling["id"])
-    for task in (child, unknown, root):
+    for task in (sibling, child, unknown, root):
         expect("scope_conflict", lambda task=task: s.claim(pg.owner, operation(), task["id"]))
+    assert s.get_scopes(pg.owner, sibling["id"])["scopes"] == [{"kind": "path", "value": pg.prefix + "/src/ab"}]
     assert normalize_scopes([{"kind": "path", "value": "Src//./A"}]) == [{"kind": "path", "value": "src/a"}]
 
 
@@ -303,6 +337,16 @@ def test_handoff_preserves_context_and_fences_previous_holder(pg):
     assert assignment["prompt"] == "Synthetic work task"
     expect("revision_conflict", lambda: s.handoff(pg.editor, operation(), task["id"], transferred["epoch"], pg.owner, base_commit="changed"))
     assert s.get_task(pg.owner, task["id"])["holder"] == pg.editor.principal
+
+
+def test_handoff_cannot_fill_an_originally_null_base_commit(pg):
+    s = pg.store
+    task = manual(pg)
+    claim = s.claim(pg.owner, operation(), task["id"])
+    expect("revision_conflict", lambda: s.handoff(pg.owner, operation(), task["id"], claim["epoch"], pg.editor, base_commit="new-base"))
+    assert s.get_task(pg.owner, task["id"])["holder"] == pg.owner.principal
+    transferred = s.handoff(pg.owner, operation(), task["id"], claim["epoch"], pg.editor)
+    assert transferred["base_commit"] is None
 
 
 def test_manual_gates_reject_self_review_and_old_candidate(pg):
@@ -454,6 +498,24 @@ def test_audit_triggers_reject_even_owner_dml_and_truncate(pg):
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 with conn.transaction():
                     conn.execute(statement)
+
+
+def test_checkpoint_migration_is_repeatable_and_readiness_rejects_missing_assignee(pg):
+    config_path = os.environ.get("BATON_TEST_DATABASE_ADMIN_CONFIG")
+    if not config_path:
+        pytest.skip("Checkpoint migration check needs explicitly authorized test admin config")
+    config = json.loads(Path(config_path).read_text())
+    schema = (Path(__file__).parents[1] / "bridge/space_schema.sql").read_text()
+    with psycopg.connect(**config, autocommit=True) as conn:
+        conn.execute("SET ROLE baton_owner")
+        conn.execute(schema)
+        conn.execute(schema)
+        conn.execute("ALTER TABLE baton.tasks RENAME COLUMN assignee TO synthetic_missing_assignee")
+        try:
+            expect("storage_unavailable", lambda: pg.store.check_schema(SERVICE_ACTOR))
+        finally:
+            conn.execute("ALTER TABLE baton.tasks RENAME COLUMN synthetic_missing_assignee TO assignee")
+    assert pg.store.check_schema(SERVICE_ACTOR)["status"] == "ok"
 
 
 def test_connection_errors_do_not_contain_credentials(tmp_path):

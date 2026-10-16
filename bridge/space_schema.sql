@@ -52,8 +52,16 @@ CREATE TABLE IF NOT EXISTS baton.mentions (
     id uuid PRIMARY KEY, comment_id uuid NOT NULL REFERENCES baton.comments(id),
     target_type text NOT NULL CHECK (target_type IN ('person','agent')), target_id text NOT NULL,
     action_requested boolean NOT NULL, requested_by text NOT NULL,
-    UNIQUE(comment_id,target_type,target_id)
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT mentions_recipient_requester_key UNIQUE(comment_id,target_type,target_id,requested_by)
 );
+ALTER TABLE baton.mentions ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT clock_timestamp();
+ALTER TABLE baton.mentions DROP CONSTRAINT IF EXISTS mentions_comment_id_target_type_target_id_key;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='baton.mentions'::regclass AND conname='mentions_recipient_requester_key') THEN
+        ALTER TABLE baton.mentions ADD CONSTRAINT mentions_recipient_requester_key UNIQUE(comment_id,target_type,target_id,requested_by);
+    END IF;
+END; $$;
 CREATE INDEX IF NOT EXISTS mentions_recipient ON baton.mentions(target_type,target_id);
 CREATE TABLE IF NOT EXISTS baton.proposals (
     id uuid PRIMARY KEY, block_id uuid NOT NULL REFERENCES baton.blocks(id), expected_revision bigint NOT NULL,

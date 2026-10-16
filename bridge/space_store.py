@@ -107,7 +107,7 @@ def _items(value):
 
 
 def normalize_scopes(scopes):
-    """Normalize declared logical paths; unknown modules reserve the whole repo."""
+    """Keep declarations for display; v1 cannot prove physical path independence."""
     if scopes is None or scopes == []:
         return [{"kind": "path", "value": ""}]
     if not isinstance(scopes, list) or len(scopes) > 100:
@@ -143,8 +143,9 @@ def scopes_overlap(left, right):
                 return True  # No administrator module map exists in v1.
             if a["kind"] != b["kind"]:
                 continue
-            x, y = a["value"], b["value"]
-            if x == y or (a["kind"] == "path" and (not x or not y or x.startswith(y + "/") or y.startswith(x + "/"))):
+            # No trusted repository/alias catalogue exists. Two different path
+            # strings might name the same file, so every path reserves the root.
+            if a["kind"] == "path" or a["value"] == b["value"]:
                 return True
     return False
 
@@ -282,6 +283,29 @@ class SpaceStore:
                 CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
                 WHERE r.rolname=current_user AND n.nspname='baton' AND c.relname='x_audit'""").fetchone()
             triggers = conn.execute("SELECT count(*) AS n FROM pg_trigger WHERE tgrelid='baton.x_audit'::regclass AND tgname IN ('audit_no_change','audit_no_truncate') AND tgenabled='O'").fetchone()
+            required = {
+                "spaces": "id name owner_account scope_repository default_for",
+                "pages": "id space_id parent_id owner_account title revision",
+                "blocks": "id page_id kind content position revision author_principal author_account author_kind",
+                "block_revisions": "block_id revision content author_principal operation_id proposal_id",
+                "teams": "id name owner_account", "team_members": "team_id account",
+                "grants": "resource_type resource_id subject_type subject_id role",
+                "comments": "id page_id thread_id body author_principal requested_by",
+                "mentions": "id comment_id target_type target_id action_requested requested_by created_at",
+                "proposals": "id block_id expected_revision proposed_content status revision",
+                "proposal_revisions": "proposal_id revision content author_principal",
+                "tasks": "id page_id block_id owner owner_account owner_kind assignee idempotency_key input_hash prompt execution_mode gate_mode reviewers scopes state epoch result_epoch result result_author result_author_account base_commit context evidence a2a_id backend dispatch_started_at error",
+                "x_claim": "task_id holder holder_account holder_kind epoch lease_expires_at scopes scope_repository",
+                "x_handoff": "task_id old_epoch new_epoch base_commit context evidence",
+                "x_gate": "task_id epoch decision reviewer reviewer_account evidence",
+                "operations": "principal operation_id request_hash method result",
+                "x_audit": "id time event agent actor_account actor_kind requested_by performed_by operation_id space_id task_id metadata",
+            }
+            columns = {}
+            for column in conn.execute("SELECT table_name,column_name FROM information_schema.columns WHERE table_schema='baton'"):
+                columns.setdefault(column["table_name"], set()).add(column["column_name"])
+            if any(not set(names.split()) <= columns.get(table, set()) for table, names in required.items()):
+                raise StoreError("storage_unavailable")
             if not version or version["version"] != 1 or not role or role["rolsuper"] or role["owns_audit"] or triggers["n"] != 2:
                 raise StoreError("storage_unavailable")
             return {"status": "ok", "schema_version": 1}
@@ -491,8 +515,8 @@ class SpaceStore:
             self._require(conn, actor, "page", str(comment["page_id"]), "comment")
         def effect(conn):
             comment = self._row(conn, "comments", comment_id)
-            row = conn.execute("""INSERT INTO baton.mentions VALUES (%s,%s,%s,%s,%s,%s)
-                ON CONFLICT(comment_id,target_type,target_id) DO UPDATE SET target_id=EXCLUDED.target_id RETURNING *""",
+            row = conn.execute("""INSERT INTO baton.mentions(id,comment_id,target_type,target_id,action_requested,requested_by) VALUES (%s,%s,%s,%s,%s,%s)
+                ON CONFLICT(comment_id,target_type,target_id,requested_by) DO UPDATE SET target_id=EXCLUDED.target_id RETURNING *""",
                 (uuid.uuid4(), comment_id, target_type, target_id, target_type == "agent", actor.principal)).fetchone()
             page = self._row(conn, "pages", str(comment["page_id"]))
             task = conn.execute("SELECT id FROM baton.tasks WHERE id=%s AND page_id=%s", (comment["thread_id"], comment["page_id"])).fetchone()
@@ -505,22 +529,30 @@ class SpaceStore:
         _integer(limit, 1, 100)
         self._user(actor)
         def read(conn):
-            rows = conn.execute("""SELECT DISTINCT c.* FROM baton.comments c JOIN baton.mentions m ON m.comment_id=c.id
-                WHERE (m.target_type='agent' AND m.target_id=%s) OR (m.target_type='person' AND m.target_id=%s)
-                ORDER BY c.created_at DESC,c.id DESC""", (actor.principal, actor.account)).fetchall()
-            messages = [{"id": str(row["id"]), "thread_id": str(row["thread_id"]), "subject": row["subject"],
-                         "from": row["author_principal"], "to": [actor.principal], "created_ts": row["created_at"], "body_md": row["body"]}
-                        for row in rows if self._role(conn, actor, "page", str(row["page_id"]))]
+            rows = conn.execute("""SELECT c.*,m.id AS mention_id,m.action_requested AS mention_action_requested,
+                m.requested_by AS mention_requested_by,m.target_type,m.target_id,m.created_at AS requested_at
+                FROM baton.comments c JOIN baton.mentions m ON m.comment_id=c.id
+                WHERE m.target_id=%s AND m.target_type IN ('person','agent')
+                ORDER BY m.created_at DESC,m.id DESC""", (actor.principal,)).fetchall()
             threads = {}
-            for message in messages:
-                threads.setdefault(message["thread_id"], message)
+            for row in rows:
+                if not self._role(conn, actor, "page", str(row["page_id"])):
+                    continue
+                request = {"mention_id": str(row["mention_id"]), "comment_id": str(row["id"]),
+                           "requested_by": row["mention_requested_by"], "action_requested": row["mention_action_requested"],
+                           "target_principal": row["target_id"], "target_type": row["target_type"], "created_ts": row["requested_at"]}
+                message = {"id": str(row["id"]), "thread_id": str(row["thread_id"]), "subject": row["subject"],
+                           "from": row["author_principal"], "to": [actor.principal], "created_ts": row["requested_at"], "body_md": row["body"],
+                           "requested_by": request["requested_by"], "action_requested": request["action_requested"], "requests": []}
+                threads.setdefault(message["thread_id"], message)["requests"].append(request)
             assigned = conn.execute("SELECT * FROM baton.tasks WHERE assignee=%s ORDER BY created_at DESC", (actor.principal,)).fetchall()
             for task in assigned:
                 if not self._role(conn, actor, "page", str(task["page_id"])):
                     continue
                 identity = str(task["id"])
                 message = threads.setdefault(identity, {"id": identity, "thread_id": identity, "subject": "[assigned] " + identity,
-                    "from": task["owner"], "to": [actor.principal], "created_ts": task["created_at"], "body_md": task["prompt"]})
+                    "from": task["owner"], "to": [actor.principal], "created_ts": task["created_at"], "body_md": task["prompt"],
+                    "requested_by": task["owner"], "action_requested": True, "requests": []})
                 message.update(task_id=identity, assignee=task["assignee"], prompt=task["prompt"], state=self._task_view(conn, identity)["state"], kind="assignment")
             for identity, message in threads.items():
                 if "task_id" not in message:
@@ -638,7 +670,7 @@ class SpaceStore:
     def _notify_task(self, conn, actor, operation_id, task, phase, body, recipient=None):
         row = self._comment(conn, actor, operation_id, str(task["page_id"]), body, str(task["id"]),
                             subject=f'[{phase}] {task["id"]}', requested_by=task["owner"])
-        conn.execute("INSERT INTO baton.mentions VALUES (%s,%s,'agent',%s,false,%s)",
+        conn.execute("INSERT INTO baton.mentions(id,comment_id,target_type,target_id,action_requested,requested_by) VALUES (%s,%s,'agent',%s,false,%s)",
                      (uuid.uuid4(), row["id"], recipient or task["owner"], task["owner"]))
         self._task_audit(conn, actor, operation_id, "thread." + phase, task)
 
@@ -878,9 +910,9 @@ class SpaceStore:
         def effect(conn):
             self._live(conn, actor, task_id, epoch)
             task = self._row(conn, "tasks", task_id)
-            if base_commit is not None and task["base_commit"] is not None and base_commit != task["base_commit"]:
+            if base_commit is not None and base_commit != task["base_commit"]:
                 raise StoreError("revision_conflict")
-            base = task["base_commit"] if base_commit is None else base_commit
+            base = task["base_commit"]
             contexts, evidence_items = task["context"] + _items(context), task["evidence"] + _items(evidence)
             conn.execute("""UPDATE baton.x_claim SET holder=%s,holder_account=%s,holder_kind=%s,epoch=epoch+1,
                 lease_expires_at=clock_timestamp()+%s*interval '1 second' WHERE task_id=%s""", (target.principal, target.account, target.kind, lease_seconds, task_id))
