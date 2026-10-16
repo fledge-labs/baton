@@ -56,7 +56,7 @@ services:
     depends_on:
       gateway: {condition: service_started}
     healthcheck:
-      test: [CMD, wget, -q, --spider, http://localhost:8080/board]
+      test: [CMD, wget, -q, --spider, http://127.0.0.1:8080/board]
       interval: 10s
       timeout: 3s
       retries: 12

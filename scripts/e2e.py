@@ -25,7 +25,7 @@ async def run(args):
     tls=ssl.create_default_context(cafile=str(args.ca_file)) if args.ca_file else True
     async with httpx.AsyncClient(verify=tls,timeout=30,trust_env=False) as http:
         denied=await http.get(args.url+'/healthz')
-        assert denied.status_code in (401,403),'Missing token was accepted'
+        assert denied.status_code in (401,403),f'Expected authenticated Baton endpoint (401/403), got HTTP {denied.status_code}'
     async with httpx.AsyncClient(headers={'Authorization':'Bearer '+token},verify=tls,timeout=45,trust_env=False) as http:
         async with streamable_http_client(args.url+'/mcp',http_client=http) as (read,write,_):
             async with ClientSession(read,write) as session:
