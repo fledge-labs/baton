@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# Compose >= 2.24.4; replaces the local HTTP publication with HTTPS only.
+services:
+  edge:
+    ports: !override ["${BIND_ADDRESS:-127.0.0.1}:${HTTPS_PORT:-8443}:8443"]
+    volumes:
+      - ./nginx.tls.conf:/etc/nginx/nginx.conf:ro
+      - ${TLS_CERT_FILE:?set an external certificate path}:/tls/fullchain.pem:ro
+      - ${TLS_KEY_FILE:?set an external private key path}:/tls/privkey.pem:ro
+    healthcheck:
+      test: [CMD, nginx, -t]

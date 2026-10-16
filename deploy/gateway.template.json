@@ -1,0 +1,129 @@
+{
+  "_license": "SPDX-License-Identifier: Apache-2.0",
+  "config": {
+    "logging": {
+      "format": "json"
+    }
+  },
+  "frontendPolicies": {
+    "accessLog": {
+      "add": {
+        "agent": "apiKey.agent",
+        "request_id": "request.headers[\"x-request-id\"]"
+      },
+      "remove": [
+        "http.path",
+        "http.query"
+      ]
+    }
+  },
+  "binds": [
+    {
+      "port": 3000,
+      "listeners": [
+        {
+          "protocol": "HTTP",
+          "routes": [
+            {
+              "name": "codex-a2a",
+              "matches": [
+                {
+                  "path": {
+                    "pathPrefix": "/a2a/"
+                  }
+                },
+                {
+                  "path": {
+                    "exact": "/.well-known/agent-card.json"
+                  }
+                }
+              ],
+              "policies": {
+                "apiKey": {
+                  "keys": [],
+                  "mode": "strict",
+                  "location": {
+                    "header": {
+                      "name": "authorization",
+                      "prefix": "Bearer "
+                    }
+                  }
+                },
+                "transformations": {
+                  "request": {
+                    "set": {
+                      "authorization": "\"Bearer \" + apiKey.key.unredacted()"
+                    }
+                  }
+                },
+                "authorization": {
+                  "rules": [
+                    "apiKey.role == 'dispatcher'"
+                  ]
+                },
+                "a2a": {},
+                "timeout": {
+                  "requestTimeout": "360s"
+                }
+              },
+              "backends": [
+                {
+                  "host": "codex:9001"
+                }
+              ]
+            },
+            {
+              "name": "mcp-tasks-and-mail",
+              "matches": [
+                {
+                  "path": {
+                    "pathPrefix": "/mcp"
+                  }
+                },
+                {
+                  "path": {
+                    "pathPrefix": "/board"
+                  }
+                },
+                {
+                  "path": {
+                    "exact": "/healthz"
+                  }
+                }
+              ],
+              "policies": {
+                "apiKey": {
+                  "keys": [],
+                  "mode": "strict",
+                  "location": {
+                    "header": {
+                      "name": "authorization",
+                      "prefix": "Bearer "
+                    }
+                  }
+                },
+                "transformations": {
+                  "request": {
+                    "set": {
+                      "authorization": "\"Bearer \" + apiKey.key.unredacted()"
+                    }
+                  }
+                },
+                "authorization": {
+                  "rules": [
+                    "apiKey.role == 'client'"
+                  ]
+                }
+              },
+              "backends": [
+                {
+                  "host": "bridge:9000"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

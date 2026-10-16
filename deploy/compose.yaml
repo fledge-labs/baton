@@ -1,0 +1,144 @@
+# SPDX-License-Identifier: Apache-2.0
+name: ${COMPOSE_PROJECT_NAME:-baton}
+x-service: &service
+  restart: unless-stopped
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  logging:
+    driver: json-file
+    options: {max-size: 10m, max-file: "5"}
+x-app: &app
+  image: ${COMPOSE_PROJECT_NAME:-baton}-app:local
+  build: {context: .., dockerfile: deploy/Dockerfile}
+x-admin-volumes: &admin-volumes
+  - config:/runtime/config
+  - bridge-secrets:/runtime/secrets/bridge
+  - mail-secrets:/runtime/secrets/mail
+  - codex-home:/runtime/secrets/codex-home
+  - client-secrets:/runtime/secrets/clients
+  - bridge-data:/runtime/data/bridge
+  - codex-data:/runtime/data/codex
+  - mail-data:/runtime/data/mail
+services:
+  initialize:
+    <<: [*service, *app]
+    restart: "no"
+    user: "0:0"
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    command: [python, scripts/tokens.py, --runtime, /runtime, init]
+    volumes: *admin-volumes
+    tmpfs: ["/runtime:mode=0700", "/tmp:mode=1777"]
+    network_mode: none
+  admin:
+    <<: [*service, *app]
+    profiles: [ops]
+    restart: "no"
+    user: "0:0"
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    entrypoint: [python, scripts/tokens.py, --runtime, /runtime]
+    command: [list]
+    volumes: *admin-volumes
+    tmpfs: ["/runtime:mode=0700", "/tmp:mode=1777"]
+    network_mode: none
+  edge:
+    <<: *service
+    image: nginx:1.28.0-alpine@sha256:30f1c0d78e0ad60901648be663a710bdadf19e4c10ac6782c235200619158284
+    user: "${EDGE_UID:-101}:${EDGE_GID:-101}"
+    entrypoint: [nginx, -g, "daemon off;"]
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-8080}:8080"]
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../board:/usr/share/nginx/html:ro
+    tmpfs: ["/tmp:mode=1777", "/var/cache/nginx:uid=${EDGE_UID:-101},gid=${EDGE_GID:-101},mode=0700"]
+    networks: [private, ingress]
+    depends_on:
+      gateway: {condition: service_started}
+    healthcheck:
+      test: [CMD, wget, -q, --spider, http://localhost:8080/board]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+  gateway:
+    <<: *service
+    image: ghcr.io/agentgateway/agentgateway:v1.6.0@sha256:9d3e6044ddcdc0878b1787f77bd401252b95e22684203fb5e874c4c42d2ed90c
+    command: [-f, /config/gateway.json]
+    volumes: [config:/config:ro]
+    networks: [private]
+    depends_on:
+      initialize: {condition: service_completed_successfully}
+      bridge: {condition: service_healthy}
+      codex: {condition: service_healthy}
+  bridge:
+    <<: [*service, *app]
+    command: [python, -m, bridge.server]
+    environment:
+      BATON_STATE: /data
+      BATON_CONFIG: /config
+      MAIL_URL: http://mail:8765/mcp/
+      GATEWAY_INTERNAL: http://gateway:3000
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+    volumes: [config:/config:ro, bridge-secrets:/run/secrets:ro, bridge-data:/data]
+    tmpfs: ["/tmp:size=32m,mode=1777"]
+    networks: [private]
+    depends_on:
+      initialize: {condition: service_completed_successfully}
+      mail: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -c, "import socket; socket.create_connection(('localhost',9000),2).close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+  codex:
+    <<: [*service, *app]
+    command: [python, -m, bridge.codex_agent]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./security/codex-seccomp.json
+      - apparmor=unconfined
+    environment:
+      BATON_STATE: /data
+      BATON_CONFIG: /config
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+      WORKER_MODE: ${WORKER_MODE:-codex}
+      CODEX_MODEL: ${CODEX_MODEL:-}
+    volumes: [config:/config:ro, codex-data:/data, codex-home:/home/agent/.codex]
+    tmpfs: ["/tmp:size=64m,mode=1777", "/work:size=64m,uid=10001,gid=10001,mode=0700"]
+    networks: [private, worker-egress]
+    pids_limit: 128
+    depends_on:
+      initialize: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, python, -c, "import socket; socket.create_connection(('localhost',9001),2).close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+  mail:
+    <<: *service
+    image: ${COMPOSE_PROJECT_NAME:-baton}-mail:local
+    build: {context: .., dockerfile: deploy/Dockerfile.mail}
+    volumes: [mail-secrets:/run/secrets:ro, mail-data:/data]
+    tmpfs: ["/tmp:size=32m,mode=1777"]
+    networks: [private]
+    depends_on:
+      initialize: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8765/health/readiness',timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+networks:
+  private: {internal: true}
+  ingress: {}
+  worker-egress: {}
+volumes:
+  config: {}
+  bridge-secrets: {}
+  mail-secrets: {}
+  codex-home: {}
+  client-secrets: {}
+  bridge-data: {}
+  codex-data: {}
+  mail-data: {}

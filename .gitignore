@@ -5,3 +5,16 @@ secrets/
 .venv/
 __pycache__/
 node_modules/
+evidence/
+runtime/
+.pytest_cache/
+*.sqlite*
+*.db
+*.pem
+*.key
+*.crt
+auth.json
+*.log
+*.scan.json
+.env.*
+!.env.example
