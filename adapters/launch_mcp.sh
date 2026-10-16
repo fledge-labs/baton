@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 set -eu
 
-if [ "$#" -ne 2 ]; then
-  echo 'Usage: launch_mcp.sh <agent-id> <TOKEN_FILE>' >&2
+if [ "$#" -lt 2 ]; then
+  echo 'Usage: launch_mcp.sh <agent-id> <TOKEN_FILE> [adapter-options...]' >&2
   exit 2
 fi
 case "$1" in
@@ -14,5 +14,8 @@ if [ "${#1}" -gt 96 ]; then
   exit 2
 fi
 baton_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+agent_id=$1
+token_file=$2
+shift 2
 exec "${BATON_PYTHON:-$baton_dir/.venv/bin/python}" "$baton_dir/adapters/mcp_stdio.py" \
-  --agent-id "$1" --token-file "$2"
+  --agent-id "$agent_id" --token-file "$token_file" "$@"

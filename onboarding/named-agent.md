@@ -10,7 +10,18 @@
 
 令牌交给该身份的负责人，经已有 SSH/SCP 渠道放到接收方主机的 `~/.config/baton/beigua.token`，目录权限 0700、文件权限 0600。令牌不经过聊天，不交给任务发起人，也不放入命令参数。先确认目标主机和操作者；Baton 不主动登录接收方主机，不安装或强制启动 agent。
 
-接收方自愿配置 MCP stdio 适配器：`adapters/launch_mcp.sh beigua "$HOME/.config/baton/beigua.token"`，设置 `BATON_URL=https://example.com` 为实际的独立测试入口。令牌文件路径可以出现在配置中，令牌原值不可以。私有 CA 使用 `BATON_CA_FILE`，不跳过 TLS 校验。
+接收方自愿配置 MCP stdio 适配器，设置 `BATON_URL=https://example.com/mcp` 为实际的独立测试入口。令牌文件路径可以出现在配置中，令牌原值不可以。私有 CA 使用 `BATON_CA_FILE`，不跳过 TLS 校验。
+
+适配器默认仅允许 `submit_task,get_task,list_tasks,fetch_inbox`。下文的领取、续租、评论和提交结果必须显式加入白名单：
+
+```sh
+adapters/launch_mcp.sh beigua "$HOME/.config/baton/beigua.token" \
+  --allow-tools submit_task,get_task,list_tasks,fetch_inbox,claim,renew,comment,submit_result
+```
+
+`--allow-tools` 接受逗号分隔的已知 Baton 工具名称，区分大小写，可去除名称两端空格；它**替换**默认白名单，重复名称合并，空名称、未知名称和通配符会报错。也可把该参数直接传给 `adapters/mcp_stdio.py`。发起人或审阅人使用下文的建页、分享、派单扩展、审阅和审计工具时，也应在自己的适配器中显式加入相应名称，例如 `create_space,create_page,share,gate,x_audit`；白名单不会扩大服务端权限。
+
+远端发现结果中的未允许工具不会暴露给客户端，直接猜测名称调用也在本地拒绝。每次发现响应有过滤项时写一条汇总审计（仅记录数量），每次拒绝调用写一条审计，不记录工具原名或参数正文。设置 `BATON_AUDIT_FILE` 或 `--audit-file` 时审计追加到权限为 0600 的文件；未设置或文件写入失败时，审计写到 stderr，不占用 MCP 的 stdout。成功调用回执仍只在配置审计文件时记录。
 
 ## 发起人派单
 

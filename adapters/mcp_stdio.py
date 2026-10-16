@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Token-file MCP adapter; optional receipts contain validated metadata only."""
+"""Allowlisted token-file MCP adapter with metadata-only policy audits."""
 
 import argparse
 import asyncio
@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
-from mcp import ClientSession
+from mcp import ClientSession, types
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
@@ -28,12 +28,20 @@ TOOLS = {"submit_task", "get_task", "list_tasks", "fetch_inbox", "create_space",
          "create_task_block", "assign_task", "plan", "ready", "claim", "renew", "submit_result", "handoff", "gate", "get_claim", "list_claims",
          "get_scopes", "list_audit", "x_claim", "x_scope", "x_handoff", "x_gate", "x_audit"}
 STATUSES = {"queued", "working", "completed", "failed", "interrupted", "claimed", "awaiting_gate", "done"}
+DEFAULT_ALLOWED_TOOLS = frozenset({"submit_task", "get_task", "list_tasks", "fetch_inbox"})
 
 
 def safe_agent(value):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", value):
         raise argparse.ArgumentTypeError("Invalid agent identifier")
     return value
+
+
+def parse_allow_tools(value):
+    names = [name.strip() for name in value.split(",")]
+    if any(not name or name not in TOOLS for name in names):
+        raise argparse.ArgumentTypeError("Use comma-separated known Baton tool names; empty names and wildcards are not allowed")
+    return frozenset(names)
 
 
 def valid_uuid(value):
@@ -81,9 +89,74 @@ def write_receipt(path, row):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
+        # Creation mode alone does not protect an existing audit file.
+        os.fchmod(fd, 0o600)
         os.write(fd, (json.dumps(row) + "\n").encode())
     finally:
         os.close(fd)
+
+
+def audit_rejection(path, agent, event, rejected_count):
+    if event not in {"adapter.tools_filtered", "adapter.tool_denied"} or type(rejected_count) is not int or rejected_count < 1:
+        raise ValueError("Invalid adapter audit metadata")
+    row = {"time": datetime.now(timezone.utc).isoformat(), "agent": safe_agent(agent),
+           "event": event, "rejected_count": rejected_count}
+    if path:
+        try:
+            write_receipt(path, row)
+            return
+        except OSError:
+            # Preserve the audit without exposing the path or exception text.
+            row["audit_file_error"] = True
+    print(json.dumps(row), file=sys.stderr, flush=True)
+
+
+def create_proxy_server(remote, *, agent_id, allow_tools=DEFAULT_ALLOWED_TOOLS, audit_file=None):
+    safe_agent(agent_id)
+    allow_tools = frozenset(allow_tools)
+    if not allow_tools <= TOOLS:
+        raise ValueError("Invalid adapter tool allowlist")
+    server = Server("baton-proxy")
+
+    @server.list_tools()
+    async def tools():
+        try:
+            remote_tools = (await remote.list_tools()).tools
+        except Exception:
+            raise RuntimeError("Baton remote tool discovery failed") from None
+        allowed = [tool for tool in remote_tools if tool.name in allow_tools]
+        rejected_count = len(remote_tools) - len(allowed)
+        if rejected_count:
+            # One aggregate record per discovery response, never remote names.
+            audit_rejection(audit_file, agent_id, "adapter.tools_filtered", rejected_count)
+        return allowed
+
+    @server.call_tool()
+    async def call(name, arguments):
+        try:
+            result = await remote.call_tool(name, arguments)
+        except Exception:
+            raise RuntimeError("Baton remote tool failed") from None
+        if audit_file:
+            write_receipt(audit_file, receipt(agent_id, name, arguments, result))
+        return result
+
+    forward_call = server.request_handlers[types.CallToolRequest]
+
+    async def guarded_call(request):
+        # The SDK refreshes tool definitions before invoking the decorated
+        # callback. Reject first so even guessed names never trigger discovery,
+        # input validation, or SDK warnings containing untrusted names.
+        if request.params.name not in allow_tools:
+            audit_rejection(audit_file, agent_id, "adapter.tool_denied", 1)
+            return types.ServerResult(types.CallToolResult(
+                isError=True,
+                content=[types.TextContent(type="text", text="Baton tool is not allowed by this adapter")],
+            ))
+        return await forward_call(request)
+
+    server.request_handlers[types.CallToolRequest] = guarded_call
+    return server
 
 
 async def main(args):
@@ -100,34 +173,25 @@ async def main(args):
         async with streamable_http_client(args.url, http_client=http) as (read, write, _):
             async with ClientSession(read, write) as remote:
                 await remote.initialize()
-                server = Server("baton-proxy")
-
-                @server.list_tools()
-                async def tools():
-                    return (await remote.list_tools()).tools
-
-                @server.call_tool()
-                async def call(name, arguments):
-                    try:
-                        result = await remote.call_tool(name, arguments)
-                    except Exception:
-                        raise RuntimeError("Baton remote tool failed") from None
-                    if args.audit_file:
-                        write_receipt(args.audit_file, receipt(args.agent_id, name, arguments, result))
-                    return result
+                server = create_proxy_server(remote, agent_id=args.agent_id,
+                                             allow_tools=args.allow_tools, audit_file=args.audit_file)
 
                 async with stdio_server() as (stdio_read, stdio_write):
                     await server.run(stdio_read, stdio_write, server.create_initialization_options())
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--agent-id", required=True, type=safe_agent)
     parser.add_argument("--token-file", required=True, type=Path)
     parser.add_argument("--url", default=os.environ.get("BATON_URL", "http://localhost:8080/mcp"))
     parser.add_argument("--ca-file", type=Path, default=os.environ.get("BATON_CA_FILE") or None)
     parser.add_argument("--audit-file", type=Path, default=os.environ.get("BATON_AUDIT_FILE") or None)
-    return parser.parse_args()
+    parser.add_argument("--allow-tools", type=parse_allow_tools, default=DEFAULT_ALLOWED_TOOLS,
+                        metavar="NAME,NAME,...",
+                        help="Comma-separated known Baton tool names; replaces the default allowlist: "
+                             "submit_task,get_task,list_tasks,fetch_inbox (no wildcards)")
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
