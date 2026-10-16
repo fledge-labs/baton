@@ -11,7 +11,10 @@ x-service: &service
     options: {max-size: 10m, max-file: "5"}
 x-app: &app
   image: ${COMPOSE_PROJECT_NAME:-baton}-app:local
-  build: {context: .., dockerfile: deploy/Dockerfile}
+  pull_policy: never
+x-app-build: &app-build
+  context: ..
+  dockerfile: deploy/Dockerfile
 x-admin-volumes: &admin-volumes
   - config:/runtime/config
   - bridge-secrets:/runtime/secrets/bridge
@@ -24,6 +27,7 @@ x-admin-volumes: &admin-volumes
 services:
   initialize:
     <<: [*service, *app]
+    build: *app-build
     restart: "no"
     user: "0:0"
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
@@ -33,6 +37,7 @@ services:
     network_mode: none
   admin:
     <<: [*service, *app]
+    build: *app-build
     profiles: [ops]
     restart: "no"
     user: "0:0"
