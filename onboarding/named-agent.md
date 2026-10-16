@@ -1,0 +1,39 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
+# 指定接收人：主动拉取任务
+
+这是 Baton 自有协议，不是 ChatGPT Space API。调用方式见 [API](../docs/api.md)，权限与租约规则见 [规格](../docs/spec/space.md)。下面以发起人 `nangua`、接收人 `beigua` 为例；身份名可以替换，所有动作都按调用方令牌认证。
+
+## 操作者准备
+
+使用独立测试 Baton 实例。管理员通过 `tokens.py issue` 签发普通客户端身份；已有预签发文件则用 `import-client` 安全导入，不能把客户端设成 dispatcher。每个身份有自己的令牌。
+
+令牌交给该身份的负责人，经已有 SSH/SCP 渠道放到接收方主机的 `~/.config/baton/beigua.token`，目录权限 0700、文件权限 0600。令牌不经过聊天，不交给任务发起人，也不放入命令参数。先确认目标主机和操作者；Baton 不主动登录接收方主机，不安装或强制启动 agent。
+
+接收方自愿配置 MCP stdio 适配器：`adapters/launch_mcp.sh beigua "$HOME/.config/baton/beigua.token"`，设置 `BATON_URL=https://example.com` 为实际的独立测试入口。令牌文件路径可以出现在配置中，令牌原值不可以。私有 CA 使用 `BATON_CA_FILE`，不跳过 TLS 校验。
+
+## 发起人派单
+
+1. 用 `create_space`、`create_page` 建立测试页面，或使用已有页面。
+2. 用 `share` 给接收人的账户明确授予该页面的 edit 权限。身份与账户的绑定由管理员设置；分配任务不会自动扩大权限。
+3. 调用 `submit_task`，携带稳定的 `idempotency_key`、任务说明 `prompt`、`page_id`、`assignee_principal: "beigua"` 和声明范围 `scopes`。
+
+指定接收人的任务进入手工拉取模式，不会被内置 Codex worker 抢走。默认审阅人是发起人的 principal。`assignee` 是允许领取的人，`holder` 是当前有效租约持有人，派单不会伪造接收方已领取。
+
+也可以先创建 `create_task_block` 并配置 reviewers，再调用 `assign_task(task_id, target_principal, operation_id)`。在任务线程中 `comment` 后调用 `mention(comment_id, target_type="agent", target_id="beigua", operation_id)` 可发出行动请求；提及不会暗中改派任务或授予权限。需要独占指定领取时，应显式设置 assignee。
+
+## 接收人领取与回报
+
+1. 自行调用 `fetch_inbox`，查看“@我的和分给我的”，核对任务、请求者、状态和范围。
+2. 对愿意处理的任务调用 `claim(task_id, operation_id, lease_seconds)`。保存返回的 `epoch`；其他身份不能抢走显式分给自己的任务。
+3. 在自己的 CLI 权限边界内执行。需要更多时间时调用 `renew(task_id, epoch, operation_id, lease_seconds)`；过期或 fence 失效后停止提交旧结果，不能绕过检查。
+4. 调用 `submit_result(task_id, epoch, result, evidence, operation_id)`。结果以实际持有人署名写入同一任务线程，任务进入 `awaiting_gate`。也可用 `comment(page_id, thread_id=task_id, body, operation_id)`补充说明。
+5. 发起人或配置的 reviewer 检查结果后调用 `gate(task_id, expected_epoch=result_epoch, decision="pass", evidence, operation_id)`，此后才成为 `done`，兼容视图为 `completed`。持有人不能自批自己的结果。
+
+每个有副作用的新动作使用一个稳定 UUID `operation_id`；网络重试复用它，不重新生成。MCP `submit_task` 兼容工具根据 principal 与业务键生成操作 ID；直接调用 HTTP 时需显式提供。
+
+## 验收证据
+
+使用 `x_audit(task_id)` 核对 `task.assigned → task.claimed → task.result_submitted → gate.reviewed → task.completed`，全部关联同一任务 ID；评论线程 ID 也等于任务 ID。保存回执到仓库外的私有目录。
+
+`scripts/assignment_acceptance.py` 用不同令牌验证本地协议，明确标记 `remote_cli_acceptance: NOT_RUN`。它不能代替两个真实 CLI、真实主机和自愿拉取的验收；只有实际接收方运行完成后，才记录真实跨机通过。

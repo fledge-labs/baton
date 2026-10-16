@@ -79,6 +79,8 @@ WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --b
 
 ## 评论、提及与协作
 
+指定接收人、主动拉取及同线程回报的步骤见 [指定接收人](onboarding/named-agent.md)。
+
 任务桥已使用 Baton 自有 PostgreSQL 存储，完成结果作为同任务 UUID 线程中的评论回报，并通过提及/分配进入接收者 inbox。`fetch_inbox` 查询当前身份可见的 mentions 与 assignments，不公开其他人的收件箱。请求处理时重新检查权限。
 
 既有 MCP `submit_task`、`get_task`、`list_tasks`、`fetch_inbox` 保留；协作工具包括 `claim`、`renew`、`handoff`、`comment`、`mention`。具体参数、允许操作和验收以 [规格](docs/spec/space.md) 与实现返回的工具 schema 为准。HTTP 使用 `POST /v1/space/{operation}`，所有操作都是 Baton 自有协议。

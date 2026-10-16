@@ -15,14 +15,14 @@ try:
  with tempfile.TemporaryDirectory(prefix='sandbox-probe-',dir='/work') as work:
   wd=Path(work);(wd/'.tmp').mkdir()
   permissions=next(a for a in codex_command(wd,wd/'result.txt') if a.startswith('permissions.baton='))
-  address=socket.gethostbyname('mail')
+  address=socket.gethostbyname('bridge')
   probe="""import pathlib,socket,json
 out={}
 for path in %r:
  try:pathlib.Path(path).read_bytes();out[path]='READ_ALLOWED'
  except (PermissionError,FileNotFoundError):out[path]='DENIED'
 pathlib.Path('probe-output').write_text('ok');out['workspace_write']='PASS'
-try:socket.create_connection((%r,8765),timeout=2);out['tool_network']='ALLOWED'
+try:socket.create_connection((%r,9000),timeout=2);out['tool_network']='ALLOWED'
 except OSError:out['tool_network']='DENIED'
 print(json.dumps(out))
 """ % (paths+['/config/identities.json'],address)
