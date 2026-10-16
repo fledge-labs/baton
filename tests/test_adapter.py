@@ -23,7 +23,7 @@ def test_receipt_validates_task_ids_and_drops_arbitrary_response_values():
         "messages": [{"thread_id": private}, {"thread_id": str(uuid.uuid4()), "body_md": private}],
     })
     row = adapter.receipt("custom-agent", "fetch_inbox", {}, result)
-    assert private not in json.dumps(row) and len(row["mail_thread_ids"]) == 1
+    assert private not in json.dumps(row) and len(row["thread_ids"]) == 1
     row = adapter.receipt("custom-agent", "get_task", {"task_id": private}, result)
     assert private not in json.dumps(row)
     result.structuredContent = {"task_id": str(uuid.uuid4()), "status": "completed", "replay": True}

@@ -48,7 +48,7 @@ approval_mode = "approve"
 approval_mode = "approve"
 ```
 
-这三项设置仅用于已获授权的任务提交、任务查询和收件箱读取。`list_tasks` 保持询问；不要扩大成全局自动允许。客户端的允许设置不能替代 gateway 的身份和权限检查。
+这三项设置仅用于已获授权的任务提交、任务查询和mentions/assignments 读取。`list_tasks` 保持询问；不要扩大成全局自动允许。客户端的允许设置不能替代 gateway 的身份和权限检查。
 
 若 CLI 与适配器在同一主机，将上述 `command` 改为 `sh`，`args` 改为以下数组；其余策略不变：
 
@@ -61,8 +61,14 @@ args = ["-c", 'BATON_URL="https://example.com/mcp" exec "$HOME/baton/adapters/la
 
 ## 检查连接
 
-运行 `codex mcp list`，重新启动会话后用 `/mcp` 检查 `baton`。先调用 `fetch_inbox`；再用一个明确授权的小任务调用 `submit_task`，用返回的任务 ID 调用 `get_task`，最后用 `fetch_inbox` 核对完成消息。连接成功或列出工具不等于任务链已成功。
+运行 `codex mcp list`，重新启动会话后用 `/mcp` 检查 `baton`。先调用 `fetch_inbox`；再用一个明确授权的小任务调用 `submit_task`，用返回的任务 ID 调用 `get_task`，最后用 `fetch_inbox` 核对同一任务线程中的完成评论。连接成功或列出工具不等于任务链已成功。
 
 失败时依次检查 SSH、适配器 Python 环境、token 文件权限、`BATON_URL` 和 CA。排查日志时不要打印 token，也不要将运行回执提交到仓库。
 
 依据：[官方 MCP 文档](https://developers.openai.com/codex/mcp)、[Codex 0.154.0 配置 schema](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/core/config.schema.json)。
+
+## 空间协作与普通 HTTP
+
+`fetch_inbox` 现在来自 PostgreSQL 的评论提及和任务分配视图；它只返回当前身份仍可访问的内容。任务状态中的 `submission_mail_status`、`mail_status`、`mail_error` 已分别更名为 `submission_thread_status`、`thread_status`、`thread_error`；适配器回执中的 `mail_thread_ids` 更名为 `thread_ids`。
+
+空间、页面、块、评论、分享、提案和手工 claim/gate 工具的清单可通过 MCP 工具发现读取。需要使用新工具时，在已有配置内按实际授权扩展 `enabled_tools`，保留逐工具审批。没有 MCP 的任意 runtime 可直接调用 [Baton HTTP API](../docs/api.md)；协议标识为 `baton.space.v1`，这是 Baton 自有接口，不是 OpenAI Space wire protocol。

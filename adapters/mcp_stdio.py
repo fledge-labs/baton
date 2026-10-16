@@ -21,8 +21,13 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
-TOOLS = {"submit_task", "get_task", "list_tasks", "fetch_inbox"}
-STATUSES = {"queued", "working", "completed", "failed", "interrupted"}
+TOOLS = {"submit_task", "get_task", "list_tasks", "fetch_inbox", "create_space", "get_space", "list_spaces",
+         "create_page", "get_page", "list_pages", "create_block", "get_block", "list_blocks", "update_block",
+         "revert_block", "share", "effective_role", "create_team", "set_team_member", "comment", "list_comments",
+         "mention", "proposal_create", "proposal_review", "get_proposal", "list_proposals", "list_attribution",
+         "create_task_block", "assign_task", "claim", "renew", "submit_result", "handoff", "gate", "get_claim", "list_claims",
+         "get_scopes", "list_audit", "x_claim", "x_scope", "x_handoff", "x_gate", "x_audit"}
+STATUSES = {"queued", "working", "completed", "failed", "interrupted", "claimed", "awaiting_gate", "done"}
 
 
 def safe_agent(value):
@@ -47,8 +52,10 @@ def receipt(agent, name, arguments, result):
             data = json.loads(next(item.text for item in result.content if item.type == "text"))
         except (ValueError, StopIteration):
             data = {}
+    if isinstance(data, dict) and data.get("x_protocol") == "baton.space.v1":
+        data = data.get("result", {})
     if isinstance(data, dict):
-        for key in ("task_id", "a2a_id"):
+        for key in ("task_id", "a2a_id", "thread_id", "page_id", "block_id"):
             value = valid_uuid(data.get(key))
             if value:
                 row[key] = value
@@ -65,7 +72,7 @@ def receipt(agent, name, arguments, result):
         if isinstance(messages, dict):
             messages = messages.get("result", [])
         if isinstance(messages, list):
-            row["mail_thread_ids"] = [thread for item in messages if isinstance(item, dict)
+            row["thread_ids"] = [thread for item in messages if isinstance(item, dict)
                                       if (thread := valid_uuid(item.get("thread_id")))]
     return row
 

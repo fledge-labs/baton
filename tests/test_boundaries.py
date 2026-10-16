@@ -3,6 +3,7 @@
 import hashlib
 import importlib
 import json
+import time
 import uuid
 
 import pytest
@@ -10,50 +11,57 @@ from starlette.testclient import TestClient
 
 
 @pytest.mark.asyncio
-async def test_idempotency_is_stable_and_owner_scoped(modules, make_context):
+async def test_idempotency_is_stable_and_owner_scoped(modules, pg_store, make_context):
     _, server, _ = modules
     first = await server.submit_task("stable-key", "test prompt", make_context())
     replay = await server.submit_task("stable-key", "test prompt", make_context())
     assert first["task_id"] == replay["task_id"] and replay["replay"]
-    with pytest.raises(ValueError, match="different input"):
+    with pytest.raises(server.BridgeError) as error:
         await server.submit_task("stable-key", "changed", make_context())
-    with pytest.raises(ValueError, match="not found"):
+    assert error.value.code == "operation_conflict"
+    with pytest.raises(server.BridgeError) as error:
         await server.get_task(first["task_id"], make_context("other-client"))
+    assert error.value.code in {"not_found", "forbidden"}
     assert await server.list_tasks(make_context("other-client")) == []
     other = await server.submit_task("stable-key", "test prompt", make_context("other-client"))
     assert other["task_id"] != first["task_id"]
     view = await server.get_task(first["task_id"], make_context())
-    assert "prompt" not in view and "idem" not in view and "token" not in view
+    assert not {"prompt", "idem", "idempotency_key", "token"} & view.keys()
 
 
 @pytest.mark.asyncio
-async def test_restart_never_reexecutes_ambiguous_task_or_mail(modules, make_context):
-    common, server, _ = modules
+async def test_restart_never_reexecutes_ambiguous_pg_dispatch(modules, pg_store, make_context):
+    _, server, _ = modules
     task = await server.submit_task("stable-key", "test", make_context())
-    with common.database("tasks.sqlite3") as db:
-        db.execute("UPDATE tasks SET status='working',submission_mail_status='sending' WHERE id=?", (task["task_id"],))
-    server.init_db()
+    claim = pg_store.claim_next(server.SERVICE, str(uuid.uuid4()), lease_seconds=1)
+    assert claim["id"] == task["task_id"]
+    pg_store.mark_dispatched(server.SERVICE, str(uuid.uuid4()), claim["id"], claim["epoch"])
+    time.sleep(1.1)  # The authority is real PostgreSQL time, not a patched clock.
+    await server.recover_auto()
     view = await server.get_task(task["task_id"], make_context())
     assert view["status"] == "interrupted"
-    assert view["submission_mail_status"] == "interrupted"
-    assert server.claim_next() is None
-    with common.database("tasks.sqlite3") as db:
-        db.execute("UPDATE tasks SET status='completed',mail_status='sending',result='done' WHERE id=?", (task["task_id"],))
-    server.init_db()
-    view = await server.get_task(task["task_id"], make_context())
-    assert view["status"] == "completed" and view["mail_status"] == "interrupted" and view["result"] == "done"
+    assert await server.claim_next() is None
+    replay = await server.submit_task("stable-key", "test", make_context())
+    assert replay["replay"] and replay["status"] == "interrupted"
+    assert await server.claim_next() is None
 
 
 def test_identity_revocation_reloads_and_returns_no_hash(modules):
     common, _, _ = modules
     token = "synthetic-client-credential"
     records = {"test-client": {"agent": "test-client", "role": "client", "active": True,
+                               "account": "connected-account", "kind": "agent",
                                "hash": hashlib.sha256(token.encode()).hexdigest()}}
     path = common.CONFIG / "identities.json"
     path.write_text(json.dumps(records))
-    assert common.identity("Bearer " + token) == {"agent": "test-client", "role": "client"}
+    assert common.identity("Bearer " + token) == {"agent": "test-client", "role": "client",
+                                                   "account": "connected-account", "kind": "agent"}
     assert common.identity("Bearer wrong") is None
     records["test-client"]["active"] = False
+    path.write_text(json.dumps(records))
+    assert common.identity("Bearer " + token) is None
+    records["test-client"]["active"] = True
+    del records["test-client"]["account"]
     path.write_text(json.dumps(records))
     assert common.identity("Bearer " + token) is None
     path.write_text("{")
@@ -61,27 +69,27 @@ def test_identity_revocation_reloads_and_returns_no_hash(modules):
 
 
 @pytest.mark.asyncio
-async def test_audit_contains_metadata_not_prompts_or_untrusted_request_ids(modules, make_context):
+async def test_audit_contains_metadata_not_prompts_or_untrusted_request_ids(modules, pg_store, make_context):
     common, server, _ = modules
     marker = "synthetic-private-prompt-and-token-marker"
     await server.submit_task("private-key", marker, make_context(request_id=marker))
     log = (common.STATE / "audit.jsonl").read_text()
     assert marker not in log and "private-key" not in log
     assert hashlib.sha256(marker.encode()).hexdigest() in log
-    assert "request_id" not in json.loads(log)
+    assert all("request_id" not in json.loads(line) for line in log.splitlines())
     with pytest.raises(ValueError, match="Unsupported audit field"):
         common.audit("task.test", prompt=marker)
     common.audit("task.test", task_id=marker, request_id=str(uuid.uuid4()))
     assert marker not in (common.STATE / "audit.jsonl").read_text()
 
 
-def test_mcp_dynamic_origin_host_and_client_role(modules, monkeypatch):
+def test_mcp_dynamic_origin_host_and_client_role(modules, pg_store, monkeypatch):
     common, server, _ = modules
     monkeypatch.setenv("PUBLIC_URL", "https://baton.example.com:9443")
     importlib.reload(server)
     monkeypatch.setattr(common, "identity", lambda value: {
-        "Bearer client": {"agent": "test-client", "role": "client"},
-        "Bearer dispatcher": {"agent": "codex-worker", "role": "dispatcher"},
+        "Bearer client": {"agent": "test-client", "role": "client", "account": "test-account", "kind": "agent"},
+        "Bearer dispatcher": {"agent": "codex-worker", "role": "dispatcher", "account": "baton-service", "kind": "service"},
     }.get(value))
     request = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
         "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "synthetic-test", "version": "1"},
@@ -90,12 +98,24 @@ def test_mcp_dynamic_origin_host_and_client_role(modules, monkeypatch):
     with TestClient(server.app) as client:
         for host in ("bridge", "bridge:9000", "baton.example.com:9443"):
             response = client.post("/mcp", json=request, headers={**headers, "Host": host})
-            assert response.status_code == 200, response.text
+            assert response.status_code == 200
             assert response.headers["cache-control"] == "no-store"
         assert client.post("/mcp", json=request, headers={**headers, "Host": "evil.invalid"}).status_code == 421
         assert client.post("/mcp", json=request, headers={**headers, "Host": "bridge", "Origin": "https://evil.invalid"}).status_code == 403
         assert client.get("/healthz").status_code == 401
         assert client.get("/healthz", headers={"Authorization": "Bearer dispatcher"}).status_code == 403
+
+
+def test_nested_and_database_credentials_are_redacted(modules, monkeypatch):
+    common, _, _ = modules
+    secret = "synthetic-database-password"
+    path = common.SECRETS / "database.json"
+    path.write_text(json.dumps({"password": secret}))
+    monkeypatch.setenv("BATON_DATABASE_CONFIG", str(path))
+    assert common.redact(secret + " synthetic-dispatcher-credential") == "[REDACTED] [REDACTED]"
+    path.write_text("{")
+    with pytest.raises(RuntimeError, match="Credential store is unreadable"):
+        common.redact(secret)
 
 
 @pytest.mark.parametrize("url", ["ftp://example.com", "https://user:password@example.com", "https://example.com/path", "https://example.com?token=test"])

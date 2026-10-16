@@ -73,7 +73,7 @@
               ]
             },
             {
-              "name": "mcp-tasks-and-mail",
+              "name": "baton-space",
               "matches": [
                 {
                   "path": {
@@ -88,6 +88,11 @@
                 {
                   "path": {
                     "exact": "/healthz"
+                  }
+                },
+                {
+                  "path": {
+                    "pathPrefix": "/v1/space/"
                   }
                 }
               ],

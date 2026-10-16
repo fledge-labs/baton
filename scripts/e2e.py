@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Verify a real MCP/A2A/Mail journey and correlate container audit records."""
+"""Verify a real MCP/A2A/comment-thread journey and correlate container audit records."""
 import argparse
 import asyncio
 import hashlib
@@ -55,7 +55,7 @@ async def run(args):
                     matches=[m for m in messages if m.get('thread_id')==tid and m.get('subject','').startswith('[completed]') and m.get('body_md','').strip()==expected]
                     if matches:break
                     await asyncio.sleep(1)
-                assert matches,'No same-thread completed Mail report'
+                assert matches,'No same-thread completed comment report'
     command=['docker','compose','-f',str(args.compose_file)]
     if args.project:command+=['-p',args.project]
     records=[]
@@ -68,7 +68,7 @@ async def run(args):
             except ValueError:continue
             record['_service']=service;records.append(record)
     stages=[r for r in records if r.get('task_id')==tid]
-    required={'task.submitted','task.dispatched','task.completed','mail.submitted','mail.completed','worker.claimed','worker.completed'}
+    required={'task.submitted','task.dispatched','task.completed','thread.submitted','thread.completed','worker.claimed','worker.completed'}
     assert required <= {r.get('event') for r in stages},'Missing audit stages'
     claims=[r for r in stages if r.get('event')=='worker.claimed']
     assert len(claims)==1,'Task executed more than once'
@@ -79,7 +79,7 @@ async def run(args):
     assert any(r.get('_service')=='gateway' and r.get('request_id')==tid and r.get('protocol')=='a2a' and r.get('a2a.task.state')=='completed' for r in records),'A2A gateway correlation missing'
     assert any(r.get('_service')=='edge' and r.get('request_id') in request_ids for r in records),'Ingress correlation missing'
     receipt={'status':'PASS','mode':args.mode,'task_id':tid,'a2a_task_id':result['a2a_id'],
-             'mail_message_ids':[m['id'] for m in matches],'idempotency_replay':True,'execution_count':1,
+             'thread_message_ids':[m['id'] for m in matches],'idempotency_replay':True,'execution_count':1,
              'result_sha256':hashlib.sha256(result['result'].encode()).hexdigest(),
              'audit_stages':sorted(required),'credential_log_matches':0}
     if args.artifact_dir:
