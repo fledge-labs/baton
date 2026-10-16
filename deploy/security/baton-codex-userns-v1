@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Named user-namespace exception; this is not an enforcing AppArmor sandbox.
+abi <abi/4.0>,
+profile baton-codex-userns-v1 flags=(unconfined) {
+  userns,
+}

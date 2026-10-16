@@ -104,7 +104,10 @@ services:
       WORKER_MODE: ${WORKER_MODE:-codex}
       CODEX_MODEL: ${CODEX_MODEL:-}
     volumes: [config:/config:ro, codex-data:/data, codex-home:/home/agent/.codex]
-    tmpfs: ["/tmp:size=64m,mode=1777", "/work:size=64m,uid=10001,gid=10001,mode=0700"]
+    # Keep helper aliases out of the credential tree. Codex falls back to its
+    # immutable executable and bundled bubblewrap; credentials remain writable
+    # by the harness but inaccessible to model-generated tools.
+    tmpfs: ["/tmp:size=64m,mode=1777", "/work:size=64m,uid=10001,gid=10001,mode=0700", "/home/agent/.codex/tmp:size=1m,uid=0,gid=0,mode=0555"]
     networks: [private, worker-egress]
     pids_limit: 128
     depends_on:

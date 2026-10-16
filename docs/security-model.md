@@ -21,7 +21,7 @@ token、model auth、邮件 registration token、私钥和任务库均在专属�
 
 Codex 0.154.0 的工具沙箱拒绝读取 /data、/config、/run/secrets 和 /home/agent/.codex，只允许当前任务目录写入，禁用工具网络。最终结果在返回前按已知秘密值过滤；这只是额外措施，不能替代沙箱。
 
-为避免要求使用者手工安装宿主 AppArmor profile，只有 Codex 容器设为 apparmor=unconfined，并在 Moby seccomp 基线上允许嵌套 bubblewrap 所需的六个 syscall；其他容器保留默认 Docker profile。禁用这一层 AppArmor 限制会减少宿主 LSM 保护，不能等同于原始 Docker 默认安全配置。内层沙箱必须在目标主机验证；若无法建立隔离应失败，不得添加危险的 CLI bypass 参数来掩盖问题。
+基础配置只有 Codex 容器设为 apparmor=unconfined，并在 Moby seccomp 基线上允许嵌套 bubblewrap 所需的六个 syscall；其他容器保留默认 Docker profile。禁用这一层 AppArmor 限制会减少宿主 LSM 保护，不能等同于原始 Docker 默认安全配置。内层沙箱必须在目标主机验证；若无法建立隔离应失败，不得添加危险的 CLI bypass 参数来掩盖问题。
 
 这是独立、受信任操作者的测试环境，不是经验证的敌对多租户代码执行产品。不要接入生产系统、生产数据或敏感源代码。镜像与包还有各自许可证和安全更新责任，见 THIRD_PARTY。
 
@@ -34,3 +34,5 @@ worker 只有一个执行记录；运行中进程退出后状态为 interrupted�
 stdout 和审计只记录白名单元数据，错误文本固定化。Docker 日志轮转；业务 JSONL/SQLite 的备份、保留与访问控制由操作者负责。不能把可由管理员改写的本地日志当作防篡改审计证明。
 
 发布前运行 gitleaks 全历史扫描与私有信息扫描，检查源码 SPDX 和全部提交 Signed-off-by；运行回执一律保存到仓库外。详见 CONTRIBUTING。
+
+Ubuntu 的非特权 userns 限制可能仍阻止基础配置启动内部沙箱。可选 `compose.apparmor.yaml` 使用管理员在 Engine 宿主预加载的 `baton-codex-userns-v1`；该 profile 是 `flags=(unconfined)` 加 `userns` 的显式例外，并非完整 AppArmor 策略。Baton 不关闭宿主的全局限制，也不自动创建拥有宿主策略修改权限的加载容器。原理见 [Ubuntu 官方说明](https://discourse.ubuntu.com/t/spec-unprivileged-user-namespace-restrictions-via-apparmor-in-ubuntu-23-10/37626)。实际隔离仍需 `scripts/sandbox_probe.py` 在目标主机通过。

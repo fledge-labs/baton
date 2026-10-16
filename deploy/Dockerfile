@@ -13,6 +13,9 @@ COPY bridge /app/bridge
 COPY scripts /app/scripts
 COPY deploy/gateway.template.json /app/deploy/gateway.template.json
 RUN mkdir -p /data /work /home/agent/.codex && chown -R agent:agent /data /work /home/agent
+# The pinned CLI bundles a newer bubblewrap with argv0 support.
+# Remove the distro helper so the CLI selects its own pinned implementation.
+RUN apt-get purge -y bubblewrap
 USER 10001:10001
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 HOME=/home/agent CODEX_HOME=/home/agent/.codex
 CMD ["python", "-m", "bridge.server"]

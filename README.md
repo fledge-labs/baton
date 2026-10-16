@@ -1,7 +1,9 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Baton
 
-一个供人和 CLI agent 协作的独立任务空间：**MCP 提交任务 → A2A 工作进程执行 → Agent Mail 同线程回报 → 审计关联**。
+**开源的沟通与协作工作空间：agent 与 agent、agent 与人、人与人。**
+
+人和 AI agent 在同一个地方沟通、共享工作、互相交接任务。当前可运行的第一步是：**MCP 提交任务 → A2A 工作进程执行 → Agent Mail 同线程回报 → 审计关联**。
 
 当前实现包括 agentgateway 入口、持久任务队列、Codex 工作进程、消息看板、独立 agent 令牌与 stdio 适配器。claim/lease、重叠文件检查和合并关卡是后续里程碑，当前版本没有实现这些能力。
 
@@ -13,7 +15,7 @@ Baton 自有代码使用 [Apache-2.0](LICENSE)。依赖保持各自许可证；�
 - 运行客户端适配器或端到端检查需要 Python 3.12。服务自身运行在容器内。
 - 真实 Codex 模式需要你自己的有效 Codex 认证；Baton 不附带模型账号、token 或示例密钥。
 
-固定依赖和镜像摘要见 [deploy/versions.json](deploy/versions.json)。不需要 Kubernetes、宿主 nginx 或宿主 AppArmor profile 安装。
+固定依赖和镜像摘要见 [deploy/versions.json](deploy/versions.json)。不需要 Kubernetes 或宿主 nginx。Ubuntu 24.04 等限制非特权用户命名空间的宿主，在真实 Codex 模式下还需要下述一次性 AppArmor 准备；demo 不需要。
 
 ## 快速启动：显式 demo 模式
 
@@ -67,6 +69,22 @@ WORKER_MODE=codex docker compose up --build -d --wait
 
 工作进程保留 Docker 非 root、只读根、capability 全移除和 no-new-privileges；内部 Codex 工具沙箱禁止读取状态、凭据与配置目录，只能写当前任务目录，禁止工具联网。为让嵌套 bubblewrap 在标准 Docker 上运行，**仅工作进程容器**使用专用 seccomp 和 `apparmor=unconfined`。这是明确的隔离取舍，不是完整的敌对多租户安全边界；详见 [安全模型](docs/security-model.md)。
 
+### Ubuntu AppArmor 前提
+
+若宿主启用了 `kernel.apparmor_restrict_unprivileged_userns=1`，单独设置 `apparmor=unconfined` 仍无法启动 Codex 的工具沙箱。由 Docker Engine 宿主管理员使用 AppArmor 4 的 parser 加载仓库内的固定例外，然后启动同一个 Compose 栈：
+
+```sh
+# SPDX-License-Identifier: Apache-2.0
+# 在 Docker Engine 所在 Linux 主机的 clone 中执行，当前目录为 deploy/。
+# -a 仅添加新 profile；若同名已存在，先由管理员核对，勿盲目替换。
+sudo apparmor_parser -a security/baton-codex-userns-v1
+WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --build -d --wait
+```
+
+这是仅供指定工作进程使用的 userns 例外，**不是额外的 AppArmor 强制隔离**。不修改全局 sysctl，不给 worker 添加 capability，不在 Compose 内放入可修改宿主策略的特权加载器。远程 Docker 或虚拟机环境须在 Engine 宿主执行预加载；宿主重启后需重新加载。若需持久化，管理员可以将该文件安装到宿主的 `/etc/apparmor.d/` 并纳入其现有策略管理。HTTPS 时在上述命令再加 `-f compose.tls.yaml`。
+
+启动后在 `deploy/` 目录运行 `python3.12 ../scripts/sandbox_probe.py`（自定义项目使用 `--project`），验证凭据和配置不可读、当前任务目录可写、工具网络不可达。无法通过时不要关闭内层沙箱。卸载前先停止所有使用该 profile 的 Baton 实例，再在 Engine 宿主执行 `sudo apparmor_parser -R security/baton-codex-userns-v1`。
+
 ## 端到端验收
 
 在仓库根目录安装固定客户端依赖：
@@ -111,6 +129,8 @@ WORKER_MODE=codex
 ```sh
 # SPDX-License-Identifier: Apache-2.0
 docker compose -f compose.yaml -f compose.tls.yaml up --build -d --wait
+# 已按前文加载 AppArmor userns profile 的宿主必须保留该 override：
+# docker compose -f compose.yaml -f compose.apparmor.yaml -f compose.tls.yaml up --build -d --wait
 ```
 
 TLS override **替换** HTTP 端口映射，只发布所选 HTTPS 端口；可把 `HTTPS_PORT` 设为 443。证书由操作者负责续期。私有 CA 客户端使用 `BATON_CA_FILE` 或验收脚本的 `--ca-file`，不要关闭证书校验。
