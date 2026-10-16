@@ -90,6 +90,13 @@ CREATE TABLE IF NOT EXISTS baton.tasks (
 );
 CREATE INDEX IF NOT EXISTS tasks_queue ON baton.tasks(execution_mode,state,created_at);
 ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS assignee text;
+CREATE TABLE IF NOT EXISTS baton.task_dependencies (
+    task_id uuid NOT NULL REFERENCES baton.tasks(id),
+    depends_on uuid NOT NULL REFERENCES baton.tasks(id),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY(task_id,depends_on), CHECK (task_id <> depends_on)
+);
+CREATE INDEX IF NOT EXISTS dependency_reverse ON baton.task_dependencies(depends_on,task_id);
 CREATE TABLE IF NOT EXISTS baton.x_claim (
     task_id uuid PRIMARY KEY REFERENCES baton.tasks(id), holder text NOT NULL, holder_account text NOT NULL,
     holder_kind text NOT NULL, epoch bigint NOT NULL, lease_expires_at timestamptz NOT NULL,

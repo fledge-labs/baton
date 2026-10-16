@@ -27,6 +27,7 @@ MESSAGES = {
     "operation_conflict": "Operation identifier was used for different input", "scope_conflict": "Scope is already claimed",
     "stale_claim": "Claim is expired or superseded", "revision_conflict": "Revision has changed",
     "gate_required": "A valid gate decision is required", "storage_unavailable": "Space storage is unavailable",
+    "dependency_blocked": "Task dependencies are not satisfied", "graph_cycle": "Task graph would contain a cycle",
 }
 
 
@@ -148,6 +149,35 @@ def scopes_overlap(left, right):
             if a["kind"] == "path" or a["value"] == b["value"]:
                 return True
     return False
+
+
+def _dependency_ids(values):
+    if values is None:
+        return []
+    if not isinstance(values, list) or len(values) > 100:
+        raise StoreError("invalid")
+    return sorted({_uuid(value) for value in values})
+
+
+def _graph_entries(graph):
+    if not isinstance(graph, list) or not graph or len(graph) > 100:
+        raise StoreError("invalid")
+    normalized = []
+    seen = set()
+    for entry in graph:
+        if not isinstance(entry, dict) or set(entry) != {"task_id", "depends_on"} or not isinstance(entry["depends_on"], list):
+            raise StoreError("invalid")
+        task_id = _uuid(entry["task_id"])
+        if task_id in seen:
+            raise StoreError("invalid")
+        seen.add(task_id)
+        dependencies = _dependency_ids(entry["depends_on"])
+        if task_id in dependencies:
+            raise StoreError("graph_cycle")
+        normalized.append({"task_id": task_id, "depends_on": dependencies})
+    if sum(len(entry["depends_on"]) for entry in normalized) > 1000:
+        raise StoreError("invalid")
+    return sorted(normalized, key=lambda entry: entry["task_id"])
 
 
 class SpaceStore:
@@ -295,6 +325,7 @@ class SpaceStore:
                 "proposals": "id block_id expected_revision proposed_content status revision",
                 "proposal_revisions": "proposal_id revision content author_principal",
                 "tasks": "id page_id block_id owner owner_account owner_kind assignee idempotency_key input_hash prompt execution_mode gate_mode reviewers scopes state epoch result_epoch result result_author result_author_account base_commit context evidence a2a_id backend dispatch_started_at error",
+                "task_dependencies": "task_id depends_on created_at",
                 "x_claim": "task_id holder holder_account holder_kind epoch lease_expires_at scopes scope_repository",
                 "x_handoff": "task_id old_epoch new_epoch base_commit context evidence",
                 "x_gate": "task_id epoch decision reviewer reviewer_account evidence",
@@ -667,7 +698,98 @@ class SpaceStore:
         row["status"] = {"claimed": "working", "done": "completed"}.get(row["state"], row["state"])
         row.update(submission_mail_status="sent", mail_status="sent" if row["state"] == "done" else "not_ready", mail_error=None)
         row.update(submission_thread_status="sent", report_status="sent" if row["state"] == "done" else "not_ready")
+        # Edges expose identifiers only, never a dependency's private content or state.
+        row["depends_on"] = self._dependencies(conn, task_id)
         return row
+
+    @staticmethod
+    def _dependencies(conn, task_id):
+        return [str(row["depends_on"]) for row in conn.execute(
+            "SELECT depends_on FROM baton.task_dependencies WHERE task_id=%s ORDER BY depends_on", (task_id,))]
+
+    @staticmethod
+    def _dependencies_satisfied(conn, task_id):
+        blocked = conn.execute("""SELECT 1 FROM baton.task_dependencies e JOIN baton.tasks d ON d.id=e.depends_on
+            WHERE e.task_id=%s AND (d.state<>'done' OR d.result_epoch IS DISTINCT FROM d.epoch OR NOT EXISTS (
+                SELECT 1 FROM baton.x_gate g WHERE g.task_id=d.id AND g.epoch=d.epoch AND g.decision='pass')) LIMIT 1""",
+            (task_id,)).fetchone()
+        return blocked is None
+
+    @staticmethod
+    def _add_dependencies(conn, task_id, dependencies):
+        if task_id in dependencies:
+            raise StoreError("graph_cycle")
+        added = 0
+        for dependency in dependencies:
+            row = conn.execute("""INSERT INTO baton.task_dependencies(task_id,depends_on) VALUES (%s,%s)
+                ON CONFLICT DO NOTHING RETURNING depends_on""", (task_id, dependency)).fetchone()
+            added += row is not None
+        return added
+
+    @staticmethod
+    def _require_acyclic(conn, task_id):
+        cycle = conn.execute("""WITH RECURSIVE reachable(id) AS (
+            SELECT depends_on FROM baton.task_dependencies WHERE task_id=%s
+            UNION SELECT e.depends_on FROM baton.task_dependencies e JOIN reachable r ON e.task_id=r.id
+        ) SELECT 1 FROM reachable WHERE id=%s LIMIT 1""", (task_id, task_id)).fetchone()
+        if cycle:
+            raise StoreError("graph_cycle")
+
+    def plan(self, actor, operation_id, graph):
+        entries = _graph_entries(graph)
+        def authorize(conn):
+            for entry in entries:
+                self._task_for(conn, actor, entry["task_id"], "edit")
+                for dependency in entry["depends_on"]:
+                    self._task_for(conn, actor, dependency)
+        def view(conn):
+            return {"graph": [{"task_id": entry["task_id"], "depends_on": self._dependencies(conn, entry["task_id"])} for entry in entries]}
+        def effect(conn):
+            self._expire(conn, operation_id)
+            tasks = {}
+            for entry in entries:
+                task = self._row(conn, "tasks", entry["task_id"])
+                if task["state"] != "queued" or task["dispatch_started_at"] is not None:
+                    raise StoreError("stale_claim")
+                tasks[entry["task_id"]] = task
+            additions = {entry["task_id"]: self._add_dependencies(conn, entry["task_id"], entry["depends_on"]) for entry in entries}
+            for entry in entries:
+                self._require_acyclic(conn, entry["task_id"])
+            for task_id, count in additions.items():
+                if count:
+                    self._task_audit(conn, actor, operation_id, "task.dependencies_added", tasks[task_id], count=count)
+            return view(conn)
+        return self._mutate(actor, operation_id, "plan", {"graph": entries}, authorize, effect, lambda conn, old: view(conn))
+
+    def ready(self, actor, page_id=None, limit=50):
+        self._user(actor)
+        _integer(limit, 1, 100)
+        if page_id is not None:
+            _uuid(page_id)
+        def read(conn):
+            if page_id is not None:
+                self._require(conn, actor, "page", page_id)
+            tasks = conn.execute("""SELECT * FROM baton.tasks WHERE execution_mode='manual' AND state IN ('queued','claimed')
+                AND (%s::uuid IS NULL OR page_id=%s::uuid) ORDER BY created_at,id""", (page_id, page_id)).fetchall()
+            live_scopes = [row["scopes"] for row in conn.execute("SELECT scopes FROM baton.x_claim WHERE lease_expires_at>clock_timestamp()")]
+            result = []
+            for task in tasks:
+                if task["assignee"] is not None and task["assignee"] != actor.principal:
+                    continue
+                if self._role(conn, actor, "page", str(task["page_id"])) != "edit":
+                    continue
+                view = self._task_view(conn, str(task["id"]))
+                if view["state"] != "queued" or task["dispatch_started_at"] is not None:
+                    continue
+                if not self._dependencies_satisfied(conn, str(task["id"])):
+                    continue
+                if any(scopes_overlap(task["scopes"], scopes) for scopes in live_scopes):
+                    continue
+                result.append(view)
+                if len(result) == limit:
+                    break
+            return result
+        return self._read(actor, read)
 
     def _task_audit(self, conn, actor, operation_id, event, task, **metadata):
         page = self._row(conn, "pages", str(task["page_id"]))
@@ -695,7 +817,7 @@ class SpaceStore:
         return str(page_id)
 
     def _new_task(self, conn, actor, operation_id, page_id, prompt, scopes, mode, reviewers,
-                  input_hash, idempotency_key=None, base_commit=None, context=None, evidence=None, assignee=None):
+                  input_hash, idempotency_key=None, base_commit=None, context=None, evidence=None, assignee=None, depends_on=None):
         if assignee is not None:
             if not isinstance(assignee, Actor):
                 raise StoreError("invalid")
@@ -714,27 +836,37 @@ class SpaceStore:
             (task_id, page_id, block_id, actor.principal, actor.account, actor.kind, assignee.principal if assignee else None,
              idempotency_key, input_hash, prompt, mode, "worker_success" if mode == "codex" else "reviewer", Jsonb(reviewers),
              Jsonb(scopes), base_commit, Jsonb(_items(context)), Jsonb(_items(evidence)))).fetchone()
+        dependency_count = self._add_dependencies(conn, str(task_id), depends_on or [])
+        self._require_acyclic(conn, str(task_id))
         self._task_audit(conn, actor, operation_id, "task.submitted", task, input_sha256=hashlib.sha256(prompt.encode()).hexdigest(), execution_mode=mode)
+        if dependency_count:
+            self._task_audit(conn, actor, operation_id, "task.dependencies_added", task, count=dependency_count)
         self._notify_task(conn, actor, operation_id, task, "submitted", prompt, assignee.principal if assignee else None)
         if assignee:
             self._task_audit(conn, actor, operation_id, "task.assigned", task)
         return self._task_view(conn, str(task_id))
 
-    def submit_task(self, actor, operation_id, idempotency_key, prompt, page_id=None, scopes=None, assignee=None):
+    def submit_task(self, actor, operation_id, idempotency_key, prompt, page_id=None, scopes=None, assignee=None, depends_on=None):
         _identifier(idempotency_key)
         _text(prompt)
         normalized = normalize_scopes(scopes)
+        dependencies = _dependency_ids(depends_on)
         if assignee is not None and not isinstance(assignee, Actor):
             raise StoreError("invalid")
         if assignee is not None and assignee.principal == actor.principal:
             raise StoreError("invalid")
         args = {"idempotency_key": idempotency_key, "prompt": prompt, "page_id": page_id, "scopes": normalized,
                 "assignee": asdict(assignee) if assignee else None}
+        # Preserve v1 hashes for already-persisted submissions without dependencies.
+        if dependencies:
+            args["depends_on"] = dependencies
         digest = hashlib.sha256(_canonical(args).encode()).hexdigest()
         def authorize(conn):
             self._user(actor)
             if page_id:
                 self._require(conn, actor, "page", page_id, "edit")
+            for dependency in dependencies:
+                self._task_for(conn, actor, dependency)
             prior = conn.execute("SELECT * FROM baton.tasks WHERE owner=%s AND idempotency_key=%s", (actor.principal, idempotency_key)).fetchone()
             if prior:
                 self._require(conn, actor, "page", str(prior["page_id"]), "edit")
@@ -746,14 +878,15 @@ class SpaceStore:
                 return {**self._task_view(conn, str(prior["id"])), "_business_replay": True}
             chosen = page_id or self._default_page(conn, actor, operation_id)
             return self._new_task(conn, actor, operation_id, chosen, prompt, normalized, "manual" if assignee else "codex",
-                                  [actor.principal] if assignee else [], digest, idempotency_key=idempotency_key, assignee=assignee)
+                                  [actor.principal] if assignee else [], digest, idempotency_key=idempotency_key, assignee=assignee, depends_on=dependencies)
         def replay(conn, old):
             return self._task_view(conn, old["task_id"])
         return self._mutate(actor, operation_id, "submit_task", args, authorize, effect, replay)
 
-    def create_task_block(self, actor, operation_id, page_id, prompt, scopes, reviewers, base_commit=None, context=None, evidence=None, assignee=None):
+    def create_task_block(self, actor, operation_id, page_id, prompt, scopes, reviewers, base_commit=None, context=None, evidence=None, assignee=None, depends_on=None):
         _text(prompt)
         normalized = normalize_scopes(scopes)
+        dependencies = _dependency_ids(depends_on)
         if not isinstance(reviewers, list) or not reviewers or len(reviewers) > 100:
             raise StoreError("invalid")
         for reviewer in reviewers:
@@ -766,11 +899,18 @@ class SpaceStore:
             raise StoreError("invalid")
         args = {"page_id": page_id, "prompt": prompt, "scopes": normalized, "reviewers": reviewers,
                 "base_commit": base_commit, "context": context, "evidence": evidence, "assignee": asdict(assignee) if assignee else None}
+        if dependencies:
+            args["depends_on"] = dependencies
         digest = hashlib.sha256(_canonical(args).encode()).hexdigest()
+        def authorize(conn):
+            self._require(conn, actor, "page", page_id, "edit")
+            for dependency in dependencies:
+                self._task_for(conn, actor, dependency)
         return self._mutate(actor, operation_id, "create_task_block", args,
-                            lambda conn: self._require(conn, actor, "page", page_id, "edit"),
+                            authorize,
                             lambda conn: self._new_task(conn, actor, operation_id, page_id, prompt, normalized, "manual", reviewers, digest,
-                                                        base_commit=base_commit, context=context, evidence=evidence, assignee=assignee))
+                                                        base_commit=base_commit, context=context, evidence=evidence, assignee=assignee, depends_on=dependencies),
+                            lambda conn, old: self._task_view(conn, old["task_id"]))
 
     def get_task(self, actor, task_id):
         def read(conn):
@@ -829,6 +969,8 @@ class SpaceStore:
     def _take_claim(self, conn, actor, operation_id, task, lease_seconds):
         if task["state"] != "queued" or conn.execute("SELECT 1 FROM baton.x_claim WHERE task_id=%s AND lease_expires_at>clock_timestamp()", (task["id"],)).fetchone():
             raise StoreError("scope_conflict")
+        if not self._dependencies_satisfied(conn, str(task["id"])):
+            raise StoreError("dependency_blocked")
         for other in conn.execute("SELECT scopes FROM baton.x_claim WHERE lease_expires_at>clock_timestamp()"):
             if scopes_overlap(task["scopes"], other["scopes"]):
                 raise StoreError("scope_conflict")
@@ -859,6 +1001,8 @@ class SpaceStore:
         def effect(conn):
             self._expire(conn, operation_id)
             for task in conn.execute("SELECT * FROM baton.tasks WHERE execution_mode='codex' AND state='queued' ORDER BY created_at,id").fetchall():
+                if not self._dependencies_satisfied(conn, str(task["id"])):
+                    continue
                 conflicts = any(scopes_overlap(task["scopes"], row["scopes"]) for row in conn.execute("SELECT scopes FROM baton.x_claim WHERE lease_expires_at>clock_timestamp()"))
                 if not conflicts:
                     return self._take_claim(conn, actor, operation_id, task, lease_seconds)

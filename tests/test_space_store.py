@@ -7,6 +7,7 @@ or model credentials are read. The fixture never drops or truncates shared data.
 """
 
 import json
+import hashlib
 import os
 import threading
 import uuid
@@ -554,3 +555,190 @@ def test_explicit_request_promotes_assignment_notice_and_sorts_by_latest_activit
     repeated = s.mention(pg.owner, operation(), submitted["id"], "agent", pg.editor.principal)
     assert repeated["created_at"] == promoted["created_at"] and repeated["replay"]
     assert len(s.list_audit(pg.owner, task_id=task["id"])) == len(before)
+
+
+def test_graph_blocks_claim_until_dependency_has_current_epoch_pass(pg):
+    s = pg.store
+    parent = manual(pg, "parent")
+    child = manual(pg, "child", assignee=pg.editor)
+    plan = s.plan(pg.owner, operation(), [{"task_id": child["id"], "depends_on": [parent["id"]]}])
+    assert plan["graph"] == [{"task_id": child["id"], "depends_on": [parent["id"]]}]
+    expect("dependency_blocked", lambda: s.claim(pg.editor, operation(), child["id"]))
+    assert child["id"] not in {row["id"] for row in s.ready(pg.editor, pg.page["id"])}
+    parent_claim = s.claim(pg.editor, operation(), parent["id"])
+    s.submit_result(pg.editor, operation(), parent["id"], parent_claim["epoch"], "Private dependency result")
+    expect("dependency_blocked", lambda: s.claim(pg.editor, operation(), child["id"]))
+    assert child["id"] not in {row["id"] for row in s.ready(pg.editor, pg.page["id"])}
+    s.gate(pg.reviewer, operation(), parent["id"], parent_claim["epoch"], "pass")
+    assert child["id"] in {row["id"] for row in s.ready(pg.editor, pg.page["id"])}
+    # A historical PASS does not approve a later generation, even if its state
+    # were incorrectly labelled done by an out-of-band repair.
+    with s._transaction(write=True) as conn:
+        conn.execute("UPDATE baton.tasks SET epoch=epoch+1,result_epoch=result_epoch+1 WHERE id=%s", (parent["id"],))
+    expect("dependency_blocked", lambda: s.claim(pg.editor, operation(), child["id"]))
+    assert child["id"] not in {row["id"] for row in s.ready(pg.editor, pg.page["id"])}
+    with s._transaction(write=True) as conn:
+        conn.execute("UPDATE baton.tasks SET state='awaiting_gate' WHERE id=%s", (parent["id"],))
+    s.gate(pg.reviewer, operation(), parent["id"], parent_claim["epoch"] + 1, "pass")
+    claimed = s.claim(pg.editor, operation(), child["id"])
+    assert claimed["depends_on"] == [parent["id"]]
+    assert "Private dependency result" not in json.dumps(claimed)
+
+
+def test_graph_plan_appends_idempotently_and_reauthorizes_replays(pg):
+    s = pg.store
+    first, second, child = manual(pg, "first"), manual(pg, "second"), manual(pg, "child")
+    op = operation()
+    graph = [{"task_id": child["id"], "depends_on": [first["id"]]}]
+    initial = s.plan(pg.editor, op, graph)
+    assert s.plan(pg.editor, op, graph)["replay"]
+    expect("operation_conflict", lambda: s.plan(pg.editor, op, [{"task_id": child["id"], "depends_on": [second["id"]]}]))
+    added = s.plan(pg.editor, operation(), [{"task_id": child["id"], "depends_on": [second["id"]]}])
+    assert added["graph"][0]["depends_on"] == sorted([first["id"], second["id"]])
+    assert s.plan(pg.editor, operation(), [{"task_id": child["id"], "depends_on": []}])["graph"] == added["graph"]
+    assert initial["graph"][0]["depends_on"] == [first["id"]]
+    events = s.list_audit(pg.owner, task_id=child["id"])
+    assert len([event for event in events if event["event"] == "task.dependencies_added"]) == 2
+    s.share(pg.owner, operation(), "space", pg.space["id"], "person", pg.editor.account, None)
+    expect("forbidden", lambda: s.plan(pg.editor, op, graph))
+
+
+def test_graph_cycle_batch_is_atomic_and_concurrent_opposite_edges_cannot_both_commit(pg):
+    s = pg.store
+    a, b, c = manual(pg, "a"), manual(pg, "b"), manual(pg, "c")
+    s.plan(pg.owner, operation(), [{"task_id": a["id"], "depends_on": [b["id"]]}])
+    failed_op = operation()
+    expect("graph_cycle", lambda: s.plan(pg.owner, failed_op, [
+        {"task_id": b["id"], "depends_on": [c["id"]]}, {"task_id": c["id"], "depends_on": [a["id"]]},
+    ]))
+    assert s.get_task(pg.owner, b["id"])["depends_on"] == []
+    assert s.get_task(pg.owner, c["id"])["depends_on"] == []
+    with s._transaction() as conn:
+        assert not conn.execute("SELECT 1 FROM baton.operations WHERE operation_id=%s", (failed_op,)).fetchone()
+        assert not conn.execute("SELECT 1 FROM baton.x_audit WHERE operation_id=%s", (failed_op,)).fetchone()
+    x, y = manual(pg, "x"), manual(pg, "y")
+    barrier = threading.Barrier(2)
+    def append(pair):
+        target, dependency = pair
+        barrier.wait()
+        try:
+            s.plan(pg.owner, operation(), [{"task_id": target["id"], "depends_on": [dependency["id"]]}])
+            return "planned"
+        except StoreError as exc:
+            return exc.code
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(append, [(x, y), (y, x)]))
+    assert sorted(results) == ["graph_cycle", "planned"]
+    assert len(s.get_task(pg.owner, x["id"])["depends_on"]) + len(s.get_task(pg.owner, y["id"])["depends_on"]) == 1
+
+
+def test_graph_cannot_modify_live_or_terminal_tasks_but_can_modify_expired_undispatched(pg):
+    s = pg.store
+    parent, child = manual(pg, "parent"), manual(pg, "child")
+    claim = s.claim(pg.editor, operation(), child["id"])
+    graph = [{"task_id": child["id"], "depends_on": [parent["id"]]}]
+    expect("stale_claim", lambda: s.plan(pg.owner, operation(), graph))
+    expire(pg, child["id"])
+    assert s.plan(pg.owner, operation(), graph)["graph"][0]["depends_on"] == [parent["id"]]
+    expect("stale_claim", lambda: s.renew(pg.editor, operation(), child["id"], claim["epoch"]))
+    terminal = manual(pg, "terminal")
+    terminal_claim = s.claim(pg.editor, operation(), terminal["id"])
+    s.submit_result(pg.editor, operation(), terminal["id"], terminal_claim["epoch"], "Candidate")
+    terminal_graph = [{"task_id": terminal["id"], "depends_on": [parent["id"]]}]
+    expect("stale_claim", lambda: s.plan(pg.owner, operation(), terminal_graph))
+    s.gate(pg.reviewer, operation(), terminal["id"], terminal_claim["epoch"], "pass")
+    expect("stale_claim", lambda: s.plan(pg.owner, operation(), terminal_graph))
+
+
+def test_ready_filters_assignment_role_and_scopes_and_is_only_a_hint(pg):
+    s = pg.store
+    assigned = manual(pg, "assigned", assignee=pg.editor)
+    other = manual(pg, "other")
+    assert assigned["id"] not in {row["id"] for row in s.ready(pg.owner, pg.page["id"])}
+    s.share(pg.owner, operation(), "space", pg.space["id"], "person", pg.reader.account, "view")
+    assert s.ready(pg.reader, pg.page["id"]) == []
+    s.claim(pg.reviewer, operation(), other["id"])
+    assert s.ready(pg.editor, pg.page["id"]) == []
+    expire(pg, other["id"])
+    assert assigned["id"] in {row["id"] for row in s.ready(pg.editor, pg.page["id"])}
+    s.claim(pg.owner, operation(), other["id"])
+    expect("scope_conflict", lambda: s.claim(pg.editor, operation(), assigned["id"]))
+    s.share(pg.owner, operation(), "space", pg.space["id"], "person", pg.editor.account, None)
+    assert s.ready(pg.editor) == []
+
+
+def test_graph_requires_dependency_visibility_without_exposing_private_content(pg):
+    s = pg.store
+    private_space = s.create_space(pg.owner, operation(), "Private dependencies")
+    private_page = s.create_page(pg.owner, operation(), private_space["id"], "Private page")
+    private_task = s.create_task_block(pg.owner, operation(), private_page["id"], "PRIVATE-DEPENDENCY-BODY", [], [pg.owner.principal])
+    child = manual(pg, "child", depends_on=[private_task["id"]])
+    expect("forbidden", lambda: s.plan(pg.editor, operation(), [{"task_id": child["id"], "depends_on": [private_task["id"]]}]))
+    visible = s.get_task(pg.editor, child["id"])
+    assert visible["depends_on"] == [private_task["id"]]
+    assert "PRIVATE-DEPENDENCY-BODY" not in json.dumps(visible)
+    expect("forbidden", lambda: s.get_task(pg.editor, private_task["id"]))
+    before = len(s.list_blocks(pg.owner, pg.page["id"]))
+    for automatic in (False, True):
+        op = operation()
+        if automatic:
+            call = lambda: s.submit_task(pg.editor, op, "invisible-dep", "Forbidden node", page_id=pg.page["id"], depends_on=[private_task["id"]])
+        else:
+            call = lambda: s.create_task_block(pg.editor, op, pg.page["id"], "Forbidden node", [], [pg.reviewer.principal], depends_on=[private_task["id"]])
+        expect("forbidden", call)
+        with s._transaction() as conn:
+            assert not conn.execute("SELECT 1 FROM baton.operations WHERE operation_id=%s", (op,)).fetchone()
+    assert len(s.list_blocks(pg.owner, pg.page["id"])) == before
+
+
+def test_creation_dependencies_are_atomic_with_auto_queue_admission(pg):
+    s = pg.store
+    parent = manual(pg, "parent")
+    child = s.submit_task(pg.owner, operation(), "auto-dependent", "Synthetic dependent auto task",
+                         page_id=pg.page["id"], depends_on=[parent["id"]])
+    assert child["depends_on"] == [parent["id"]]
+    assert s.claim_next(SERVICE_ACTOR, operation()) is None
+    parent_claim = s.claim(pg.editor, operation(), parent["id"])
+    s.submit_result(pg.editor, operation(), parent["id"], parent_claim["epoch"], "Candidate")
+    assert s.claim_next(SERVICE_ACTOR, operation()) is None
+    s.gate(pg.reviewer, operation(), parent["id"], parent_claim["epoch"], "pass")
+    claimed = s.claim_next(SERVICE_ACTOR, operation())
+    assert claimed["task_id"] == child["id"] and claimed["depends_on"] == [parent["id"]]
+    s.mark_dispatched(SERVICE_ACTOR, operation(), child["id"], claimed["epoch"])
+    assert s.finish_auto(SERVICE_ACTOR, operation(), child["id"], claimed["epoch"], "Synthetic graph demo", operation(), "demo")["state"] == "done"
+
+
+def test_empty_dependencies_preserve_v1_persisted_idempotency_hashes(pg):
+    s = pg.store
+    scopes = [{"kind": "path", "value": pg.prefix}]
+    actor_fields = {"principal": pg.owner.principal, "account": pg.owner.account, "kind": pg.owner.kind}
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()).hexdigest()
+    submit_op = operation()
+    task = s.submit_task(pg.owner, submit_op, "legacy-no-deps", "Legacy auto task", page_id=pg.page["id"], scopes=scopes)
+    legacy_submit_args = {"idempotency_key": "legacy-no-deps", "prompt": "Legacy auto task", "page_id": pg.page["id"], "scopes": scopes, "assignee": None}
+    with s._transaction() as conn:
+        assert conn.execute("SELECT input_hash FROM baton.tasks WHERE id=%s", (task["id"],)).fetchone()["input_hash"] == digest(legacy_submit_args)
+        assert conn.execute("SELECT request_hash FROM baton.operations WHERE principal=%s AND operation_id=%s", (pg.owner.principal, submit_op)).fetchone()["request_hash"] == digest([actor_fields, "submit_task", legacy_submit_args])
+    assert s.submit_task(pg.owner, submit_op, "legacy-no-deps", "Legacy auto task", page_id=pg.page["id"], scopes=scopes, depends_on=[])["replay"]
+    assert s.submit_task(pg.owner, operation(), "legacy-no-deps", "Legacy auto task", page_id=pg.page["id"], scopes=scopes, depends_on=[])["id"] == task["id"]
+    create_op = operation()
+    manual_task = s.create_task_block(pg.owner, create_op, pg.page["id"], "Legacy manual task", scopes, [pg.reviewer.principal])
+    legacy_create_args = {"page_id": pg.page["id"], "prompt": "Legacy manual task", "scopes": scopes, "reviewers": [pg.reviewer.principal],
+                          "base_commit": None, "context": None, "evidence": None, "assignee": None}
+    with s._transaction() as conn:
+        assert conn.execute("SELECT input_hash FROM baton.tasks WHERE id=%s", (manual_task["id"],)).fetchone()["input_hash"] == digest(legacy_create_args)
+        assert conn.execute("SELECT request_hash FROM baton.operations WHERE principal=%s AND operation_id=%s", (pg.owner.principal, create_op)).fetchone()["request_hash"] == digest([actor_fields, "create_task_block", legacy_create_args])
+    s.plan(pg.owner, operation(), [{"task_id": task["id"], "depends_on": [manual_task["id"]]}])
+    replay = s.submit_task(pg.owner, submit_op, "legacy-no-deps", "Legacy auto task", page_id=pg.page["id"], scopes=scopes)
+    assert replay["depends_on"] == [manual_task["id"]] and replay["replay"]
+    assert s.create_task_block(pg.owner, create_op, pg.page["id"], "Legacy manual task", scopes, [pg.reviewer.principal], depends_on=[])["replay"]
+
+
+def test_graph_rejects_self_cycles_and_non_contract_payload_shapes(pg):
+    s = pg.store
+    task = manual(pg)
+    expect("graph_cycle", lambda: s.plan(pg.owner, operation(), [{"task_id": task["id"], "depends_on": [task["id"]]}]))
+    expect("invalid", lambda: s.plan(pg.owner, operation(), [{"task_id": task["id"], "depends_on": [], "state": "done"}]))
+    expect("invalid", lambda: s.plan(pg.owner, operation(), [{"task_id": task["id"], "depends_on": None}]))
+    expect("invalid", lambda: s.plan(pg.owner, operation(), [{"task_id": task["id"], "depends_on": []}] * 2))
