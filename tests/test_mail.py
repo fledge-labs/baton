@@ -63,6 +63,22 @@ async def test_mail_response_whitelists_fields_and_redacts_tokens(modules, make_
 
 
 @pytest.mark.asyncio
+async def test_upstream_mail_errors_do_not_echo_credentials(modules, make_context, monkeypatch):
+    common, server, _ = modules
+    marker = "synthetic-upstream-credential-must-not-escape"
+
+    async def fail(*args):
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(server, "_mail_request", fail)
+    with pytest.raises(RuntimeError, match="^Mail request failed$"):
+        await server.mail_call("fetch_inbox", {})
+    with pytest.raises(RuntimeError, match="^Mail inbox is unavailable$"):
+        await server.fetch_inbox(make_context())
+    assert marker not in (common.STATE / "audit.jsonl").read_text()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mail_failure", [False, True])
 async def test_completed_task_preserves_result_when_mail_fails(modules, make_context, fake_mail, monkeypatch, mail_failure):
     common, server, _ = modules

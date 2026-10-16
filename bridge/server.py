@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.fastmcp import Context, FastMCP
@@ -74,7 +74,7 @@ def public_task(row):
     return {key: row[key] for key in TASK_COLUMNS.split(",")}
 
 
-async def mail_call(name, args):
+async def _mail_request(name, args):
     token = (SECRETS / "mail.token").read_text().strip()
     async with httpx.AsyncClient(headers={"Authorization": "Bearer " + token}, timeout=30) as http:
         async with streamable_http_client(MAIL_URL, http_client=http) as (read, write, _):
@@ -86,6 +86,15 @@ async def mail_call(name, args):
                 if result.structuredContent is not None:
                     return result.structuredContent
                 return json.loads("\n".join(c.text for c in result.content if c.type == "text"))
+
+
+async def mail_call(name, args):
+    try:
+        return await _mail_request(name, args)
+    except Exception:
+        # MCP error content is upstream-controlled and can quote submitted
+        # registration credentials. Never put it in a client error response.
+        raise RuntimeError("Mail request failed") from None
 
 
 async def mail_agent(agent):
@@ -200,12 +209,16 @@ async def list_tasks(ctx: Context) -> list[dict]:
 @mcp.tool()
 async def fetch_inbox(ctx: Context) -> dict:
     """Read the Agent Mail inbox bound to your bearer-token identity."""
-    who = await mail_agent(owner(ctx))
-    result = await mail_call("fetch_inbox", {
-        "project_key": PROJECT, "agent_name": who["name"], "registration_token": who["token"],
-        "include_bodies": True, "limit": 30,
-    })
-    return {"agent_name": who["name"], "messages": clean_mail(result)}
+    try:
+        who = await mail_agent(owner(ctx))
+        result = await mail_call("fetch_inbox", {
+            "project_key": PROJECT, "agent_name": who["name"], "registration_token": who["token"],
+            "include_bodies": True, "limit": 30,
+        })
+        return {"agent_name": who["name"], "messages": clean_mail(result)}
+    except Exception as exc:
+        audit("mail.inbox_failed", agent=owner(ctx), error_type=type(exc).__name__)
+        raise RuntimeError("Mail inbox is unavailable") from None
 
 
 class DispatchUncertain(RuntimeError):
@@ -311,12 +324,16 @@ async def board_data(request: Request):
         tasks = [dict(row) for row in db.execute(
             f"SELECT {TASK_COLUMNS} FROM tasks WHERE owner=? ORDER BY rowid DESC LIMIT 50", (agent,)
         )]
-    who = await mail_agent(agent)
-    inbox = await mail_call("fetch_inbox", {
-        "project_key": PROJECT, "agent_name": who["name"], "registration_token": who["token"],
-        "include_bodies": True, "limit": 30,
-    })
-    return {"agent": agent, "tasks": tasks, "mail": clean_mail(inbox)}
+    try:
+        who = await mail_agent(agent)
+        inbox = await mail_call("fetch_inbox", {
+            "project_key": PROJECT, "agent_name": who["name"], "registration_token": who["token"],
+            "include_bodies": True, "limit": 30,
+        })
+        return {"agent": agent, "tasks": tasks, "mail": clean_mail(inbox)}
+    except Exception as exc:
+        audit("mail.inbox_failed", agent=agent, error_type=type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Mail inbox is unavailable") from None
 
 
 app.mount("/", mcp.streamable_http_app())

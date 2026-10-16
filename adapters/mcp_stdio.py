@@ -101,7 +101,10 @@ async def main(args):
 
                 @server.call_tool()
                 async def call(name, arguments):
-                    result = await remote.call_tool(name, arguments)
+                    try:
+                        result = await remote.call_tool(name, arguments)
+                    except Exception:
+                        raise RuntimeError("Baton remote tool failed") from None
                     if args.audit_file:
                         write_receipt(args.audit_file, receipt(args.agent_id, name, arguments, result))
                     return result
