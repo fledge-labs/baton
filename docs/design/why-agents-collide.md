@@ -22,6 +22,27 @@ Agents collide more than people do. They run with high parallelism, they do not 
 
 Real-time co-editing (OT/CRDT, as in Google Docs) keeps every keystroke but cannot keep two pieces of code logically compatible. For code, the order is: claim first, merge later, and test before merging.
 
+## How a construction site runs work in order
+
+Railways teach "do not collide". Construction sites teach "work in order". A crew may enter only after its work face is opened.
+
+| On the site | For agents | Baton feature |
+|---|---|---|
+| Site readiness (water, power, access, levelled ground) before any crew arrives | Base commit, environment, fixtures, identities and tokens are ready before work starts | `x_ready` (a preparation task gates the construction tasks) |
+| Setting out: lines are marked on the ground, so every crew knows its area | Each lane declares the files, modules and migration numbers it will touch | `x_scope` |
+| Work-face handover: the finished trade hands the face to the next one in writing, and both sign | A hand-off carries base commit, evidence and acceptance; it completes only when the receiver confirms | `x_handoff` |
+| Concealed-work inspection: rebar and pipes are inspected before they are closed into walls | Anything others will build on (e.g. a database migration) must pass its gate before the next task builds on top | `x_gate` + `x_graph` |
+| Trade sequencing: trades on separate faces work in parallel; trades sharing a face take turns | Non-overlapping scopes run in parallel; overlapping ones queue | overlap check + `x_graph` |
+| Daily coordination meeting: progress, clashes, who enters which area tomorrow | Live task states and the audit log replace the meeting | `x_audit` |
+
+Each kind of failure maps to a skipped step:
+- duplicated migration numbers: no setting out;
+- work on a stale base: no site readiness;
+- a change that waits forever for an environment the test site does not have: the handover did not check site conditions;
+- a regression that only appears after merging: concealed work was covered before inspection.
+
+On real sites most disputes come from unclear handovers and skipped concealed-work inspections, because the boundary of responsibility is unclear. Baton's audit log is the signed handover sheet for every step.
+
 ## The point
 Collisions are not new and not specific to AI. Railways, plants, construction sites and large monorepos all solved them with the same few moves:
 - one token per section;
