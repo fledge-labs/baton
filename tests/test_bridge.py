@@ -24,6 +24,10 @@ def api(modules, pg_store, make_context):
     for label in ("owner", "reviewer", "worker", "replacement", "stranger"):
         kind = "human" if label in {"owner", "reviewer"} else "agent"
         who = make_context(label, kind=kind).request_context.request.state.identity
+        if label == "reviewer":
+            # A person's principal and connected account are distinct so a
+            # mention cannot accidentally route by account instead of person.
+            who["account"] += "-account"
         token = "synthetic-" + uuid.uuid4().hex
         identities[label] = who
         tokens[label] = token
@@ -58,10 +62,16 @@ def test_schema_mcp_parameters_and_actor_injection_are_safe(api, modules, capsys
     assert client.get("/v1/space/schema").status_code == 401
     schema = client.get("/v1/space/schema", headers={"Authorization": "Bearer " + tokens["owner"]}).json()
     operations = schema["operations"]
-    assert {"create_space", "comment", "mention", "assign_task", "claim", "renew", "handoff", "gate", "list_audit"} <= operations.keys()
+    assert {"create_space", "comment", "mention", "assign_task", "plan", "ready", "claim", "renew", "handoff", "gate", "list_audit"} <= operations.keys()
     assert not {"claim_next", "finish_auto", "recover_auto", "check_schema"} & operations.keys()
     assert operations["handoff"]["request"]["properties"]["target_principal"]["type"] == "string"
     assert "target" not in operations["handoff"]["request"]["properties"]
+    graph_entry = operations["plan"]["request"]["$defs"]["GraphEntry"]
+    assert graph_entry["additionalProperties"] is False
+    assert set(graph_entry["required"]) == {"task_id", "depends_on"}
+    for name in ("create_task_block", "submit_task"):
+        assert "depends_on" in operations[name]["request"]["properties"]
+        assert "depends_on" not in operations[name]["request"].get("required", [])
     error = call("owner", "create_space", 422, operation_id=op(), name="Safe", actor={"principal": private})
     assert error["code"] == "invalid" and private not in json.dumps(error)
     assert call("owner", "finish_auto", 422, operation_id=op(), result=private)["code"] == "invalid"
@@ -70,7 +80,8 @@ def test_schema_mcp_parameters_and_actor_injection_are_safe(api, modules, capsys
     response = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     tools = {tool["name"]: tool for tool in response.json()["result"]["tools"]}
     assert {"x_claim", "x_scope", "x_handoff", "x_gate", "x_audit"} <= tools.keys()
-    for name in ("create_space", "handoff", "comment", "assign_task"):
+    assert "depends_on" in tools["submit_task"]["inputSchema"]["properties"]
+    for name in ("create_space", "handoff", "comment", "assign_task", "plan"):
         assert not {"ctx", "arguments", "actor"} & tools[name]["inputSchema"].get("properties", {}).keys()
         assert "operation_id" in tools[name]["inputSchema"]["required"]
     response = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
@@ -252,3 +263,89 @@ def test_gateway_routes_http_api_through_client_acl():
         config = (root / "deploy" / filename).read_text()
         assert "proxy_pass http://gateway:3000;" in config
         assert "$request_body" not in config and "$http_authorization" not in config
+
+
+def test_graph_plan_and_ready_keep_current_gate_as_claim_authority(api):
+    client, call, identities, tokens, _, _ = api
+    _, page = shared_page(call, identities)
+    tasks = []
+    for label in ("prerequisite", "dependent"):
+        tasks.append(call("owner", "create_task_block", operation_id=op(), page_id=page["id"],
+                          prompt="Synthetic " + label, scopes=[{"kind": "path", "value": "src/" + label}],
+                          reviewers=[identities["owner"]["agent"]],
+                          assignee_principal=identities["worker"]["agent"]))
+    first, second = tasks
+    plan_id = op()
+    graph = [{"task_id": second["task_id"], "depends_on": [first["task_id"]]}]
+    call("owner", "plan", operation_id=plan_id, graph=graph)
+    ready = call("worker", "ready", page_id=page["id"])
+    assert {task["task_id"] for task in ready} == {first["task_id"]}
+    assert call("worker", "claim", 409, operation_id=op(), task_id=second["task_id"])["code"] == "dependency_blocked"
+    cycle = [{"task_id": first["task_id"], "depends_on": [second["task_id"]]}]
+    assert call("owner", "plan", 409, operation_id=op(), graph=cycle)["code"] == "graph_cycle"
+    assert {task["task_id"] for task in call("worker", "ready", page_id=page["id"])} == {first["task_id"]}
+    malformed = [{"task_id": second["task_id"], "depends_on": [], "actor": "synthetic-private-graph"}]
+    assert call("owner", "plan", 422, operation_id=op(), graph=malformed)["code"] == "invalid"
+    headers = {"Authorization": "Bearer " + tokens["owner"], "Host": "bridge", "Accept": "application/json, text/event-stream"}
+    response = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 20, "method": "tools/call", "params": {
+        "name": "plan", "arguments": {"operation_id": plan_id, "graph": graph}}})
+    result = response.json()["result"]
+    assert not result.get("isError", False)
+    claim = call("worker", "claim", operation_id=op(), task_id=first["task_id"])
+    call("worker", "submit_result", operation_id=op(), task_id=first["task_id"], epoch=claim["epoch"], result="Candidate")
+    assert call("worker", "ready", page_id=page["id"]) == []
+    call("owner", "gate", operation_id=op(), task_id=first["task_id"], expected_epoch=claim["epoch"], decision="pass")
+    ready = call("worker", "ready", page_id=page["id"])
+    assert {task["task_id"] for task in ready} == {second["task_id"]}
+    assert ready[0]["prompt"] == "Synthetic dependent"
+    headers["Authorization"] = "Bearer " + tokens["worker"]
+    response = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 21, "method": "tools/call", "params": {"name": "ready"}})
+    result = response.json()["result"]
+    assert not result.get("isError", False)
+    content = result.get("structuredContent") or json.loads(result["content"][0]["text"])
+    assert content["x_protocol"] == "baton.space.v1"
+    assert {task["task_id"] for task in content["result"]} == {second["task_id"]}
+
+
+def test_person_mentions_use_active_human_principal_not_connected_account(api):
+    _, call, identities, _, registry, records = api
+    _, page = shared_page(call, identities)
+    comment = call("owner", "comment", operation_id=op(), page_id=page["id"], body="For this specific person")
+    assert identities["reviewer"]["agent"] != identities["reviewer"]["account"]
+    call("owner", "mention", operation_id=op(), comment_id=comment["id"], target_type="person", target_id=identities["reviewer"]["agent"])
+    inbox = call("reviewer", "fetch_inbox")
+    assert any(message["id"] == comment["id"] for message in inbox["messages"])
+    for target_type, target_id in (("person", identities["reviewer"]["account"]),
+                                   ("person", identities["worker"]["agent"]),
+                                   ("agent", identities["reviewer"]["agent"])):
+        assert call("owner", "mention", 422, operation_id=op(), comment_id=comment["id"],
+                    target_type=target_type, target_id=target_id)["code"] == "invalid"
+    records["reviewer"]["active"] = False
+    registry.write_text(json.dumps(records))
+    assert call("owner", "mention", 422, operation_id=op(), comment_id=comment["id"],
+                target_type="person", target_id=identities["reviewer"]["agent"])["code"] == "invalid"
+
+
+def test_atomic_dependencies_block_auto_dispatch_until_current_gate_passes(api, modules, pg_store):
+    client, call, identities, tokens, _, _ = api
+    _, page = shared_page(call, identities)
+    parent = call("owner", "create_task_block", operation_id=op(), page_id=page["id"], prompt="Prerequisite",
+                  scopes=[{"kind": "path", "value": "src/parent"}], reviewers=[identities["owner"]["agent"]],
+                  assignee_principal=identities["worker"]["agent"])
+    arguments = {"idempotency_key": "atomic-auto-dependent", "prompt": "Automatic dependent", "page_id": page["id"],
+                 "scopes": [{"kind": "path", "value": "src/automatic"}], "depends_on": [parent["task_id"]]}
+    headers = {"Authorization": "Bearer " + tokens["owner"], "Host": "bridge", "Accept": "application/json, text/event-stream"}
+    response = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 30, "method": "tools/call", "params": {
+        "name": "submit_task", "arguments": arguments}})
+    result = response.json()["result"]
+    assert not result.get("isError", False)
+    child = result.get("structuredContent") or json.loads(result["content"][0]["text"])
+    assert pg_store.claim_next(modules[1].SERVICE, op()) is None
+    claim = call("worker", "claim", operation_id=op(), task_id=parent["task_id"])
+    candidate = call("worker", "submit_result", operation_id=op(), task_id=parent["task_id"], epoch=claim["epoch"], result="Candidate")
+    assert candidate["state"] == "awaiting_gate"
+    assert pg_store.claim_next(modules[1].SERVICE, op()) is None
+    call("owner", "gate", operation_id=op(), task_id=parent["task_id"], expected_epoch=claim["epoch"], decision="pass")
+    dispatchable = pg_store.claim_next(modules[1].SERVICE, op())
+    assert dispatchable["task_id"] == child["task_id"]
+    assert call("owner", "submit_task", 409, operation_id=op(), **{**arguments, "depends_on": []})["code"] == "operation_conflict"

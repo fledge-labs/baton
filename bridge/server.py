@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from pydantic import ConfigDict, ValidationError, create_model
+from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 
 from bridge import common
 from bridge.common import AuthMiddleware, audit, redact, safe_id, transport_origins, uuid_id
@@ -42,6 +42,8 @@ ERRORS = {
     "stale_claim": (409, "Claim is no longer current"),
     "revision_conflict": (409, "Revision is no longer current"),
     "gate_required": (409, "Required gate has not passed"),
+    "dependency_blocked": (409, "Task dependencies are not complete"),
+    "graph_cycle": (409, "Dependency graph contains a cycle"),
     "storage_unavailable": (503, "Storage is unavailable"),
 }
 
@@ -63,7 +65,7 @@ class SafeFastMCP(FastMCP):
             if canonical not in PUBLIC_OPERATIONS:
                 raise BridgeError("invalid")
             if name in {"submit_task", "get_task", "list_tasks", "fetch_inbox"}:
-                allowed = {"submit_task": {"idempotency_key", "prompt", "page_id", "scopes", "assignee_principal"}, "get_task": {"task_id"},
+                allowed = {"submit_task": {"idempotency_key", "prompt", "page_id", "scopes", "assignee_principal", "depends_on"}, "get_task": {"task_id"},
                            "list_tasks": set(), "fetch_inbox": set()}[name]
                 if not isinstance(arguments, dict) or set(arguments) - allowed:
                     raise BridgeError("invalid")
@@ -94,6 +96,12 @@ mcp = SafeFastMCP(
 # This allowlist is the public protocol. Internal service operations are never
 # reflected into HTTP or MCP. Parameters describe business targets, not actors.
 # A tuple is (annotation, default); Ellipsis marks a required argument.
+class GraphEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    task_id: str
+    depends_on: list[str]
+
+
 PUBLIC_OPERATIONS = {
     "create_space": (True, {"name": (str, ...)}),
     "get_space": (False, {"space_id": (str, ...)}),
@@ -118,9 +126,11 @@ PUBLIC_OPERATIONS = {
     "get_proposal": (False, {"proposal_id": (str, ...)}),
     "list_proposals": (False, {"block_id": (str, ...)}),
     "list_attribution": (False, {"block_id": (str, ...)}),
-    "create_task_block": (True, {"page_id": (str, ...), "prompt": (str, ...), "scopes": (list[dict], ...), "reviewers": (list[str], ...), "base_commit": (str | None, None), "context": (Any, None), "evidence": (Any, None), "assignee_principal": (str | None, None)}),
-    "submit_task": (True, {"idempotency_key": (str, ...), "prompt": (str, ...), "page_id": (str | None, None), "scopes": (list[dict] | None, None), "assignee_principal": (str | None, None)}),
+    "create_task_block": (True, {"page_id": (str, ...), "prompt": (str, ...), "scopes": (list[dict], ...), "reviewers": (list[str], ...), "base_commit": (str | None, None), "context": (Any, None), "evidence": (Any, None), "assignee_principal": (str | None, None), "depends_on": (list[str] | None, None)}),
+    "submit_task": (True, {"idempotency_key": (str, ...), "prompt": (str, ...), "page_id": (str | None, None), "scopes": (list[dict] | None, None), "assignee_principal": (str | None, None), "depends_on": (list[str] | None, None)}),
     "assign_task": (True, {"task_id": (str, ...), "target_principal": (str, ...)}),
+    "plan": (True, {"graph": (list[GraphEntry], ...)}),
+    "ready": (False, {"page_id": (str | None, None), "limit": (int, 50)}),
     "get_task": (False, {"task_id": (str, ...)}),
     "list_tasks": (False, {"limit": (int, 50)}),
     "fetch_inbox": (False, {"limit": (int, 30)}),
@@ -209,8 +219,10 @@ async def invoke(operation, payload, request):
             if principal is not None and not who:
                 raise BridgeError("invalid")
             arguments["assignee"] = actor_from_identity(who) if who else None
-        if operation == "mention" and arguments["target_type"] == "agent":
-            if not common.resolve_principal(arguments["target_id"]):
+        if operation == "mention":
+            target = common.resolve_principal(arguments["target_id"])
+            expected_kind = {"person": "human", "agent": "agent"}.get(arguments["target_type"])
+            if not target or not expected_kind or target["kind"] != expected_kind:
                 raise BridgeError("invalid")
     except (ValidationError, ValueError, TypeError, AttributeError) as exc:
         if isinstance(exc, BridgeError):
@@ -227,21 +239,22 @@ async def invoke(operation, payload, request):
                   thread_id=result.get("thread_id"), agent=actor.principal)
     if operation in {"get_task", "submit_task", "create_task_block", "assign_task", "claim", "renew", "handoff", "submit_result", "gate"}:
         return public_task(result)
-    if operation == "list_tasks":
+    if operation in {"list_tasks", "ready"}:
         return [public_task(row) for row in result]
     return result
 
 
 @mcp.tool()
 async def submit_task(idempotency_key: str, prompt: str, ctx: Context, page_id: str | None = None,
-                      scopes: list[dict] | None = None, assignee_principal: str | None = None) -> dict:
+                      scopes: list[dict] | None = None, assignee_principal: str | None = None,
+                      depends_on: list[str] | None = None) -> dict:
     """Submit a task; a named assignee uses the manual claim/review path. Reuse keys on retry."""
     request = ctx.request_context.request
     actor = request_actor(request)
     operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "baton/submit_task/" + actor.principal + "/" + idempotency_key))
     return await invoke("submit_task", {"operation_id": operation_id, "idempotency_key": idempotency_key,
                         "prompt": prompt, "page_id": page_id, "scopes": scopes,
-                        "assignee_principal": assignee_principal}, request)
+                        "assignee_principal": assignee_principal, "depends_on": depends_on}, request)
 
 
 @mcp.tool()

@@ -72,3 +72,5 @@ args = ["-c", 'BATON_URL="https://example.com/mcp" exec "$HOME/baton/adapters/la
 `fetch_inbox` 现在来自 PostgreSQL 的评论提及和任务分配视图；它只返回当前身份仍可访问的内容。任务状态中的 `submission_mail_status`、`mail_status`、`mail_error` 已分别更名为 `submission_thread_status`、`thread_status`、`thread_error`；适配器回执中的 `mail_thread_ids` 更名为 `thread_ids`。
 
 空间、页面、块、评论、分享、提案和手工 claim/gate 工具的清单可通过 MCP 工具发现读取。需要使用新工具时，在已有配置内按实际授权扩展 `enabled_tools`，保留逐工具审批。没有 MCP 的任意 runtime 可直接调用 [Baton HTTP API](../docs/api.md)；协议标识为 `baton.space.v1`，这是 Baton 自有接口，不是 OpenAI Space wire protocol。
+
+创建有依赖的任务时，在 submit_task 或 create_task_block 中同时传入 `depends_on=[前置任务UUID]`，确保任务与依赖原子建立，自动 worker 不会在后续 plan 前抢先领取。已有任务用 `plan(operation_id, graph)` 建立或扩展依赖图；graph 的每项只接受 task_id 和 depends_on。接收人用 `ready(page_id?, limit?)` 查看当前可领取任务，再调用 claim。ready 结果只是当前视图，领取时仍重新校验前置 gate、权限和租约。MCP enabled_tools 如需开放 plan/ready，应按本任务授权增量添加；普通 HTTP 使用同名操作，不需要特定 agent runtime。
