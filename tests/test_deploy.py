@@ -1495,7 +1495,9 @@ def test_catalog_sql_and_diff_on_a_real_postgres_accept_the_shipped_schema_and_c
             internal = [item for item in before["triggers"] if item["t"] == "baton.df18_child"]
             assert internal and all(item["enabled"] == "O" for item in internal)
             assert all(item["name"].startswith("RI_ConstraintTrigger_") for item in internal)
-            apply("ALTER TABLE baton.df18_child DISABLE TRIGGER ALL")
+            # System triggers (foreign keys) can be disabled only by a superuser, which is the session
+            # user after RESET ROLE. baton_owner is refused; the catalog diff is what still has to see it.
+            conn.execute("ALTER TABLE baton.df18_child DISABLE TRIGGER ALL")
             changes = deploy.schema_breaking_changes(before, snapshot())
             assert changes and all(
                 change.startswith("disables trigger ") and change.endswith(" on baton.df18_child") for change in changes), changes
