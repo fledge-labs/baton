@@ -19,7 +19,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import psycopg
@@ -58,7 +58,10 @@ CLAIM_EXPIRING_MIN_LEASE = 120
 CLAIM_EXPIRING_HORIZON_SECONDS = int(3600 * CLAIM_EXPIRING_FRACTION)
 BLOCK_REASONS = ("scope_conflict", "lease_held", "dependency_blocked", "waiting_input", "other")
 PERMISSION_OPTIONS = ("allow_once", "allow_always", "deny")
-PERMISSION_EVENTS = ("permission.requested", "permission.decided", "permission.granted", "permission.revoked")
+PERMISSION_EVENTS = ("permission.requested", "permission.decided", "permission.granted", "permission.revoked",
+                     "permission.cancelled")
+PERMISSION_DEFAULT_TTL = 3600
+PERMISSION_MAX_TTL = 86400
 PERMISSION_GRANT_EVENTS = ("granted", "revoked")
 PERMISSION_MAX_PER_EPOCH = 10
 PERMISSION_CLI = re.compile(r"[a-z][a-z0-9_-]{0,31}")
@@ -2089,18 +2092,39 @@ class SpaceStore:
                 views[meta["request_id"]] = {
                     "request_id": meta["request_id"], "task_id": str(task_id), "epoch": meta["epoch"], "worker": row["agent"],
                     "worker_account": row["actor_account"], **meta["permission"], "options": list(PERMISSION_OPTIONS),
-                    "status": "pending", "requested_at": row["time"], "decided_by": None, "decided_at": None,
+                    "status": "pending", "requested_at": row["time"],
+                    "expires_at": row["time"] + timedelta(seconds=meta["permission"]["ttl_seconds"]), "decided_by": None, "decided_at": None,
                     "authority": None, "grant": None, "granted_at": None, "revoked_at": None}
             elif view is None:
                 continue
             elif row["event"] == "permission.decided":
                 authority = "root" if meta.get("root") else f'delegated by {meta["grantor"]} via {meta["delegation_id"]}'
                 view.update(status=meta["decision"], decided_by=row["agent"], decided_at=row["time"], authority=authority)
+            elif row["event"] == "permission.cancelled":
+                if view["status"] == "pending":
+                    view.update(status="cancelled", decided_by=row["agent"], decided_at=row["time"])
             elif row["event"] == "permission.granted":
                 view.update(grant="granted", granted_at=row["time"])
             else:
                 view.update(grant="revoked", revoked_at=row["time"])
+        self._expire_requests(conn, task_id, views)
         return views
+
+    @staticmethod
+    def _expire_requests(conn, task_id, views):
+        """A pending request is only live while the claim it was made under is: it expires when the epoch moves on, the
+        holder's lease is gone, or its own time-to-live passes. Derived, so nothing has to run to free the task."""
+        pending = [view for view in views.values() if view["status"] == "pending"]
+        if not pending:
+            return
+        task = conn.execute("SELECT state,epoch FROM baton.tasks WHERE id=%s", (task_id,)).fetchone()
+        claim = conn.execute("SELECT holder,epoch FROM baton.x_claim WHERE task_id=%s AND lease_expires_at>clock_timestamp()",
+                             (task_id,)).fetchone()
+        now = conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
+        for view in pending:
+            if (task["state"] != "claimed" or task["epoch"] != view["epoch"] or claim is None
+                    or (claim["holder"], claim["epoch"]) != (view["worker"], view["epoch"]) or view["expires_at"] <= now):
+                view["status"] = "expired"
 
     def _permission_request(self, conn, task_id, request_id):
         view = self._permission_views(conn, task_id).get(_uuid(request_id, "request_id"))
@@ -2109,13 +2133,14 @@ class SpaceStore:
         return view
 
     def request_permission(self, actor, operation_id, task_id, epoch, cli, tool, directory=None, reason=None, excerpt=None,
-                           approvers=None):
+                           approvers=None, ttl_seconds=PERMISSION_DEFAULT_TTL):
         """The live holder asks for input: its CLI hit a permission wall. The task keeps its claim and epoch.
 
         Marks the task `waiting_input` (the state a reader sees), writes a thread comment with the structured request and
         mentions the named approvers. The request itself lives in the append-only audit, so no schema change is needed.
         """
         _integer(epoch, 1, 2**63 - 1, "epoch")
+        _integer(ttl_seconds, 1, PERMISSION_MAX_TTL, "ttl_seconds")
         if not isinstance(cli, str) or not PERMISSION_CLI.fullmatch(cli):
             raise StoreError("invalid", "cli", "lowercase CLI name of at most 32 characters")
         _one_line(tool, 200, "tool")
@@ -2140,7 +2165,7 @@ class SpaceStore:
                 raise StoreError("rate_limited")
             request_id = str(uuid.uuid4())
             permission = {"cli": cli, "tool": tool, "directory": directory, "reason": reason, "approvers": approvers,
-                          "excerpt_sha256": _sha256(excerpt) if excerpt else None}
+                          "ttl_seconds": ttl_seconds, "excerpt_sha256": _sha256(excerpt) if excerpt else None}
             self._task_audit(conn, actor, operation_id, "permission.requested", task, epoch=epoch, request_id=request_id,
                              permission=permission)
             conn.execute("UPDATE baton.tasks SET blocked_reason='waiting_input',blocked_by=%s,blocked_at=clock_timestamp() WHERE id=%s",
@@ -2167,7 +2192,7 @@ class SpaceStore:
             self._enqueue(conn, actor, "task.blocked", "task", task["id"], task["page_id"], parties, task_id)
             return self._permission_views(conn, task_id)[request_id]
         args = {"task_id": task_id, "epoch": epoch, "cli": cli, "tool": tool, "directory": directory, "reason": reason,
-                "excerpt": excerpt, "approvers": approvers}
+                "excerpt": excerpt, "approvers": approvers, **({"ttl_seconds": ttl_seconds} if ttl_seconds != PERMISSION_DEFAULT_TTL else {})}
         return self._mutate(actor, operation_id, "request_permission", args,
                             lambda conn: self._manual(conn, actor, task_id, "comment"), effect,
                             lambda conn, old: self._permission_request(conn, task_id, old["request_id"]))
@@ -2248,6 +2273,28 @@ class SpaceStore:
                              decision=request["status"])
             return self._permission_request(conn, task_id, request_id)
         return self._mutate(actor, operation_id, "record_permission", {"task_id": task_id, "request_id": request_id, "event": event},
+                            authorize, effect, lambda conn, old: self._permission_request(conn, task_id, request_id))
+
+    def cancel_permission(self, actor, operation_id, task_id, request_id):
+        """Withdraw a pending request: the requesting worker, or the space root. Frees the task to ask again."""
+        _uuid(request_id, "request_id")
+        def authorize(conn):
+            task = self._manual(conn, actor, task_id, "comment")
+            request = self._permission_request(conn, task_id, request_id)
+            page = self._row(conn, "pages", str(task["page_id"]))
+            root = self._is_root(self._row(conn, "spaces", str(page["space_id"])), actor.principal, actor.account, actor.kind)
+            if not root and (actor.principal, actor.account) != (request["worker"], request["worker_account"]):
+                raise StoreError("forbidden")
+        def effect(conn):
+            task = self._row(conn, "tasks", task_id)
+            request = self._permission_request(conn, task_id, request_id)
+            if request["status"] != "pending":
+                raise StoreError("stale_claim")
+            self._task_audit(conn, actor, operation_id, "permission.cancelled", task, epoch=request["epoch"], request_id=request_id)
+            conn.execute("""UPDATE baton.tasks SET blocked_reason=NULL,blocked_by=NULL,blocked_at=NULL
+                WHERE id=%s AND blocked_reason='waiting_input' AND blocked_by=%s""", (task_id, request["worker"]))
+            return self._permission_request(conn, task_id, request_id)
+        return self._mutate(actor, operation_id, "cancel_permission", {"task_id": task_id, "request_id": request_id},
                             authorize, effect, lambda conn, old: self._permission_request(conn, task_id, request_id))
 
     def list_permissions(self, actor, task_id):
