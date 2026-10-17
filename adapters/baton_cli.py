@@ -28,6 +28,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 PROTOCOL = "baton.space.v1"
+# Protocol generation this client speaks. The server accepts this generation and the one before it.
+CLIENT_VERSION = 2
 EXIT_OK, EXIT_BATON, EXIT_USAGE, EXIT_NETWORK = 0, 1, 2, 3
 LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1"})
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -58,6 +60,14 @@ class BatonError(Exception):
     def __init__(self, code, status, details=()):
         super().__init__(code)
         self.code, self.status, self.details = code, status, tuple(details)
+
+
+class UpgradeRequired(BatonError):
+    """The server's minimum client generation is newer than this program (exit 1, not retried)."""
+
+    def __init__(self, minimum):
+        super().__init__("protocol_incompatible", 409)
+        self.minimum = minimum
 
 
 class NetworkError(Exception):
@@ -174,6 +184,54 @@ def spki_sha256(der):
     return hashlib.sha256(spki_from_certificate(der)).digest()
 
 
+def transport_category(exc, during_handshake):
+    """Fixed category for a transport failure. Handshake, certificate checks and later network errors stay distinct.
+
+    ssl.SSLError is the base of both a failed handshake and ssl.SSLCertVerificationError, and it is also raised when
+    the peer shuts the TLS session down after the handshake (SSLZeroReturnError, SSLSyscallError). A single label
+    for all of those made watch report a handshake failure when the handshake had already succeeded.
+    """
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return "tls: certificate verification failed"
+    if isinstance(exc, ssl.SSLError):
+        return "tls: handshake failed" if during_handshake else "connection failed"
+    if isinstance(exc, socket.timeout):
+        return "timeout"
+    return "connection failed"
+
+
+def announced_minimum(header, payload):
+    """The server's minimum client generation, from the response header or the JSON body. Absent means an old server."""
+    candidates = [header]
+    if isinstance(payload, dict):
+        candidates.append(payload.get("min_client_version"))
+    for candidate in candidates:
+        if type(candidate) is int and 0 < candidate <= 1000:
+            return candidate
+        if isinstance(candidate, str) and candidate.isdigit() and 0 < int(candidate) <= 1000:
+            return int(candidate)
+    return None
+
+
+def keepalive_interval(lease):
+    """Seconds between background renewals, ahead of expiry and of the warning window.
+
+    The bridge warns once the remainder drops under max(60s, 20% of the lease). Renew at half of the time
+    before that window. A lease of only a few seconds cannot wait a whole second: the request would land as
+    the lease ends and come back stale_claim.
+    """
+    window = max(60, int(lease * CLAIM_EXPIRING_FRACTION))
+    before_warning = max(1, lease - window)
+    half = min(lease // 2, before_warning // 2)
+    if half >= 1:
+        return half
+    return max(0.2, lease * 0.4)
+
+
+CLAIM_EXPIRING_FRACTION = 0.2
+WARNING_RE = re.compile(r"reviewer [A-Za-z0-9][A-Za-z0-9_.-]{0,95} currently cannot approve \(no delegation\)")
+
+
 class Client:
     def __init__(self, endpoint, token, context, pin, request_timeout):
         self.endpoint, self.token, self.context = endpoint, token, context
@@ -202,37 +260,42 @@ class Client:
     def call(self, operation, arguments, read_timeout=None):
         body = json.dumps(arguments, separators=(",", ":")).encode("ascii")
         headers = {"Authorization": "Bearer " + self.token, "Content-Type": "application/json",
-                   "Accept": "application/json", "Connection": "close", "User-Agent": "baton-cli/1"}
+                   "Accept": "application/json", "Connection": "close", "User-Agent": "baton-cli/" + str(CLIENT_VERSION),
+                   "X-Baton-Client-Version": str(CLIENT_VERSION)}
         conn = None
         try:
-            conn = self._connect()
-            if read_timeout:
-                conn.sock.settimeout(read_timeout)
-            conn.request("POST", self.endpoint.prefix + "/v1/space/" + operation, body=body, headers=headers)
-            response = conn.getresponse()
-            status, data = response.status, response.read(MAX_RESPONSE_BYTES + 1)
-        except NetworkError:
-            raise
-        except ssl.SSLError:
-            raise NetworkError("tls: handshake or certificate verification failed") from None
-        except socket.timeout:
-            raise NetworkError("timeout") from None
-        except (OSError, http.client.HTTPException):
-            raise NetworkError("connection failed") from None
+            try:
+                conn = self._connect()
+            except NetworkError:
+                raise
+            except (ssl.SSLError, socket.timeout, OSError, http.client.HTTPException) as exc:
+                raise NetworkError(transport_category(exc, True)) from None
+            try:
+                if read_timeout:
+                    conn.sock.settimeout(read_timeout)
+                conn.request("POST", self.endpoint.prefix + "/v1/space/" + operation, body=body, headers=headers)
+                response = conn.getresponse()
+                announced = response.getheader("X-Baton-Min-Client-Version")
+                status, data = response.status, response.read(MAX_RESPONSE_BYTES + 1)
+            except (ssl.SSLError, socket.timeout, OSError, http.client.HTTPException) as exc:
+                raise NetworkError(transport_category(exc, False)) from None
         finally:
             if conn is not None:
                 conn.close()
-        return self._result(status, data)
+        return self._result(status, data, announced)
 
     @staticmethod
-    def _result(status, data):
+    def _result(status, data, announced=None):
         payload = None
         if len(data) <= MAX_RESPONSE_BYTES:
             try:
                 payload = json.loads(data.decode("utf-8"))
             except ValueError:
                 payload = None
+        minimum = announced_minimum(announced, payload)
         if status == 200:
+            if minimum is not None and minimum > CLIENT_VERSION:
+                raise UpgradeRequired(minimum)
             if (isinstance(payload, dict) and payload.get("x_protocol") == PROTOCOL
                     and "result" in payload and "error" not in payload):
                 return payload["result"]
@@ -242,6 +305,8 @@ class Client:
         if isinstance(error, dict) and isinstance(error.get("code"), str) and ERROR_CODE_RE.fullmatch(error["code"]):
             code = error["code"]
             details = well_formed_details(error.get("details"))
+        if code == "protocol_incompatible" or (minimum is not None and minimum > CLIENT_VERSION):
+            raise UpgradeRequired(minimum if minimum is not None else CLIENT_VERSION + 1)
         raise BatonError(code, status, details)
 
 
@@ -398,13 +463,17 @@ def build_parser():
                      help="declared scope, repeatable; kind is path, module or migration; "
                           "'none' declares no repository footprint and cannot be combined")
     sub.add_argument("--depends-on", action="extend", type=uuid_csv, metavar="TASK_ID[,TASK_ID]")
+    sub.add_argument("--reviewer", action="append", type=agent_arg, dest="reviewers",
+                     help="reviewer principal, repeatable; a reviewer who cannot approve yet is warned and the task is still created")
     sub.set_defaults(build=build_submit, write=True)
 
     sub = command("claim", "claim: take a task lease", summary=True)
     add_write_options(sub)
     sub.add_argument("--task", required=True, type=uuid_arg)
     sub.add_argument("--lease", type=int, metavar="SECONDS")
-    sub.set_defaults(build=lambda a: ("claim", {"task_id": a.task, **opt(a, lease_seconds="lease")}), write=True)
+    sub.add_argument("--keepalive", action="store_true",
+                     help="after a successful claim, renew the lease in the background until this process exits or the task leaves claimed")
+    sub.set_defaults(build=lambda a: ("claim", {"task_id": a.task, **opt(a, lease_seconds="lease")}), write=True, keepalive=False)
 
     sub = command("renew", "renew: extend a lease", summary=True)
     add_write_options(sub)
@@ -504,7 +573,8 @@ def build_submit(args):
     if any(scope["kind"] == "none" for scope in scopes) and any(scope["kind"] != "none" for scope in scopes):
         raise UsageError("--scope none cannot be combined with other scopes")
     arguments = {"idempotency_key": args.key, "prompt": text_value(args, "prompt")}
-    arguments.update(opt(args, page_id="page", assignee_principal="assignee", scopes="scope", depends_on="depends_on"))
+    arguments.update(opt(args, page_id="page", assignee_principal="assignee", scopes="scope", depends_on="depends_on",
+                         reviewers="reviewers"))
     return "submit_task", arguments
 
 
@@ -655,6 +725,78 @@ def make_client(args):
     return Client(endpoint, token, context, pin, args.request_timeout)
 
 
+def print_warnings(result):
+    """Echo reviewer warnings. Only the fixed sentence is printed, so server text cannot inject controls."""
+    if not isinstance(result, dict) or not isinstance(result.get("warnings"), list):
+        return
+    for item in result["warnings"]:
+        if isinstance(item, str) and WARNING_RE.fullmatch(item):
+            say(item)
+
+
+def recovery_message(client, task_id):
+    """Exact next step after stale_claim: re-claim, or ask whoever holds the live lease."""
+    task = None
+    try:
+        task = client.call("get_task", {"task_id": task_id})
+    except UpgradeRequired:
+        raise
+    except (BatonError, NetworkError):
+        task = None
+    holder = task.get("holder") if isinstance(task, dict) else None
+    if (isinstance(task, dict) and task.get("state") == "claimed" and task.get("lease_valid") is True
+            and isinstance(holder, str) and AGENT_RE.fullmatch(holder)):
+        return "recovery: ask the new holder " + holder
+    return "recovery: baton_cli.py claim --task " + task_id
+
+
+def run_keepalive(args, client, claim):
+    """Renew until the process is signaled, the task leaves claimed, or the lease is no longer ours."""
+    lease = args.lease if args.lease is not None else 300
+    epoch = claim.get("epoch") if isinstance(claim, dict) else None
+    if type(epoch) is not int:
+        raise BatonError("bad_response", 200)
+    interval = keepalive_interval(lease)
+    stopper = Stopper()
+    signal.signal(signal.SIGINT, stopper.handle)
+    signal.signal(signal.SIGTERM, stopper.handle)
+    failures = 0
+    while not stopper.stop:
+        stopper.sleep(interval if failures == 0 else backoff_delay(failures))
+        if stopper.stop:
+            return EXIT_OK
+        def renew():
+            return client.call("renew", {"task_id": args.task, "epoch": epoch, "lease_seconds": lease,
+                                         "operation_id": str(uuid.uuid4())})
+        try:
+            result = stopper.run(renew)
+        except BatonError as error:
+            if stopper.stop:
+                return EXIT_OK
+            if error.code == "stale_claim":
+                say(recovery_message(client, args.task))
+                return EXIT_BATON
+            if not transient(error):
+                raise
+            failures += 1
+            say("keepalive: " + error.code + " (HTTP " + str(error.status) + "); retrying")
+            continue
+        except NetworkError as error:
+            if stopper.stop:
+                return EXIT_OK
+            failures += 1
+            say("keepalive: " + error.category + "; retrying")
+            continue
+        if result is Stopper.STOPPED:
+            return EXIT_OK
+        failures = 0
+        state = result.get("state") if isinstance(result, dict) else None
+        if state != "claimed":
+            say("keepalive: task left claimed")
+            return EXIT_OK
+    return EXIT_OK
+
+
 def run_command(args):
     operation, arguments = args.build(args)
     if getattr(args, "write", False):
@@ -666,12 +808,21 @@ def run_command(args):
             args.prepare(args, client, arguments)
         result = client.call(operation, arguments,
                              read_timeout=args.request_timeout + read_timeout(args) if read_timeout else None)
-    except (BatonError, NetworkError) as error:
+    except BatonError as error:
+        error.operation_id = arguments.get("operation_id")
+        task_id = arguments.get("task_id")
+        if error.code == "stale_claim" and isinstance(task_id, str) and SUMMARY_UUID_RE.fullmatch(task_id):
+            error.recovery = recovery_message(client, task_id)
+        raise
+    except NetworkError as error:
         error.operation_id = arguments.get("operation_id")
         raise
     emit_json(result, indent=2)
+    print_warnings(result)
     if getattr(args, "summary", False):
         print_summary(result)
+    if getattr(args, "keepalive", False):
+        return run_keepalive(args, client, result)
     return EXIT_OK
 
 
@@ -893,9 +1044,15 @@ def main(argv=None):
         say("error: " + str(error))
         return EXIT_USAGE
     except BatonError as error:
+        if getattr(error, "minimum", None) is not None:
+            say("please upgrade baton_cli to >= " + str(error.minimum))
+            return EXIT_BATON
         say("error: " + error.code + " (HTTP " + str(error.status) + ")")
         for field, expected in error.details:
             say("  " + field + ": expected " + expected)
+        recovery = getattr(error, "recovery", None)
+        if isinstance(recovery, str):
+            say(recovery)
         retry_hint(error)
         return EXIT_BATON
     except NetworkError as error:

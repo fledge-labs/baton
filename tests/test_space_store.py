@@ -2275,3 +2275,81 @@ def test_edit_rows_must_be_internally_consistent(pg):
                 with conn.transaction():
                     conn.execute("""INSERT INTO baton.x_gate(id,task_id,epoch,decision,reviewer,reviewer_account,evidence,edited,original_result,edited_result)
                         VALUES (%s,%s,%s,%s,'r','a','[]',%s,%s,%s)""", (uuid.uuid4(), task["id"], claim["epoch"], decision, edit_flag, original, edited))
+
+
+def expiring(pg, actor):
+    return [row for row in pg.store.poll_notifications(actor)["notifications"] if row["event"] == "claim.expiring"]
+
+
+def nudge_lease(pg, task_id, seconds):
+    with pg.store._transaction(write=True) as conn:
+        conn.execute("UPDATE baton.x_claim SET lease_expires_at=clock_timestamp()+%s*interval '1 second' WHERE task_id=%s",
+                     (seconds, task_id))
+
+
+def test_submit_task_warns_when_a_reviewer_cannot_approve_and_still_creates_the_task(pg):
+    s = pg.store
+    warned = s.submit_task(pg.owner, operation(), "warn-reviewer", "Synthetic warn", page_id=pg.page["id"],
+                           scopes=[{"kind": "path", "value": pg.prefix + "/warn"}], reviewers=[pg.editor.principal],
+                           assignee=pg.editor)
+    assert warned["state"] == "queued" and warned["reviewers"] == [pg.editor.principal]
+    assert warned["warnings"] == ["reviewer %s currently cannot approve (no delegation)" % pg.editor.principal]
+    quiet = s.submit_task(pg.owner, operation(), "warn-root", "Synthetic root reviewer", page_id=pg.page["id"],
+                          scopes=[{"kind": "path", "value": pg.prefix + "/warn-root"}], reviewers=[pg.owner.principal])
+    assert "warnings" not in quiet
+    omitted = s.submit_task(pg.owner, operation(), "warn-omitted", "Synthetic default reviewer", page_id=pg.page["id"],
+                            scopes=[{"kind": "path", "value": pg.prefix + "/warn-omitted"}])
+    assert omitted["reviewers"] == [pg.owner.principal] and "warnings" not in omitted
+    expect("invalid", lambda: s.submit_task(pg.owner, operation(), "warn-bad", "Synthetic", page_id=pg.page["id"], reviewers=[]))
+    grant(pg, pg.editor)
+    op = operation()
+    covered = s.submit_task(pg.owner, op, "warn-covered", "Synthetic covered", page_id=pg.page["id"],
+                            scopes=[{"kind": "path", "value": pg.prefix + "/warn-covered"}], reviewers=[pg.editor.principal])
+    assert "warnings" not in covered
+    s.delegation_revoke(pg.owner, operation(), grant(pg, pg.reviewer)["id"])
+    # The editor's delegation is still live; revoking a different one must not invent a warning.
+    assert "warnings" not in s.submit_task(pg.owner, op, "warn-covered", "Synthetic covered", page_id=pg.page["id"],
+                                           scopes=[{"kind": "path", "value": pg.prefix + "/warn-covered"}], reviewers=[pg.editor.principal])
+    bare = operation()
+    again = s.submit_task(pg.owner, bare, "warn-replay", "Synthetic replay", page_id=pg.page["id"],
+                          scopes=[{"kind": "path", "value": pg.prefix + "/warn-replay"}], reviewers=[pg.reviewer.principal])
+    assert again["warnings"] == ["reviewer %s currently cannot approve (no delegation)" % pg.reviewer.principal]
+    grant(pg, pg.reviewer)
+    replay = s.submit_task(pg.owner, bare, "warn-replay", "Synthetic replay", page_id=pg.page["id"],
+                           scopes=[{"kind": "path", "value": pg.prefix + "/warn-replay"}], reviewers=[pg.reviewer.principal])
+    assert replay["replay"] is True and "warnings" not in replay
+
+
+def test_claim_expiring_is_one_notification_per_lease_grant(pg):
+    s = pg.store
+    task = s.submit_task(pg.owner, operation(), "expiring", "Synthetic expiring", page_id=pg.page["id"],
+                         scopes=[{"kind": "path", "value": pg.prefix + "/expiring"}])
+    claim = s.claim(pg.editor, operation(), task["id"], lease_seconds=300)
+    with s._transaction() as conn:
+        row = conn.execute("""SELECT metadata FROM baton.x_audit WHERE task_id=%s AND event='task.claimed'""", (task["id"],)).fetchone()
+    assert row["metadata"]["lease_seconds"] == 300 and row["metadata"]["epoch"] == claim["epoch"]
+    nudge_lease(pg, task["id"], 30)
+    assert task["id"] not in s.escalate_overdue(SERVICE_ACTOR)["escalated"]
+    notes = expiring(pg, pg.editor)
+    assert len(notes) == 1 and notes[0]["object_id"] == task["id"] and notes[0]["recipient"] == pg.editor.principal
+    assert "result_epoch" not in notes[0] and notes[0]["actor"]["kind"] == "service"
+    assert notes[0]["subject"].startswith("[expiring] ")
+    s.escalate_overdue(SERVICE_ACTOR)
+    assert len(expiring(pg, pg.editor)) == 1
+    assert not expiring(pg, pg.owner)
+    renewed = s.renew(pg.editor, operation(), task["id"], claim["epoch"], lease_seconds=300)
+    assert renewed["state"] == "claimed"
+    s.escalate_overdue(SERVICE_ACTOR)
+    assert len(expiring(pg, pg.editor)) == 1, "a fresh lease is not inside the window"
+    nudge_lease(pg, task["id"], 30)
+    s.escalate_overdue(SERVICE_ACTOR)
+    assert len(expiring(pg, pg.editor)) == 2
+    long = s.submit_task(pg.owner, operation(), "expiring-long", "Synthetic long lease", page_id=pg.page["id"],
+                         scopes=[{"kind": "path", "value": pg.prefix + "/expiring-long"}])
+    s.claim(pg.editor, operation(), long["id"], lease_seconds=3600)
+    nudge_lease(pg, long["id"], 800)
+    s.escalate_overdue(SERVICE_ACTOR)
+    assert len(expiring(pg, pg.editor)) == 2, "800s remains above 20 percent of a 3600s lease"
+    nudge_lease(pg, long["id"], 700)
+    s.escalate_overdue(SERVICE_ACTOR)
+    assert len(expiring(pg, pg.editor)) == 3

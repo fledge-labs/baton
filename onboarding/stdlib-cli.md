@@ -75,8 +75,8 @@ openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/
 | `comments` | `list_comments` | `--task`（按任务读取其页面和线程），或 `--page` 加可选的 `--thread`；`--task` 不能与 `--page`/`--thread` 同用 |
 | `tasks` | `list_tasks` | `--limit` |
 | `ready` | `ready` | `--page`、`--limit` |
-| `submit` | `submit_task` | `--key`，`--prompt` 或 `--prompt-file`，`--page`、`--assignee`、`--scope kind=value`（可重复，kind 为 path/module/migration；`--scope none` 表示不触碰任何仓库路径，不能与其他 scope 组合）、`--depends-on`（可重复或逗号分隔） |
-| `claim` | `claim` | `--task`、`--lease` |
+| `submit` | `submit_task` | `--key`，`--prompt` 或 `--prompt-file`，`--page`、`--assignee`、`--reviewer`（可重复）、`--scope kind=value`（可重复，kind 为 path/module/migration；`--scope none` 表示不触碰任何仓库路径，不能与其他 scope 组合）、`--depends-on`（可重复或逗号分隔） |
+| `claim` | `claim` | `--task`、`--lease`、`--keepalive` |
 | `renew` | `renew` | `--task`、`--epoch`、`--lease` |
 | `comment` | `comment` | `--page`、`--thread`、`--body` 或 `--body-file` |
 | `result` | `submit_result` | `--task`、`--epoch`，`--result` 或 `--result-file` |
@@ -92,6 +92,9 @@ openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/
 - `claim`、`renew`、`result`、`gate`、`block` 默认再向 stderr 打印一行摘要，如 `task <id> state=claimed epoch=3`；用 `--no-summary` 关闭，`submit`、`task`、`comment`、`call` 可用 `--summary` 打开。stdout 不受影响。`gate` 的摘要行还带审批人与权限来源，见下文。`watch` 的 `--summary` 含义不同，见下文。
 - 省略 scope 时，所有任务（不论是否带 `--assignee`）默认声明 `none`（不占用任何 scope，多个无文件足迹的审阅、文档任务可同时领取）。不带 `--assignee` 的 `submit` 创建未指派的手工任务，任何对该页面有 edit 权限的主体都能用 `ready` 看到并 `claim` 它；Baton 不执行任务。
 - 写操作失败后，stderr 会多打一行 `operation_id=...`。网络中断后不知道操作是否生效时，用同一个 `--operation-id` 重试，服务端保证只产生一次效果；不要重新生成。
+- `submit --reviewer <principal>` 可重复，用来指定审批人；省略时审批人仍是请求者。任务总会创建。若某个审批人既不是该 Space 的根身份，也没有覆盖该任务的审批人委托，stderr 立即打印 `baton_cli: reviewer <principal> currently cannot approve (no delegation)`，stdout 的 JSON 带同样的 `warnings` 列表，退出码仍是 0。被指派的 `--assignee` 若同时列为 `--reviewer`，按同一条规则警告。委托后来补上之后，用同一个 `--operation-id` 重放会按当前委托重新计算，警告可以消失。
+- `claim --keepalive` 在领取成功后不退出：按租期在后台续租，直到进程退出（`SIGINT`/`SIGTERM`，退出码 0）或任务不再是 `claimed`。`--lease` 省略时按 300 秒续。遇到 `stale_claim` 时停止，并打印恢复命令（见下）。
+- 任何返回 `stale_claim` 的命令（`renew`、`result`，以及 `--keepalive` 的续租）都会在 stderr 给出下一步：租约已经没人持有时是 `baton_cli: recovery: baton_cli.py claim --task <任务 id>`；任务仍被别人有效持有时是 `baton_cli: recovery: ask the new holder <principal>`。这两行不含令牌或 URL。
 
 ## 命名接收人流程：wait → claim → comment → result
 
@@ -231,9 +234,20 @@ python3 "$HOME/baton/adapters/baton_cli.py" --token-file "$HOME/.config/baton/be
   watch --agent beigua --exec 'python3 "$HOME/baton/handle_notification.py"'
 ```
 
+## 协议版本
+
+客户端在每个请求上发送 `X-Baton-Client-Version`（当前是 `2`）。服务端在每个 `/v1/space` 响应上返回 `X-Baton-Protocol-Version` 和 `X-Baton-Min-Client-Version`，JSON 体里也有 `protocol_version` 与 `min_client_version`。没有版本头的旧客户端按版本 1 处理。服务器保留一个协议版本的兼容窗口：现在接受版本 1 和 2。窗口挪到下一代时，本客户端若低于最低版本，打印 `baton_cli: please upgrade baton_cli to >= N` 并以退出码 1 停止；`watch` 不会把这个错误当成网络故障重试。见 [API：协议版本与兼容窗口](../docs/api.md#协议版本与兼容窗口)。
+
 ## 排错
 
-- 退出码 3 且提示 `tls: handshake or certificate verification failed`：CA 不受信任或主机名与证书不符。检查 `--ca-file`、证书的 SAN 以及 `--url` 里的主机名，不要尝试关闭校验（没有这个选项）。
-- 退出码 3 且提示 `tls: server public key does not match --pin-sha256`：服务端公钥与指纹不一致。证书是否更换了密钥、是否连到了错误的主机，需要先确认，再更新指纹。
-- 退出码 1 的 `unauthorized (HTTP 401)`：令牌无效或已撤销；`forbidden (HTTP 403)`：能看到对象但当前身份没有该操作的权限；`not_found (HTTP 404)`：对象不存在，或当前身份看不到它（两种情况不可区分）；其余错误码见 [API](../docs/api.md#错误与审计)。
+错误按类别分开，不再把证书问题和握手失败写成同一句：
+
+- 退出码 3 且提示 `tls: handshake failed`：TLS 握手没有完成。检查服务器是否在说话、TLS 版本是否不低于 1.2。
+- 退出码 3 且提示 `tls: certificate verification failed`：证书校验失败（CA 不受信任或主机名与证书不符）。检查 `--ca-file`、证书的 SAN 以及 `--url` 里的主机名，不要尝试关闭校验（没有这个选项）。
+- 退出码 3 且提示 `tls: server public key does not match --pin-sha256`：证书校验之外的公钥固定失败。证书是否更换了密钥、是否连到了错误的主机，需要先确认，再更新指纹。
+- 退出码 3 且提示 `connection failed` 或 `timeout`：网络失败（连接被拒绝、中途断开、读超时）。握手已经成功之后的 TLS 关闭也归在 `connection failed`，不再说成握手失败。
+- 退出码 1 且提示 `<错误码> (HTTP <状态>)`：服务端或中间层返回了 HTTP 状态。例如 `unauthorized (HTTP 401)` 是令牌无效或已撤销；`forbidden (HTTP 403)` 是能看到对象但当前身份没有该操作的权限；`not_found (HTTP 404)` 是对象不存在，或当前身份看不到它（两种情况不可区分）；`storage_unavailable (HTTP 503)` 是存储暂时不可用。`watch` 对 5xx 和 429 重试，对其他 4xx 停止。
+- 退出码 1 且提示 `please upgrade baton_cli to >= N`：协议不兼容（`protocol_incompatible`，或服务端要求的最低版本高于本客户端）。升级 `baton_cli.py`，不要把它当成证书错误。
 - 退出码 2：用法或配置问题，stderr 的第一行说明了是哪一项，从不回显令牌或 URL。
+
+其余错误码见 [API](../docs/api.md#错误与审计)。

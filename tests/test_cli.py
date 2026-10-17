@@ -417,7 +417,7 @@ def test_tls_verification_is_always_on(cli, bridge):
     wrong_ca = cli.run("--url", bridge.https, "--token-file", bridge.tokens["owner"],
                        "--ca-file", bridge.pki["other_ca"], "tasks")
     assert unknown_ca.rc == 3 and wrong_ca.rc == 3
-    assert unknown_ca.err == "baton_cli: network error: tls: handshake or certificate verification failed\n"
+    assert unknown_ca.err == "baton_cli: network error: tls: certificate verification failed\n"
     assert unknown_ca.out == "" and wrong_ca.out == ""
     assert len(bridge.requests) == before, "no request (and no token) may reach an unverified server"
 
