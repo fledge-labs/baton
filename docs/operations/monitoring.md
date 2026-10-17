@@ -11,9 +11,11 @@ Every `--interval` seconds (default 60) it runs three probes. Each is timed.
 
 | Check | Request | Healthy when | Alert name |
 | --- | --- | --- | --- |
-| `board` | `GET /board` | status is exactly `200` (redirects are not followed) | `BatonBoardDown` |
+| `board` | `GET /healthz` on the public edge with the **monitoring token** (`Authorization: Bearer …` from `--token-file`; the token is never logged) | HTTP `200` and a JSON body whose `status` field is exactly `"ok"` after the request passes the gateway client ACL and reaches the bridge database check | `BatonBoardDown` |
 | `mcp_unauth` | `POST /mcp` with an `initialize` body and **no** credentials | status is exactly `401`; anything else means authentication is not enforced at the edge | `BatonMcpAuthBroken` |
 | `mcp_call` | `POST /mcp` `initialize`, `notifications/initialized`, then `tools/call` `fetch_inbox`, authenticated with the monitoring token | each step succeeds and the tool result is not an error | `BatonMcpCallFailed` |
+
+Unlike the static `/board` HTML page at the edge, **`/healthz` is not public**: unauthenticated requests are rejected at the gateway and bridge. The `board` probe therefore uses the same monitoring token as `mcp_call`, which proves the path through the edge and gateway to a live bridge and database.
 
 `mcp_call` is read-only: `fetch_inbox` does not change any state. Plain JSON and `text/event-stream` replies are both understood; a stream is read until the server closes it, so a server that keeps a stream open fails the probe with `timeout`.
 
@@ -32,7 +34,7 @@ docker compose run --rm --no-deps \
   --output /delivery/baton-monitor.token --uid "$(id -u)" --gid "$(id -g)"
 ```
 
-The token is only ever read from `--token-file`. It is not accepted as an argument or environment variable, so it cannot leak through `ps` or the process environment.
+The token is only ever read from `--token-file`. It is not accepted as an argument or environment variable, so it cannot leak through `ps` or the process environment. The `board` and `mcp_call` probes send it to the configured Baton URL only.
 
 ## Pull-mode contract
 
@@ -57,8 +59,8 @@ A [vmalert](https://docs.victoriametrics.com/vmalert/)-compatible list of the al
       {
         "labels": {"alertname": "BatonBoardDown", "severity": "critical", "service": "baton"},
         "annotations": {
-          "summary": "Baton board is not answering 200",
-          "description": "GET /board did not return 200 on baton-prod; last error: http_503; 3 consecutive failed probes"
+          "summary": "Baton board stack is not healthy",
+          "description": "GET /healthz with the monitoring token did not return 200 with status ok on baton-prod; last error: http_503; 3 consecutive failed probes"
         },
         "state": "firing",
         "activeAt": "2026-01-01T12:00:00Z",

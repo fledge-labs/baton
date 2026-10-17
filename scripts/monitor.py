@@ -4,7 +4,7 @@
 
 Probes, every --interval seconds:
 
-  board      GET  /board                          must answer 200
+  board      GET  /healthz through the edge with the monitoring token  must answer 200 and status ok
   mcp_unauth POST /mcp without credentials        must answer 401
   mcp_call   POST /mcp initialize + fetch_inbox   must succeed with the monitoring token
 
@@ -70,8 +70,8 @@ DEFAULT_PORT = 19801
 STALE_INTERVALS = 3
 LOOPBACK_DEFAULT = "127.0.0.1"
 ALERT_TEMPLATES = {
-    "board": ("BatonBoardDown", "critical", "Baton board is not answering 200",
-              "GET /board did not return 200"),
+    "board": ("BatonBoardDown", "critical", "Baton board stack is not healthy",
+              "GET /healthz with the monitoring token did not return 200 with status ok"),
     "mcp_unauth": ("BatonMcpAuthBroken", "critical", "Baton MCP endpoint does not reject unauthenticated requests",
                    "POST /mcp without credentials did not return 401"),
     "mcp_call": ("BatonMcpCallFailed", "critical", "Baton MCP call with the monitoring token fails",
@@ -241,11 +241,18 @@ def parse_rpc(response, data):
     return message
 
 
-def probe_board(endpoint, timeout, context, deadline):
-    status, _, _ = http_request(endpoint, "GET", "/board", timeout=timeout, context=context,
-                                budget=Budget(deadline))
+def probe_board(endpoint, token, timeout, context, deadline):
+    headers = {"Authorization": "Bearer " + token}
+    status, _, data = http_request(endpoint, "GET", "/healthz", headers=headers, timeout=timeout, context=context,
+                                   budget=Budget(deadline))
     if status != 200:
         raise ProbeError("http_%d" % status)
+    try:
+        body = json.loads(data.decode("utf-8"))
+    except ValueError:
+        raise ProbeError("invalid_response") from None
+    if not isinstance(body, dict) or body.get("status") != "ok":
+        raise ProbeError("health_not_ok")
 
 
 def initialize_body():
@@ -717,7 +724,7 @@ def build_probes(args):
     context = tls_context(args.ca_file) if endpoint.scheme == "https" else None
     timeout, deadline = args.timeout, args.probe_deadline
     return {
-        "board": lambda: probe_board(endpoint, timeout, context, deadline),
+        "board": lambda: probe_board(endpoint, token, timeout, context, deadline),
         "mcp_unauth": lambda: probe_mcp_unauth(endpoint, timeout, context, deadline),
         "mcp_call": lambda: probe_mcp_call(endpoint, token, timeout, context, deadline),
     }
