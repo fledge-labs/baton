@@ -2587,10 +2587,11 @@ def test_one_pending_grant_that_cannot_be_settled_does_not_stop_the_others(tmp_p
     work = "/work/w1"
     once = keeper.grant(request_view("r-once", "allow_once", "t-once"), "rg", work)
     always = keeper.grant(request_view("r-always", "allow_always", "t-always"), "sed", work, command="sed -n 's/a/b/p'")
-    sed_rule = agy_rule("sed", work)
-    lr.edit_rule(settings, lr.CLI_PROFILES["agy"], sed_rule, True)
+    # A rule no live grant holds, so settling the good pending entry can remove it without touching sed's shim.
+    planted = "/var/lib/baton-runner/shims/w1/planted"
+    lr.edit_rule(settings, lr.CLI_PROFILES["agy"], planted, True)
     grants = keeper.ledger.load()
-    common = {"tool": "sed", "directory": work, "rule": sed_rule, "option": "allow_once", "cli": "agy",
+    common = {"tool": "sed", "directory": work, "rule": planted, "option": "allow_once", "cli": "agy",
               "granted_reported": False, "revoked_reported": False, "preexisting": False}
     grants["bad"] = {"id": "bad", "request_id": "r-bad", "task_id": "t-bad", "config_file": "/etc/passwd",
                      "status": "pending", "created": 0, **common}
@@ -2601,7 +2602,7 @@ def test_one_pending_grant_that_cannot_be_settled_does_not_stop_the_others(tmp_p
     keeper.log = lambda task, what, **fields: notes.append((what, fields))
     keeper.reconcile()
     allow = json.loads(settings.read_text())["permissions"]["allow"]
-    assert sed_rule not in allow and agy_rule("rg", work) not in allow
+    assert planted not in allow and agy_rule("rg", work) not in allow
     assert agy_rule("sed", work) in allow
     loaded = keeper.ledger.load()
     assert loaded["bad"]["status"] == "pending" and loaded["good"]["status"] == "revoked"
