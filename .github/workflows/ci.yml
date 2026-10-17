@@ -18,7 +18,7 @@ jobs:
       - name: install bubblewrap for the sandbox tests
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq bubblewrap
+          sudo apt-get install -y -qq bubblewrap ripgrep
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: sh scripts/test_with_postgres.sh
   hygiene:

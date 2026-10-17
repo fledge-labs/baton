@@ -15,7 +15,7 @@ environment. Tokens are read only by this process; the child gets a scrubbed env
 
 A worker whose CLI refuses a command because its own allowlist lacks it can ask for input instead of failing: the runner
 parses the refusal, posts a permission request in the task thread and waits, holding the same claim and epoch. On approval
-by a Baton approver it adds one rule to that CLI's allowlist (never to the sandbox) and re-runs in the same worktree.
+by a Baton approver it allowlists a runner-owned shim for that one program (never a blanket command, and never the sandbox) and re-runs in the same worktree. The shim checks the argument policy on every later call.
 `--list-grants`, `--revoke-grant` and `--revoke-worker` list and withdraw those rules.
 
 Exit codes: 0 ok, 1 runtime error, 2 usage or configuration error.
@@ -25,6 +25,7 @@ import argparse
 import contextlib
 import fcntl
 import importlib.util
+import inspect
 import json
 import os
 import queue
@@ -242,11 +243,8 @@ def parse_permissions(raw, what, principal):
     if principal in approvers:
         raise ConfigError(what + ".approvers may not name the worker itself")
     template = raw.get("rule_template")
-    if template is not None and (not isinstance(template, str) or any(template.count(mark) != 1 for mark in ("{tool}", "{args}", "{directory}"))
-                                 or len(template) > 200
-                                 or re.search(r"[\x00-\x1f\x7f]", template)):
-        raise ConfigError(what + ".rule_template must be one line of at most 200 characters with {tool}, {args} and "
-                          "{directory} each exactly once")
+    if template is not None and template != EXACT_TEMPLATE:
+        raise ConfigError(what + ".rule_template must be the exact string {shim}")
     return PermissionConfig(
         cli=name, config_file=_path(raw, "config_file", what), approvers=list(dict.fromkeys(approvers)),
         wait_seconds=_int(raw, "wait_seconds", what, 1800, 1, 86400),
@@ -567,6 +565,8 @@ class SandboxPlan:
     keychain_dirs: list = field(default_factory=list)
     home_dirs: list = field(default_factory=list)
     home_read: list = field(default_factory=list)
+    shim_read: list = field(default_factory=list)
+    spool_write: list = field(default_factory=list)
 
 
 def _real(path):
@@ -619,11 +619,14 @@ def bwrap_command(plan, argv):
         args += ["--tmpfs", directory]
     if plan.config_file and os.path.exists(plan.config_file):
         args += ["--ro-bind", "/dev/null", plan.config_file]
-    for path in plan.home_read:
+    for path in [*plan.home_read, *plan.shim_read]:
         if os.path.exists(path):
             args += ["--ro-bind", path, path]
     for path in [plan.worktree, plan.tmpdir, *plan.extra_write]:
         args += ["--bind", path, path]
+    for path in plan.spool_write:
+        if os.path.isdir(path):
+            args += ["--bind", path, path]
     for directory in masked:
         args += ["--remount-ro", directory]  # the empty tmpfs stays empty; the binds above remain separate mounts
     return args + ["--chdir", plan.worktree, "--"] + list(argv)
@@ -649,13 +652,13 @@ def sandbox_exec_profile(plan):
         lines.append("(deny file-read* (subpath %s))" % _sbpl(directory))
     if plan.keychain_dirs:
         lines.append("(deny mach-lookup %s)" % " ".join("(global-name %s)" % _sbpl(n) for n in KEYCHAIN_MACH_SERVICES))
-    readable = [plan.worktree, plan.tmpdir, *plan.extra_write, *plan.home_read]
+    readable = [plan.worktree, plan.tmpdir, *plan.extra_write, *plan.home_read, *plan.shim_read, *plan.spool_write]
     for path in readable:
         lines.append("(allow file-read* (subpath %s))" % _sbpl(path))
     for path in home_ancestors(plan, readable):
         lines.append("(allow file-read-metadata (literal %s))" % _sbpl(path))
     lines.append("(deny file-write*)")
-    writable = [plan.worktree, plan.tmpdir, *plan.extra_write]
+    writable = [plan.worktree, plan.tmpdir, *plan.extra_write, *plan.spool_write]
     lines.append("(allow file-write* %s (literal \"/dev/null\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/tty\"))"
                  % " ".join("(subpath %s)" % _sbpl(path) for path in writable))
     if not plan.allow_network:
@@ -1313,6 +1316,21 @@ def _git_problem(argv, worktree):
 _GRANT_POLICIES = {"rg": _rg_problem, "sed": _sed_problem, "git": _git_problem}
 
 
+def argv_problem(tool, argv, worktree):
+    """None when this argv is within the tool's fixed policy and every path it writes stays in worktree.
+
+    The generated shim calls this on every execution. `argv[0]` is the program name, not a path.
+    """
+    name = tool_basename(tool)
+    if name not in _GRANT_POLICIES:
+        return "%s is not on the allow-list and is never granted" % (name or tool)
+    if not argv or tool_basename(argv[0]) != name:
+        return "the command line does not start with %s, so it is never granted" % name
+    if not isinstance(worktree, str) or not os.path.isabs(worktree):
+        return "the task worktree is not an absolute path, so nothing is granted"
+    return _GRANT_POLICIES[name](argv, worktree)
+
+
 def argument_problem(tool, command, worktree):
     """None when this exact command line is within the tool's fixed policy and every path it writes stays in worktree."""
     name = tool_basename(tool)
@@ -1323,11 +1341,203 @@ def argument_problem(tool, command, worktree):
     argv = _split_command(command)
     if not argv:
         return "the command line could not be parsed, so it is never granted"
-    if tool_basename(argv[0]) != name:
-        return "the command line does not start with %s, so it is never granted" % name
-    if not isinstance(worktree, str) or not os.path.isabs(worktree):
-        return "the task worktree is not an absolute path, so nothing is granted"
-    return _GRANT_POLICIES[name](argv, worktree)
+    return argv_problem(name, argv, worktree)
+
+
+def runner_data_root():
+    """Runner-owned directory under the real HOME, outside every task worktree."""
+    return os.path.join(os.path.expanduser("~"), ".local", "share", "baton-runner")
+
+
+def _principal_dir(principal, kind):
+    if not isinstance(principal, str) or not cli.AGENT_RE.fullmatch(principal):
+        raise RunnerError("the worker name cannot name a %s directory" % kind)
+    return os.path.join(runner_data_root(), kind, principal)
+
+
+def shim_dir(principal):
+    return _principal_dir(principal, "shims")
+
+
+def spool_dir(principal):
+    return _principal_dir(principal, "spool")
+
+
+def shim_path(principal, tool):
+    """Absolute path of the runner-owned shim for one worker and one allow-listed program."""
+    name = tool_basename(tool)
+    if name not in GRANTABLE_TOOLS:
+        raise RunnerError("%s is not on the allow-list" % (name or tool))
+    return os.path.join(shim_dir(principal), name)
+
+
+def ensure_shim_dirs(principal):
+    """Create the shim directory (0755) and the refusal spool (0700). The sandbox re-binds them."""
+    shim, spool = shim_dir(principal), spool_dir(principal)
+    os.makedirs(shim, mode=0o755, exist_ok=True)
+    os.chmod(shim, 0o755)
+    os.makedirs(spool, mode=0o700, exist_ok=True)
+    os.chmod(spool, 0o700)
+    return shim, spool
+
+
+def shim_inside_writable(worker):
+    """True when the shim or its spool would sit inside a directory this worker's CLI can write."""
+    roots = [os.path.realpath(worker.workdir_root)]
+    roots.extend(os.path.realpath(path) for path in worker.sandbox.extra_write_paths)
+    for path in (shim_dir(worker.principal), spool_dir(worker.principal)):
+        real = os.path.realpath(path)
+        if any(real == root or _under(real, [root]) for root in roots):
+            return True
+    return False
+
+
+def resolve_real_binary(name):
+    """Absolute path of the real program, never a path under the runner's own shim tree and never via a later PATH lookup."""
+    root = os.path.realpath(runner_data_root())
+    prefix = root.rstrip(os.sep) + os.sep
+    entries = []
+    for entry in os.environ.get("PATH", "/usr/bin:/bin").split(os.pathsep):
+        if not entry:
+            continue
+        real = os.path.realpath(entry)
+        if real == root or real.startswith(prefix):
+            continue
+        entries.append(entry)
+    found = shutil.which(name, path=os.pathsep.join(entries) or "/usr/bin:/bin")
+    if not found:
+        return None
+    real = os.path.realpath(found)
+    if real == root or real.startswith(prefix) or not os.path.isfile(real) or not os.access(real, os.X_OK):
+        return None
+    return real
+
+
+_SHIM_FUNCTIONS = (tool_basename, _inside_worktree, _rg_problem, _sed_regex_end, _sed_address, _sed_line_path,
+                   _sed_script_problem, _sed_problem, _git_forbidden, _git_problem, argv_problem)
+
+# Appended to every generated shim. Standard library only; no eval; the real program is exec'd by the baked absolute path.
+SHIM_MAIN = """
+def _cwd_covers(worktree):
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        return False
+    return _inside_worktree(cwd, worktree)
+
+
+def _once_path(grant):
+    return os.path.join(SPOOL, grant["id"] + ".once")
+
+
+def _note(grant, reason):
+    record = {"grant_id": grant.get("id"), "request_id": grant.get("request_id"), "task_id": grant.get("task_id"),
+              "tool": TOOL, "reason": reason, "argv": sys.argv[1:][:40], "time": time.time()}
+    name = "%d-%d-%s.json" % (time.time_ns(), os.getpid(), os.urandom(4).hex())
+    try:
+        fd = os.open(os.path.join(SPOOL, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, json.dumps(record).encode("utf-8"))
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+    sys.stderr.write("baton shim: %s\\n" % reason)
+    return 1
+
+
+def main():
+    argv = [TOOL, *sys.argv[1:]]
+    problem = "no grant allows this command"
+    chosen = None
+    ordered = [grant for grant in GRANTS if grant.get("option") != "allow_once"]
+    ordered += [grant for grant in GRANTS if grant.get("option") == "allow_once"]
+    for grant in ordered:
+        if grant.get("option") == "allow_once" and os.path.exists(_once_path(grant)):
+            problem = "allow_once was already used"
+            continue
+        problem = argv_problem(TOOL, argv, grant.get("worktree"))
+        if problem:
+            continue
+        if not _cwd_covers(grant.get("worktree")):
+            problem = "the command is outside the granted worktree"
+            continue
+        chosen = grant
+        break
+    if chosen is None:
+        sys.exit(_note(GRANTS[0] if GRANTS else {}, problem or "refused"))
+    if chosen.get("option") == "allow_once":
+        try:
+            fd = os.open(_once_path(chosen), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(fd)
+        except FileExistsError:
+            sys.exit(_note(chosen, "allow_once was already used"))
+        except OSError:
+            sys.exit(_note(chosen, "allow_once could not be recorded"))
+        others = [grant for grant in GRANTS if grant.get("id") != chosen.get("id")
+                  and not (grant.get("option") == "allow_once" and os.path.exists(_once_path(grant)))]
+        if not others:
+            try:
+                os.remove(sys.argv[0])
+            except OSError:
+                pass
+    try:
+        os.execv(REAL, [REAL, *sys.argv[1:]])
+    except OSError:
+        sys.exit(_note(chosen, "the real program could not be started"))
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+def shim_script(tool, real, spool, grants):
+    """A read-only standard-library program. It never imports the runner and never carries a Baton token."""
+    interpreter = "/usr/bin/python3" if os.path.isfile("/usr/bin/python3") and os.access("/usr/bin/python3", os.X_OK) else sys.executable
+    rows = [{"id": grant["id"], "request_id": grant["request_id"], "task_id": grant["task_id"],
+             "worktree": grant.get("directory"), "option": grant.get("option")} for grant in grants]
+    parts = [
+        "#!%s" % interpreter,
+        "# SPDX-License-Identifier: Apache-2.0",
+        "# Baton runner shim for %s. The worker can read this file and cannot write it." % tool,
+        "# Every call checks argv, then execs the real program at the absolute path fixed when the grant was written.",
+        "# Policy: %s" % POLICY_ARGS[tool],
+        "import json, os, sys, time",
+        "TOOL = %r" % tool,
+        "REAL = %r" % real,
+        "SPOOL = %r" % spool,
+        "GRANTS = %r" % (rows,),
+        "GIT_READONLY = frozenset(%r)" % (tuple(sorted(GIT_READONLY)),),
+        "GIT_SAFE_GLOBAL = frozenset(%r)" % (tuple(sorted(GIT_SAFE_GLOBAL)),),
+    ]
+    parts.extend(inspect.getsource(function).rstrip() for function in _SHIM_FUNCTIONS)
+    parts.append('_GRANT_POLICIES = {"rg": _rg_problem, "sed": _sed_problem, "git": _git_problem}')
+    parts.append(SHIM_MAIN.strip("\n"))
+    return "\n".join(parts) + "\n"
+
+
+def write_shim(path, tool, real, spool, grants):
+    """Atomically install the shim as mode 0555. The directory stays writable by the runner and is remounted read-only for the worker."""
+    text = shim_script(tool, real, spool, grants)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(str(path.parent), 0o755)
+    temporary = path.with_name("." + path.name + "." + uuid.uuid4().hex[:8] + ".tmp")
+    fd = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o555)
+    try:
+        os.write(fd, text.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.chmod(str(temporary), 0o555)
+    try:
+        os.replace(str(temporary), str(path))
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(str(temporary))
+        raise
+    os.chmod(str(path), 0o555)
 
 
 @dataclass(frozen=True)
@@ -1388,25 +1598,27 @@ class Denial:
 class Profile:
     """Where and how a CLI's own allowlist is written.
 
-    `rule` must carry {tool}, {args} (the fixed argument policy) and {directory} (the task worktree). A syntax that
-    cannot say both is not grantable: the runner will not write a rule that is wider than the check it just made.
+    `exact` is true only when an entry is matched as that whole string. The runner then writes the shim's absolute
+    path and nothing else. A prefix or glob matcher cannot say "forbid --pre", so a CLI with exact=False is not grantable.
     """
     kind: str
     keys: tuple
     rule: str
+    exact: bool
 
 
-# Only agy's `permissions.allow` array is documented in this repository (onboarding/agy.md); every other path and every rule
-# syntax here is an unverified assumption that the operator must check, or override with permissions.rule_template. The
-# default for each CLI names the program, the argument policy and the worktree. A template that drops {args} or
-# {directory} makes that CLI not grantable.
+# Only agy's `permissions.allow` array of exact strings is documented in this repository (onboarding/agy.md). Opencode's
+# bash map is treated as an exact key match; that is an assumption the operator must confirm. Codex, grok, cline and dsh
+# are detected but not grantable: their documented matchers are prefix or glob, which cannot express a negative
+# constraint, and this repository does not have a syntax that is guaranteed to match one absolute path and nothing else.
+EXACT_TEMPLATE = "{shim}"
 CLI_PROFILES = {
-    "agy": Profile("json_list", ("permissions", "allow"), "run_command({tool} {args} in {directory})"),
-    "codex": Profile("lines", (), 'prefix_rule(pattern=["{tool}", "{args}"], decision="allow", cwd="{directory}")'),
-    "grok": Profile("json_list", ("permissions", "allow"), "Bash({tool}:{args} in {directory})"),
-    "cline": Profile("json_list", ("allow",), "{tool} {args} {directory}"),
-    "opencode": Profile("json_map", ("permission", "bash"), "{tool} {args} {directory}"),
-    "dsh": Profile("json_list", ("permissions", "allow"), "shell({tool} {args} in {directory})"),
+    "agy": Profile("json_list", ("permissions", "allow"), EXACT_TEMPLATE, True),
+    "codex": Profile("lines", (), EXACT_TEMPLATE, False),
+    "grok": Profile("json_list", ("permissions", "allow"), EXACT_TEMPLATE, False),
+    "cline": Profile("json_list", ("allow",), EXACT_TEMPLATE, False),
+    "opencode": Profile("json_map", ("permission", "bash"), EXACT_TEMPLATE, True),
+    "dsh": Profile("json_list", ("permissions", "allow"), EXACT_TEMPLATE, False),
 }
 
 
@@ -1460,29 +1672,45 @@ def detect_denial(cli_name, text, secrets=()):
     return denial
 
 
-DIRECTORY_RE = re.compile(r"[A-Za-z0-9_./@+:-][A-Za-z0-9_./@+: -]{0,498}")
+# An allowlist entry is this absolute path and nothing else: no glob, no space, no extra argument text.
+SHIM_RE = re.compile(r"/[A-Za-z0-9_./@+:-]{1,500}")
 
 
 def rule_template_of(permissions):
     return permissions.rule_template or CLI_PROFILES[permissions.cli].rule
 
 
-def rule_encodes_constraints(permissions):
-    """The CLI rule can state the argument policy and the worktree. Otherwise the tool is not grantable for this CLI."""
-    template = rule_template_of(permissions)
-    return all(template.count(mark) == 1 for mark in ("{tool}", "{args}", "{directory}"))
+def render_rule(permissions, shim_path):
+    """The allowlist entry for one shim: its absolute path, and only when this CLI matches that string exactly."""
+    profile = CLI_PROFILES[permissions.cli]
+    if not profile.exact or rule_template_of(permissions) != EXACT_TEMPLATE:
+        raise RunnerError("this CLI cannot be guaranteed to exact-match a shim path, so nothing is granted")
+    if (not isinstance(shim_path, str) or not SHIM_RE.fullmatch(shim_path)
+            or any(part == ".." for part in shim_path.split("/"))):
+        raise RunnerError("the shim path cannot be written as an exact allowlist entry")
+    return shim_path
 
 
-def render_rule(permissions, tool, directory):
-    template = rule_template_of(permissions)
-    if not rule_encodes_constraints(permissions):
-        raise RunnerError("the CLI rule cannot express the argument limits and the worktree")
+def refusal_grant_problem(permissions, principal, tool, command, worktree, active):
+    """Why this refusal cannot become a grant, or None when a request may be posted."""
+    if is_ungrantable(tool):
+        return "%s cannot be allowlisted through Baton (it is not on the allow-list)" % tool
+    problem = argument_problem(tool, command, worktree)
+    if problem:
+        return problem
     name = tool_basename(tool)
-    if name not in POLICY_ARGS:
-        raise RunnerError("%s is not on the allow-list" % name)
-    if not directory or not DIRECTORY_RE.fullmatch(directory):
-        raise RunnerError("the worktree cannot be written into the rule")
-    return (template.replace("{tool}", name).replace("{args}", POLICY_ARGS[name]).replace("{directory}", directory))
+    if not CLI_PROFILES[permissions.cli].exact or rule_template_of(permissions) != EXACT_TEMPLATE:
+        return "this CLI cannot be guaranteed to exact-match a shim path, so nothing is granted"
+    if resolve_real_binary(name) is None:
+        return "the real %s program is not installed, so nothing is granted" % name
+    try:
+        render_rule(permissions, os.path.realpath(shim_path(principal, name)))
+    except RunnerError as error:
+        return str(error)
+    if any(record.get("tool") == name and record.get("directory") == worktree and record.get("status") == "active"
+           for record in active):
+        return "the CLI still refused %s although it is already allowlisted for this worktree" % tool
+    return None
 
 
 def replace_file(path, text):
@@ -1573,6 +1801,7 @@ class GrantLedger:
     LOCK_WAIT_SECONDS = 10.0
 
     def __init__(self, state_dir, principal):
+        self.principal = principal
         self.path = Path(state_dir) / (principal + ".grants.json")
         self.lock_path = Path(state_dir) / (principal + ".grants.lock")
         self.thread_lock = threading.Lock()
@@ -1637,11 +1866,29 @@ class GrantLedger:
             if edit_rule(record["config_file"], profile, record["rule"], False, dry_run=True):
                 raise RunnerError("the rule is still present in the CLI configuration")
 
-    def add(self, worker, request, tool, directory, command):
-        """Record, then write, then activate one rule; returns the entry. Undo it with remove() if it cannot be reported.
+    def _refresh_shim(self, grants, record):
+        """Rewrite the shim from the grants that still hold it, or delete the file when none do.
 
-        `directory` is the runner's own task worktree, never a path taken from CLI output. The rule names that directory
-        and the tool's fixed argument policy; a template that cannot say both is refused.
+        Records planted without a shim path (a crash leftover from before shims) leave the file alone.
+        """
+        path, tool = record.get("shim"), record.get("tool")
+        if not path or not tool or not record.get("real"):
+            return
+        living = [other for other in grants.values() if other.get("tool") == tool and other.get("shim") and other.get("real")
+                  and other.get("status") in ("active", "pending")]
+        if not living:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path)
+            return
+        living.sort(key=lambda item: item.get("created") or 0)
+        current = living[-1]
+        write_shim(current["shim"], tool, current["real"], spool_dir(self.principal), living)
+
+    def add(self, worker, request, tool, directory, command):
+        """Record, install the shim, then write its absolute path into the allowlist. Undo with remove().
+
+        `directory` is the runner's own task worktree, never a path taken from CLI output. The allowlist entry is
+        only that shim's absolute path. The shim, not the CLI rule, checks the argument policy on every later call.
         """
         permissions = worker.permissions
         profile = CLI_PROFILES[permissions.cli]
@@ -1651,18 +1898,25 @@ class GrantLedger:
         problem = argument_problem(name, command, directory)
         if problem:
             raise RunnerError(problem)
-        if not rule_encodes_constraints(permissions):
-            raise RunnerError("the CLI rule cannot express the argument limits and the worktree")
-        rule = render_rule(permissions, name, directory)
+        real = resolve_real_binary(name)
+        if real is None:
+            raise RunnerError("the real %s program is not installed, so nothing is granted" % name)
+        if not profile.exact or rule_template_of(permissions) != EXACT_TEMPLATE:
+            raise RunnerError("this CLI cannot be guaranteed to exact-match a shim path, so nothing is granted")
+        ensure_shim_dirs(worker.principal)
+        if shim_inside_writable(worker):
+            raise RunnerError("permission shims would be inside a writable directory")
+        shim = os.path.realpath(shim_path(worker.principal, name))
+        rule = render_rule(permissions, shim)
         path = os.path.realpath(permissions.config_file)
         if not self.confined(worker, path):
             raise RunnerError("the CLI configuration is not inside the worker's own directories")
         with self.locked():
             grants = self.load()
             record = {"id": uuid.uuid4().hex, "request_id": request["request_id"], "task_id": request["task_id"],
-                      "tool": name, "directory": directory, "rule": rule, "option": request["status"], "cli": permissions.cli,
-                      "config_file": path, "status": "pending", "granted_reported": False, "revoked_reported": False,
-                      "created": time.time()}
+                      "tool": name, "directory": directory, "rule": rule, "shim": shim, "real": real,
+                      "option": request["status"], "cli": permissions.cli, "config_file": path, "status": "pending",
+                      "granted_reported": False, "revoked_reported": False, "created": time.time()}
             holders = self.holders(grants, record)
             # An entry that was there before the runner touched the file is the operator's: it is never removed.
             record["preexisting"] = edit_rule(path, profile, rule, True, dry_run=True) and (
@@ -1670,6 +1924,7 @@ class GrantLedger:
             grants[record["id"]] = record
             self.save(grants)
             try:
+                self._refresh_shim(grants, record)
                 edit_rule(path, profile, rule, True)
                 if not edit_rule(path, profile, rule, True, dry_run=True):
                     raise RunnerError("the rule did not reach the CLI configuration")
@@ -1680,12 +1935,13 @@ class GrantLedger:
                     self._undo(grants, record)
                     record["status"] = "revoked"
                     record["revoked_reported"] = True
+                    self._refresh_shim(grants, record)
                     self.save(grants)
                 raise
             return dict(record)
 
     def remove(self, worker, grant_id):
-        """Withdraw one active grant and check the rule is really gone; None when nothing is active under that id."""
+        """Withdraw one active grant: drop it from the shim and check the allowlist entry is really gone."""
         with self.locked():
             grants = self.load()
             record = grants.get(grant_id)
@@ -1693,6 +1949,7 @@ class GrantLedger:
                 return None
             self._undo(grants, record, self.confined(worker, record["config_file"]))
             record["status"] = "revoked"
+            self._refresh_shim(grants, record)
             self.save(grants)
             return dict(record)
 
@@ -1711,6 +1968,7 @@ class GrantLedger:
                     self._undo(grants, record, self.confined(worker, record["config_file"]))
                     record["status"] = "revoked"
                     record["revoked_reported"] = True
+                    self._refresh_shim(grants, record)
                     self.save(grants)
                 except (RunnerError, OSError) as error:
                     failed.append((record.get("id"), str(error) if isinstance(error, RunnerError) else "the CLI configuration is not writable"))
@@ -1748,7 +2006,8 @@ class Baton:
         return self.client.call(operation, arguments, read_timeout=read_timeout)
 
     def write(self, operation, arguments):
-        arguments = dict(arguments, operation_id=str(uuid.uuid4()))
+        arguments = dict(arguments)
+        arguments.setdefault("operation_id", str(uuid.uuid4()))
         for attempt in range(1, self.ATTEMPTS + 1):
             try:
                 return self.client.call(operation, arguments)
@@ -1773,18 +2032,26 @@ class GrantKeeper:
     def __init__(self, worker, ledger, baton, log):
         self.worker, self.ledger, self.baton, self.log = worker, ledger, baton, log
 
-    def _report(self, record, kind):
+    def _report(self, record, kind, reason=None):
+        """True when Baton accepted the report. A Baton or network error is returned so a spool drain can tell a
+        permanent rejection from a retry. Granted and revoked reports also mark the ledger; a shim refusal does not."""
         if self.baton is None:
             return False
+        arguments = {"task_id": record["task_id"], "request_id": record["request_id"], "event": kind}
+        if reason:
+            arguments["reason"] = reason
+        if record.get("operation_id"):
+            arguments["operation_id"] = record["operation_id"]
         try:
-            self.baton.write("record_permission", {"task_id": record["task_id"], "request_id": record["request_id"], "event": kind})
+            self.baton.write("record_permission", arguments)
         except (cli.BatonError, cli.NetworkError) as error:
             self.log(record["task_id"], "grant-unreported", event=kind, error=error_code(error))
-            return False
-        try:
-            self.ledger.mark(record["id"], **{kind + "_reported": True})
-        except (RunnerError, OSError):
-            self.log(record["task_id"], "grant-ledger-unwritten", event=kind)
+            return error
+        if kind in ("granted", "revoked"):
+            try:
+                self.ledger.mark(record["id"], **{kind + "_reported": True})
+            except (RunnerError, OSError):
+                self.log(record["task_id"], "grant-ledger-unwritten", event=kind)
         return True
 
     def grant(self, request, tool, directory, command=None):
@@ -1798,7 +2065,7 @@ class GrantKeeper:
         except (RunnerError, OSError) as error:
             raise RunnerError("could not apply the approved permission: " + (str(error) if isinstance(error, RunnerError)
                                                                                else "the CLI configuration is not writable")) from None
-        if not self._report(record, "granted"):
+        if self._report(record, "granted") is not True:
             self.revoke(record["id"])
             raise RunnerError("the approved permission could not be recorded in Baton and was withdrawn")
         self.log(record["task_id"], "grant-applied", tool=tool, option=record["option"], grant=record["id"])
@@ -1841,10 +2108,64 @@ class GrantKeeper:
             for record in self.ledger.unreported():
                 if record["status"] == "revoked":
                     self._report(record, "revoked")
-                elif not self._report(record, "granted"):
+                elif self._report(record, "granted") is not True:
                     self.revoke(record["id"])
         except (RunnerError, OSError):
             self.log(None, "grant-reconcile-failed", grant="unreported")
+
+    def retire_consumed(self):
+        """Delete a shim once every grant that still points at it is an allow_once that has already run.
+
+        The worker can delete the counter file (the spool is writable) but cannot put the shim back: its directory
+        is read-only inside the sandbox. Another grant that has not been consumed keeps the file.
+        """
+        spool = spool_dir(self.worker.principal)
+        with self.ledger.locked():
+            grants = self.ledger.load()
+            grouped = {}
+            for record in grants.values():
+                if record.get("status") in ("active", "pending") and record.get("shim"):
+                    grouped.setdefault(record["shim"], []).append(record)
+            for path, records in grouped.items():
+                if records and all(item.get("option") == "allow_once" and os.path.exists(
+                        os.path.join(spool, item["id"] + ".once")) for item in records):
+                    with contextlib.suppress(OSError):
+                        os.unlink(path)
+
+    def drain_spool(self):
+        """Forward shim refusals. The shim writes a file; this process, which holds the token, reports it.
+
+        Unknown files are discarded. A permanent Baton rejection is discarded too, so one bad file cannot spin.
+        """
+        if self.baton is None:
+            return
+        spool = spool_dir(self.worker.principal)
+        if not os.path.isdir(spool):
+            return
+        names = sorted(name for name in os.listdir(spool) if name.endswith(".json"))
+        with self.ledger.locked():
+            grants = self.ledger.load()
+        for name in names:
+            path = os.path.join(spool, name)
+            try:
+                payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
+                continue
+            grant_id = payload.get("grant_id") if isinstance(payload, dict) else None
+            known = grants.get(grant_id) if isinstance(grant_id, str) else None
+            if not isinstance(known, dict) or known.get("request_id") != payload.get("request_id"):
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
+                continue
+            reported = self._report(
+                {"id": known["id"], "task_id": known["task_id"], "request_id": known["request_id"],
+                 "operation_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "baton/shim-refusal/" + name))},
+                "shim_refused", one_line(str(payload.get("reason") or "refused"), 300))
+            if reported is True or (isinstance(reported, cli.BatonError) and not cli.transient(reported)):
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
 
 
 def call_interruptible(stop, work):
@@ -1900,8 +2221,17 @@ class WorkerRunner:
         for index in range(self.worker.concurrency):
             self.threads.append(threading.Thread(target=self.exec_loop, name="exec-%s-%d" % (self.principal, index),
                                                  daemon=True))
+        if self.keeper is not None:
+            self.threads.append(threading.Thread(target=self.shim_watch_loop, name="shim-" + self.principal, daemon=True))
         for thread in self.threads:
             thread.start()
+
+    def shim_watch_loop(self):
+        """Unlink a consumed allow_once shim from the host, and forward refusal records the shim left in the spool."""
+        while not self.stop.wait(0.2):
+            with contextlib.suppress(RunnerError, OSError, cli.BatonError, cli.NetworkError):
+                self.keeper.retire_consumed()
+                self.keeper.drain_spool()
 
     def schedule(self, task_id, delay):
         if delay <= 0:
@@ -2127,7 +2457,14 @@ class WorkerRunner:
         finally:
             renewing.set()
             renewer.join(10)
+            if self.keeper is not None:
+                with contextlib.suppress(RunnerError, OSError):
+                    self.keeper.drain_spool()
             self.drop_once_grants(task_id, once)
+            if self.keeper is not None:
+                with contextlib.suppress(RunnerError, OSError):
+                    self.keeper.retire_consumed()
+                    self.keeper.drain_spool()
             shutil.rmtree(str(tmpdir), ignore_errors=True)
         try:
             if denied is not None:
@@ -2157,19 +2494,8 @@ class WorkerRunner:
             return None
         if denial.kind != "command":
             return "the CLI wants %s permission, which is outside the command allowlist and is never granted here" % plain(denial.tool)
-        if is_ungrantable(denial.tool):
-            return "%s cannot be allowlisted through Baton (it is not on the allow-list)" % denial.tool
-        problem = argument_problem(denial.tool, denial.command, plan.worktree)
-        if problem:
-            return problem
-        if not rule_encodes_constraints(self.worker.permissions):
-            return "this CLI's rule cannot express the argument limits and the worktree, so nothing is granted"
-        if not DIRECTORY_RE.fullmatch(plan.worktree):
-            return "the worktree path cannot be written into the rule"
-        if any(record["tool"] == tool_basename(denial.tool) and record.get("directory") == plan.worktree
-               and record["status"] == "active" for record in self.keeper.ledger.active()):
-            return "the CLI still refused %s although it is already allowlisted for this worktree" % denial.tool
-        return None
+        return refusal_grant_problem(self.worker.permissions, self.principal, denial.tool, denial.command, plan.worktree,
+                                     self.keeper.ledger.active())
 
     def post_request(self, task_id, epoch, denial, worktree):
         permissions = self.worker.permissions
@@ -2356,6 +2682,13 @@ class WorkerRunner:
 
     def sandbox_plan(self, workdir, tmpdir, admin=None):
         workers = self.runner.config.workers
+        shim_read, spool_write = [], []
+        if self.worker.permissions is not None:
+            shim_directory, spool_directory = os.path.realpath(shim_dir(self.principal)), os.path.realpath(spool_dir(self.principal))
+            if os.path.isdir(shim_directory):
+                shim_read.append(shim_directory)
+            if os.path.isdir(spool_directory):
+                spool_write.append(spool_directory)
         return SandboxPlan(
             backend=self.worker.sandbox.backend, allow_network=self.worker.sandbox.allow_network,
             worktree=_real(str(workdir)), tmpdir=_real(str(tmpdir)), own_root=_real(self.worker.workdir_root),
@@ -2369,11 +2702,14 @@ class WorkerRunner:
                            [_real(os.path.join(os.path.expanduser("~"), "Library", "Keychains")),
                             _real("/Library/Keychains")]),
             home_dirs=sorted({os.path.normpath(os.path.expanduser("~")), _real(os.path.expanduser("~"))}),
-            home_read=self.home_read_paths(admin))
+            home_read=self.home_read_paths(admin), shim_read=shim_read, spool_write=spool_write)
 
     def child_env(self, tmpdir, keychain=None):
         home = os.path.expanduser("~") if self.worker.home == "real" else str(tmpdir / "home")
-        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": home,
+        path = os.environ.get("PATH", "/usr/bin:/bin")
+        if self.worker.permissions is not None:
+            path = os.path.realpath(shim_dir(self.principal)) + os.pathsep + path
+        env = {"PATH": path, "HOME": home,
                "LANG": os.environ.get("LANG", "C.UTF-8"), "TERM": os.environ.get("TERM", "dumb"),
                "TMPDIR": str(tmpdir / "tmp")}
         for name in self.worker.env_passthrough:
@@ -2554,6 +2890,15 @@ class Runner:
             if missing:
                 self.refuse(worker, "sandbox.extra_write_paths entry is not a directory")
                 continue
+            if worker.permissions is not None:
+                try:
+                    ensure_shim_dirs(worker.principal)
+                except (OSError, RunnerError):
+                    self.refuse(worker, "permission shim directory could not be created")
+                    continue
+                if shim_inside_writable(worker):
+                    self.refuse(worker, "permission shims would be inside a writable directory")
+                    continue
             if worker.allow_keychain and worker.sandbox.backend != "none":
                 event(worker.principal, None, "WARNING allow_keychain=true: the sandbox lets this worker's CLI "
                       "read the Keychain, so any secret stored there can be exfiltrated over the network")

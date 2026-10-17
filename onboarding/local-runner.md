@@ -402,7 +402,7 @@ worker 字段：
 1. CLI 以非零退出结束（不含超时、被停止、租约丢失）。执行器在它的 stdout/stderr 里按该 CLI 的检测器表解析拒绝信息：被拒绝的程序（`tool`）、原因，以及输出里声称的目录。这个目录**只出现在检测结果里供人对照，不用于授权**：请求和写入的规则一律使用执行器自己的任务 worktree。解析不出字段，但输出里有明确的审批措辞（`requires approval`、`not in the allow list`、`denied by policy`、`no prompt available` 等）时，仍发请求，`tool` 记为 `(unparsed)`，并附带一段**有界、已脱敏**的原始输出片段（至多 1500 字符，对令牌、`env_passthrough` 值、Keychain 值做字面脱敏）。普通的操作系统 `Permission denied` 不算。
 2. 执行器发 `request_permission`：任务保持 `claimed`，视图出现 `blocked.reason_code=waiting_input`（`input required: permission`），线程出现一条以 `[input required: permission]` 开头的评论（一行说明加一段结构化 JSON），并提及 `permissions.approvers`，选项是 `allow_once`、`allow_always`、`deny`。执行器每 `poll_seconds`（默认 5）读一次 `list_permissions`，等待期间续租线程继续续租，最多等 `wait_seconds`（默认 1800）；超时、被停止或丢失租约时，执行器会 `cancel_permission` 撤回自己的请求（请求也会随 epoch 变化或 TTL 自动 `expired`），所以任务之后还能再申请；超时按普通失败处理（计一次失败）。
 3. 决定必须由 approver 通过 Baton 做出：Space 根，或持有覆盖该任务的审批人委托的主体（与 gate 的规则相同）。执行器自己的 worker 身份永远不能决定自己的请求，执行器代码里也没有任何决定调用；`approvers` 配置里不能写 worker 自己。别的人（没有委托的 reviewer、别的 agent）得到 `403`。
-4. `allow_once` / `allow_always`：执行器在**该 CLI 自己的白名单文件**（`permissions.config_file`）里加一条规则。规则写的是程序名、该程序写死的参数约束，以及**这个任务的 worktree**，不是 CLI 输出里的路径，也不是一条任意参数的通配。然后向 Baton 报告 `granted`，续租，在评论里说明，并在**同一个 worktree** 里重新运行 CLI（上一次运行留下的改动还在）。每次重跑都有完整的 `task_timeout_seconds`；一个任务至多发 `max_requests`（默认 3）个请求。`allow_once` 的规则在整个任务运行结束后（成功或失败，提交结果之前）移除并报告 `revoked`；之后的任务会重新请求。`allow_always` 的规则一直保留到撤销命令，但它仍然只指向写下它的那个 worktree：下一个任务的 worktree 路径不同，不会被这条规则覆盖。
+4. `allow_once` / `allow_always`：执行器**不**把 `rg …` 这类参数约束写进 CLI 白名单（各家 CLI 大多按前缀或通配匹配，表达不了“禁止 `--pre`”）。它在自己的目录 `~/.local/share/baton-runner/shims/<worker>/` 里放一个只读 shim（例如 `rg`），并把**这个 shim 的绝对路径**、且只有这一条精确字符串，写进 CLI 白名单。worker 的沙箱 `PATH` 最前面是这个目录，所以 CLI 里的 `rg` 命中 shim，而不是系统里的 `rg`。shim 在**每次调用**时用写死的参数策略检查 argv（见下表），通过才 `exec` 授权时解析好的真实二进制的绝对路径（不查 `PATH`）；不通过就以非零退出，并把一条记录写进执行器拥有的 spool，由执行器转发成审计 `permission.shim_refused`。shim 自己不持有 Baton 令牌。然后执行器向 Baton 报告 `granted`，续租，在评论里说明，并在**同一个 worktree** 里重新运行 CLI。每次重跑都有完整的 `task_timeout_seconds`；一个任务至多发 `max_requests`（默认 3）个请求。`allow_once` 的 shim 用一次后记一个计数文件并尝试删掉自己；执行器在宿主机上看到计数文件、且没有别的未用完的授权还需要这个文件时，也会删掉 shim。任务结束时（成功或失败，提交结果之前）执行器再删掉白名单条目并报告 `revoked`。`allow_always` 一直留到撤销命令：撤销就是删掉 shim（没有别的授权还需要它时）并撤掉白名单条目。下一次调用的工作目录必须落在这条授权记下的任务 worktree 里。
 5. `deny`：执行器评论说明，释放租约并 `mark_blocked(reason_code="other", note="permission_denied: <tool> (request <id>)")`，不再自动重试，也不记入失败次数。`permission_denied` 写在 `note` 里而不是原因码，因为 `blocked_reason` 的数据库约束只允许五个固定原因码，本功能不改 schema。
 
 配置（只示意 `permissions` 块；其余字段同上文 worker 配置）：
@@ -429,22 +429,24 @@ worker 字段：
 | `config_file` | 该 CLI 白名单文件的绝对路径（`~` 会展开）。必须落在**这个 worker 自己的 `home_read` 之内**（按真实路径比较，符号链接绕不过去），不能同时落在 `extra_write_paths` 里（否则 CLI 自己能改写白名单），也不能和别的 worker 共用同一个文件。这样授权只影响该 worker，且沙箱不会为此放宽：沙箱里这个文件仍是只读的，只有执行器进程（在沙箱外）写它 |
 | `approvers` | 1 到 10 个 principal，请求里会提及他们；不能包含 worker 自己。它决定提醒谁，不决定谁有权批准 |
 | `wait_seconds` / `poll_seconds` / `max_requests` | 等待上限（默认 1800 秒）、轮询间隔（默认 5 秒）、每个任务的请求数上限（默认 3） |
-| `rule_template` | 可选：覆盖默认规则模板。必须是一行、至多 200 字符，且 `{tool}`、`{args}`、`{directory}` 各出现恰好一次。`{args}` 换成该程序写死的参数约束文本，`{directory}` 换成任务 worktree。少了其中任何一个，这个 CLI 就不能通过这条路径授权 |
+| `rule_template` | 可选，只能是精确字符串 `{shim}`（也是默认值）。它被换成 shim 的绝对路径，不能再带通配、参数或目录。写成别的东西时配置直接被拒绝 |
 
 `home: "real"` 才有意义：授权写入的是操作者真实 `HOME` 下的 CLI 配置文件。用 `home: "task"`（临时 HOME）的 worker，CLI 读不到这个文件。
 
 ### 各 CLI 的检测器与白名单格式
 
-**这些都是未验证的。** 本仓库没有真实运行任何一个 CLI：测试里的每一条输出样例都是**合成的**（按各 CLI 拒绝信息的大致样子手写），不是从真实程序捕获的；检测器的正则因此只是“当前最好的猜测”，真实输出可能不同。解析不到的拒绝信息会走“未解析 + 原始片段”的兜底，人看得到，但不能自动授权（批准后执行器会明说“无法识别被拒绝的工具”，需要手工加白名单后重新分派）。下表“白名单文件”和“规则”也都需要操作者对照该 CLI 的官方文档确认，仅 agy 的 `permissions.allow` 数组路径在本仓库的 [agy 接入页](agy.md)里有出处，其规则写法同样未验证；不对时用 `rule_template` 覆盖，或者不要启用该 worker 的 `permissions`。
+**这些都是未验证的。** 本仓库没有真实运行任何一个 CLI：测试里的每一条输出样例都是**合成的**（按各 CLI 拒绝信息的大致样子手写），不是从真实程序捕获的；检测器的正则因此只是“当前最好的猜测”，真实输出可能不同。解析不到的拒绝信息会走“未解析 + 原始片段”的兜底，人看得到，但不能自动授权（批准后执行器会明说“无法识别被拒绝的工具”，需要手工加白名单后重新分派）。下表“白名单文件”需要操作者对照该 CLI 的官方文档确认，仅 agy 的 `permissions.allow` 数组（精确字符串）在本仓库的 [agy 接入页](agy.md)里有出处。写进去的永远是 shim 的绝对路径；`rule_template` 只能是 `{shim}`，不能用来改成通配。匹配方式对不上的 CLI 不要启用 `permissions`。
 
-| `cli` | 白名单位置（写入方式） | 默认规则（`{tool}` 程序名，`{args}` 参数约束，`{directory}` 任务 worktree） | 检测的拒绝信息（合成样例的形状） |
+| `cli` | 白名单位置（写入方式） | 能否授权 | 检测的拒绝信息（合成样例的形状） |
 | --- | --- | --- | --- |
-| `agy` | JSON，`permissions.allow` 数组 | `run_command({tool} {args} in {directory})` | `Permission denied: run_command "<命令>" is not in permissions.allow (cwd: <目录>)` |
-| `codex` | 文本，每行一条规则（追加/删除整行） | `prefix_rule(pattern=["{tool}", "{args}"], decision="allow", cwd="{directory}")` | `exec` / `<命令> in <目录>` / `…requires approval…` 三行 |
-| `grok` | JSON，`permissions.allow` 数组 | `Bash({tool}:{args} in {directory})` | `tool "bash" denied in non-interactive mode: command <命令，反引号包裹> is not allowed by permissions (cwd=<目录>)` |
-| `cline` | JSON，顶层 `allow` 数组 | `{tool} {args} {directory}` | `Command "<命令>" was blocked: no allow rule in CLINE_COMMAND_PERMISSIONS matches (workdir: <目录>)` |
-| `opencode` | JSON，`permission.bash` 映射（规则 → `"allow"`） | `{tool} {args} {directory}` | `permission requested: bash (<命令>); auto-rejecting`（这条样例没有目录；授权仍限定在任务 worktree）；`external_directory` 等非命令权限能解析但不授权 |
-| `dsh` | JSON，`permissions.allow` 数组 | `shell({tool} {args} in {directory})` | `dsh: shell command "<命令>" denied (policy=…, headless: no prompt available); cwd=<目录>` |
+| `agy` | JSON，`permissions.allow` 数组，条目是精确字符串 | 能。写入 shim 的绝对路径 | `Permission denied: run_command "<命令>" is not in permissions.allow (cwd: <目录>)` |
+| `codex` | 文本，每行一条规则（追加/删除整行） | **不能。** 已知匹配是前缀，保证不了“只等于这一条绝对路径” | `exec` / `<命令> in <目录>` / `…requires approval…` 三行 |
+| `grok` | JSON，`permissions.allow` 数组 | **不能。** 已知匹配是通配 | `tool "bash" denied in non-interactive mode: command <命令，反引号包裹> is not allowed by permissions (cwd=<目录>)` |
+| `cline` | JSON，顶层 `allow` 数组 | **不能。** 已知匹配是通配 | `Command "<命令>" was blocked: no allow rule in CLINE_COMMAND_PERMISSIONS matches (workdir: <目录>)` |
+| `opencode` | JSON，`permission.bash` 映射（规则 → `"allow"`） | 能，按“映射的键是整条命令的精确匹配”这个**未验证假设**。写入 shim 的绝对路径 | `permission requested: bash (<命令>); auto-rejecting`（这条样例没有目录；shim 仍只在任务 worktree 里放行）；`external_directory` 等非命令权限能解析但不授权 |
+| `dsh` | JSON，`permissions.allow` 数组 | **不能。** 没有可以保证精确匹配一条绝对路径的语法 | `dsh: shell command "<命令>" denied (policy=…, headless: no prompt available); cwd=<目录>` |
+
+`codex`、`grok`、`cline`、`dsh` 的拒绝信息仍然会被解析出来给人看，但执行器**不会**为它们发可批准的请求：批准了也无法保证 CLI 只放行 shim、不放行真实二进制。只有白名单能精确匹配 shim 绝对路径，或者命令经过沙箱 `PATH`（shim 挡住同名程序）且规则写的就是这条路径的 CLI，才能授权。
 
 账本先于配置文件写入：条目先以 `pending` 状态落盘，再把规则写进 CLI 配置，最后标为 `active`；写入后会回读确认规则确实在文件里。执行器在任何一步之间崩溃，都会留下一条 `pending` 记录，下次启动时 `settle_pending` 把它可能写下的规则撤回（操作者原有的规则和仍被别的授权使用的规则除外）。每一条 pending 单独处理：一条撤不掉（例如配置文件已经不在这个 worker 的目录里）会记一条 `grant-reconcile-failed` 并保持 `pending`，其余条目照常撤回，遗留的 `allow_once` 也不会因此被跳过。撤销同样回读确认规则已不在文件里，且要求配置文件仍在这个 worker 自己的 `home_read` 内；确认不了就保持 `active` 并报告失败，不会把一条仍然存在的规则标成已撤销。账本锁最长等待 10 秒，卡住的撤销命令不会拖死执行器（超时视为失败）。
 
@@ -460,9 +462,9 @@ worker 字段：
 | --- | --- | --- |
 | `rg` | 普通搜索。`--` 后面的内容当作模式，不当作选项 | `--pre`、`--pre-glob`（以及 `--pre=`、`--pre-glob=`）：它们会再执行一个程序 |
 | `sed` | 看得见的脚本，且其中没有执行命令；`w`/`W` 和 `-i` 的目标文件必须落在任务 worktree 内（按真实路径，穿过符号链接） | `e` 命令、`s///e`、`-f`/`--file`（脚本不在命令行里，无法检查）、写到 worktree 之外、解析不了的脚本 |
-| `git` | 只读子命令 `status`、`log`、`diff`、`show`、`ls-files`、`rev-parse`、`blame`，以及少量不改配置、不换目录的全局选项（例如 `--no-pager`） | 任何其他子命令（别名也算）、`-c`、`--config`、`--upload-pack`、`--exec`、`-C`、`--git-dir`、`--work-tree`、`--ext-diff`。`log -c` 这种合并 diff 同样拒绝：写进 CLI 的规则文本就是 `! -c`，执行器不会放行一条比这条文本更宽的命令 |
+| `git` | 只读子命令 `status`、`log`、`diff`、`show`、`ls-files`、`rev-parse`、`blame`，以及少量不改配置、不换目录的全局选项（例如 `--no-pager`） | 任何其他子命令（别名也算）、`-c`、`--config`、`--upload-pack`、`--exec`、`-C`、`--git-dir`、`--work-tree`、`--ext-diff`。`log -c` 这种合并 diff 同样拒绝 |
 
-写入 CLI 配置的规则不是被拒绝的那条原始命令，而是模板里的 `{tool}`、`{args}`、`{directory}`：`{args}` 是上表对应的固定约束文本，`{directory}` 是任务 worktree。某个 CLI 的模板表达不了这两项时，这个工具对该 CLI 不可授权。执行器在写规则之前用上面的检查看过真实命令行；CLI 自己是否理解规则文本里的约束，本仓库没有验证，见下节的限制。
+这些限制由 shim 在**每一次执行**时检查，不靠 CLI 白名单的文本。写进白名单的只有 shim 的绝对路径。shim 是执行器生成的一小段标准库 Python（不用 `eval`），解释器是 `/usr/bin/python3` 的绝对路径；它放在任务 worktree 之外、worker 可写目录之外，沙箱里以只读挂载。真实程序的路径在授权时解析并写死。拒绝时 shim 把 JSON 写到 `~/.local/share/baton-runner/spool/<worker>/`（沙箱里这块是可写的），执行器读到后用自己的令牌调用 `record_permission(event=shim_refused)`。`shim_refused` 可以重复报告，不改变授权是 `granted` 还是 `revoked`。调用时的工作目录必须在这条授权的 worktree 之内。
 
 ### 永远不会通过这条路径授权的东西
 
@@ -487,7 +489,7 @@ python3 adapters/local_runner.py --config <CONFIG_FILE> --revoke-worker <PRINCIP
 
 ### 审计
 
-每一步都有审计，且在任务线程里可见：`permission.requested`（谁、哪个 CLI、程序、目录、原因、点名的 approvers，excerpt 只存 SHA-256）、`permission.decided`（approver、选项、根或委托链）、`permission.cancelled`（worker 或根撤回）、`permission.granted`（执行器报告已写入）、`permission.revoked`。审计的 actor 分别是 worker、approver、worker、worker。无法向 Baton 报告 `granted` 的授权会被撤回并让任务失败，不会留下没有审计的规则；执行器崩溃后下次启动会撤回遗留的 `allow_once` 规则并补报未报告的事件。
+每一步都有审计，且在任务线程里可见：`permission.requested`（谁、哪个 CLI、程序、目录、原因、点名的 approvers，excerpt 只存 SHA-256）、`permission.decided`（approver、选项、根或委托链）、`permission.cancelled`（worker 或根撤回）、`permission.granted`（执行器报告已写入）、`permission.revoked`、`permission.shim_refused`（shim 拒绝了一次调用，带 `reason`，不改变 grant 状态，可以有多条）。审计的 actor 分别是 worker、approver、worker、worker、worker。无法向 Baton 报告 `granted` 的授权会被撤回并让任务失败，不会留下没有审计的规则；执行器崩溃后下次启动会撤回遗留的 `allow_once` 规则并补报未报告的事件。shim 和 spool 若会落在该 worker 的 worktree 或 `extra_write_paths` 里，这个 worker 拒绝启动。
 
 ### 限制，请明确知晓
 

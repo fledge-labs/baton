@@ -35,7 +35,7 @@ lr = load_runner_module()
 baton = lr.cli
 
 FAKE_CLI = '''#!{python}
-import json, os, socket, subprocess, sys, time
+import json, os, shutil, socket, subprocess, sys, time
 from pathlib import Path
 
 scenario = json.loads(Path(sys.argv[1]).read_text())
@@ -61,24 +61,54 @@ if scenario.get("mark"):
     marker_seen = os.path.exists(scenario["mark"])
     with open(scenario["mark"], "a") as handle:
         handle.write("x")
+shim_probe = {{}}
 gate = scenario.get("gate")
 if gate:
     try:
         raw = json.loads(Path(gate["config"]).read_text())
     except OSError:
         raw = {{}}
-    allowed = list((raw.get("permissions") or {{}}).get("allow") or [])
+    allowed = [item for item in list((raw.get("permissions") or {{}}).get("allow") or []) if isinstance(item, str)]
     bash = (raw.get("permission") or {{}}).get("bash") or {{}}
     if isinstance(bash, dict):
-        allowed.extend(key for key, value in bash.items() if value == "allow")
-    rule = gate["rule"]
-    cwd = os.path.realpath(os.getcwd())
-    # A constrained rule names the program and this worktree; an exact pre-seeded rule still matches too.
-    matched = rule in allowed or any(isinstance(item, str) and rule in item and cwd in item for item in allowed)
-    if not matched:
+        allowed.extend(key for key, value in bash.items() if value == "allow" and isinstance(key, str))
+    tool = gate.get("tool") or "rg"
+    resolved = shutil.which(tool)
+
+    def exact(path):
+        if not isinstance(path, str) or not path.startswith("/"):
+            return False
+        candidates = {{path, os.path.realpath(path)}}
+        for item in allowed:
+            if not item.startswith("/"):
+                continue
+            if item in candidates or os.path.realpath(item) in candidates:
+                return True
+        return False
+
+    # The allowlist holds the shim's absolute path. A prefix of the command, or the real binary, does not match.
+    if not exact(resolved):
         sys.stderr.write(gate["message"].replace("{{cwd}}", os.getcwd()) + "\\n")
         sys.stderr.flush()
         sys.exit(gate.get("exit", 1))
+    if scenario.get("probe_shim"):
+        done = subprocess.run([resolved, "--pre=sh"], capture_output=True, text=True)
+        direct, shim_real = None, os.path.realpath(os.path.dirname(resolved))
+        for entry in os.environ.get("PATH", "").split(os.pathsep):
+            if not entry or os.path.realpath(entry) == shim_real:
+                continue
+            candidate = os.path.join(entry, tool)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                direct = os.path.realpath(candidate)
+                break
+        writable = True
+        try:
+            fd = os.open(resolved, os.O_WRONLY | os.O_APPEND)
+            os.close(fd)
+        except OSError:
+            writable = False
+        shim_probe = {{"shim_pre_rc": done.returncode, "shim_pre_err": done.stderr[-300:], "direct": direct,
+                      "direct_allowlisted": exact(direct) if direct else False, "shim_writable": writable}}
 report["marker_seen"] = marker_seen
 counter = scenario.get("counter")
 attempt = 1
@@ -109,6 +139,7 @@ for address in scenario.get("probe_connect", []):
 if scenario.get("run_git"):
     done = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
     probes["git_status"] = "rc=%d" % done.returncode
+probes.update(shim_probe)
 report["probes"] = probes
 Path("fake-report.json").write_text(json.dumps(report))
 Path("fake-output.txt").write_text("changed by the fake cli\\n")
@@ -1677,9 +1708,11 @@ def permission_worker_config(tmp_path, monkeypatch, cli_name="agy", **permission
 
 
 def test_permissions_config_is_accepted_inside_the_workers_own_home_read(tmp_path, monkeypatch):
-    home, data = permission_worker_config(tmp_path, monkeypatch, poll_seconds=0.5, wait_seconds=60, max_requests=2)
+    home, data = permission_worker_config(tmp_path, monkeypatch, poll_seconds=0.5, wait_seconds=60, max_requests=2,
+                                          rule_template="{shim}")
     permissions = lr.parse_config(data).workers[0].permissions
     assert permissions.cli == "agy" and permissions.approvers == ["boss"] and permissions.max_requests == 2
+    assert permissions.rule_template == "{shim}"
     assert permissions.config_file == str(home / ".gemini/antigravity-cli/settings.json")
 
 
@@ -1688,6 +1721,7 @@ def test_permissions_config_is_accepted_inside_the_workers_own_home_read(tmp_pat
     {"approvers": "boss"}, {"config_file": "relative/settings.json"}, {"wait_seconds": 0}, {"max_requests": 11},
     {"rule_template": "no placeholder"}, {"rule_template": "{tool} {tool}"}, {"rule_template": "a\n{tool}"},
     {"rule_template": "Bash({tool} *)"}, {"rule_template": "{tool} {args}"}, {"rule_template": "{tool} {directory}"},
+    {"rule_template": "{shim} *"}, {"rule_template": "{shim}{shim}"}, {"rule_template": "{shim}\n"},
     {"surprise": 1}])
 def test_permissions_config_rejects_bad_values(tmp_path, monkeypatch, override):
     _, data = permission_worker_config(tmp_path, monkeypatch)
@@ -1784,8 +1818,7 @@ def test_the_text_writer_appends_and_removes_exact_lines_only(tmp_path):
     path = tmp_path / "default.rules"
     path.write_text('prefix_rule(pattern=["git"], decision="allow")\n')
     profile = lr.CLI_PROFILES["codex"]
-    rule = lr.render_rule(lr.PermissionConfig("codex", "/x", ["boss"]), "rg", "/work/w1")
-    assert "{args}" not in rule and "/work/w1" in rule and "--pre" in rule
+    rule = "/var/lib/baton-runner/shims/w1/rg"
     assert lr.edit_rule(path, profile, rule, True) and lr.edit_rule(path, profile, rule, True) is False
     assert path.read_text() == 'prefix_rule(pattern=["git"], decision="allow")\n' + rule + "\n"
     assert lr.edit_rule(path, profile, rule, False)
@@ -1801,12 +1834,19 @@ def test_the_writer_refuses_a_file_it_does_not_understand_and_leaves_it_alone(tm
     assert path.read_text() == content
 
 
-def test_the_rule_template_can_be_overridden_per_worker():
-    permissions = lr.PermissionConfig("agy", "/x", ["boss"], rule_template="Bash({tool} {args} in {directory})")
-    assert lr.render_rule(permissions, "rg", "/work/w1") == "Bash(rg [! --pre ! --pre-glob] in /work/w1)"
-    permissions.rule_template = "run_command({tool})"
-    with pytest.raises(lr.RunnerError, match="argument limits"):
-        lr.render_rule(permissions, "rg", "/work/w1")
+def test_the_rule_template_is_the_shim_path_and_only_an_exact_match_cli_can_use_it():
+    permissions = lr.PermissionConfig("agy", "/x", ["boss"], rule_template="{shim}")
+    path = "/var/lib/baton-runner/shims/w1/rg"
+    assert lr.render_rule(permissions, path) == path
+    permissions.rule_template = "run_command({shim})"
+    with pytest.raises(lr.RunnerError, match="exact-match"):
+        lr.render_rule(permissions, path)
+    permissions.rule_template = "{shim}"
+    for name in ("codex", "grok", "cline", "dsh"):
+        with pytest.raises(lr.RunnerError, match="exact-match"):
+            lr.render_rule(lr.PermissionConfig(name, "/x", ["boss"]), path)
+    with pytest.raises(lr.RunnerError, match="exact allowlist"):
+        lr.render_rule(permissions, path + " *")
 
 
 class RecordingBaton:
@@ -1837,8 +1877,8 @@ def request_view(identity="r1", status="allow_always", task="t1"):
     return {"request_id": identity, "task_id": task, "status": status}
 
 
-def agy_rule(tool="rg", directory="/work/w1"):
-    return lr.render_rule(lr.PermissionConfig("agy", "/x", ["boss"]), tool, directory)
+def agy_rule(tool="rg", directory=None):
+    return os.path.realpath(lr.shim_path("w1", tool))
 
 
 def test_a_grant_is_written_audited_and_withdrawn_through_the_ledger(tmp_path, monkeypatch):
@@ -1846,7 +1886,10 @@ def test_a_grant_is_written_audited_and_withdrawn_through_the_ledger(tmp_path, m
     settings.write_text(json.dumps({"permissions": {"allow": ["mine"]}}))
     record = keeper.grant(request_view(), "rg", "/work/w1")
     assert json.loads(settings.read_text())["permissions"]["allow"] == ["mine", agy_rule()]
-    assert record["directory"] == "/work/w1" and record["rule"] == agy_rule() and "--pre" in record["rule"]
+    shim_text = Path(record["shim"]).read_text(encoding="utf-8")
+    assert record["directory"] == "/work/w1" and record["rule"] == agy_rule()
+    assert "--pre" in shim_text and "/work/w1" in shim_text and record["real"] in shim_text
+    assert record["real"] not in json.loads(settings.read_text())["permissions"]["allow"]
     assert recorder.calls == [("record_permission", {"task_id": "t1", "request_id": "r1", "event": "granted"})]
     assert keeper.revoke(record["id"]) is True and keeper.revoke(record["id"]) is None
     assert json.loads(settings.read_text())["permissions"]["allow"] == ["mine"]
@@ -1934,9 +1977,11 @@ def agy(tmp_path, monkeypatch):
                             "allow": lambda self: json.loads(settings.read_text())["permissions"]["allow"]})()
 
 
-def agy_worker(lab, bridge, agy, label="worker", message=AGY_RG, rule="run_command(rg ", cli_name="agy", **permissions):
+def agy_worker(lab, bridge, agy, label="worker", message=AGY_RG, rule="run_command(rg ", cli_name="agy", probe_shim=False,
+               **permissions):
     assert shutil.which("bwrap"), "bubblewrap must be installed: the sandbox tests may not be skipped"
-    scenario = lab.scenario(gate={"config": str(agy.settings), "rule": rule, "message": message}, mark="ran.txt")
+    scenario = lab.scenario(gate={"config": str(agy.settings), "rule": rule, "message": message}, mark="ran.txt",
+                            probe_shim=probe_shim)
     settings = {"cli": cli_name, "config_file": str(agy.settings), "approvers": [bridge.identities["owner"]["agent"]],
                 "poll_seconds": 0.2, "wait_seconds": 60}
     settings.update(permissions)
@@ -2005,9 +2050,11 @@ def test_approved_permission_resumes_the_same_task_in_the_same_epoch_and_worktre
     assert view["epoch"] == 1 and view["result_epoch"] == 1 and view["result_author"] == worker_name
     assert view["blocked"] is None and "exit code: 0" in view["result"]
     worktree = os.path.realpath(str(lab.tmp / "roots" / "worker" / task_id))
-    expected = lr.render_rule(lab.runners[0].workers[0].worker.permissions, "rg", worktree)
-    assert agy.allow() == ["mcp(baton/get_task)", expected]
-    assert worktree in expected and "--pre" in expected and request["directory"] == worktree
+    shim = os.path.realpath(lr.shim_path(worker_name, "rg"))
+    assert agy.allow() == ["mcp(baton/get_task)", shim]
+    shim_text = Path(shim).read_text(encoding="utf-8")
+    assert worktree in shim_text and "--pre" in shim_text and request["directory"] == worktree
+    assert lr.resolve_real_binary("rg") not in agy.allow() and lr.resolve_real_binary("rg") in shim_text
     settings = json.loads(agy.settings.read_text())
     assert settings["permissions"]["deny"] == ["run_command(rm)"] and settings["theme"] == "dark"
     report = lab.report("worker", task_id)
@@ -2135,6 +2182,10 @@ def test_a_stranger_cannot_see_or_decide_a_request_and_only_the_worker_records_g
                                                          event="granted")) == ("stale_claim", 409), "not approved yet"
     assert api_error(lambda: Api(bridge, "worker").write("record_permission", task_id=task_id, request_id=request["request_id"],
                                                          event="weird"))[1] == 422
+    assert api_error(lambda: Api(bridge, "worker").write("record_permission", task_id=task_id, request_id=request["request_id"],
+                                                         event="shim_refused"))[1] == 422, "a refusal needs a reason"
+    assert api_error(lambda: Api(bridge, "worker").write("record_permission", task_id=task_id, request_id=request["request_id"],
+                                                         event="shim_refused", reason="rg --pre")) == ("stale_claim", 409)
     ask = {"task_id": task_id, "epoch": 1, "cli": "agy", "tool": "cat"}
     assert api_error(lambda: Api(bridge, "worker").write("request_permission", **ask)) == ("operation_conflict", 409), "one pending"
     assert api_error(lambda: Api(bridge, "owner").write("request_permission", **ask)) == ("stale_claim", 409), "only the holder asks"
@@ -2174,9 +2225,32 @@ def test_opencode_is_granted_from_the_worktree_even_though_its_detector_has_no_d
     assert request["cli"] == "opencode" and request["tool"] == "rg" and request["directory"] == worktree
     space.owner.write("decide_permission", task_id=task_id, request_id=request["request_id"], option="allow_always")
     wait_state(space, task_id, "awaiting_gate")
-    rule = lr.render_rule(lab.runners[0].workers[0].worker.permissions, "rg", worktree)
+    worker_name = bridge.identities["worker"]["agent"]
+    shim = os.path.realpath(lr.shim_path(worker_name, "rg"))
     bash = json.loads(agy.settings.read_text())["permission"]["bash"]
-    assert bash[rule] == "allow" and worktree in rule and "--pre" in rule
+    shim_text = Path(shim).read_text(encoding="utf-8")
+    assert bash[shim] == "allow" and worktree in shim_text and "--pre" in shim_text
+
+
+def test_an_approved_rg_shim_rejects_pre_and_the_real_binary_is_not_allowlisted(lab, bridge, space, agy):
+    worker_name = bridge.identities["worker"]["agent"]
+    task_id = assign(space, bridge, "worker", prompt="Search the sources with rg")
+    lab.start([agy_worker(lab, bridge, agy, probe_shim=True)])
+    request = pending_request(space, task_id)
+    space.owner.write("decide_permission", task_id=task_id, request_id=request["request_id"], option="allow_always")
+    wait_state(space, task_id, "awaiting_gate")
+    shim = os.path.realpath(lr.shim_path(worker_name, "rg"))
+    real = lr.resolve_real_binary("rg")
+    assert shim in agy.allow() and real not in agy.allow()
+    report = lab.report("worker", task_id)
+    probes = report["probes"]
+    assert probes["shim_pre_rc"] != 0 and "--pre" in probes["shim_pre_err"]
+    assert probes["direct_allowlisted"] is False and probes["shim_writable"] is False
+    assert report["env"]["PATH"].split(os.pathsep)[0] == os.path.dirname(shim)
+    audit = next(row for row in space.owner.read("list_audit", task_id=task_id) if row["event"] == "permission.shim_refused")
+    assert audit["agent"] == worker_name and "--pre" in audit["metadata"]["reason"]
+    assert audit["metadata"]["request_id"] == request["request_id"]
+    assert permissions_of(space, task_id)[0]["grant"] == "granted"
 
 
 def test_permissions_without_a_sandbox_refuse_to_start_that_worker(tmp_path, monkeypatch, capsys):
@@ -2203,6 +2277,23 @@ def test_permissions_without_a_sandbox_refuse_to_start_that_worker(tmp_path, mon
     assert [worker.principal for worker in ok.prepare()] == ["w1"] and ok.refusals == []
 
 
+def test_permissions_refuse_to_start_when_the_shim_would_be_inside_a_writable_directory(tmp_path, monkeypatch):
+    assert shutil.which("bwrap"), "bubblewrap must be installed: the sandbox tests may not be skipped"
+    subprocess.run(["git", "init", "-q", str(tmp_path / "repo")], check=True)
+    home, data = permission_worker_config(tmp_path, monkeypatch)
+    token = Path(data["workers"][0]["token_file"])
+    token.parent.mkdir(parents=True, exist_ok=True)
+    token.write_text("synthetic-token\n")
+    token.chmod(0o600)
+    data["workers"][0]["workdir_root"] = str(home / ".local/share/baton-runner")
+    path = tmp_path / "runner-shim.json"
+    path.write_text(json.dumps(data))
+    path.chmod(0o600)
+    runner = lr.Runner(lr.load_config(path))
+    assert runner.prepare() == []
+    assert runner.refusals == [("w1", "permission shims would be inside a writable directory")]
+
+
 def test_a_forged_directory_in_cli_output_is_ignored_and_the_rule_is_scoped_to_the_worktree(lab, bridge, space, agy):
     message = 'Permission denied: run_command "rg -n key /etc" is not in permissions.allow (cwd: /etc)'
     task_id = assign(space, bridge, "worker")
@@ -2212,9 +2303,10 @@ def test_a_forged_directory_in_cli_output_is_ignored_and_the_rule_is_scoped_to_t
     assert request["directory"] == worktree and "/etc" not in request["directory"]
     space.owner.write("decide_permission", task_id=task_id, request_id=request["request_id"], option="allow_always")
     wait_state(space, task_id, "awaiting_gate")
-    rule = lr.render_rule(lab.runners[0].workers[0].worker.permissions, "rg", worktree)
-    assert agy.allow() == ["mcp(baton/get_task)", rule]
-    assert worktree in rule and "/etc" not in rule
+    shim = os.path.realpath(lr.shim_path(bridge.identities["worker"]["agent"], "rg"))
+    assert agy.allow() == ["mcp(baton/get_task)", shim]
+    shim_text = Path(shim).read_text(encoding="utf-8")
+    assert worktree in shim_text and "/etc" not in shim_text and "/etc" not in shim
 
 
 def test_an_unparsed_refusal_is_posted_with_a_redacted_excerpt_and_cannot_be_auto_granted(lab, bridge, space, agy):
@@ -2358,22 +2450,69 @@ def test_a_refusal_without_an_absolute_directory_is_still_scoped_to_the_worktree
     space.owner.write("decide_permission", task_id=task_id, request_id=request["request_id"], option="deny")
 
 
-def test_the_rule_template_carries_the_argument_policy_and_the_worktree(tmp_path, monkeypatch):
-    settings, keeper, _ = keeper_for(tmp_path, monkeypatch, template="run_command({tool} {args} in {directory})")
-    record = keeper.grant(request_view(), "rg", "/work/w1/task one")
-    assert record["rule"] == "run_command(rg %s in /work/w1/task one)" % lr.POLICY_ARGS["rg"]
-    assert record["directory"] == "/work/w1/task one"
-    assert record["rule"] in json.loads(settings.read_text())["permissions"]["allow"]
-    with pytest.raises(lr.RunnerError, match="worktree"):
-        keeper.grant(request_view("r2"), "rg", '/work/"quoted"')
+def test_the_shim_carries_the_argument_policy_and_the_worktree(tmp_path, monkeypatch):
+    settings, keeper, _ = keeper_for(tmp_path, monkeypatch)
+    work = tmp_path / "tree" / "task one"
+    work.mkdir(parents=True)
+    record = keeper.grant(request_view(), "rg", str(work))
+    assert record["rule"] == os.path.realpath(lr.shim_path("w1", "rg"))
+    assert record["directory"] == str(work)
+    allow = json.loads(settings.read_text())["permissions"]["allow"]
+    assert record["rule"] in allow and record["real"] not in allow
+    shim_text = Path(record["shim"]).read_text(encoding="utf-8")
+    assert str(work) in shim_text and "--pre" in shim_text and record["real"] in shim_text
     with pytest.raises(lr.RunnerError, match="worktree"):
         keeper.grant(request_view("r3"), "rg", None)
     keeper.worker.permissions.rule_template = "run_command({tool})"
-    with pytest.raises(lr.RunnerError, match="argument limits"):
-        keeper.grant(request_view("r4"), "rg", "/work/w1")
+    with pytest.raises(lr.RunnerError, match="exact-match"):
+        keeper.grant(request_view("r4"), "rg", str(work))
     _, data = permission_worker_config(tmp_path, monkeypatch, rule_template="{tool} {directory} {directory}")
     with pytest.raises(lr.ConfigError):
         lr.parse_config(data)
+
+
+def test_the_shim_rejects_rg_pre_and_an_allow_once_shim_runs_only_once(tmp_path, monkeypatch):
+    settings, keeper, recorder = keeper_for(tmp_path, monkeypatch)
+    work = tmp_path / "work"
+    work.mkdir()
+    always = keeper.grant(request_view("r-always", "allow_always"), "rg", str(work))
+    refused = subprocess.run([always["shim"], "--pre=sh"], cwd=work, capture_output=True, text=True)
+    assert refused.returncode != 0 and "--pre" in refused.stderr and "baton shim:" in refused.stderr
+    assert not list(Path(lr.spool_dir("w1")).glob("*.once"))
+    keeper.drain_spool()
+    refusal = next(call for call in recorder.calls if call[1]["event"] == "shim_refused")
+    assert "--pre" in refusal[1]["reason"] and refusal[1]["request_id"] == "r-always" and refusal[1]["operation_id"]
+    assert always["real"] not in json.loads(settings.read_text())["permissions"]["allow"]
+    direct = subprocess.run([always["real"], "--version"], cwd=work, capture_output=True, text=True)
+    assert direct.returncode == 0, "the real binary still runs; the allowlist, not this process, is what blocks it"
+    once = keeper.grant(request_view("r-once", "allow_once", "t-once"), "rg", str(work))
+    kept = subprocess.run([always["shim"], "--version"], cwd=work, capture_output=True, text=True)
+    assert kept.returncode == 0 and not (Path(lr.spool_dir("w1")) / (once["id"] + ".once")).exists()
+    assert keeper.revoke(always["id"]) is True
+    os.chmod(os.path.dirname(once["shim"]), 0o555)
+    try:
+        first = subprocess.run([once["shim"], "--version"], cwd=work, capture_output=True, text=True)
+        assert first.returncode == 0 and os.path.exists(once["shim"])
+        second = subprocess.run([once["shim"], "--version"], cwd=work, capture_output=True, text=True)
+        assert second.returncode != 0 and "already used" in second.stderr
+    finally:
+        os.chmod(os.path.dirname(once["shim"]), 0o755)
+    keeper.retire_consumed()
+    assert not os.path.exists(once["shim"])
+    again = keeper.grant(request_view("r-self", "allow_once", "t-self"), "rg", str(work))
+    consumed = subprocess.run([again["shim"], "--version"], cwd=work, capture_output=True, text=True)
+    assert consumed.returncode == 0 and not os.path.exists(again["shim"]), "a lone allow_once shim deletes itself"
+
+
+def test_a_cli_that_cannot_exact_match_the_shim_is_never_granted(tmp_path, monkeypatch):
+    settings, keeper, _ = keeper_for(tmp_path, monkeypatch, cli_name="codex")
+    with pytest.raises(lr.RunnerError, match="exact-match"):
+        keeper.grant(request_view(), "rg", "/work/w1")
+    assert not settings.exists() or "rg" not in settings.read_text()
+    permissions = lr.PermissionConfig("codex", "/x", ["boss"])
+    problem = lr.refusal_grant_problem(permissions, "w1", "rg", "rg -n TODO", "/work/w1", [])
+    assert "exact-match" in problem
+    assert "never granted" in lr.refusal_grant_problem(permissions, "w1", "rg", "rg --pre=sh", "/work/w1", [])
 
 
 def test_the_ledger_is_written_pending_before_the_rule_and_active_after(tmp_path, monkeypatch):
@@ -2525,7 +2664,7 @@ def test_a_second_runner_on_the_same_state_directory_is_refused_until_the_first_
         lab.start([agy_worker(lab, bridge, agy)])
     assert [item["id"] for item in lr.GrantLedger(lab.tmp / "state", worker_name).active()] == [leftover["id"]], \
         "the refused second runner did not clean up the first one's grant"
-    assert leftover["rule"] in agy.allow() and "/work/w1" in leftover["rule"]
+    assert leftover["rule"] in agy.allow() and "/work/w1" in Path(leftover["shim"]).read_text(encoding="utf-8")
     lab.runners[0].request_stop()
     lab.runners[0].join(20)
     lab.start([agy_worker(lab, bridge, agy)])

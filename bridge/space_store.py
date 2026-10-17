@@ -63,6 +63,8 @@ PERMISSION_EVENTS = ("permission.requested", "permission.decided", "permission.g
 PERMISSION_DEFAULT_TTL = 3600
 PERMISSION_MAX_TTL = 86400
 PERMISSION_GRANT_EVENTS = ("granted", "revoked")
+# shim_refused is repeatable audit only. It is not folded into the grant view (that would mark the grant revoked).
+PERMISSION_REPORT_EVENTS = PERMISSION_GRANT_EVENTS + ("shim_refused",)
 PERMISSION_MAX_PER_EPOCH = 10
 PERMISSION_CLI = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 WEBHOOK_LIMIT = 10
@@ -2252,11 +2254,19 @@ class SpaceStore:
         return self._mutate(actor, operation_id, "decide_permission", args, authorize, effect,
                             lambda conn, old: self._permission_request(conn, task_id, request_id))
 
-    def record_permission(self, actor, operation_id, task_id, request_id, event):
-        """The requesting worker reports that it applied (granted) or removed (revoked) the approved permission."""
+    def record_permission(self, actor, operation_id, task_id, request_id, event, reason=None):
+        """The requesting worker reports that it applied or removed an approved permission, or that its shim refused a call.
+
+        `shim_refused` is repeatable and does not change the grant view. `reason` is part of the request digest only
+        for that event, so a retry of a grant recorded before the field existed still matches.
+        """
         _uuid(request_id, "request_id")
-        if not isinstance(event, str) or event not in PERMISSION_GRANT_EVENTS:
-            raise StoreError("invalid", "event", "one of " + ", ".join(PERMISSION_GRANT_EVENTS))
+        if not isinstance(event, str) or event not in PERMISSION_REPORT_EVENTS:
+            raise StoreError("invalid", "event", "one of " + ", ".join(PERMISSION_REPORT_EVENTS))
+        if event == "shim_refused":
+            reason = _one_line(reason, 300, "reason")
+        elif reason not in (None, ""):
+            raise StoreError("invalid", "reason", "only a shim refusal takes a reason")
         def authorize(conn):
             self._manual(conn, actor, task_id, "comment")
             request = self._permission_request(conn, task_id, request_id)
@@ -2265,15 +2275,24 @@ class SpaceStore:
         def effect(conn):
             task = self._row(conn, "tasks", task_id)
             request = self._permission_request(conn, task_id, request_id)
-            wanted = {"granted": (request["status"] in ("allow_once", "allow_always") and request["grant"] is None),
-                      "revoked": request["grant"] == "granted"}[event]
+            approved = request["status"] in ("allow_once", "allow_always")
+            if event == "shim_refused":
+                if not approved:
+                    raise StoreError("stale_claim")
+                self._task_audit(conn, actor, operation_id, "permission.shim_refused", task, epoch=request["epoch"],
+                                 request_id=request_id, reason=reason)
+                return self._permission_request(conn, task_id, request_id)
+            wanted = {"granted": (approved and request["grant"] is None), "revoked": request["grant"] == "granted"}[event]
             if not wanted:
                 raise StoreError("stale_claim")
             self._task_audit(conn, actor, operation_id, "permission." + event, task, epoch=request["epoch"], request_id=request_id,
                              decision=request["status"])
             return self._permission_request(conn, task_id, request_id)
-        return self._mutate(actor, operation_id, "record_permission", {"task_id": task_id, "request_id": request_id, "event": event},
-                            authorize, effect, lambda conn, old: self._permission_request(conn, task_id, request_id))
+        args = {"task_id": task_id, "request_id": request_id, "event": event}
+        if event == "shim_refused":
+            args["reason"] = reason
+        return self._mutate(actor, operation_id, "record_permission", args, authorize, effect,
+                            lambda conn, old: self._permission_request(conn, task_id, request_id))
 
     def cancel_permission(self, actor, operation_id, task_id, request_id):
         """Withdraw a pending request: the requesting worker, or the space root. Frees the task to ask again."""
