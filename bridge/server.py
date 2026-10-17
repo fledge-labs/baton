@@ -50,7 +50,13 @@ ERRORS = {
     "task_canceled": (409, "Task was canceled through A2A"),
     "rate_limited": (429, "Too many requests"),
     "storage_unavailable": (503, "Storage is unavailable"),
+    "protocol_incompatible": (409, "Client protocol version is no longer accepted"),
 }
+# Current space protocol generation and the oldest client generation this server still accepts.
+# The window is one protocol version: clients at PROTOCOL_VERSION or PROTOCOL_VERSION-1 (and clients that
+# omit the version header, which are treated as the previous generation) keep working. x_protocol stays baton.space.v1.
+PROTOCOL_VERSION = 2
+MIN_CLIENT_VERSION = 1
 
 
 class BridgeError(ValueError):
@@ -172,7 +178,7 @@ class SafeFastMCP(FastMCP):
             if name in {"submit_task", "get_task", "list_tasks", "fetch_inbox"}:
                 allowed = {"submit_task": {"idempotency_key", "prompt", "page_id", "scopes", "assignee_principal", "depends_on",
                                            "work_face", "require_work_face", "task_kind", "priority", "escalate_to",
-                                           "fallback_assignee", "approvals_required"}, "get_task": {"task_id"},
+                                           "fallback_assignee", "approvals_required", "reviewers"}, "get_task": {"task_id"},
                            "list_tasks": set(), "fetch_inbox": set()}[name]
                 if not isinstance(arguments, dict):
                     raise BridgeError("invalid", [{"field": "arguments", "expected": "object"}])
@@ -240,7 +246,7 @@ PUBLIC_OPERATIONS = {
     "submit_task": (True, {"idempotency_key": (str, ...), "prompt": (str, ...), "page_id": (str | None, None), "scopes": (list[dict] | None, None), "assignee_principal": (str | None, None), "depends_on": (list[str] | None, None),
                     "work_face": (dict[str, Any] | None, None), "require_work_face": (bool, False), "task_kind": (str, "construction"),
                     "priority": (str, "normal"), "escalate_to": (str | None, None), "fallback_assignee": (str | None, None),
-                    "approvals_required": (int | None, None)}),
+                    "approvals_required": (int | None, None), "reviewers": (list[str] | None, None)}),
     "assign_task": (True, {"task_id": (str, ...), "target_principal": (str, ...)}),
     "set_priority": (True, {"task_id": (str, ...), "priority": (str, ...)}),
     "mark_blocked": (True, {"task_id": (str, ...), "reason_code": (str, ...), "note": (str | None, None)}),
@@ -571,10 +577,11 @@ async def submit_task(idempotency_key: str, prompt: str, ctx: Context, page_id: 
                       depends_on: list[str] | None = None, work_face: dict[str, Any] | None = None,
                       require_work_face: bool = False, task_kind: str = "construction", priority: str = "normal",
                       escalate_to: str | None = None, fallback_assignee: str | None = None,
-                      approvals_required: int | None = None) -> dict:
+                      approvals_required: int | None = None, reviewers: list[str] | None = None) -> dict:
     """Create a manual task and return it; Baton never executes it. With assignee_principal only that principal may claim
     it; without one the task is unassigned and any principal with edit on the page sees it in ready and may claim it.
-    The reviewer is the requester, scopes default to none, and the usual gate applies. Reuse keys on retry."""
+    Reviewers default to the requester; pass reviewers to name them. A reviewer who is not the space root and has no
+    approver delegation is listed in warnings and the task is still created. Scopes default to none. Reuse keys on retry."""
     request = ctx.request_context.request
     actor = request_actor(request)
     operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "baton/submit_task/" + actor.principal + "/" + idempotency_key))
@@ -583,7 +590,7 @@ async def submit_task(idempotency_key: str, prompt: str, ctx: Context, page_id: 
                         "assignee_principal": assignee_principal, "depends_on": depends_on,
                         "work_face": work_face, "require_work_face": require_work_face, "task_kind": task_kind,
                         "priority": priority, "escalate_to": escalate_to, "fallback_assignee": fallback_assignee,
-                        "approvals_required": approvals_required}, request)
+                        "approvals_required": approvals_required, "reviewers": reviewers}, request)
 
 
 @mcp.tool()
@@ -717,11 +724,76 @@ async def lifespan(app):
 app = FastAPI(lifespan=lifespan)
 
 
+def versioned(body):
+    """Space JSON carries the protocol generation and the oldest client generation still accepted."""
+    return {"x_protocol": PROTOCOL, "protocol_version": PROTOCOL_VERSION, "min_client_version": MIN_CLIENT_VERSION, **body}
+
+
+def client_protocol_version(scope):
+    """Header absent means the previous generation, which the one-version window still accepts. A present but unusable value does not."""
+    raw = None
+    for key, value in scope.get("headers", []):
+        if key.lower() == b"x-baton-client-version":
+            raw = value
+            break
+    if raw is None:
+        return MIN_CLIENT_VERSION
+    try:
+        text = raw.decode("ascii").strip()
+    except UnicodeError:
+        return 0
+    if not text.isdigit() or not 1 <= len(text) <= 6:
+        return 0
+    return int(text)
+
+
+class ProtocolVersion:
+    """Report the protocol generation on every /v1/space response, and reject a client older than the compatibility window.
+
+    Sits outside authentication so a too-old client learns the minimum version instead of an auth failure, and so
+    401/403 responses carry the same headers. The client's supplied version is never copied into the response.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not scope.get("path", "").startswith("/v1/space"):
+            return await self.app(scope, receive, send)
+        if client_protocol_version(scope) < MIN_CLIENT_VERSION:
+            status, message = ERRORS["protocol_incompatible"]
+            body = json.dumps(versioned({"error": {"code": "protocol_incompatible", "message": message}}),
+                              separators=(",", ":")).encode()
+            await send({"type": "http.response.start", "status": status, "headers": [
+                (b"content-type", b"application/json"), (b"cache-control", b"no-store"),
+                (b"content-length", str(len(body)).encode()),
+                (b"x-baton-protocol-version", str(PROTOCOL_VERSION).encode()),
+                (b"x-baton-min-client-version", str(MIN_CLIENT_VERSION).encode()),
+            ]})
+            await send({"type": "http.response.body", "body": body})
+            return
+
+        async def send_with_version(message):
+            if message["type"] == "http.response.start":
+                message.setdefault("headers", []).extend((
+                    (b"x-baton-protocol-version", str(PROTOCOL_VERSION).encode()),
+                    (b"x-baton-min-client-version", str(MIN_CLIENT_VERSION).encode()),
+                ))
+            await send(message)
+
+        await self.app(scope, receive, send_with_version)
+
+
 @app.exception_handler(BridgeError)
 async def bridge_error(request, exc):
     status, message = ERRORS[exc.code]
     error = {"code": exc.code, "message": message, **({"details": exc.details} if exc.details else {})}
-    return JSONResponse(status_code=status, content={"x_protocol": PROTOCOL, "error": error})
+    body = {"error": error}
+    if request.url.path.startswith("/v1/space"):
+        body = versioned(body)
+    else:
+        body = {"x_protocol": PROTOCOL, **body}
+    return JSONResponse(status_code=status, content=body)
 
 
 @app.exception_handler(RequestValidationError)
@@ -742,15 +814,15 @@ async def space_operation(operation: str, request: Request):
     except Exception:
         raise BridgeError("invalid") from None
     result = await invoke(operation, payload, request)
-    return {"x_protocol": PROTOCOL, "result": result}
+    return versioned({"result": result})
 
 
 @app.get("/v1/space/schema")
 async def space_schema():
-    return {"x_protocol": PROTOCOL, "operations": {
+    return versioned({"operations": {
         name: {"mutation": mutation, "request": MODELS[name].model_json_schema()}
         for name, (mutation, _) in PUBLIC_OPERATIONS.items()
-    }, "aliases": ALIASES}
+    }, "aliases": ALIASES})
 
 
 @app.post(a2a_public.RPC_PATH)
@@ -772,7 +844,7 @@ async def board_data(request: Request):
 
 
 app.mount("/", mcp.streamable_http_app())
-app = a2a_public.PublicDiscovery(AuthMiddleware(DeprecationHeaders(app), role="client"))
+app = a2a_public.PublicDiscovery(ProtocolVersion(AuthMiddleware(DeprecationHeaders(app), role="client")))
 
 
 if __name__ == "__main__":

@@ -129,6 +129,8 @@ CREATE TABLE IF NOT EXISTS baton.x_claim (
     holder_kind text NOT NULL, epoch bigint NOT NULL, lease_expires_at timestamptz NOT NULL,
     scopes jsonb NOT NULL, scope_repository text NOT NULL DEFAULT 'global' CHECK (scope_repository = 'global')
 );
+-- The expiring-lease scan reads only claims whose expiry is inside the warning horizon, soonest first.
+CREATE INDEX IF NOT EXISTS claim_lease_expiry ON baton.x_claim(lease_expires_at);
 CREATE TABLE IF NOT EXISTS baton.x_handoff (
     id uuid PRIMARY KEY, task_id uuid NOT NULL REFERENCES baton.tasks(id), from_holder text NOT NULL, to_holder text NOT NULL,
     old_epoch bigint NOT NULL, new_epoch bigint NOT NULL, base_commit text, context jsonb NOT NULL, evidence jsonb NOT NULL,

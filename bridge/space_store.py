@@ -42,11 +42,20 @@ MESSAGES = {
     "rate_limited": "Too many requests",
 }
 NOTIFY_EVENTS = frozenset({"mention.created", "task.assigned", "comment.created", "task.awaiting_gate",
-                           "gate.decided", "task.handed_off", "task.failed", "task.overdue", "task.blocked"})
+                           "gate.decided", "task.handed_off", "task.failed", "task.overdue", "task.blocked",
+                           "claim.expiring"})
 PREVIEW_CHARS = 200
 SUBJECT_TITLE_CHARS = 60
 EVENT_LABELS = {"task.assigned": "assigned", "task.handed_off": "handed_off", "task.awaiting_gate": "awaiting_gate",
-                "gate.decided": "gate_decided", "task.failed": "failed", "task.overdue": "overdue", "task.blocked": "blocked"}
+                "gate.decided": "gate_decided", "task.failed": "failed", "task.overdue": "overdue", "task.blocked": "blocked",
+                "claim.expiring": "expiring"}
+# One claim.expiring per lease window. The warning opens once the remainder is under this fraction of the lease and at least this many seconds.
+# A lease shorter than the minimum never warns: the 60s floor would otherwise be true for the whole lease, and every renew would notify.
+CLAIM_EXPIRING_FRACTION = 0.2
+CLAIM_EXPIRING_MIN_SECONDS = 60
+CLAIM_EXPIRING_MIN_LEASE = 120
+# _integer caps a lease at 3600s, so a warning is never further out than 20% of that. The scan's index range stops there.
+CLAIM_EXPIRING_HORIZON_SECONDS = int(3600 * CLAIM_EXPIRING_FRACTION)
 BLOCK_REASONS = ("scope_conflict", "lease_held", "dependency_blocked", "waiting_input", "other")
 WEBHOOK_LIMIT = 10
 WEBHOOK_MAX_ATTEMPTS = 8
@@ -626,7 +635,8 @@ class SpaceStore:
                    "subscription_id", "notification_id", "attempts", "http_status", "notify_event", "object_type",
                    "priority", "escalate_to", "from_assignee", "to_assignee", "reason_code", "delegation_id", "grantor", "scope",
                    "created_via", "chain", "owner_kind", "self_approval", "root", "approvals", "approvals_required",
-                   "required_approvals", "root_required", "scope_kind", "approver", "reason", "original_sha256", "edited_sha256", "grace_seconds"}
+                   "required_approvals", "root_required", "scope_kind", "approver", "reason", "original_sha256", "edited_sha256", "grace_seconds",
+                   "lease_seconds"}
         if not set(metadata) <= allowed:
             raise StoreError("invalid")
         conn.execute("""INSERT INTO baton.x_audit(id,event,agent,actor_account,actor_kind,requested_by,performed_by,
@@ -1479,9 +1489,78 @@ class SpaceStore:
             args["task_kind"] = task_kind
         return args
 
+    def _reviewer_identity(self, name, actor):
+        """The Actor a reviewer name denotes: the caller when it is them, otherwise the directory."""
+        if name == actor.principal:
+            return actor
+        if not self.directory:
+            return None
+        try:
+            who = self.directory(name)
+        except Exception:
+            return None
+        return who if isinstance(who, Actor) and who.principal == name else None
+
+    def _reviewer_can_approve(self, conn, space, task, name, actor):
+        """True when this reviewer is the space root or holds a covering approver delegation right now."""
+        who = self._reviewer_identity(name, actor)
+        if who is not None and self._is_root(space, who.principal, who.account, who.kind):
+            return True
+        if who is not None:
+            try:
+                self._approver_chain(conn, who, task)
+                return True
+            except StoreError as exc:
+                if exc.code != "delegation_required":
+                    raise
+                return False
+        if space["owner_principal"] == name:
+            return True
+        rows = conn.execute("""SELECT DISTINCT delegate_account, delegate_kind FROM baton.x_delegation
+            WHERE delegate=%s AND scope=%s AND revoked_at IS NULL
+            AND (expires_at IS NULL OR expires_at>clock_timestamp())""", (name, APPROVE)).fetchall()
+        for row in rows:
+            try:
+                candidate = Actor(name, row["delegate_account"], row["delegate_kind"])
+            except StoreError:
+                continue
+            try:
+                self._approver_chain(conn, candidate, task)
+                return True
+            except StoreError as exc:
+                if exc.code != "delegation_required":
+                    raise
+        return False
+
+    def _attach_reviewer_warnings(self, actor, result):
+        """Warn, without failing, when a configured reviewer cannot approve. Recomputed on every return, including replay."""
+        if not isinstance(result, dict) or not result.get("task_id"):
+            return result
+        task_id = result["task_id"]
+
+        def read(conn):
+            task = self._row(conn, "tasks", task_id)
+            page = self._row(conn, "pages", str(task["page_id"]))
+            space = self._row(conn, "spaces", str(page["space_id"]))
+            warnings, seen = [], set()
+            for name in task["reviewers"] or []:
+                if not isinstance(name, str) or name in seen:
+                    continue
+                seen.add(name)
+                if self._reviewer_can_approve(conn, space, task, name, actor):
+                    continue
+                warnings.append("reviewer %s currently cannot approve (no delegation)" % name)
+            return warnings
+
+        warnings = self._read(actor, read)
+        cleaned = {key: value for key, value in result.items() if key != "warnings"}
+        if warnings:
+            cleaned["warnings"] = warnings
+        return cleaned
+
     def submit_task(self, actor, operation_id, idempotency_key, prompt, page_id=None, scopes=None, assignee=None, depends_on=None,
                     work_face=None, require_work_face=False, task_kind="construction",
-                    priority="normal", escalate_to=None, fallback_assignee=None, approvals_required=None):
+                    priority="normal", escalate_to=None, fallback_assignee=None, approvals_required=None, reviewers=None):
         _identifier(idempotency_key, "idempotency_key")
         _text(prompt, field="prompt")
         normalized = normalize_scopes(scopes)
@@ -1494,15 +1573,23 @@ class SpaceStore:
             raise StoreError("invalid", 'assignee_principal', 'principal different from the requester')
         priority, escalate_to, fallback_assignee, response_args = _response_request(priority, escalate_to, fallback_assignee, actor.principal, assignee)
         approvals_required = _approvals_request(approvals_required)
+        if reviewers is not None:
+            if not isinstance(reviewers, list) or not reviewers or len(reviewers) > 100:
+                raise StoreError("invalid", "reviewers", "array of 1-100 principal identifiers")
+            for reviewer in reviewers:
+                _identifier(reviewer, "reviewers")
         args = {"idempotency_key": idempotency_key, "prompt": prompt, "page_id": page_id, "scopes": _request_scopes(normalized),
                 "assignee": asdict(assignee) if assignee else None}
         # Preserve v1 hashes for already-persisted submissions without dependencies.
+        # Omitted reviewers stay out of the digest too: the default remains the requester.
         if dependencies:
             args["depends_on"] = dependencies
         args.update(self._work_face_args(face, require_work_face, task_kind))
         args.update(response_args)
         if approvals_required is not None:
             args["approvals_required"] = approvals_required
+        if reviewers is not None:
+            args["reviewers"] = reviewers
         digest = hashlib.sha256(_canonical(args).encode()).hexdigest()
         def authorize(conn):
             self._user(actor)
@@ -1521,13 +1608,13 @@ class SpaceStore:
                 return {**self._task_view(conn, actor, str(prior["id"])), "_business_replay": True}
             chosen = page_id or self._default_page(conn, actor, operation_id)
             return self._new_task(conn, actor, operation_id, chosen, prompt, stored, "manual",
-                                  [actor.principal], digest, idempotency_key=idempotency_key, assignee=assignee, depends_on=dependencies,
+                                  reviewers if reviewers is not None else [actor.principal], digest, idempotency_key=idempotency_key, assignee=assignee, depends_on=dependencies,
                                   work_face=face, require_work_face=require_work_face, task_kind=task_kind,
                                   priority=priority, escalate_to=escalate_to, fallback_assignee=fallback_assignee,
                                   approvals_required=approvals_required)
         def replay(conn, old):
             return self._task_view(conn, actor, old["task_id"])
-        return self._mutate(actor, operation_id, "submit_task", args, authorize, effect, replay)
+        return self._attach_reviewer_warnings(actor, self._mutate(actor, operation_id, "submit_task", args, authorize, effect, replay))
 
     def create_task_block(self, actor, operation_id, page_id, prompt, scopes, reviewers, base_commit=None, context=None, evidence=None, assignee=None, depends_on=None,
                           work_face=None, require_work_face=False, task_kind="construction",
@@ -1637,7 +1724,7 @@ class SpaceStore:
         self._record_holder(conn, task["id"], epoch, actor)
         if task["assignee"] == actor.principal:
             conn.execute("UPDATE baton.tasks SET responded_at=COALESCE(responded_at,clock_timestamp()) WHERE id=%s", (task["id"],))
-        self._task_audit(conn, actor, operation_id, "task.claimed", task, epoch=epoch)
+        self._task_audit(conn, actor, operation_id, "task.claimed", task, epoch=epoch, lease_seconds=lease_seconds)
         return self._task_view(conn, actor, str(task["id"]), include_prompt=True)
 
     def claim(self, actor, operation_id, task_id, lease_seconds=300):
@@ -1663,7 +1750,7 @@ class SpaceStore:
         def effect(conn):
             self._live(conn, actor, task_id, epoch)
             conn.execute("UPDATE baton.x_claim SET lease_expires_at=clock_timestamp()+%s*interval '1 second' WHERE task_id=%s", (lease_seconds, task_id))
-            self._task_audit(conn, actor, operation_id, "claim.renewed", self._row(conn, "tasks", task_id), epoch=epoch)
+            self._task_audit(conn, actor, operation_id, "claim.renewed", self._row(conn, "tasks", task_id), epoch=epoch, lease_seconds=lease_seconds)
             return self._task_view(conn, actor, task_id)
         def replay(conn, old):
             self._live(conn, actor, task_id, epoch)
@@ -1701,7 +1788,7 @@ class SpaceStore:
             self._record_holder(conn, task["id"], epoch + 1, target)
             conn.execute("INSERT INTO baton.x_handoff(id,task_id,from_holder,to_holder,old_epoch,new_epoch,base_commit,context,evidence) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                          (uuid.uuid4(), task_id, actor.principal, target.principal, epoch, epoch + 1, base, Jsonb(contexts), Jsonb(evidence_items)))
-            self._task_audit(conn, actor, operation_id, "task.handed_off", task, old_epoch=epoch, epoch=epoch + 1)
+            self._task_audit(conn, actor, operation_id, "task.handed_off", task, old_epoch=epoch, epoch=epoch + 1, lease_seconds=lease_seconds)
             self._notify_task(conn, actor, operation_id, task, "assigned", "Task handed off", target.principal)
             self._enqueue(conn, actor, "task.handed_off", "task", task["id"], task["page_id"], [self._party(target)], task["id"])
             return self._task_view(conn, actor, task_id, include_prompt=True)
@@ -1846,7 +1933,89 @@ class SpaceStore:
                     self._escalate(conn, operation_id, task, escalated, reassigned)
         except _Busy:
             return {"skipped": True, "escalated": [], "reassigned": []}
+        # Audit reads for expiring leases stay outside LOCK_ID so a renew is not stuck behind this scan.
+        self._notify_expiring_claims(limit)
         return {"skipped": False, "escalated": escalated, "reassigned": reassigned}
+
+    def _notify_expiring_claims(self, limit):
+        """One claim.expiring per lease window, for at most `limit` claims, without the global advisory lock.
+
+        One statement selects the rows. It range-scans x_claim(lease_expires_at) for leases inside the horizon,
+        soonest first, and drops any task+epoch whose current window already has a notification. A renew starts
+        that window over only when its new expiry passes the previous warning point. Leases under 120s never match.
+        """
+        _integer(limit, 1, 1000)
+        try:
+            config = json.loads(self.config_path.read_text())
+            if set(config) != {"host", "port", "dbname", "user", "password"}:
+                raise StoreError("storage_unavailable")
+            with psycopg.connect(**config, connect_timeout=5, row_factory=dict_row) as conn:
+                # Single-flight only. The global LOCK_ID is intentionally not taken around the audit read.
+                if not conn.execute("SELECT pg_try_advisory_xact_lock(%s) AS ok", (ESCALATION_LOCK_ID,)).fetchone()["ok"]:
+                    return
+                rows = conn.execute("""WITH RECURSIVE bounds AS (
+                        SELECT %s::int AS min_lease, %s::int AS min_window, %s::numeric AS fraction
+                    ), candidates AS (
+                        SELECT c.task_id, c.holder, c.holder_account, c.epoch, t.page_id, c.lease_expires_at,
+                            EXTRACT(EPOCH FROM (c.lease_expires_at - clock_timestamp())) AS remaining
+                        FROM baton.x_claim c
+                        JOIN baton.tasks t ON t.id=c.task_id
+                        WHERE t.state='claimed'
+                          AND c.lease_expires_at>clock_timestamp()
+                          AND c.lease_expires_at<=clock_timestamp()+%s*interval '1 second'
+                    ), grants AS (
+                        SELECT a.task_id, (a.metadata->>'epoch')::bigint AS epoch, a.time,
+                            (a.metadata->>'lease_seconds')::int AS lease_seconds,
+                            row_number() OVER (PARTITION BY a.task_id, a.metadata->>'epoch' ORDER BY a.time, a.id) AS n
+                        FROM baton.x_audit a
+                        JOIN candidates c ON c.task_id=a.task_id AND a.metadata->>'epoch'=c.epoch::text
+                        WHERE a.event IN ('task.claimed','claim.renewed','task.handed_off')
+                          AND a.metadata->>'epoch' ~ '^[0-9]+$'
+                          AND a.metadata->>'lease_seconds' ~ '^[0-9]+$'
+                    ), walk AS (
+                        SELECT g.task_id, g.epoch, g.n, g.lease_seconds,
+                            CASE WHEN g.lease_seconds>=b.min_lease THEN g.time ELSE NULL::timestamptz END AS window_start,
+                            CASE WHEN g.lease_seconds>=b.min_lease THEN g.time+((g.lease_seconds-GREATEST(b.min_window, g.lease_seconds*b.fraction))::float8*interval '1 second')
+                                 ELSE NULL::timestamptz END AS warning_point
+                        FROM grants g CROSS JOIN bounds b WHERE g.n=1
+                        UNION ALL
+                        SELECT g.task_id, g.epoch, g.n, g.lease_seconds,
+                            CASE WHEN w.warning_point IS NULL OR g.time+g.lease_seconds*interval '1 second'>w.warning_point
+                                 THEN CASE WHEN g.lease_seconds>=b.min_lease THEN g.time ELSE NULL::timestamptz END
+                                 ELSE w.window_start END,
+                            CASE WHEN w.warning_point IS NULL OR g.time+g.lease_seconds*interval '1 second'>w.warning_point
+                                 THEN CASE WHEN g.lease_seconds>=b.min_lease
+                                           THEN g.time+((g.lease_seconds-GREATEST(b.min_window, g.lease_seconds*b.fraction))::float8*interval '1 second')
+                                           ELSE NULL::timestamptz END
+                                 ELSE w.warning_point END
+                        FROM grants g
+                        JOIN walk w ON w.task_id=g.task_id AND w.epoch=g.epoch AND g.n=w.n+1
+                        CROSS JOIN bounds b
+                    ), latest AS (
+                        SELECT DISTINCT ON (task_id, epoch) task_id, epoch, lease_seconds, window_start
+                        FROM walk ORDER BY task_id, epoch, n DESC
+                    )
+                    SELECT c.task_id, c.holder, c.holder_account, c.page_id
+                    FROM candidates c
+                    JOIN latest l ON l.task_id=c.task_id AND l.epoch=c.epoch
+                    CROSS JOIN bounds b
+                    WHERE l.lease_seconds>=b.min_lease AND l.window_start IS NOT NULL
+                      AND c.remaining<GREATEST(b.min_window, l.lease_seconds*b.fraction)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM baton.x_notify n
+                          WHERE n.event='claim.expiring' AND n.object_id=c.task_id AND n.recipient=c.holder
+                            AND n.created_at>=l.window_start)
+                    ORDER BY c.lease_expires_at, c.task_id
+                    LIMIT %s""", (
+                    CLAIM_EXPIRING_MIN_LEASE, CLAIM_EXPIRING_MIN_SECONDS, CLAIM_EXPIRING_FRACTION,
+                    CLAIM_EXPIRING_HORIZON_SECONDS, limit)).fetchall()
+                for row in rows:
+                    self._enqueue(conn, SERVICE_ACTOR, "claim.expiring", "task", row["task_id"], row["page_id"],
+                                  [(row["holder"], row["holder_account"])], row["task_id"])
+        except StoreError:
+            raise
+        except (psycopg.Error, OSError, ValueError, TypeError):
+            raise StoreError("storage_unavailable") from None
 
     def _escalate(self, conn, operation_id, task, escalated, reassigned):
         target = task["escalate_to"] or task["owner"]

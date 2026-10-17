@@ -62,7 +62,7 @@ with urlopen(request) as response:
 - `list_proposals(block_id: str)` — 读取。已弃用，见 [Deprecated](#deprecated)。
 - `list_attribution(block_id: str)` — 读取。已弃用，见 [Deprecated](#deprecated)。
 - `create_task_block(operation_id: str, page_id: str, prompt: str, reviewers: list[str], scopes: list[dict] | None = None, base_commit: str | None = None, context: Any = None, evidence: Any = None, assignee_principal: str | None = None, depends_on: list[str] | None = None, work_face: dict | None = None, require_work_face: bool = False, task_kind: str = "construction", approvals_required: int | None = None)` — 写入；`approvals_required` 为 1 或 2，见“审批关卡”。
-- `submit_task(operation_id: str, idempotency_key: str, prompt: str, page_id: str | None = None, scopes: list[dict] | None = None, assignee_principal: str | None = None, depends_on: list[str] | None = None, work_face: dict | None = None, require_work_face: bool = False, task_kind: str = "construction", approvals_required: int | None = None)` — 写入；`approvals_required` 为 1 或 2，见“审批关卡”。
+- `submit_task(operation_id: str, idempotency_key: str, prompt: str, page_id: str | None = None, scopes: list[dict] | None = None, assignee_principal: str | None = None, depends_on: list[str] | None = None, work_face: dict | None = None, require_work_face: bool = False, task_kind: str = "construction", approvals_required: int | None = None, reviewers: list[str] | None = None)` — 写入；`approvals_required` 为 1 或 2，见“审批关卡”。`reviewers` 省略时仍是请求者，见下。
 - `assign_task(operation_id: str, task_id: str, target_principal: str)` — 写入。
 - `plan(operation_id: str, graph: list[dict])` — 写入。
 - `set_work_face(operation_id: str, task_id: str, work_face: dict, base_commit: str | None = None)` — 写入。
@@ -102,7 +102,9 @@ with urlopen(request) as response:
 
 ## 任务、租约与 gate
 
-Baton 不执行任务。`submit_task` 总是创建一条手工任务（`execution_mode=manual`、`gate_mode=reviewer`），保留稳定业务 idempotency_key；即使换 operation_id，同一 principal/key 也不会创建第二任务。reviewer 默认是请求者，gate 规则不变（见下文“审批关卡”），范围省略时为 `none`。MCP 工具签名没有变化。
+Baton 不执行任务。`submit_task` 总是创建一条手工任务（`execution_mode=manual`、`gate_mode=reviewer`），保留稳定业务 idempotency_key；即使换 operation_id，同一 principal/key 也不会创建第二任务。reviewer 默认是请求者，gate 规则不变（见下文“审批关卡”），范围省略时为 `none`。MCP 的 `submit_task` 增加可选参数 `reviewers`；省略时行为与以前相同。
+
+`reviewers` 是 1–100 个 principal 的可选列表。省略时不进入幂等摘要（默认仍是请求者，已持久化的请求重放不变）；显式传入时计入摘要，非法值返回 `422 invalid`。任务总会创建，这不是错误。响应只在有人目前不能批准时带 `warnings`（没有则省略该字段）：每个既不是该 Space 根身份、也没有覆盖该任务的有效审批人委托的 reviewer，对应一条 `reviewer <principal> currently cannot approve (no delegation)`。被指派的 assignee 若同时出现在 `reviewers` 里，按同一条规则警告。重放（同一 operation_id 或同一业务 key）按当前委托重新计算，不使用提交当时存下的结论。
 
 - **不带 `assignee_principal`：** 创建未指派（`assignee` 为 null）的任务，没有响应时限。任何对该任务所在页面有 edit 权限的主体都会在 `ready` 里看到它，并可以 `claim`；先领取的持有租约，其余人看到的是 `scope_conflict`/不再 ready。没有 edit 权限的主体看不到它（`404 not_found`）。默认页面（省略 `page_id` 时创建的请求者私有 Space）只有请求者有权限，要让别人领取，请传共享页面的 `page_id`，或先共享该页面。
 - **带 `assignee_principal`：** 进入指派路径，只有该 principal 能领取；目标必须已具有页面 edit 权限，服务端不会自动分享。submit_task 不能把请求者自己设为接收人。
@@ -185,15 +187,18 @@ Baton 不会执行 `acceptance_command`。它只是显示给领取人和 gate �
 | `task.failed` | 旧版内置 worker 行的历史事件；当前没有任何路径产生它，保留是为了让旧订阅与旧 outbox 行继续有效 | owner | task |
 | `task.overdue` | 后台升级循环发现任务超过 `respond_by` 仍无响应（见“响应时效与超时升级”） | `escalate_to`，与其不同时还有 owner | task |
 | `task.blocked` | `mark_blocked`（见“阻塞标记”） | 任务 owner（不含操作者） | task |
+| `claim.expiring` | 既有的响应时效扫描发现一条有效租约剩余不足 `max(60 秒, 租期的 20%)`，租期至少 120 秒，且该 epoch 的当前租约窗口还没有这条通知 | 当前持有人 | task |
 
 操作者本人不会收到自己操作产生的通知，同一 principal 在一次事件中只收到一条。收件人在插入时必须对对象所在页面有 view 权限，否则不写行。outbox 与 webhook 默认负载只含元数据：`id`、`seq`、`event`、`object_type`、`object_id`、`thread_id`、`created_at`、`recipient`；`task.awaiting_gate` 另带 `result_epoch`（被通知的结果所属 epoch）与 `result_author`（提交结果的 principal），见下一段；outbox、审计和日志从不存放 prompt、评论正文或结果文本，接收者凭 object_id 再用 `get_task`、`list_comments` 等带权限检查的读取操作取完整内容。
 
 **`task.awaiting_gate` 的 `result_epoch`（DF-15）。** `submit_result` 写入该通知时，同时把当次结果的 epoch 和作者记在 outbox 行（`x_notify.result_epoch`、`x_notify.result_author`，只是整数和 principal 名，不含结果文本）。`wait_inbox` 返回的该事件行与 webhook 负载（无论是否 `include_preview`）都带这两个字段，审批人可以直接用 `gate(expected_epoch=result_epoch)`，不必先 `get_task`。其他事件没有这两个字段。审批人收到的是通知发出时的 epoch：任务之后被退回并重新提交，会有一条新通知带新 epoch，用旧 epoch gate 返回 `409 stale_claim`。命令行 `gate --task <id>` 省略 `--epoch` 时用任务当前的 `result_epoch`（一次 `get_task`）；`watch --summary` 的通知行显示 `result_epoch=` 与 `result_author=`。
 
+**`claim.expiring`。** bridge 不另起定时线程。已有的响应时效扫描（`escalate_overdue`，默认每 30 秒）先在全局排他锁里处理逾期任务，提交并放开这把锁之后，才在另一事务里查看即将到期的租约。后一个事务只拿升级循环的单飞咨询锁，不拿全局排他锁，所以读审计不会挡住续租。选择是一条语句：按 `x_claim(lease_expires_at)` 索引只看仍有效、且到期时刻落在警告地平线（最长租期 3600 秒的 20%，即 720 秒）内的租约，按 `lease_expires_at` 排序，`LIMIT` 与本轮升级批的上限相同。租期记在 `task.claimed`、`claim.renewed` 和 `task.handed_off` 的审计元数据 `lease_seconds`（整数秒，没有新列）。租期短于 120 秒从不警告（60 秒下限会让整段短租约都落在窗口里，每次续租都会再写一条）。更长的租约在剩余时间小于 `max(60 秒, 租期的 20%)` 时，给当前持有人写一条 `claim.expiring`。同一 epoch 的一个租约窗口只写一条。续租只有在把到期时刻推过上一个警告点时才开启新窗口；没有越过警告点的续租仍算原窗口，不会因为多了一条审计再通知一次。这条通知不带 `result_epoch` 或 `result_author`。持有人在扫描提交之后的下一次 `wait_inbox` 读到它。命令行 `claim --keepalive` 在进程内自行续租，不依赖这条通知。
+
 **`wait_inbox` 通知预览。** 为了不必为每条通知多读一次，`wait_inbox` 返回的每一行在上述元数据之外，在**读取时**由当前对象现算三个字段（不进入 outbox）：
 
 - `actor`：`{"principal","kind"}`，触发者；`kind` 为 `human`、`agent`，或后台升级循环产生的 `service`。升级前写入的旧行没有记录触发者时，评论类通知取评论作者，其余省略该字段。
-- `subject`：任务事件为 `[<事件>] <任务说明前 60 个字符>`（空白折叠为单个空格），如 `[assigned] 核对发布清单`，事件标签为 `assigned`、`handed_off`、`awaiting_gate`、`gate_decided`、`failed`、`overdue`、`blocked`；评论为 `comment on <任务 id>`（线程不是任务时为 `comment on thread <线程 id>`），提及为 `mention in <任务 id>` 或 `mention in thread <线程 id>`。
+- `subject`：任务事件为 `[<事件>] <任务说明前 60 个字符>`（空白折叠为单个空格），如 `[assigned] 核对发布清单`，事件标签为 `assigned`、`handed_off`、`awaiting_gate`、`gate_decided`、`failed`、`overdue`、`blocked`、`expiring`；评论为 `comment on <任务 id>`（线程不是任务时为 `comment on thread <线程 id>`），提及为 `mention in <任务 id>` 或 `mention in thread <线程 id>`。
 - `body_preview`：评论正文或手工任务说明的前 200 个字符，不加省略号。
 
 只有读取时调用者仍对对象所在页面有 view 权限才会返回这些内容：失权的行整条不返回（见 `next_seq` 语义），重新获得权限后按当前内容再次可见。旧版 worker 行的 prompt 与任务视图一致保持不可见：其通知只有 `actor` 和 `[<事件>] <任务 id>` 形式的 `subject`，没有 `body_preview`。`fetch_inbox` 的每条 message 同样增加 `actor` 与 `body_preview`（`subject`、`body_md` 保持原样）。
@@ -432,7 +437,7 @@ docker compose exec bridge python -m bridge.a2a_public init-keys
 
 ## MCP 兼容与发现
 
-`submit_task(idempotency_key,prompt,page_id=None,scopes=None,assignee_principal=None,depends_on=None,work_face=None,require_work_face=False,task_kind="construction",priority="normal",escalate_to=None,fallback_assignee=None)`、`get_task(task_id)`、`list_tasks()`、`fetch_inbox()` 保持既有工具入口与结果形状。兼容 submit_task 在服务端从 principal + 业务 key 派生稳定 operation_id。其他工具与上列 HTTP 同名同参数，返回包含 x_protocol 和 result 的对象；它们通过同一个 operation dispatcher 执行，MCP 工具发现提供完整 JSON Schema。
+`submit_task(idempotency_key,prompt,page_id=None,scopes=None,assignee_principal=None,depends_on=None,work_face=None,require_work_face=False,task_kind="construction",priority="normal",escalate_to=None,fallback_assignee=None,reviewers=None)`、`get_task(task_id)`、`list_tasks()`、`fetch_inbox()` 保持既有工具入口。`reviewers` 可选，省略时结果形状与以前相同；传入后可能多一个 `warnings` 列表。兼容 submit_task 在服务端从 principal + 业务 key 派生稳定 operation_id。其他工具与上列 HTTP 同名同参数，返回包含 x_protocol 和 result 的对象；它们通过同一个 operation dispatcher 执行，MCP 工具发现提供完整 JSON Schema。
 
 旧显示字段 submission_mail_status/mail_status/mail_error 改为 submission_thread_status/thread_status/thread_error；适配器只记录经过校验的 thread_ids 等元数据，不记录正文。fetch_inbox.messages 仍提供 id/thread_id/subject/from/to/created_ts/body_md，来源是评论与提及视图。
 
@@ -464,6 +469,21 @@ Link: <docs/api.md#deprecated>; rel="deprecation"
 
 **服务端记录。** 每次弃用调用输出一行结构化日志 `{"event":"deprecated.call","operation":...,"principal":...,"kind":...}`（`kind` 为块类型，或 `proposal`/`attribution`/`selection`/`block` 等类别；只含操作名、principal 和类型，不含正文、凭据或请求值），并使计数器 `baton_deprecated_calls_total{operation}` 加一（进程内计数，日志行同时带当前累计值）。
 
+## 协议版本与兼容窗口
+
+当前协议代是 **2**，服务器仍接受的最低客户端代是 **1**（一个协议版本的兼容窗口）。`x_protocol` 保持 `baton.space.v1`，旧客户端只认这个字符串时不受影响。
+
+每个 `/v1/space` 响应（成功、业务错误，以及认证失败的 401/403）都带响应头：
+
+```
+X-Baton-Protocol-Version: 2
+X-Baton-Min-Client-Version: 1
+```
+
+`/v1/space` 的 JSON 体（成功、`error`，以及 schema）另带同值的 `protocol_version` 与 `min_client_version`。客户端发送 `X-Baton-Client-Version`。没有这个头的请求按版本 1 处理，窗口内仍然接受。显式版本小于最低值（或头的值不是十进制整数）时，服务器在认证之前返回 `409 protocol_incompatible`，消息固定，**不回显**客户端送来的版本。高于或等于最低值的客户端，包括比服务器更新的，照常处理。
+
+窗口的含义：这一代服务器同时服务协议代 2 和上一代（代 1，含不发送版本头的现有 `baton_cli`）。新增字段保持可选，旧客户端忽略未知 JSON 字段。下一次不兼容变更会把协议代升到 3、最低代升到 2，那时代 1 的客户端才收到 `protocol_incompatible`，而不是一条含糊的 TLS 错误。`baton_cli` 发现最低代高于自己时打印 `please upgrade baton_cli to >= N` 并以退出码 1 停止；`watch` 不把这个错误当作暂时故障重试。
+
 ## 错误与审计
 
 - `401 unauthorized`：缺少、重复、无效或已撤销的认证。
@@ -471,6 +491,7 @@ Link: <docs/api.md#deprecated>; rel="deprecation"
 - `403 delegation_required`：gate 的调用者（人或 agent）不是根审批人，也没有覆盖该任务的有效审批人委托；错误体的 `error.details` 与其他错误相同，不回显输入值。
 - `404 not_found`：资源不存在，或调用者对它没有 view 权限（包括已被撤权）；两种情况的响应完全相同，不泄漏存在性（规格 X7）。`get_task`、`list_comments`、`get_page`、`comment` 等读写一律如此。对他人目标（assignee、handoff 目标）缺权限的检查仍报告 `403`，因为调用者看得到该对象。
 - `409 operation_conflict / scope_conflict / stale_claim / revision_conflict / gate_required / dependency_blocked / graph_cycle / work_face_incomplete / task_canceled`：幂等、作用域、租约、版本、gate、依赖图、施工面清单不满足当前条件，或任务已通过 A2A `CancelTask` 取消。
+- `409 protocol_incompatible`：客户端声明的协议代低于 `X-Baton-Min-Client-Version`。见“协议版本与兼容窗口”。
 - `422 invalid`：未知操作、额外字段、无效类型或无效业务参数。响应的 `error.details` 在可定位时给出字段级提示，见下。
 - `429 rate_limited`：webhook 订阅数或 wait_inbox 并发等待数超过上限。
 - `503 storage_unavailable`：数据库不可用，不能当作成功；重试须沿用同一 operation_id。
