@@ -48,8 +48,9 @@ async def test_demo_is_explicit_audited_and_replay_does_not_execute(modules, mon
     await executor.execute(context(task_id, owner="other-client"), changed)
     assert changed.events[-1].status.state == TaskState.TASK_STATE_FAILED
     events = [json.loads(line) for line in (common.STATE / "audit.jsonl").read_text().splitlines()]
-    assert [event["event"] for event in events] == ["worker.claimed", "worker.completed", "worker.replay"]
+    assert [event["event"] for event in events] == ["worker.claimed", "worker.completed", "worker.replay", "worker.replay"]
     assert all(event["backend"] == "demo" for event in events)
+    assert events[-1]["error_code"] == "CODEX_IDEMPOTENCY_CONFLICT" and events[-1]["stage"] == "replay"
 
 
 @pytest.mark.asyncio
@@ -57,7 +58,8 @@ async def test_running_worker_becomes_interrupted_and_never_reexecutes(modules, 
     common, _, worker = modules
     task_id = str(uuid.uuid4())
     with common.database("executions.sqlite3") as db:
-        db.execute("INSERT INTO executions VALUES (?,?,?,?,?,?)", (task_id, "synthetic-digest", "running", None, str(uuid.uuid4()), "codex"))
+        db.execute("INSERT INTO executions(id,digest,status,result,a2a_id,backend) VALUES (?,?,?,?,?,?)",
+                   (task_id, "synthetic-digest", "running", None, str(uuid.uuid4()), "codex"))
     worker.init_db()
     executor = worker.CodexExecutor("codex")
 
@@ -74,41 +76,36 @@ async def test_running_worker_becomes_interrupted_and_never_reexecutes(modules, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("returncode", [0, 7])
-async def test_harness_result_cannot_follow_a_task_created_symlink(modules, monkeypatch, returncode):
+async def test_harness_result_cannot_follow_a_task_created_symlink(modules, fake_codex, returncode):
     common, _, worker = modules
     protected = common.STATE / "synthetic-protected-state"
     protected.write_text("must remain unchanged")
-    captured = {}
-
-    async def spawn(*command, **options):
-        if command == ("codex", "--version"):
-            async def version_output():
-                return ("codex-cli " + worker.CODEX_VERSION).encode(), None
-            return SimpleNamespace(returncode=0, communicate=version_output)
-        wd = Path(options["cwd"])
-        final = Path(command[command.index("--output-last-message") + 1])
-        captured.update(wd=wd, final=final)
-        # A tool may create a symlink in its own writable directory even when
-        # it cannot read or write the destination. The harness must ignore it.
-        (wd / "result.txt").symlink_to(protected)
-
-        async def complete(_input):
-            final.write_text("synthetic model result")
-            return None, None
-        return SimpleNamespace(returncode=returncode, communicate=complete)
-
-    monkeypatch.setattr(worker.asyncio, "create_subprocess_exec", spawn)
-    executor = worker.CodexExecutor("codex")
-    if returncode:
-        with pytest.raises(RuntimeError, match="Codex execution failed"):
-            await executor.run_codex("synthetic task", str(uuid.uuid4()))
-    else:
-        assert await executor.run_codex("synthetic task", str(uuid.uuid4())) == "synthetic model result"
+    fake_codex(steps=[{"symlink": str(protected)}], result="synthetic model result", exit=returncode)
+    executor = worker.CodexExecutor("codex", cgroup_root=common.STATE / "no-cgroup")
+    async with executor.lock:
+        if returncode:
+            with pytest.raises(worker.FailureError) as failed:
+                await executor.run_codex("synthetic task", str(uuid.uuid4()))
+            assert failed.value.failure.code == "CODEX_EXECUTION_FAILED"
+        else:
+            assert await executor.run_codex("synthetic task", str(uuid.uuid4())) == "synthetic model result"
     assert protected.read_text() == "must remain unchanged"
-    assert captured["final"].parent.parent == common.STATE
-    assert not captured["final"].is_relative_to(captured["wd"])
-    assert not captured["final"].parent.exists()
-    assert not captured["wd"].exists()
+    invocation = json.loads((common.CODEX_HOME / "invocation.json").read_text())
+    final = Path(invocation["argv"][invocation["argv"].index("--output-last-message") + 1])
+    assert final.parent.parent == common.STATE
+    assert not final.is_relative_to(Path(invocation["cwd"]))
+    assert not final.parent.exists()
+    assert not Path(invocation["cwd"]).exists()
+
+
+@pytest.mark.asyncio
+async def test_run_path_requires_the_executor_lock(modules):
+    _, _, worker = modules
+    executor = worker.CodexExecutor("codex")
+    with pytest.raises(RuntimeError, match="lock"):
+        await executor.run_codex("synthetic task", str(uuid.uuid4()))
+    with pytest.raises(RuntimeError, match="lock"):
+        await executor.run_backend("synthetic task", str(uuid.uuid4()))
 
 
 def test_codex_command_denies_credentials_and_only_writes_task_directory(modules, monkeypatch, tmp_path):
@@ -123,6 +120,7 @@ def test_codex_command_denies_credentials_and_only_writes_task_directory(modules
     assert all(profile["filesystem"][path] == "deny" for path in ("/data", "/config", "/run/secrets", "/home/agent/.codex"))
     assert profile["network"]["enabled"] is False
     assert config["approval_policy"] == "never" and config["web_search"] == "disabled"
+    assert command[:3] == ["codex", "exec", "--json"]
     assert "--model" not in command and not any("bypass" in item for item in command)
     monkeypatch.setenv("CODEX_MODEL", "synthetic-model")
     assert worker.codex_command(tmp_path, tmp_path / "result.txt")[-3:] == ["--model", "synthetic-model", "-"]

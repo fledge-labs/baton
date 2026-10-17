@@ -20,6 +20,8 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from bridge.failures import TASK_FAILURE_CODES, Failure
+
 LOCK_ID = 0x4241544F4E
 ROLES = {None: 0, "view": 1, "comment": 2, "edit": 3}
 MESSAGES = {
@@ -349,7 +351,7 @@ class SpaceStore:
     def _audit(conn, actor, operation_id, event, space_id=None, task_id=None, requested_by=None, **metadata):
         allowed = {"page_id", "block_id", "thread_id", "epoch", "revision", "proposal_id", "team_id", "subject_type",
                    "role", "decision", "backend", "a2a_task_id", "input_sha256", "output_sha256", "error_code",
-                   "count", "target_type", "execution_mode", "old_epoch", "work_face_keys", "work_face_sha256"}
+                   "count", "target_type", "execution_mode", "old_epoch", "work_face_keys", "work_face_sha256", "stage"}
         if not set(metadata) <= allowed:
             raise StoreError("invalid")
         conn.execute("""INSERT INTO baton.x_audit(id,event,agent,actor_account,actor_kind,requested_by,performed_by,
@@ -752,8 +754,9 @@ class SpaceStore:
         if row["state"] == "claimed" and not row["lease_valid"]:
             row["state"] = "interrupted" if row["execution_mode"] == "codex" and row["dispatch_started_at"] else "queued"
         row["status"] = {"claimed": "working", "done": "completed"}.get(row["state"], row["state"])
-        row.update(submission_mail_status="sent", mail_status="sent" if row["state"] == "done" else "not_ready", mail_error=None)
-        row.update(submission_thread_status="sent", report_status="sent" if row["state"] == "done" else "not_ready")
+        reported = row["state"] in {"done", "failed"}
+        row.update(submission_mail_status="sent", mail_status="sent" if reported else "not_ready", mail_error=None)
+        row.update(submission_thread_status="sent", report_status="sent" if reported else "not_ready")
         row["work_face_missing"] = self._work_face_missing(row)
         authority = self._authorization_context(actor, row)
         row["depends_on"], row["has_hidden_dependencies"] = self._visible_dependencies(conn, authority, task_id)
@@ -1376,6 +1379,33 @@ class SpaceStore:
                 raise StoreError("stale_claim")
             return self._task_view(conn, actor, task_id)
         return self._mutate(actor, operation_id, "finish_auto", {"task_id": task_id, "epoch": epoch, "result": result, "a2a_id": a2a_id, "backend": backend, "a2a_state": a2a_state},
+                            lambda conn: self._auto(conn, actor, task_id), effect, replay)
+
+    def fail_auto(self, actor, operation_id, task_id, epoch, error_code, a2a_id):
+        """Record a definite worker failure by closed code and report it in the task thread."""
+        _uuid(a2a_id)
+        if not isinstance(error_code, str) or error_code not in TASK_FAILURE_CODES:
+            raise StoreError("invalid")
+        failure = Failure(error_code)
+        def effect(conn):
+            self._live(conn, actor, task_id, epoch)
+            task = self._row(conn, "tasks", task_id)
+            if task["dispatch_started_at"] is None:
+                raise StoreError("gate_required")
+            conn.execute("UPDATE baton.tasks SET state='failed',error=%s,a2a_id=%s WHERE id=%s", (error_code, a2a_id, task_id))
+            conn.execute("DELETE FROM baton.x_claim WHERE task_id=%s", (task_id,))
+            self._task_audit(conn, actor, operation_id, "worker.failed", task, epoch=epoch, a2a_task_id=a2a_id,
+                             error_code=error_code, stage=failure.stage)
+            self._task_audit(conn, actor, operation_id, "task.failed", task, epoch=epoch, a2a_task_id=a2a_id,
+                             error_code=error_code, stage=failure.stage)
+            self._notify_task(conn, actor, operation_id, task, "failed", failure.report())
+            return self._task_view(conn, actor, task_id)
+        def replay(conn, old):
+            task = self._row(conn, "tasks", task_id)
+            if task["epoch"] != epoch or task["state"] != "failed":
+                raise StoreError("stale_claim")
+            return self._task_view(conn, actor, task_id)
+        return self._mutate(actor, operation_id, "fail_auto", {"task_id": task_id, "epoch": epoch, "error_code": error_code, "a2a_id": a2a_id},
                             lambda conn: self._auto(conn, actor, task_id), effect, replay)
 
     def interrupt_auto(self, actor, operation_id, task_id, epoch, error_code="dispatch_uncertain"):

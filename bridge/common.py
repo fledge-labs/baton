@@ -13,6 +13,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from bridge.failures import HEALTH_STATES, STAGES
+from bridge.phases import sanitize_phases
+
 STATE = Path(os.environ.get("BATON_STATE", "/data"))
 CONFIG = Path(os.environ.get("BATON_CONFIG", "/config"))
 SECRETS = Path("/run/secrets")
@@ -61,7 +64,7 @@ def audit(event, **fields):
     for key, value in fields.items():
         if value is None:
             continue
-        if key in {"task_id", "a2a_task_id", "request_id", "operation_id", "thread_id"}:
+        if key in {"task_id", "a2a_task_id", "request_id", "operation_id", "thread_id", "probe_id"}:
             try:
                 record[key] = uuid_id(value)
             except (ValueError, TypeError, AttributeError):
@@ -71,6 +74,19 @@ def audit(event, **fields):
                 record[key] = value
         elif key in {"agent", "error_type", "error_code"}:
             record[key] = safe_id(value)
+        elif key == "stage" and isinstance(value, str) and value in STAGES:
+            record[key] = value
+        elif key == "source" and value in {"resources", "canary"}:
+            record[key] = value
+        elif key == "health" and isinstance(value, str) and value in HEALTH_STATES:
+            record[key] = value
+        elif key == "level" and value in {"info", "warning", "error"}:
+            record[key] = value
+        elif key == "phases":
+            # Timing numbers and event type names only; anything else is dropped.
+            phases = sanitize_phases(value)
+            if phases is not None:
+                record[key] = phases
         elif key == "backend" and value in {"demo", "codex"}:
             record[key] = value
         elif key in {"status", "exit_code", "epoch"} and type(value) is int:

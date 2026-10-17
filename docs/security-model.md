@@ -27,6 +27,10 @@ DBA 登录是 `baton_bootstrap`；它只由数据库初始化与短期迁移服�
 
 Codex 0.154.0 工具沙箱拒绝读取 `/data`、`/config`、`/run/secrets`、`/home/agent/.codex`，只允许当前任务目录写入，禁止工具联网。harness 的模型认证与沙箱工具分离。结果的已知秘密过滤只是额外措施，不能替代访问控制。
 
+worker 以 `codex exec --json` 运行，只依据带类型的 CLI 错误事件和少量固定 stderr 模式分类失败；原始 stderr、stdout、prompt 和模型文本不写日志、审计或 A2A。A2A 失败只携带带版本的 `baton_failure` 数据片段（`version`、`code`、`stage`），bridge 只接受 worker 的已知错误码，其余一律降为固定的 `A2A_FAILED_UNCLASSIFIED`；任务 `error` 只保存错误码，失败说明以固定中文文本写入任务线程评论。
+
+worker `/healthz` 位于现有 dispatcher 认证之后，仅在 cgroup v2 资源采样新鲜且最近一次真实 canary 成功时返回 200，否则 503；容器健康检查使用只读的 `python -m bridge.worker_health check`，只读取 worker 发布的快照文件。canary 与业务任务走同一条执行路径和同一把执行锁，预算仍为 30 秒（业务 300 秒），沙箱权限不变。每次 Codex 执行（含 canary）记录各阶段的单调时钟毫秒数、cgroup `cpu.stat`/`io.stat`/`pgmajfault` 增量和是否冷启动；审计行及执行/探针记录只含这些数字和固定集合内的事件类型名，不含任何消息文本，无法读取的值记为 null 而不是 0。
+
 基础配置仅 worker 使用 `apparmor=unconfined` 与 Moby 基线上六项 syscall 例外，以支持嵌套 bubblewrap。它减少外层 LSM 保护，不能当作原始 Docker 默认隔离。Ubuntu 的非特权 userns 限制可能仍阻止启动；可选 override 使用管理员预加载的 `baton-codex-userns-v1`，其 `flags=(unconfined)` 加 `userns` 是明确例外，不是完整 AppArmor 策略。项目不关闭全局限制或自动加载宿主策略。内层隔离必须由目标主机的 `scripts/sandbox_probe.py` 验证，不得用危险 bypass 获得成功。
 
 这是受信任操作者的独立实验，不是已验证的敌对多租户代码执行平台；不接生产系统、生产数据或敏感源代码。浏览器只在内存中保留 bearer，渲染使用 textContent，不保存 localStorage 或记录 Authorization。
