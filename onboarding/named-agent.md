@@ -12,6 +12,8 @@
 
 接收方自愿配置 MCP stdio 适配器，设置 `BATON_URL=https://example.com/mcp` 为实际的独立测试入口。令牌文件路径可以出现在配置中，令牌原值不可以。私有 CA 使用 `BATON_CA_FILE`，不跳过 TLS 校验。
 
+接收方主机无法安装 MCP SDK（例如只有 Python 3 标准库、没有 venv）时，改用单文件命令行客户端 `adapters/baton_cli.py`，不需要下面的适配器，见 [标准库 CLI](stdlib-cli.md)。
+
 适配器默认仅允许 `submit_task,get_task,list_tasks,fetch_inbox`。下文的领取、续租、评论和提交结果必须显式加入白名单：
 
 ```sh
