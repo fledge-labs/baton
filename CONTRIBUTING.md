@@ -22,3 +22,14 @@ Never commit tokens, keys, internal hostnames or customer data. Examples use pla
 脚本调用 `pip-compile --generate-hashes`，保留 SPDX，并抑制索引地址与工具环境的绝对路径。索引认证只通过本地既有安全配置提供，不写入锁文件或仓库。提交前确认版本约束未改变，并在 Python 3.12 的目标平台以 `pip install --require-hashes --only-binary=:all: -r deploy/requirements.txt` 完成干净安装；Dockerfile 与所有客户端安装说明也必须保留这两个选项。只安装 wheel 可避免源发行包在构建时另外解析未锁定依赖。当前目标包括 macOS arm64 与 Linux arm64；依赖变更后须重新核验两者，不能将单平台解析视为跨平台保证。
 
 依据：[pip-tools 哈希生成与跨环境说明](https://pip-tools.readthedocs.io/en/stable/)、[pip 安全安装](https://pip.pypa.io/en/stable/topics/secure-installs/)。
+
+## Full test suite with PostgreSQL
+
+With Docker available, run every test (including PostgreSQL integration) in one command:
+
+```sh
+# SPDX-License-Identifier: Apache-2.0
+sh scripts/test_with_postgres.sh
+```
+
+The script starts a disposable PostgreSQL instance (image from `deploy/versions.json`), bootstraps roles and schema by running `deploy/migrate.py` against the published loopback port, installs locked dependencies into a temporary virtualenv, exports `BATON_TEST_DATABASE_CONFIG` and `BATON_TEST_DATABASE_ADMIN_CONFIG`, runs `pytest -q -rfEs`, then `scripts/check_public_tree.py`. Credentials stay in a mode-`700` directory outside the repository and are never printed. Pass extra arguments through to pytest (for example `sh scripts/test_with_postgres.sh tests/test_space_store.py`).
