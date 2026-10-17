@@ -473,3 +473,122 @@ async def test_dispatch_rechecks_revocation_while_mark_dispatched_waits(
     assert no_a2a == []
     log = (common.STATE / "audit.jsonl").read_text()
     assert not any(json.loads(line)["event"] == "task.dispatched" for line in log.splitlines())
+
+
+def work_face(**changes):
+    return {"environment": ["python 3.12"], "fixtures": ["seed.sql"], "constraints": ["no network"],
+            "migration": None, "acceptance_command": "pytest -q", **changes}
+
+
+def mcp_call(client, token, name, arguments, request_id=40):
+    headers = {"Authorization": "Bearer " + token, "Host": "bridge", "Accept": "application/json, text/event-stream"}
+    response = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+                                                            "params": {"name": name, "arguments": arguments}})
+    result = response.json()["result"]
+    if result.get("isError", False):
+        return None, result
+    return result.get("structuredContent") or json.loads(result["content"][0]["text"]), result
+
+
+def test_set_work_face_http_flow_enforces_gate_authority_and_error_codes(api):
+    _, call, identities, _, _, _ = api
+    _, page = shared_page(call, identities)
+    reviewer = identities["reviewer"]["agent"]
+    task = call("owner", "create_task_block", operation_id=op(), page_id=page["id"], prompt="Needs a work face",
+                scopes=[{"kind": "path", "value": "src/work-face"}], reviewers=[reviewer],
+                assignee_principal=identities["worker"]["agent"], require_work_face=True)
+    assert task["require_work_face"] is True and task["task_kind"] == "construction" and task["work_face"] is None
+    assert task["work_face_missing"] == ["base_commit", "work_face"]
+    assert call("worker", "claim", 409, operation_id=op(), task_id=task["task_id"])["code"] == "work_face_incomplete"
+    assert call("worker", "ready", page_id=page["id"]) == []
+
+    for label in ("stranger", "worker"):
+        assert call(label, "set_work_face", 403, operation_id=op(), task_id=task["task_id"], work_face=work_face())["code"] == "forbidden"
+    for body in ({"work_face": {**work_face(), "extra": 1}}, {"work_face": "text"}, {"work_face": work_face(acceptance_command=" ")},
+                 {"work_face": work_face(environment=["x"] * 21)}, {"work_face": work_face(), "base_commit": ""}, {}):
+        assert call("owner", "set_work_face", 422, operation_id=op(), task_id=task["task_id"], **body)["code"] == "invalid"
+    assert call("owner", "set_work_face", 422, operation_id=op(), task_id=task["task_id"], work_face=work_face(), actor="someone")["code"] == "invalid"
+
+    set_op = op()
+    done = call("reviewer", "set_work_face", operation_id=set_op, task_id=task["task_id"], work_face=work_face(), base_commit="http-base")
+    assert done["work_face_missing"] == [] and done["work_face"] == work_face() and done["base_commit"] == "http-base"
+    assert done["replay"] is False and "idempotency_key" not in done
+    assert call("reviewer", "set_work_face", operation_id=set_op, task_id=task["task_id"], work_face=work_face(), base_commit="http-base")["replay"] is True
+    assert call("reviewer", "set_work_face", 409, operation_id=set_op, task_id=task["task_id"],
+                work_face=work_face(fixtures=["other.sql"]), base_commit="http-base")["code"] == "operation_conflict"
+    assert call("owner", "set_work_face", 409, operation_id=op(), task_id=task["task_id"],
+                work_face=work_face(), base_commit="other-base")["code"] == "operation_conflict"
+
+    assert {item["task_id"] for item in call("worker", "ready", page_id=page["id"])} == {task["task_id"]}
+    claim = call("worker", "claim", operation_id=op(), task_id=task["task_id"])
+    assert claim["state"] == "claimed" and claim["work_face"] == work_face()
+    assert call("owner", "set_work_face", 409, operation_id=op(), task_id=task["task_id"], work_face=work_face())["code"] == "stale_claim"
+    events = [row for row in call("owner", "list_audit", task_id=task["task_id"]) if row["event"] == "task.work_face_set"]
+    assert len(events) == 1 and "pytest -q" not in json.dumps(events)
+
+
+def test_prep_task_gates_construction_over_http(api):
+    _, call, identities, _, _, _ = api
+    _, page = shared_page(call, identities)
+    owner = identities["owner"]["agent"]
+    prep = call("owner", "create_task_block", operation_id=op(), page_id=page["id"], prompt="Prepare the site",
+                scopes=[{"kind": "migration", "value": "prep-site"}], reviewers=[owner],
+                assignee_principal=identities["worker"]["agent"], task_kind="prep")
+    build = call("owner", "create_task_block", operation_id=op(), page_id=page["id"], prompt="Build on the prepared site",
+                 scopes=[{"kind": "migration", "value": "build-site"}], reviewers=[owner],
+                 assignee_principal=identities["replacement"]["agent"], depends_on=[prep["task_id"]], require_work_face=True)
+    assert prep["task_kind"] == "prep" and build["depends_on"] == [prep["task_id"]]
+    assert call("worker", "set_work_face", 403, operation_id=op(), task_id=build["task_id"], work_face=work_face())["code"] == "forbidden"
+    claim = call("worker", "claim", operation_id=op(), task_id=prep["task_id"])
+    call("worker", "set_work_face", operation_id=op(), task_id=build["task_id"], work_face=work_face(), base_commit="prepared-base")
+    assert call("replacement", "claim", 409, operation_id=op(), task_id=build["task_id"])["code"] == "dependency_blocked"
+    call("worker", "submit_result", operation_id=op(), task_id=prep["task_id"], epoch=claim["epoch"], result="Site prepared")
+    assert call("replacement", "claim", 409, operation_id=op(), task_id=build["task_id"])["code"] == "dependency_blocked"
+    assert call("replacement", "ready", page_id=page["id"]) == []
+    call("owner", "gate", operation_id=op(), task_id=prep["task_id"], expected_epoch=claim["epoch"], decision="pass")
+    assert {item["task_id"] for item in call("replacement", "ready", page_id=page["id"])} == {build["task_id"]}
+    claimed = call("replacement", "claim", operation_id=op(), task_id=build["task_id"])
+    assert claimed["state"] == "claimed" and claimed["base_commit"] == "prepared-base" and claimed["work_face"] == work_face()
+
+
+def test_set_work_face_is_published_through_schema_and_mcp_with_the_same_dispatcher(api):
+    client, call, identities, tokens, _, _ = api
+    schema = client.get("/v1/space/schema", headers={"Authorization": "Bearer " + tokens["owner"]}).json()["operations"]
+    request = schema["set_work_face"]["request"]
+    assert schema["set_work_face"]["mutation"] is True and request["additionalProperties"] is False
+    assert set(request["required"]) == {"operation_id", "task_id", "work_face"} and "base_commit" in request["properties"]
+    for name in ("create_task_block", "submit_task"):
+        properties = schema[name]["request"]["properties"]
+        assert {"work_face", "require_work_face", "task_kind"} <= properties.keys()
+        assert not {"work_face", "require_work_face", "task_kind"} & set(schema[name]["request"].get("required", []))
+    headers = {"Authorization": "Bearer " + tokens["owner"], "Host": "bridge", "Accept": "application/json, text/event-stream"}
+    listed = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 41, "method": "tools/list"}).json()["result"]["tools"]
+    tools = {tool["name"]: tool for tool in listed}
+    assert set(tools["set_work_face"]["inputSchema"]["required"]) == {"operation_id", "task_id", "work_face"}
+    assert not {"ctx", "arguments", "actor"} & tools["set_work_face"]["inputSchema"]["properties"].keys()
+    assert {"work_face", "require_work_face", "task_kind"} <= tools["submit_task"]["inputSchema"]["properties"].keys()
+
+    _, page = shared_page(call, identities)
+    submitted, raw = mcp_call(client, tokens["owner"], "submit_task", {
+        "idempotency_key": "mcp-work-face", "prompt": "Needs a work face", "page_id": page["id"],
+        "scopes": [{"kind": "path", "value": "src/mcp"}], "assignee_principal": identities["worker"]["agent"],
+        "require_work_face": True, "task_kind": "construction"})
+    assert not raw.get("isError", False) and submitted["work_face_missing"] == ["base_commit", "work_face"]
+    assert call("worker", "claim", 409, operation_id=op(), task_id=submitted["task_id"])["code"] == "work_face_incomplete"
+    set_op = op()
+    arguments = {"operation_id": set_op, "task_id": submitted["task_id"], "work_face": work_face(), "base_commit": "mcp-base"}
+    first, raw = mcp_call(client, tokens["owner"], "set_work_face", arguments)
+    assert not raw.get("isError", False) and first["x_protocol"] == "baton.space.v1"
+    assert first["result"]["work_face_missing"] == [] and first["result"]["base_commit"] == "mcp-base" and first["result"]["replay"] is False
+    replay, _ = mcp_call(client, tokens["owner"], "set_work_face", arguments, 42)
+    assert replay["result"]["replay"] is True
+    conflict, raw = mcp_call(client, tokens["owner"], "set_work_face", {**arguments, "base_commit": "other-base"}, 43)
+    assert conflict is None and raw["content"][0]["text"].startswith("operation_conflict")
+    for denied in ("worker", "stranger"):
+        error, raw = mcp_call(client, tokens[denied], "set_work_face", {**arguments, "operation_id": op()}, 44)
+        assert error is None and raw["content"][0]["text"].startswith("forbidden")
+    invalid, raw = mcp_call(client, tokens["owner"], "set_work_face", {**arguments, "operation_id": op(), "work_face": {**work_face(), "extra": 1}}, 45)
+    assert invalid is None and raw["content"][0]["text"].startswith("invalid")
+    rejected, raw = mcp_call(client, tokens["owner"], "submit_task", {"idempotency_key": "mcp-extra", "prompt": "Extra", "unknown": 1}, 46)
+    assert rejected is None and raw["content"][0]["text"].startswith("invalid")
+    assert call("worker", "claim", operation_id=op(), task_id=submitted["task_id"])["state"] == "claimed"

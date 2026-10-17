@@ -25,7 +25,7 @@ TOOLS = {"submit_task", "get_task", "list_tasks", "fetch_inbox", "create_space",
          "create_page", "get_page", "list_pages", "create_block", "get_block", "list_blocks", "update_block",
          "revert_block", "share", "effective_role", "create_team", "set_team_member", "comment", "list_comments",
          "mention", "proposal_create", "proposal_review", "get_proposal", "list_proposals", "list_attribution",
-         "create_task_block", "assign_task", "plan", "ready", "claim", "renew", "submit_result", "handoff", "gate", "get_claim", "list_claims",
+         "create_task_block", "assign_task", "plan", "set_work_face", "ready", "claim", "renew", "submit_result", "handoff", "gate", "get_claim", "list_claims",
          "get_scopes", "list_audit", "x_claim", "x_scope", "x_handoff", "x_gate", "x_audit"}
 STATUSES = {"queued", "working", "completed", "failed", "interrupted", "claimed", "awaiting_gate", "done"}
 DEFAULT_ALLOWED_TOOLS = frozenset({"submit_task", "get_task", "list_tasks", "fetch_inbox"})

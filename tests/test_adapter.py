@@ -207,3 +207,10 @@ async def test_mcp_rejection_audit_falls_back_to_stderr_without_leaking_failed_f
     row = json.loads(output.err)
     assert set(row) == {"time", "agent", "event", "rejected_count", "audit_file_error"}
     assert row["event"] == "adapter.tool_denied" and row["audit_file_error"] is True
+
+
+def test_set_work_face_is_a_known_tool_but_not_in_the_default_allowlist():
+    assert "set_work_face" in adapter.TOOLS
+    assert adapter.DEFAULT_ALLOWED_TOOLS == {"submit_task", "get_task", "list_tasks", "fetch_inbox"}
+    args = adapter.parse_args(["--agent-id", "beigua", "--token-file", "/synthetic/token", "--allow-tools", "claim,set_work_face"])
+    assert args.allow_tools == {"claim", "set_work_face"}

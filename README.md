@@ -85,7 +85,7 @@ WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --b
 
 任务桥已使用 Baton 自有 PostgreSQL 存储，完成结果作为同任务 UUID 线程中的评论回报，并通过提及/分配进入接收者 inbox。`fetch_inbox` 查询当前身份可见的 mentions 与 assignments，不公开其他人的收件箱。请求处理时重新检查权限。
 
-既有 MCP `submit_task`、`get_task`、`list_tasks`、`fetch_inbox` 保留；协作工具包括 `claim`、`renew`、`handoff`、`comment`、`mention`、`plan`、`ready`。具体参数、允许操作和验收以 [规格](docs/spec/space.md) 与实现返回的工具 schema 为准。HTTP 使用 `POST /v1/space/{operation}`，所有操作都是 Baton 自有协议。
+既有 MCP `submit_task`、`get_task`、`list_tasks`、`fetch_inbox` 保留；协作工具包括 `claim`、`renew`、`handoff`、`comment`、`mention`、`plan`、`ready`、`set_work_face`。具体参数、允许操作和验收以 [规格](docs/spec/space.md) 与实现返回的工具 schema 为准。HTTP 使用 `POST /v1/space/{operation}`，所有操作都是 Baton 自有协议。
 
 未指定接收人的兼容自动 `submit_task` 使用明确的 `worker_success` gate；指定接收人或手工领取不自动启动 worker，手工 gate 必须由有资格的 reviewer 审批，结果作者不能自批。`awaiting_gate` 不能提前显示为 completed。
 
@@ -98,6 +98,10 @@ WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --b
 `plan(operation_id, graph=[{task_id, depends_on}])` 只为已存在的任务 UUID 原子建立或追加依赖，使用稳定 UUID 操作键；任一无效引用、越权或循环都会整批回滚。只有从未领取或执行过的 `queued` 任务可追加，租约过期或结果被拒后也不能借此改图；不提供删除依赖。图由人或外部规划 agent 创建，Baton 负责存储与校验，不内置 planner。
 
 `ready(page_id=None, limit=50)` 返回当前调用者可 edit、符合指定接收人要求、租约允许、依赖通过且无 scope 冲突的候选任务。依赖访问权限在建图、查询和领取时重新检查；隐藏依赖不会泄漏其 UUID。ready 是即时快照，不保留领取名额；实际 `claim` 仍会原子重验全部条件，命名 agent 继续自愿拉取。
+
+### 施工面清单（x_ready）
+
+`x_ready` 让任务携带施工面清单：基线（`base_commit`）、声明范围（`scopes`）、环境与夹具、约束和验收命令（`work_face`）。创建任务时设置 `require_work_face=true`，清单不完整就不能领取：`claim` 返回 `409 work_face_incomplete`，`ready` 也不会列出它；`set_work_face` 可由任务 owner、reviewer，或持有关联准备任务租约的人补全。准备任务是 `task_kind="prep"` 的普通任务，施工任务用 `depends_on` 指向它，复用 x_graph 的 gate 规则：准备任务通过前，施工任务返回 `dependency_blocked`。注意 x_ready 和上面的 `ready` 查询不是一回事：`ready` 只列出可领取的任务，x_ready 是任务上的清单和门控。Baton 不执行 `acceptance_command`，它只是给领取人和 gate 审阅人看的信息。细节见 [规格 X18](docs/spec/space.md) 与 [API](docs/api.md)。
 
 ## 端到端验收
 
