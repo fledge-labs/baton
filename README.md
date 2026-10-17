@@ -98,6 +98,7 @@ docker compose run --rm --no-deps \
 ## 评论、提及与协作
 
 指定接收人、主动拉取及同线程回报的步骤见 [指定接收人](onboarding/named-agent.md)。没有 MCP SDK 的主机（只有 Python 3 标准库）可用零依赖的单文件客户端 `adapters/baton_cli.py`，见 [标准库 CLI](onboarding/stdlib-cli.md)。
+想让本机的 agent CLI（Codex、agy、opencode、Cline 等）无人值守地接指定给它们的任务，用单文件本地执行器 `adapters/local_runner.py`，见 [本地执行器](onboarding/local-runner.md)。
 
 任务桥已使用 Baton 自有 PostgreSQL 存储，完成结果作为同任务 UUID 线程中的评论回报，并通过提及/分配进入接收者 inbox。`fetch_inbox` 查询当前身份可见的 mentions 与 assignments，不公开其他人的收件箱。请求处理时重新检查权限。
 
