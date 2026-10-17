@@ -918,6 +918,9 @@ def test_backup_dir_is_required_unless_no_backup_is_given(files, capsys):
     "ALTER POLICY p ON baton.t USING (false);", "ALTER TABLE baton.t ENABLE ROW LEVEL SECURITY;",
     "ALTER TABLE baton.t FORCE ROW LEVEL SECURITY;", "ALTER TABLE baton.t NO FORCE ROW LEVEL SECURITY;",
     "ALTER TABLE baton.t DISABLE ROW LEVEL SECURITY;",
+    "ALTER TABLE baton.t DISABLE TRIGGER ALL;",
+    "ALTER TABLE baton.t DISABLE TRIGGER USER;",
+    "ALTER TABLE baton.x_audit DISABLE TRIGGER audit_no_change;",
 ])
 def test_migration_lint_flags_contract_statements_a_previous_image_cannot_survive(statement):
     assert deploy.unsafe_migration_statements("CREATE TABLE IF NOT EXISTS baton.t(a int);\n" + statement + "\n")
@@ -1318,6 +1321,19 @@ def test_schema_diff_flags_a_changed_predicate_or_column_list_on_an_existing_ind
     assert deploy.schema_breaking_changes(before, base_snapshot()) == []
 
 
+def test_schema_diff_flags_disabling_a_trigger_even_when_its_definition_is_unchanged():
+    definition = "CREATE TRIGGER audit_no_change BEFORE UPDATE ON baton.x_audit"
+    firing = {"t": "baton.x_audit", "name": "audit_no_change", "def": definition, "enabled": "O"}
+    before = altered(triggers=[firing])
+    disabled = altered(triggers=[dict(firing, enabled="D")])
+    replica = altered(triggers=[dict(firing, enabled="R")])
+    assert deploy.schema_breaking_changes(before, disabled) == [
+        "disables trigger audit_no_change on baton.x_audit"]
+    assert deploy.schema_breaking_changes(before, replica) == [
+        "changes whether trigger audit_no_change on baton.x_audit fires"]
+    assert deploy.schema_breaking_changes(before, altered(triggers=[dict(firing)])) == []
+
+
 def test_schema_diff_flags_a_non_unique_index_rebuilt_as_unique_under_the_same_name():
     plain = {"t": "baton.tasks", "name": "tasks_assignee",
              "def": "CREATE INDEX tasks_assignee ON baton.tasks USING btree (assignee)",
@@ -1434,6 +1450,8 @@ def test_catalog_sql_and_diff_on_a_real_postgres_accept_the_shipped_schema_and_c
                 ("ALTER ROLE df18_role NOLOGIN", "changes role df18_role"),
                 ("ALTER ROLE df18_role CONNECTION LIMIT 0", "changes role df18_role"),
                 ("GRANT df18_role TO baton_owner", "adds membership of baton_owner in df18_role"),
+                ("ALTER TABLE baton.x_audit DISABLE TRIGGER audit_no_change",
+                 "disables trigger audit_no_change on baton.x_audit"),
             ]:
                 before = snapshot()
                 if statement.startswith(("CREATE ROLE", "ALTER ROLE", "GRANT df18_role")):
@@ -1737,7 +1755,8 @@ def test_rollback_limits_are_documented_next_to_the_commands():
     section = readme.split("### 重新部署、冒烟与回滚")[1].split("### 升级旧实例")[0]
     for needle in ("expand", "pg_dump", "--backup-dir", "迁移", "不恢复数据库", "--allow-remove-orphans", "超时", "孤立",
                    "隔离容器", "已停止", "数据卷", "--schema-file", "保留标签", "符号链接", "互斥", "行级安全", "GRANT",
-                   "元命令", "唯一性", "--network none", "角色", "UPDATE", "1 MiB"):
+                   "元命令", "唯一性", "--network none", "角色", "UPDATE", "1 MiB",
+                   "只在这个预检容器", "tgenabled"):
         assert needle in section, needle
     assert "expand-only" in deploy.__doc__ and "backup" in deploy.__doc__ and "orphans" in deploy.__doc__
 

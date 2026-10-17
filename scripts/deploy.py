@@ -109,6 +109,7 @@ INCOMPATIBLE_SQL = (
     ('changes a row level security policy', r'\b(?:CREATE|ALTER|DROP)\s+POLICY\b'),
     ('changes row level security',
      r'\b(?:NO\s+FORCE|ENABLE|DISABLE|FORCE)\s+ROW\s+LEVEL\s+SECURITY\b'),
+    ('disables a trigger', r'\bDISABLE\s+TRIGGER\b'),
 )
 ADD_CLAUSE = re.compile(r'\bADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?'
                         r'(?!CONSTRAINT\b|PRIMARY\b|UNIQUE\b|CHECK\b|FOREIGN\b|LIKE\b|EXCLUDE\b)([^;]*?)'
@@ -144,7 +145,7 @@ CATALOG_SQL = """SELECT json_build_object(
    FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid JOIN pg_class c ON c.oid = i.indrelid
    JOIN pg_namespace n ON n.oid = c.relnamespace WHERE %(system)s),
  'triggers', (SELECT coalesce(json_agg(json_build_object('t', n.nspname||'.'||c.relname, 'name', g.tgname,
-     'def', pg_get_triggerdef(g.oid))), '[]'::json)
+     'def', pg_get_triggerdef(g.oid), 'enabled', g.tgenabled)), '[]'::json)
    FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
    WHERE NOT g.tgisinternal AND %(system)s),
  'functions', (SELECT coalesce(json_agg(json_build_object('sig', p.oid::regprocedure::text, 'def', pg_get_functiondef(p.oid))), '[]'::json)
@@ -808,9 +809,22 @@ def schema_breaking_changes(before, after):
                       or now.get('pred') != item.get('pred') or now.get('def') != item.get('def')):
                     changes.append('changes index %s on %s' % (name[1], name[0]))
                 continue
+            # pg_get_triggerdef does not include tgenabled, so DISABLE TRIGGER used to compare equal.
+            # 'O' is the normal origin firing mode the bridge health check requires.
+            if section == 'triggers':
+                if now is None:
+                    changes.append('drops trigger %s on %s' % (name[1], name[0]))
+                elif now['def'] != item['def']:
+                    changes.append('changes trigger %s on %s' % (name[1], name[0]))
+                elif now.get('enabled', 'O') != item.get('enabled', 'O'):
+                    if now.get('enabled') == 'D':
+                        changes.append('disables trigger %s on %s' % (name[1], name[0]))
+                    else:
+                        changes.append('changes whether trigger %s on %s fires' % (name[1], name[0]))
+                continue
             if now is None:
                 changes.append('drops %s %s on %s' % (label, name[1], name[0]))
-            elif now['def'] != item['def'] and (section != 'indexes' or item['unique'] or now['unique']):
+            elif now['def'] != item['def']:
                 changes.append('changes %s %s on %s' % (label, name[1], name[0]))
         for name, item in sorted(after_items.items()):
             if name in before_items or (section == 'indexes' and not item['unique']):
@@ -976,9 +990,11 @@ def precheck_migration(docker, config, sql, previous, project, clock=time.monoto
 
     The container uses the database service's image, ``--network none``, a private superuser and a tmpfs data
     directory. It is loaded from a schema-only dump plus ``pg_dumpall --roles-only --no-role-passwords`` of the
-    live database. Those two dumps are read-only. psql then runs only inside the throwaway container, so a
-    backslash meta-command cannot reach the real database or the host. The container is removed at the end.
-    Role changes commit there and show up in the diff; they never touch the live cluster. Fails closed.
+    live database. Those two dumps are read-only. Before the backup, the migration SQL runs only inside this
+    container: it is not executed on the live database. ``COMMIT``, ``RESET ROLE``, ``ALTER ROLE``,
+    ``ALTER DATABASE`` and ``COPY ... TO PROGRAM`` therefore cannot change the live cluster or start a shell
+    in its container. The container is removed before the backup. Role and trigger-enabled changes show up in
+    the diff. Fails closed.
     """
     name = PRECHECK_PREFIX + secrets.token_hex(6)
     report = {'database': name, 'network': 'none', 'ok': False, 'changes': [], 'error': None}
