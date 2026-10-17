@@ -476,7 +476,7 @@ def test_scope_blocked_automatic_tasks_are_logged_once_per_five_minutes(api, pg_
     holder = manual_task(call, identities, page, prompt="Holds a path", scopes=[{"kind": "path", "value": "src/held"}])
     call("worker", "claim", operation_id=op(), task_id=holder["task_id"])
     stuck = call("owner", "submit_task", operation_id=op(), idempotency_key="df13-stuck", prompt="Stuck auto", page_id=page["id"],
-                 scopes=[{"kind": "path", "value": "src/other"}])
+                 scopes=[{"kind": "path", "value": "src/held/other"}])
     server._SCOPE_WARNED.clear()
     clock = [1000.0]
     monkeypatch.setattr(server.time, "monotonic", lambda: clock[0])
@@ -497,10 +497,43 @@ def test_scope_blocked_automatic_tasks_are_logged_once_per_five_minutes(api, pg_
     assert len(audit_records(common, "dispatch.blocked_by_scope")) == 2
 
     other = call("owner", "submit_task", operation_id=op(), idempotency_key="df13-second", prompt="Second stuck", page_id=page["id"],
-                 scopes=[{"kind": "path", "value": "src/more"}])
+                 scopes=[{"kind": "path", "value": "src/held/more"}])
     asyncio.run(server.claim_next())
     warned = {row["task_id"] for row in audit_records(common, "dispatch.blocked_by_scope")}
     assert warned == {stuck["task_id"], other["task_id"]}, "every skipped task gets its own warning"
+
+
+def test_claim_next_runs_disjoint_paths_in_parallel_and_skips_only_prefix_overlaps(api, pg_store, modules):
+    common, server, _ = modules
+    _, call, identities, _, _, _ = api
+    _, page = shared_page(call, identities)
+    holder = manual_task(call, identities, page, prompt="Holds a path", scopes=[{"kind": "path", "value": "src/a"}])
+    call("worker", "claim", operation_id=op(), task_id=holder["task_id"])
+    inside = call("owner", "submit_task", operation_id=op(), idempotency_key="prefix-inside", prompt="Inside auto", page_id=page["id"],
+                  scopes=[{"kind": "path", "value": "src/a/deep"}])
+    sibling = call("owner", "submit_task", operation_id=op(), idempotency_key="prefix-sibling", prompt="Sibling auto", page_id=page["id"],
+                   scopes=[{"kind": "path", "value": "src/ab"}])
+    docs = call("owner", "submit_task", operation_id=op(), idempotency_key="prefix-docs", prompt="Docs auto", page_id=page["id"],
+                scopes=[{"kind": "path", "value": "docs/b"}])
+    skipped = []
+    first = pg_store.claim_next(server.SERVICE, op(), on_scope_skip=lambda task, blocker: skipped.append((task, blocker)))
+    second = pg_store.claim_next(server.SERVICE, op(), on_scope_skip=lambda task, blocker: skipped.append((task, blocker)))
+    assert (first["task_id"], second["task_id"]) == (sibling["task_id"], docs["task_id"])
+    assert pg_store.claim_next(server.SERVICE, op()) is None
+    assert (inside["task_id"], holder["task_id"]) in skipped
+    assert call("owner", "get_task", task_id=inside["task_id"])["state"] == "queued"
+
+
+def test_ready_lists_only_candidates_whose_paths_do_not_overlap_a_live_claim(api, pg_store):
+    _, call, identities, _, _, _ = api
+    _, page = shared_page(call, identities)
+    holder = manual_task(call, identities, page, prompt="Holds a path", scopes=[{"kind": "path", "value": "src/a"}])
+    call("worker", "claim", operation_id=op(), task_id=holder["task_id"])
+    nested = manual_task(call, identities, page, prompt="Nested", scopes=[{"kind": "path", "value": "src/a/x"}])
+    disjoint = manual_task(call, identities, page, prompt="Disjoint", scopes=[{"kind": "path", "value": "docs/b"}])
+    ready = {task["task_id"] for task in call("worker", "ready", page_id=page["id"])}
+    assert disjoint["task_id"] in ready and nested["task_id"] not in ready
+    call("worker", "claim", operation_id=op(), task_id=disjoint["task_id"])
 
 
 def test_unblocked_automatic_tasks_log_nothing_and_a_failing_hook_cannot_change_the_claim(api, pg_store, modules):

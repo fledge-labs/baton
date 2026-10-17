@@ -245,14 +245,14 @@ def test_concurrent_operation_and_business_retries_have_one_effect(pg):
     assert len([row for row in s.list_audit(pg.owner, task_id=tasks[0]["id"]) if row["event"] == "task.submitted"]) == 1
 
 
-@pytest.mark.parametrize("alias", [False, True], ids=["same_declared_path", "unverified_alias"])
-def test_cross_space_scope_claim_race_is_serialized_in_postgres(pg, alias):
+@pytest.mark.parametrize("nested", [False, True], ids=["same_declared_path", "nested_path"])
+def test_cross_space_scope_claim_race_is_serialized_in_postgres(pg, nested):
     s = pg.store
     other_space = s.create_space(pg.editor, operation(), "Other Space")
     other_page = s.create_page(pg.editor, operation(), other_space["id"], "Other page")
     scopes = [{"kind": "path", "value": pg.prefix + "/src"}]
     first = manual(pg, scopes=scopes)
-    other_scopes = [{"kind": "path", "value": pg.prefix + "/unverified-link"}] if alias else scopes
+    other_scopes = [{"kind": "path", "value": pg.prefix + "/src/nested"}] if nested else scopes
     second = s.create_task_block(pg.editor, operation(), other_page["id"], "Other work", other_scopes, [pg.reviewer.principal])
     barrier = threading.Barrier(2)
     def claim(pair):
@@ -267,18 +267,44 @@ def test_cross_space_scope_claim_race_is_serialized_in_postgres(pg, alias):
     assert sorted(results) == ["claimed", "scope_conflict"]
 
 
-def test_path_declarations_are_preserved_but_all_paths_and_modules_conflict(pg):
+def test_path_declarations_are_preserved_and_conflict_by_prefix_and_module(pg):
     s = pg.store
     first = manual(pg, "first", [{"kind": "path", "value": pg.prefix + "/src/a"}])
     sibling = manual(pg, "sibling", [{"kind": "path", "value": pg.prefix + "/src/ab"}])
+    other_tree = manual(pg, "other-tree", [{"kind": "path", "value": pg.prefix + "/docs/b"}])
     child = manual(pg, "child", [{"kind": "path", "value": pg.prefix + "/src/a/file.py"}])
+    parent = manual(pg, "parent", [{"kind": "path", "value": pg.prefix + "/src"}])
     unknown = manual(pg, "module", [{"kind": "module", "value": "unknown"}])
     root = manual(pg, "root", [])
     s.claim(pg.owner, operation(), first["id"])
-    for task in (sibling, child, unknown, root):
+    for task in (child, parent, unknown, root):
         expect("scope_conflict", lambda task=task: s.claim(pg.owner, operation(), task["id"]))
+    for task in (sibling, other_tree):
+        assert s.claim(pg.owner, operation(), task["id"])["state"] == "claimed"
     assert s.get_scopes(pg.owner, sibling["id"])["scopes"] == [{"kind": "path", "value": pg.prefix + "/src/ab"}]
-    assert normalize_scopes([{"kind": "path", "value": "Src//./A"}]) == [{"kind": "path", "value": "src/a"}]
+    assert normalize_scopes([{"kind": "path", "value": "Src//./A/"}]) == [{"kind": "path", "value": "Src/A"}]
+
+
+def test_parallel_claims_with_disjoint_paths_succeed_and_overlapping_claims_are_refused(pg):
+    s = pg.store
+    src = manual(pg, "src", [{"kind": "path", "value": pg.prefix + "/src/a"}])
+    docs = manual(pg, "docs", [{"kind": "path", "value": pg.prefix + "/docs/b"}])
+    inside = manual(pg, "inside", [{"kind": "path", "value": pg.prefix + "/src/a/deep/file.py"}])
+    enclosing = manual(pg, "enclosing", [{"kind": "path", "value": pg.prefix + "/docs"}])
+    assert s.claim(pg.owner, operation(), src["id"])["state"] == "claimed"
+    assert s.claim(pg.owner, operation(), docs["id"])["state"] == "claimed"
+    expect("scope_conflict", lambda: s.claim(pg.owner, operation(), inside["id"]))
+    expect("scope_conflict", lambda: s.claim(pg.owner, operation(), enclosing["id"]))
+
+
+def test_ready_uses_prefix_overlap(pg):
+    s = pg.store
+    held = manual(pg, "held", [{"kind": "path", "value": pg.prefix + "/src/a"}], assignee=pg.editor)
+    disjoint = manual(pg, "disjoint", [{"kind": "path", "value": pg.prefix + "/docs/b"}], assignee=pg.editor)
+    nested = manual(pg, "nested", [{"kind": "path", "value": pg.prefix + "/src/a/x"}], assignee=pg.editor)
+    s.claim(pg.editor, operation(), held["id"])
+    ready = {task["id"] for task in s.ready(pg.editor, pg.page["id"])}
+    assert disjoint["id"] in ready and nested["id"] not in ready
 
 
 @pytest.mark.parametrize("value", ["/absolute", "../escape", "src/../escape", "C:/drive", "src/*.py", "src/[ab]", "src\\file"])
@@ -674,8 +700,8 @@ def test_graph_cannot_modify_any_previously_claimed_or_executed_task(pg, approve
 
 def test_ready_filters_assignment_role_and_scopes_and_is_only_a_hint(pg):
     s = pg.store
-    assigned = manual(pg, "assigned", assignee=pg.editor)
-    other = manual(pg, "other")
+    assigned = manual(pg, "assigned", [{"kind": "path", "value": pg.prefix + "/shared"}], assignee=pg.editor)
+    other = manual(pg, "other", [{"kind": "path", "value": pg.prefix + "/shared/sub"}])
     assert assigned["id"] not in {row["id"] for row in s.ready(pg.owner, pg.page["id"])}
     s.share(pg.owner, operation(), "space", pg.space["id"], "person", pg.reader.account, "view")
     assert s.ready(pg.reader, pg.page["id"]) == []
@@ -1211,6 +1237,119 @@ def test_none_scope_never_overlaps_anything():
     for other in others:
         assert not scopes_overlap(NONE, other) and not scopes_overlap(other, NONE)
     assert scopes_overlap(ROOT, ROOT) and scopes_overlap([{"kind": "module", "value": "a"}], ROOT)
+
+
+def path(value):
+    return [{"kind": "path", "value": value}]
+
+
+def overlap(left, right):
+    from bridge.space_store import scopes_overlap
+    left, right = normalize_scopes(left), normalize_scopes(right)
+    result = scopes_overlap(left, right)
+    assert scopes_overlap(right, left) == result, "overlap must be symmetric"
+    return result
+
+
+@pytest.mark.parametrize("left,right,expected", [
+    ("docs/design", "docs/design", True),
+    ("docs/design", "docs/design/roadmap.md", True),
+    ("docs/design/roadmap.md", "docs/design", True),
+    ("docs/design", "docs", True),
+    ("docs", "docs/design/roadmap.md", True),
+    ("docs/design", "docs/designer", False),
+    ("docs/designer", "docs/design", False),
+    ("docs/design", "src", False),
+    ("src/a", "docs/b", False),
+    ("src/a", "src/ab", False),
+    ("src/a", "src/a/b/c.py", True),
+    ("src/a.py", "src/a", False),
+])
+def test_path_scopes_overlap_only_on_directory_prefix(left, right, expected):
+    assert overlap(path(left), path(right)) is expected
+
+
+@pytest.mark.parametrize("left,right", [
+    ("src/a/", "src/a"),
+    ("src/a/", "src/a/b"),
+    ("./src/a", "src/a"),
+    ("src/./a", "src/a/b"),
+    ("src//a", "src/a"),
+    ("src//a///b", "src/a/b"),
+    ("./", ""),
+    (".", "src"),
+])
+def test_path_scope_boundaries_are_normalized_before_comparison(left, right):
+    assert overlap(path(left), path(right))
+    assert not overlap(path("src/a/"), path("src/ab/"))
+    assert not overlap(path("src//a"), path("docs/./a"))
+    assert normalize_scopes(path("src//./a/")) == path("src/a")
+
+
+def test_root_placeholder_overlaps_every_path_and_module_but_not_migration_or_none():
+    for value in ("", "src", "src/a/b.py", "docs/designer"):
+        assert overlap(ROOT, path(value))
+    assert overlap(normalize_scopes(None), path("src/a"))
+    assert overlap(normalize_scopes([]), path("docs/b"))
+    assert overlap(ROOT, [{"kind": "module", "value": "core"}])
+    assert not overlap(ROOT, [{"kind": "migration", "value": "7"}])
+    assert not overlap(ROOT, NONE)
+
+
+def test_module_covers_the_whole_repository_while_migration_stays_exact():
+    module = [{"kind": "module", "value": "core"}]
+    for other in (path("src/a"), path(""), module, [{"kind": "module", "value": "other"}], [{"kind": "migration", "value": "7"}]):
+        assert overlap(module, other)
+    assert not overlap(module, NONE)
+    assert overlap([{"kind": "migration", "value": "7"}], [{"kind": "migration", "value": "007"}])
+    assert not overlap([{"kind": "migration", "value": "7"}], [{"kind": "migration", "value": "8"}])
+    assert not overlap([{"kind": "migration", "value": "7"}], path("src/a"))
+
+
+def test_none_never_overlaps_a_path_scope():
+    for value in ("", "src", "docs/b"):
+        assert not overlap(NONE, path(value))
+    assert not overlap(NONE, NONE)
+
+
+def test_multi_scope_declarations_overlap_when_any_pair_overlaps():
+    left = normalize_scopes([{"kind": "path", "value": "src/a"}, {"kind": "migration", "value": "9"}])
+    assert overlap(left, [{"kind": "migration", "value": "9"}])
+    assert overlap(left, path("src/a/x"))
+    assert not overlap(left, path("src/b") + [{"kind": "migration", "value": "10"}])
+
+
+def test_path_case_is_preserved_and_compared_case_sensitively_by_default(monkeypatch):
+    monkeypatch.delenv("BATON_SCOPE_CASE_INSENSITIVE", raising=False)
+    assert normalize_scopes(path("Src/A")) == path("Src/A")
+    assert not overlap(path("Src/A"), path("src/a"))
+    assert not overlap(path("Src"), path("src/a/b"))
+    for value in ("", "0", "true", "yes"):
+        monkeypatch.setenv("BATON_SCOPE_CASE_INSENSITIVE", value)
+        assert not overlap(path("Src/A"), path("src/a"))
+
+
+def test_case_insensitive_option_folds_path_comparison(monkeypatch):
+    monkeypatch.setenv("BATON_SCOPE_CASE_INSENSITIVE", "1")
+    assert overlap(path("Src/A"), path("src/a"))
+    assert overlap(path("SRC"), path("src/a/b"))
+    assert overlap(path("src/a/b"), path("Src/A"))
+    assert not overlap(path("Src/A"), path("src/ab"))
+    assert not overlap(path("Docs/B"), path("src/a"))
+    assert normalize_scopes(path("Src/A")) == path("Src/A"), "stored declarations are not rewritten by the option"
+
+
+def test_aliases_through_different_paths_are_not_detected_as_overlapping():
+    assert not overlap(path("current/app.py"), path("releases/42/app.py"))
+    assert not overlap(path("link-to-src"), path("src/a"))
+
+
+def test_policy_and_request_digests_stay_case_stable():
+    from bridge.space_store import _policy_matches, _request_scopes
+    assert _policy_matches("path", "docs", path("Docs/Design"))
+    assert _policy_matches("path", "Docs", path("docs/design"))
+    assert not _policy_matches("path", "docs", path("Documents"))
+    assert _request_scopes(normalize_scopes([{"kind": "path", "value": "Src/A"}, {"kind": "path", "value": "src/a"}])) == path("src/a")
 
 
 def test_none_with_other_scopes_is_rejected_by_the_store_entry_points(pg):

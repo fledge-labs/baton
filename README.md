@@ -136,7 +136,7 @@ WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --b
 
 未指定接收人的兼容自动 `submit_task` 使用明确的 `worker_success` gate；指定接收人或手工领取不自动启动 worker，手工 gate 必须由 Space owner（根）或配置的 reviewer 且持有审批人委托的主体审批（见下文“审批关卡与委托”），提交或执行结果的人不能批准（根可显式 `self_approval`）。`awaiting_gate` 不能提前显示为 completed。
 
-`x_scope` 首版锁域是同一 PostgreSQL 权威内跨 Space 的 `global`，不提供跨独立数据库的互斥保证。由于尚无可信的文件拓扑与别名映射，任意两个 `path` 声明都冲突，即使声明为 `src/a` 与 `docs/b` 也不能并行领取；展示路径不代表细粒度锁。`module` 覆盖整个仓库，与 path、module 和任意 migration 都冲突。`migration` 仅按规范化后的完整标识相等互斥，相异标识可并行；path 与 migration 是独立声明域，需要同时保护两者时必须同时声明。显式 scope `{"kind":"none"}` 表示任务不触碰任何仓库路径、模块或 migration，与任何 claim 都不冲突，不能与其他 scope 组合；因此没有文件足迹的审阅、文档、试用类任务可以同时领取。省略 `scopes` 时，手工任务（`create_task_block`，以及带 assignee 的 `submit_task`）默认 `none`；自动 codex 任务（不带 assignee 的 `submit_task`）会执行代码，仍使用保守的仓库根占位范围。已有任务不会被改写，已持久化请求的幂等摘要不变。
+`x_scope` 首版锁域是同一 PostgreSQL 权威内跨 Space 的 `global`，不提供跨独立数据库的互斥保证。两个 `path` 声明仅在规范化后相等、或其中一个是另一个在 `/` 边界上的目录前缀时冲突：`docs/design` 与 `docs/design/roadmap.md`、`docs` 冲突，与 `docs/designer`、`src` 不冲突，因此声明了互不重叠路径的任务（如 `src/a` 与 `docs/b`）可以同时领取，空路径（仓库根占位范围）与任何路径冲突。规范化为仓库相对路径、`/` 分隔、去除重复分隔符、结尾 `/` 与 `.` 段，拒绝绝对路径与 `..`；默认大小写敏感，运营者可设置 `BATON_SCOPE_CASE_INSENSITIVE=1`（默认关闭，默认 Compose 会把宿主环境中的该变量传给 bridge）以大小写不敏感比较，适用于大小写不敏感的文件系统。`claim`、`claim_next` 和 `ready` 使用同一规则，已有 claim 不受影响。**已知限制：** Baton 不解析符号链接、硬链接或其他别名；通过不同路径指向同一批文件的声明**不会**被检测为重叠，请用真实的规范路径声明。`module` 覆盖整个仓库，与 path、module 和任意 migration 都冲突。`migration` 仅按规范化后的完整标识相等互斥，相异标识可并行；path 与 migration 是独立声明域，需要同时保护两者时必须同时声明。显式 scope `{"kind":"none"}` 表示任务不触碰任何仓库路径、模块或 migration，与任何 claim 都不冲突，不能与其他 scope 组合；因此没有文件足迹的审阅、文档、试用类任务可以同时领取。省略 `scopes` 时，手工任务（`create_task_block`，以及带 assignee 的 `submit_task`）默认 `none`；自动 codex 任务（不带 assignee 的 `submit_task`）会执行代码，仍使用保守的仓库根占位范围。已有任务不会被改写，已持久化请求的幂等摘要不变。
 
 ### 通知与异步送达
 
@@ -225,7 +225,7 @@ python3.12 -m venv .venv
 
 ### Space HTTP 协作验收
 
-[`scripts/space_acceptance.py`](scripts/space_acceptance.py) 通过认证 HTTP API 验证共享与撤权、team、connected account 署名、人工审阅 agent 提案、提及与同线程回复、并发 scope 冲突、租约 fencing、handoff、gate，以及依赖图、ready、循环回滚和隐藏依赖。它会创建和修改测试数据，应在空闲的独立测试实例运行；首版 path 锁会与该 PostgreSQL 权威内其他任务竞争。
+[`scripts/space_acceptance.py`](scripts/space_acceptance.py) 通过认证 HTTP API 验证共享与撤权、team、connected account 署名、人工审阅 agent 提案、提及与同线程回复、并发 scope 冲突、租约 fencing、handoff、gate，以及依赖图、ready、循环回滚和隐藏依赖。它会创建和修改测试数据，应在空闲的独立测试实例运行；path 声明按目录前缀与该 PostgreSQL 权威内其他任务的声明竞争。
 
 先在 `deploy/` 目录为该测试实例准备四个独立客户端身份。名称必须保持如下；`space-owner`、`space-reviewer` 是各自账户的 human，`space-peer` 是独立账户的 agent，`space-agent` 是连接到 `space-owner` 账户的 agent。每个身份使用自己的令牌文件，不能共用令牌或授予 dispatcher 角色：
 
