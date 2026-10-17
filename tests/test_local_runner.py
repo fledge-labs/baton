@@ -2493,11 +2493,14 @@ def test_the_shim_carries_the_argument_policy_and_the_worktree(tmp_path, monkeyp
         lr.parse_config(data)
 
 
-def test_the_shim_rejects_rg_pre_and_an_allow_once_shim_runs_only_once(tmp_path, monkeypatch):
+def test_the_shim_rejects_rg_pre_and_allow_once_lasts_until_the_runner_revokes_it(tmp_path, monkeypatch):
     settings, keeper, recorder = keeper_for(tmp_path, monkeypatch)
     work = tmp_path / "work"
     work.mkdir()
     always = keeper.grant(request_view("r-always", "allow_always"), "rg", str(work))
+    shim_text = Path(always["shim"]).read_text(encoding="utf-8")
+    assert "os.execve" in shim_text and "--no-config" in shim_text
+    assert "_once_path" not in shim_text and ".once" not in shim_text
     refused = subprocess.run([always["shim"], "--pre=sh"], cwd=work, capture_output=True, text=True)
     assert refused.returncode != 0 and "--pre" in refused.stderr and "baton shim:" in refused.stderr
     assert not list(Path(lr.spool_dir("w1")).glob("*.once"))
@@ -2508,22 +2511,89 @@ def test_the_shim_rejects_rg_pre_and_an_allow_once_shim_runs_only_once(tmp_path,
     direct = subprocess.run([always["real"], "--version"], cwd=work, capture_output=True, text=True)
     assert direct.returncode == 0, "the real binary still runs; the allowlist, not this process, is what blocks it"
     once = keeper.grant(request_view("r-once", "allow_once", "t-once"), "rg", str(work))
-    kept = subprocess.run([always["shim"], "--version"], cwd=work, capture_output=True, text=True)
-    assert kept.returncode == 0 and not (Path(lr.spool_dir("w1")) / (once["id"] + ".once")).exists()
-    assert keeper.revoke(always["id"]) is True
-    os.chmod(os.path.dirname(once["shim"]), 0o555)
-    try:
-        first = subprocess.run([once["shim"], "--version"], cwd=work, capture_output=True, text=True)
-        assert first.returncode == 0 and os.path.exists(once["shim"])
-        second = subprocess.run([once["shim"], "--version"], cwd=work, capture_output=True, text=True)
-        assert second.returncode != 0 and "already used" in second.stderr
-    finally:
-        os.chmod(os.path.dirname(once["shim"]), 0o755)
-    keeper.retire_consumed()
+    for _ in range(2):
+        ran = subprocess.run([once["shim"], "--version"], cwd=work, capture_output=True, text=True)
+        assert ran.returncode == 0 and os.path.exists(once["shim"])
+    assert not list(Path(lr.spool_dir("w1")).glob("*.once"))
+    assert keeper.revoke(always["id"]) is True and os.path.exists(once["shim"]), "allow_once still holds the shim"
+    again = subprocess.run([once["shim"], "--version"], cwd=work, capture_output=True, text=True)
+    assert again.returncode == 0
+    assert keeper.revoke(once["id"]) is True
     assert not os.path.exists(once["shim"])
-    again = keeper.grant(request_view("r-self", "allow_once", "t-self"), "rg", str(work))
-    consumed = subprocess.run([again["shim"], "--version"], cwd=work, capture_output=True, text=True)
-    assert consumed.returncode == 0 and not os.path.exists(again["shim"]), "a lone allow_once shim deletes itself"
+    assert json.loads(settings.read_text())["permissions"]["allow"] == []
+
+
+def test_rg_ignores_a_ripgrep_config_that_injects_pre(tmp_path, monkeypatch):
+    _, keeper, _ = keeper_for(tmp_path, monkeypatch)
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "hello.txt").write_text("hello\n", encoding="utf-8")
+    config = tmp_path / "ripgreprc"
+    config.write_text("--pre\n/bin/false\n", encoding="utf-8")
+    record = keeper.grant(request_view("r-rg"), "rg", str(work))
+    env = dict(os.environ)
+    env["RIPGREP_CONFIG_PATH"] = str(config)
+    env["LD_PRELOAD"] = "/no/such.so"
+    env["DYLD_INSERT_LIBRARIES"] = "/no/such.so"
+    env["GIT_CONFIG_GLOBAL"] = str(config)
+    env["PYTHONPATH"] = "/tmp/not-used"
+    direct = subprocess.run([record["real"], "hello", str(work / "hello.txt")], cwd=work, env=env,
+                            capture_output=True, text=True)
+    assert direct.returncode != 0, "without --no-config the same file makes rg run the preprocessor"
+    ran = subprocess.run([record["shim"], "hello", "hello.txt"], cwd=work, env=env, capture_output=True, text=True)
+    assert ran.returncode == 0 and "hello" in ran.stdout
+
+
+def test_the_refusal_spool_is_bounded_and_untrusted(tmp_path, monkeypatch):
+    _, keeper, recorder = keeper_for(tmp_path, monkeypatch)
+    record = keeper.grant(request_view("r-spool", "allow_always", "t-spool"), "rg", "/work/w1")
+    spool = Path(lr.spool_dir("w1"))
+    notes = []
+    keeper.log = lambda task, what, **fields: notes.append((what, fields))
+
+    def plant(name, payload):
+        path = spool / name
+        if isinstance(payload, bytes):
+            path.write_bytes(payload)
+        else:
+            path.write_text(payload if isinstance(payload, str) else json.dumps(payload), encoding="utf-8")
+
+    (spool / "dir.json").mkdir()
+    nested = spool / "nested.json"
+    nested.mkdir()
+    (nested / "inside").write_text("x", encoding="utf-8")
+    os.symlink("/etc/passwd", spool / "link.json")
+    plant("big.json", b"x" * (lr.SPOOL_MAX_BYTES + 1))
+    plant("bad.json", "{")
+    plant("list.json", "[1]")
+    plant("unk.json", {"grant_id": "no-such", "request_id": "r-spool", "reason": "forged"})
+    valid = {"grant_id": record["id"], "request_id": "r-spool", "task_id": "other-task", "reason": "refused\nline"}
+    extra = lr.SPOOL_FORWARD_LIMIT + 3
+    for index in range(extra):
+        plant("v%02d.json" % index, valid)
+    limit, window = lr.SPOOL_FORWARD_LIMIT, lr.SPOOL_FORWARD_WINDOW
+    try:
+        lr.SPOOL_FORWARD_LIMIT = 2
+        keeper.drain_spool()
+        forwarded = [call for call in recorder.calls if call[1]["event"] == "shim_refused"]
+        assert len(forwarded) == 2
+        assert all(call[1]["task_id"] == "t-spool" and call[1]["request_id"] == "r-spool" for call in forwarded)
+        assert all("\n" not in call[1]["reason"] for call in forwarded)
+        assert not (spool / "dir.json").exists() and not (spool / "link.json").exists()
+        assert not (spool / "big.json").exists() and not (spool / "bad.json").exists() and not (spool / "list.json").exists()
+        assert not (spool / "unk.json").exists()
+        assert nested.is_dir(), "a non-empty directory is left alone instead of raising"
+        remaining = sorted(path.name for path in spool.glob("v*.json"))
+        assert len(remaining) == extra - 2
+        keeper.drain_spool()
+        assert len([call for call in recorder.calls if call[1]["event"] == "shim_refused"]) == 2
+        lr.SPOOL_FORWARD_WINDOW = 0
+        keeper.drain_spool()
+        assert len([call for call in recorder.calls if call[1]["event"] == "shim_refused"]) == 4
+        assert any(what == "spool-discarded" for what, _fields in notes)
+    finally:
+        lr.SPOOL_FORWARD_LIMIT = limit
+        lr.SPOOL_FORWARD_WINDOW = window
 
 
 def test_a_cli_that_cannot_exact_match_the_shim_is_never_granted(tmp_path, monkeypatch):

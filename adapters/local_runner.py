@@ -1419,8 +1419,15 @@ def _cwd_covers(worktree):
     return _inside_worktree(cwd, worktree)
 
 
-def _once_path(grant):
-    return os.path.join(SPOOL, grant["id"] + ".once")
+def _exec_env():
+    # The real program does not inherit the worker's environment.
+    # PATH is a fixed system value, not the sandbox PATH (that one starts with this shim). HOME, LANG, LC_* and TERM
+    # are the only other variables copied. RIPGREP_CONFIG_PATH, GIT_*, LD_*, DYLD_*, PYTHON* and everything else are dropped.
+    env = {"PATH": "/usr/bin:/bin"}
+    for key, value in os.environ.items():
+        if key in ("HOME", "TERM", "LANG") or key.startswith("LC_"):
+            env[key] = value
+    return env
 
 
 def _note(grant, reason):
@@ -1446,9 +1453,6 @@ def main():
     ordered = [grant for grant in GRANTS if grant.get("option") != "allow_once"]
     ordered += [grant for grant in GRANTS if grant.get("option") == "allow_once"]
     for grant in ordered:
-        if grant.get("option") == "allow_once" and os.path.exists(_once_path(grant)):
-            problem = "allow_once was already used"
-            continue
         problem = argv_problem(TOOL, argv, grant.get("worktree"))
         if problem:
             continue
@@ -1459,23 +1463,11 @@ def main():
         break
     if chosen is None:
         sys.exit(_note(GRANTS[0] if GRANTS else {}, problem or "refused"))
-    if chosen.get("option") == "allow_once":
-        try:
-            fd = os.open(_once_path(chosen), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            os.close(fd)
-        except FileExistsError:
-            sys.exit(_note(chosen, "allow_once was already used"))
-        except OSError:
-            sys.exit(_note(chosen, "allow_once could not be recorded"))
-        others = [grant for grant in GRANTS if grant.get("id") != chosen.get("id")
-                  and not (grant.get("option") == "allow_once" and os.path.exists(_once_path(grant)))]
-        if not others:
-            try:
-                os.remove(sys.argv[0])
-            except OSError:
-                pass
+    # rg reads RIPGREP_CONFIG_PATH and ~/.ripgreprc unless --no-config is set. The flag is forced here, after the
+    # argv policy, so a config file cannot put --pre back. The environment is replaced, not inherited.
+    command = [REAL, "--no-config", *sys.argv[1:]] if TOOL == "rg" else [REAL, *sys.argv[1:]]
     try:
-        os.execv(REAL, [REAL, *sys.argv[1:]])
+        os.execve(REAL, command, _exec_env())
     except OSError:
         sys.exit(_note(chosen, "the real program could not be started"))
 
@@ -1494,7 +1486,8 @@ def shim_script(tool, real, spool, grants):
         "#!%s" % interpreter,
         "# SPDX-License-Identifier: Apache-2.0",
         "# Baton runner shim for %s. The worker can read this file and cannot write it." % tool,
-        "# Every call checks argv, then execs the real program at the absolute path fixed when the grant was written.",
+        "# Every call checks argv, then execve's the real program at the absolute path fixed when the grant was written.",
+        "# The environment is replaced (PATH=/usr/bin:/bin plus HOME, LANG, LC_*, TERM). rg is always passed --no-config.",
         "# Policy: %s" % POLICY_ARGS[tool],
         "import json, os, sys, time",
         "TOOL = %r" % tool,
@@ -2021,12 +2014,57 @@ def error_code(error):
     return type(error).__name__
 
 
+# The refusal spool is worker-writable. A drain never reads more than this, and never forwards faster than the window.
+SPOOL_DRAIN_FILES = 32
+SPOOL_MAX_BYTES = 4096
+SPOOL_FORWARD_LIMIT = 8
+SPOOL_FORWARD_WINDOW = 60.0
+
+
+def _spool_kind(path):
+    """'file', 'dir', 'other', or None. Does not follow symlinks and does not raise."""
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError:
+        return None
+    if stat.S_ISREG(mode):
+        return "file"
+    if stat.S_ISDIR(mode):
+        return "dir"
+    return "other"
+
+
+def _spool_payload(path):
+    """('ok', object) or (discard reason, None). Reads at most SPOOL_MAX_BYTES and does not raise."""
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            return "nonregular", None
+        if info.st_size > SPOOL_MAX_BYTES:
+            return "oversized", None
+        with open(path, "rb") as handle:
+            raw = handle.read(SPOOL_MAX_BYTES + 1)
+    except OSError:
+        return "malformed", None
+    if len(raw) > SPOOL_MAX_BYTES:
+        return "oversized", None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        return "malformed", None
+    if not isinstance(payload, dict):
+        return "malformed", None
+    return "ok", payload
+
+
 class GrantKeeper:
     """Applies, reports and withdraws one worker's grants. `baton` may be None (token unreadable): withdrawal still works
     and the report is retried later."""
 
     def __init__(self, worker, ledger, baton, log):
         self.worker, self.ledger, self.baton, self.log = worker, ledger, baton, log
+        self._spool_forwarded = []
+        self._spool_noted = 0.0
 
     def _report(self, record, kind, reason=None):
         """True when Baton accepted the report. A Baton or network error is returned so a spool drain can tell a
@@ -2109,59 +2147,79 @@ class GrantKeeper:
         except (RunnerError, OSError):
             self.log(None, "grant-reconcile-failed", grant="unreported")
 
-    def retire_consumed(self):
-        """Delete a shim once every grant that still points at it is an allow_once that has already run.
-
-        The worker can delete the counter file (the spool is writable) but cannot put the shim back: its directory
-        is read-only inside the sandbox. Another grant that has not been consumed keeps the file.
-        """
-        spool = spool_dir(self.worker.principal)
-        with self.ledger.locked():
-            grants = self.ledger.load()
-            grouped = {}
-            for record in grants.values():
-                if record.get("status") in ("active", "pending") and record.get("shim"):
-                    grouped.setdefault(record["shim"], []).append(record)
-            for path, records in grouped.items():
-                if records and all(item.get("option") == "allow_once" and os.path.exists(
-                        os.path.join(spool, item["id"] + ".once")) for item in records):
-                    with contextlib.suppress(OSError):
-                        os.unlink(path)
-
     def drain_spool(self):
-        """Forward shim refusals. The shim writes a file; this process, which holds the token, reports it.
+        """Forward a bounded number of shim refusals. The shim writes a file; this process holds the token.
 
-        Unknown files are discarded. A permanent Baton rejection is discarded too, so one bad file cannot spin.
+        The spool is writable by the worker, so every record is untrusted. One drain looks at a fixed number of
+        regular files, each capped in size. Oversized, malformed and unknown files are deleted and counted.
+        Directories and other non-regular names are removed when that can be done without an error, and are never
+        read. Forwarding is rate-limited; files left by the limit wait for a later drain instead of flooding audit.
         """
         if self.baton is None:
             return
         spool = spool_dir(self.worker.principal)
         if not os.path.isdir(spool):
             return
-        names = sorted(name for name in os.listdir(spool) if name.endswith(".json"))
-        with self.ledger.locked():
-            grants = self.ledger.load()
+        try:
+            names = sorted(name for name in os.listdir(spool) if name.endswith(".json"))
+        except OSError:
+            return
+        discarded = {"nonregular": 0, "oversized": 0, "malformed": 0, "unknown": 0, "overflow": 0}
+        files = []
         for name in names:
             path = os.path.join(spool, name)
-            try:
-                payload = json.loads(Path(path).read_text(encoding="utf-8"))
-            except (OSError, ValueError):
+            kind = _spool_kind(path)
+            if kind == "file" and len(name) <= 200:
+                files.append(name)
+                continue
+            discarded["malformed" if kind == "file" else "nonregular"] += 1
+            with contextlib.suppress(OSError):
+                if kind == "dir":
+                    os.rmdir(path)
+                elif kind is not None:
+                    os.unlink(path)
+        if len(files) > SPOOL_DRAIN_FILES:
+            for name in files[SPOOL_DRAIN_FILES:]:
+                with contextlib.suppress(OSError):
+                    os.unlink(os.path.join(spool, name))
+                discarded["overflow"] += 1
+            files = files[:SPOOL_DRAIN_FILES]
+        now = time.monotonic()
+        self._spool_forwarded = [stamp for stamp in self._spool_forwarded if now - stamp < SPOOL_FORWARD_WINDOW]
+        with self.ledger.locked():
+            grants = self.ledger.load()
+        for name in files:
+            if len(self._spool_forwarded) >= SPOOL_FORWARD_LIMIT:
+                break
+            path = os.path.join(spool, name)
+            outcome = _spool_payload(path)
+            if outcome[0] != "ok":
+                discarded[outcome[0]] += 1
                 with contextlib.suppress(OSError):
                     os.unlink(path)
                 continue
+            payload = outcome[1]
             grant_id = payload.get("grant_id") if isinstance(payload, dict) else None
             known = grants.get(grant_id) if isinstance(grant_id, str) else None
             if not isinstance(known, dict) or known.get("request_id") != payload.get("request_id"):
+                discarded["unknown"] += 1
                 with contextlib.suppress(OSError):
                     os.unlink(path)
                 continue
+            reason = payload.get("reason")
+            reason = one_line(reason if isinstance(reason, str) and reason else "refused", 300)
             reported = self._report(
                 {"id": known["id"], "task_id": known["task_id"], "request_id": known["request_id"],
                  "operation_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "baton/shim-refusal/" + name))},
-                "shim_refused", one_line(str(payload.get("reason") or "refused"), 300))
+                "shim_refused", reason)
             if reported is True or (isinstance(reported, cli.BatonError) and not cli.transient(reported)):
                 with contextlib.suppress(OSError):
                     os.unlink(path)
+            if reported is True:
+                self._spool_forwarded.append(time.monotonic())
+        if any(discarded.values()) and time.monotonic() - self._spool_noted >= 10:
+            self._spool_noted = time.monotonic()
+            self.log(None, "spool-discarded", **{key: value for key, value in discarded.items() if value})
 
 
 def call_interruptible(stop, work):
@@ -2223,10 +2281,9 @@ class WorkerRunner:
             thread.start()
 
     def shim_watch_loop(self):
-        """Unlink a consumed allow_once shim from the host, and forward refusal records the shim left in the spool."""
+        """Forward refusal records the shim left in the spool. allow_once is withdrawn when the task run ends."""
         while not self.stop.wait(0.2):
             with contextlib.suppress(RunnerError, OSError, cli.BatonError, cli.NetworkError):
-                self.keeper.retire_consumed()
                 self.keeper.drain_spool()
 
     def schedule(self, task_id, delay):
@@ -2459,7 +2516,6 @@ class WorkerRunner:
             self.drop_once_grants(task_id, once)
             if self.keeper is not None:
                 with contextlib.suppress(RunnerError, OSError):
-                    self.keeper.retire_consumed()
                     self.keeper.drain_spool()
             shutil.rmtree(str(tmpdir), ignore_errors=True)
         try:
