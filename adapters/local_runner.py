@@ -241,7 +241,8 @@ def parse_permissions(raw, what, principal):
     if principal in approvers:
         raise ConfigError(what + ".approvers may not name the worker itself")
     template = raw.get("rule_template")
-    if template is not None and (not isinstance(template, str) or template.count("{tool}") != 1 or len(template) > 200
+    if template is not None and (not isinstance(template, str) or template.count("{tool}") != 1 or template.count("{directory}") > 1
+                                 or len(template) > 200
                                  or re.search(r"[\x00-\x1f\x7f]", template)):
         raise ConfigError(what + ".rule_template must be one line of at most 200 characters with {tool} exactly once")
     return PermissionConfig(
@@ -1005,10 +1006,30 @@ UNPARSED_TOOL = "(unparsed)"
 # Programs whose allowlisting would be a sandbox widening in disguise (network clients, shells and interpreters that run
 # anything, privilege changes, the Keychain tool, sandbox tooling): never offered, whatever the CLI asked for.
 UNGRANTABLE_TOOLS = frozenset("""
-    sh bash zsh dash ksh csh tcsh fish python python2 python3 node nodejs deno bun ruby perl php lua osascript pwsh env
-    xargs eval exec sudo su doas nc ncat netcat socat telnet curl wget ssh scp sftp rsync ftp security launchctl
-    sandbox-exec bwrap chroot nsenter unshare docker podman mount open
+    sh bash zsh dash ksh csh tcsh fish ash python pypy perl ruby node nodejs php lua luajit tclsh wish pwsh powershell
+    osascript deno bun ts-node tsx java jshell groovy scala kotlin swift julia rscript runhaskell ghc
+    awk gawk mawk nawk busybox toybox env xargs eval exec find nice nohup timeout time watch strace ltrace gdb lldb
+    script setsid flock parallel expect ex vi vim view nvim emacs less more man ed tar make cmake ninja gmake rake bundle
+    gem npm npx yarn pnpm pip pipx uv uvx cargo go gradle mvn sudo su doas nc ncat netcat socat telnet curl wget ssh scp
+    sftp rsync ftp security launchctl sandbox-exec bwrap chroot nsenter unshare docker podman mount open
 """.split())
+SCRIPT_SUFFIXES = frozenset((".sh", ".bash", ".zsh", ".py", ".pl", ".rb", ".js", ".mjs", ".php", ".lua", ".ps1", ".exe", ".bat",
+                             ".cmd", ".jar", ".command"))
+VERSION_SUFFIX = re.compile(r"(?:[-_.]?\d+)+$")
+
+
+def normalized_tool(tool):
+    """Lower-cased basename without a version suffix: python3.11 -> python, perl5.36 -> perl, node20 -> node."""
+    name = os.path.basename(str(tool)).lower()
+    stripped = VERSION_SUFFIX.sub("", name)
+    return stripped or name
+
+
+def is_ungrantable(tool):
+    """Interpreters, shells, generic executors, network clients and script files can run anything, so never allowlisted."""
+    name = os.path.basename(str(tool)).lower()
+    return (normalized_tool(tool) in UNGRANTABLE_TOOLS or name in UNGRANTABLE_TOOLS
+            or os.path.splitext(name)[1] in SCRIPT_SUFFIXES)
 
 
 @dataclass(frozen=True)
@@ -1085,9 +1106,14 @@ CLI_PROFILES = {
 }
 
 
+def clip(text, limit):
+    """Cut to `limit` characters on one line (truncate() adds a newline, which the server refuses in single-line fields)."""
+    return text if len(text) <= limit else text[:max(0, limit - 3)] + "..."
+
+
 def one_line(text, limit, secrets=()):
     text = redact(clean_text(str(text)), secrets)
-    return truncate(re.sub(r"\s+", " ", text).strip(), limit)
+    return clip(re.sub(r"\s+", " ", text).strip(), limit)
 
 
 def program_name(command):
@@ -1122,7 +1148,7 @@ def detect_denial(cli_name, text, secrets=()):
     command = found.get("command") or found.get("tool") or ""
     tool = program_name(command) if detector.kind == "command" else found.get("tool")
     denial = Denial(cli_name, tool=tool, command=one_line(command, FIELD_CHARS, secrets) or None, kind=detector.kind,
-                    directory=one_line(found["directory"], FIELD_CHARS, secrets) if found.get("directory") else None,
+                    directory=one_line(found["directory"], 4000, secrets) if found.get("directory") else None,
                     reason=one_line(found.get("reason") or detector.reason or GENERIC_REASON, FIELD_CHARS, secrets),
                     detector=detector.name)
     if tool is None:
@@ -1130,9 +1156,12 @@ def detect_denial(cli_name, text, secrets=()):
     return denial
 
 
-def render_rule(permissions, tool):
+DIRECTORY_RE = re.compile(r"[A-Za-z0-9_./@+:-][A-Za-z0-9_./@+: -]{0,498}")
+
+
+def render_rule(permissions, tool, directory=None):
     template = permissions.rule_template or CLI_PROFILES[permissions.cli].rule
-    return template.replace("{tool}", tool)
+    return template.replace("{tool}", tool).replace("{directory}", directory or "")
 
 
 def replace_file(path, text):
@@ -1154,10 +1183,11 @@ def replace_file(path, text):
     os.replace(str(temporary), str(path))
 
 
-def edit_rule(path, profile, rule, add):
+def edit_rule(path, profile, rule, add, dry_run=False):
     """Add or remove one allowlist entry in the CLI's configuration, leaving everything else as it was.
 
-    Returns whether the file changed. A file this cannot parse or a structure it does not expect is refused, not rewritten.
+    Returns whether the file changed (with dry_run: whether the rule is present, changing nothing). A file this cannot parse
+    or a structure it does not expect is refused, not rewritten.
     """
     try:
         text = Path(path).read_text(encoding="utf-8") if Path(path).exists() else ""
@@ -1165,6 +1195,8 @@ def edit_rule(path, profile, rule, add):
         raise RunnerError("cannot read the CLI configuration") from None
     if profile.kind == "lines":
         lines = text.splitlines()
+        if dry_run:
+            return rule in lines
         if (rule in lines) == add:
             return False
         lines = lines + [rule] if add else [line for line in lines if line != rule]
@@ -1179,7 +1211,7 @@ def edit_rule(path, profile, rule, add):
     node = data
     for key in profile.keys[:-1]:
         child = node.get(key)
-        if child is None and add:
+        if child is None and add and not dry_run:
             child = node[key] = {}
         if child is None:
             return False
@@ -1188,13 +1220,15 @@ def edit_rule(path, profile, rule, add):
         node = child
     leaf, wanted = profile.keys[-1], list if profile.kind == "json_list" else dict
     container = node.get(leaf)
-    if container is None and add:
+    if container is None and add and not dry_run:
         container = node[leaf] = wanted()
     if container is None:
         return False
     if not isinstance(container, wanted):
         raise RunnerError("the CLI configuration has an unexpected structure")
     present = rule in container
+    if dry_run:
+        return present
     if present == add:
         return False
     if profile.kind == "json_list":
@@ -1211,8 +1245,11 @@ class GrantLedger:
     """Per-worker record of every rule the runner added, so each can be listed and withdrawn exactly.
 
     One lock file serializes the runner and the revoke command, which may be separate processes, around both the ledger and
-    the CLI configuration they edit.
+    the CLI configuration they edit. The ledger is always written first: an entry is `pending` before its rule reaches the
+    CLI configuration and `active` only after, so a crash between the two leaves an entry that settle_pending() can undo.
     """
+
+    LOCK_WAIT_SECONDS = 10.0
 
     def __init__(self, state_dir, principal):
         self.path = Path(state_dir) / (principal + ".grants.json")
@@ -1221,13 +1258,26 @@ class GrantLedger:
 
     @contextlib.contextmanager
     def locked(self):
-        with self.thread_lock:
+        """Exclusive, but never indefinitely: a stuck holder makes this fail rather than stall the runner."""
+        if not self.thread_lock.acquire(timeout=self.LOCK_WAIT_SECONDS):
+            raise RunnerError("the grant ledger is busy")
+        try:
             fd = os.open(str(self.lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX)
+                deadline = time.monotonic() + self.LOCK_WAIT_SECONDS
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise RunnerError("the grant ledger is busy") from None
+                        time.sleep(0.05)
                 yield
             finally:
                 os.close(fd)
+        finally:
+            self.thread_lock.release()
 
     def load(self):
         try:
@@ -1244,40 +1294,88 @@ class GrantLedger:
 
     @staticmethod
     def holders(grants, record):
-        return [other for key, other in grants.items() if other is not record and other.get("status") == "active"
+        """Other entries that may have put the same rule in the same file (pending ones included)."""
+        return [other for other in grants.values() if other is not record and other.get("status") in ("active", "pending")
                 and (other["config_file"], other["rule"]) == (record["config_file"], record["rule"])]
 
-    def add(self, worker, request, tool):
-        """Write the rule and its ledger entry; returns the entry. Must be undone with remove() when it cannot be reported."""
+    @staticmethod
+    def confined(worker, path):
+        """The file is still inside this worker's own home_read and not writable by its CLI (symlinks resolved now)."""
+        real = os.path.realpath(path)
+        def within(entries):
+            return any(real == os.path.realpath(entry) or _inside(real, os.path.realpath(entry)) for entry in entries)
+        return within(worker.home_read) and not within(worker.sandbox.extra_write_paths)
+
+    def _undo(self, grants, record, confined=True):
+        """Take the rule back out unless it was not ours or another entry still needs it; raises when it cannot."""
+        if not record["preexisting"] and not self.holders(grants, record):
+            profile = CLI_PROFILES[record["cli"]]
+            if not confined:
+                raise RunnerError("the CLI configuration moved outside the worker's directories")
+            edit_rule(record["config_file"], profile, record["rule"], False)
+            if edit_rule(record["config_file"], profile, record["rule"], False, dry_run=True):
+                raise RunnerError("the rule is still present in the CLI configuration")
+
+    def add(self, worker, request, tool, directory=None):
+        """Record, then write, then activate one rule; returns the entry. Undo it with remove() if it cannot be reported."""
         permissions = worker.permissions
-        rule = render_rule(permissions, tool)
+        profile = CLI_PROFILES[permissions.cli]
+        if "{directory}" in (permissions.rule_template or "") and not (directory and DIRECTORY_RE.fullmatch(directory)):
+            raise RunnerError("the refused directory cannot be written into the rule")
+        rule = render_rule(permissions, tool, directory)
         path = os.path.realpath(permissions.config_file)
+        if not self.confined(worker, path):
+            raise RunnerError("the CLI configuration is not inside the worker's own directories")
         with self.locked():
             grants = self.load()
             record = {"id": uuid.uuid4().hex, "request_id": request["request_id"], "task_id": request["task_id"],
-                      "tool": tool, "rule": rule, "option": request["status"], "config_file": path, "status": "active",
-                      "granted_reported": False, "revoked_reported": False, "created": time.time()}
+                      "tool": tool, "directory": directory, "rule": rule, "option": request["status"], "cli": permissions.cli,
+                      "config_file": path, "status": "pending", "granted_reported": False, "revoked_reported": False,
+                      "created": time.time()}
             holders = self.holders(grants, record)
-            added = edit_rule(path, CLI_PROFILES[permissions.cli], rule, True)
             # An entry that was there before the runner touched the file is the operator's: it is never removed.
-            record["preexisting"] = (not added) and (not holders or any(h.get("preexisting") for h in holders))
+            record["preexisting"] = edit_rule(path, profile, rule, True, dry_run=True) and (
+                not holders or any(h.get("preexisting") for h in holders))
             grants[record["id"]] = record
             self.save(grants)
+            try:
+                edit_rule(path, profile, rule, True)
+                if not edit_rule(path, profile, rule, True, dry_run=True):
+                    raise RunnerError("the rule did not reach the CLI configuration")
+                record["status"] = "active"
+                self.save(grants)
+            except BaseException:
+                with contextlib.suppress(RunnerError, OSError):
+                    self._undo(grants, record)
+                    record["status"] = "revoked"
+                    record["revoked_reported"] = True
+                    self.save(grants)
+                raise
             return dict(record)
 
     def remove(self, worker, grant_id):
-        """Withdraw one active grant; returns its entry, or None when there is nothing active to withdraw."""
-        profile = CLI_PROFILES[worker.permissions.cli]
+        """Withdraw one active grant and check the rule is really gone; None when nothing is active under that id."""
         with self.locked():
             grants = self.load()
             record = grants.get(grant_id)
             if record is None or record.get("status") != "active":
                 return None
-            if not record["preexisting"] and not self.holders(grants, record):
-                edit_rule(record["config_file"], profile, record["rule"], False)
+            self._undo(grants, record, self.confined(worker, record["config_file"]))
             record["status"] = "revoked"
             self.save(grants)
             return dict(record)
+
+    def settle_pending(self, worker):
+        """After a crash between the ledger write and the activation: withdraw any rule such an entry may have written."""
+        with self.locked():
+            grants = self.load()
+            for record in list(grants.values()):
+                if record.get("status") != "pending":
+                    continue
+                self._undo(grants, record, self.confined(worker, record["config_file"]))
+                record["status"] = "revoked"
+                record["revoked_reported"] = True
+                self.save(grants)
 
     def mark(self, grant_id, **values):
         with self.locked():
@@ -1344,13 +1442,16 @@ class GrantKeeper:
         except (cli.BatonError, cli.NetworkError) as error:
             self.log(record["task_id"], "grant-unreported", event=kind, error=error_code(error))
             return False
-        self.ledger.mark(record["id"], **{kind + "_reported": True})
+        try:
+            self.ledger.mark(record["id"], **{kind + "_reported": True})
+        except (RunnerError, OSError):
+            self.log(record["task_id"], "grant-ledger-unwritten", event=kind)
         return True
 
-    def grant(self, request, tool):
+    def grant(self, request, tool, directory=None):
         """Write the approved rule into the CLI's allowlist and audit it; a grant that cannot be audited is withdrawn."""
         try:
-            record = self.ledger.add(self.worker, request, tool)
+            record = self.ledger.add(self.worker, request, tool, directory)
         except (RunnerError, OSError) as error:
             raise RunnerError("could not apply the approved permission: " + (str(error) if isinstance(error, RunnerError)
                                                                                else "the CLI configuration is not writable")) from None
@@ -1372,20 +1473,26 @@ class GrantKeeper:
         if record.get("granted_reported"):
             self._report(record, "revoked")
         else:
-            self.ledger.mark(grant_id, revoked_reported=True)
+            with contextlib.suppress(RunnerError, OSError):
+                self.ledger.mark(grant_id, revoked_reported=True)
         self.log(record["task_id"], "grant-revoked", tool=record["tool"], grant=grant_id)
         return True
 
     def reconcile(self):
-        """After a crash: withdraw leftover allow-once grants, finish unreported audits, withdraw what cannot be audited."""
-        for record in self.ledger.active():
-            if record["option"] == "allow_once":
-                self.revoke(record["id"])
-        for record in self.ledger.unreported():
-            if record["status"] == "revoked":
-                self._report(record, "revoked")
-            elif not self._report(record, "granted"):
-                self.revoke(record["id"])
+        """After a crash: undo entries that never became active, withdraw leftover allow-once grants, finish unreported
+        audits, and withdraw what cannot be audited."""
+        try:
+            self.ledger.settle_pending(self.worker)
+            for record in self.ledger.active():
+                if record["option"] == "allow_once":
+                    self.revoke(record["id"])
+            for record in self.ledger.unreported():
+                if record["status"] == "revoked":
+                    self._report(record, "revoked")
+                elif not self._report(record, "granted"):
+                    self.revoke(record["id"])
+        except (RunnerError, OSError):
+            self.log(None, "grant-reconcile-failed")
 
 
 def call_interruptible(stop, work):
@@ -1694,12 +1801,16 @@ class WorkerRunner:
             return None
         if denial.kind != "command":
             return "the CLI wants %s permission, which is outside the command allowlist and is never granted here" % plain(denial.tool)
-        if denial.tool in UNGRANTABLE_TOOLS:
-            return "%s cannot be allowlisted through Baton (it would widen the sandbox)" % denial.tool
-        if denial.directory and os.path.isabs(denial.directory):
-            roots = [plan.worktree, plan.tmpdir, plan.own_root, *plan.home_read, *plan.extra_write]
-            if not _under(_real(denial.directory), roots):
-                return "the refused directory is outside this worker's own directories"
+        if is_ungrantable(denial.tool):
+            return "%s cannot be allowlisted through Baton (it can run arbitrary programs or widen the sandbox)" % denial.tool
+        # Fail closed: a refusal that does not say where it happened cannot be shown to be inside this worker's directories.
+        if not denial.directory or not os.path.isabs(denial.directory):
+            return "the CLI did not report an absolute directory for the refusal, so it cannot be tied to this worker's directories"
+        roots = [plan.worktree, plan.tmpdir, plan.own_root, *plan.home_read, *plan.extra_write]
+        if not _under(_real(denial.directory), roots):
+            return "the refused directory is outside this worker's own directories"
+        if "{directory}" in (self.worker.permissions.rule_template or "") and not DIRECTORY_RE.fullmatch(denial.directory):
+            return "the refused directory cannot be written into the rule"
         if any(record["tool"] == denial.tool and record["status"] == "active" for record in self.keeper.ledger.active()):
             return "the CLI still refused %s although it is already allowlisted" % denial.tool
         return None
@@ -1707,12 +1818,13 @@ class WorkerRunner:
     def post_request(self, task_id, epoch, denial):
         permissions = self.worker.permissions
         reason = one_line(denial.reason or GENERIC_REASON, FIELD_CHARS, self.secrets)
+        tool_text = one_line(denial.tool or UNPARSED_TOOL, 200, self.secrets)
         if denial.command:
-            reason = truncate(reason + "; command: " + denial.command, FIELD_CHARS)
-        arguments = {"task_id": task_id, "epoch": epoch, "cli": permissions.cli, "tool": denial.tool or UNPARSED_TOOL,
-                     "reason": reason, "approvers": permissions.approvers}
+            reason = clip(reason + "; command: " + denial.command, FIELD_CHARS)
+        arguments = {"task_id": task_id, "epoch": epoch, "cli": permissions.cli, "tool": tool_text,
+                     "reason": reason, "approvers": permissions.approvers, "ttl_seconds": min(86400, permissions.wait_seconds + 60)}
         if denial.directory:
-            arguments["directory"] = truncate(denial.directory, 500)
+            arguments["directory"] = clip(denial.directory, 500)
         if denial.excerpt:
             arguments["excerpt"] = redact(denial.excerpt, self.secrets)
         try:
@@ -1738,6 +1850,8 @@ class WorkerRunner:
                 requests = []
             request = next((item for item in requests if isinstance(item, dict) and item.get("request_id") == request_id), None) \
                 if isinstance(requests, list) else None
+            if request is not None and request.get("status") in ("expired", "cancelled"):
+                raise RunnerError("permission request %s before any decision" % request["status"])
             if request is not None and request.get("status") != "pending":
                 if request.get("status") not in PERMISSION_OPTIONS or request.get("decided_by") == self.principal:
                     raise RunnerError("permission decision was not accepted: it did not come from an approver")
@@ -1746,6 +1860,13 @@ class WorkerRunner:
                 raise RunnerError("permission request was not answered within %ds" % permissions.wait_seconds)
             if self.stop.wait(permissions.poll_seconds):
                 return "stopped", None
+
+    def cancel_request(self, task_id, request_id):
+        """Best effort: a request nobody will answer must not keep the task from asking again."""
+        try:
+            self.baton.write("cancel_permission", {"task_id": task_id, "request_id": request_id})
+        except (cli.BatonError, cli.NetworkError) as error:
+            self.log(task_id, "permission-cancel-failed", error=error_code(error))
 
     def permission_loop(self, task_id, page_id, epoch, lease, outcome, launch, lease_lost, once, plan):
         """After a refused run, ask for the permission and re-run in the same worktree on approval.
@@ -1766,12 +1887,14 @@ class WorkerRunner:
                 rounds += 1
                 request = self.post_request(task_id, epoch, denial)
                 self.log(task_id, "permission-requested", request=request["request_id"], tool=denial.tool or "unparsed")
-                kind, decided = self.await_decision(task_id, request["request_id"], lease_lost)
-                if kind == "stopped":
-                    outcome.stopped = True
-                    return outcome, None, None
-                if kind == "lease_lost":
-                    outcome.lease_lost = True
+                try:
+                    kind, decided = self.await_decision(task_id, request["request_id"], lease_lost)
+                except RunnerError:
+                    self.cancel_request(task_id, request["request_id"])
+                    raise
+                if kind != "decided":
+                    self.cancel_request(task_id, request["request_id"])
+                    outcome.stopped, outcome.lease_lost = kind == "stopped", kind == "lease_lost"
                     return outcome, None, None
                 self.log(task_id, "permission-decided", request=request["request_id"], decision=decided["status"],
                          by=decided.get("decided_by"))
@@ -1780,7 +1903,7 @@ class WorkerRunner:
                 if denial.tool is None:
                     raise RunnerError("permission approved, but the refused tool could not be identified; add it to the "
                                       "CLI's allowlist by hand")
-                record = self.keeper.grant(decided, denial.tool)
+                record = self.keeper.grant(decided, denial.tool, denial.directory)
                 if decided["status"] == "allow_once":
                     once.append(record["id"])
                 self.baton.write("renew", {"task_id": task_id, "epoch": epoch, "lease_seconds": lease})
@@ -2017,6 +2140,7 @@ class Runner:
         self.workers = []
         self.refusals = []
         self.cap = None
+        self.state_lock = None
 
     def refuse(self, worker, reason):
         self.refusals.append((worker.principal, reason))
@@ -2083,8 +2207,26 @@ class Runner:
             self.workers.append(WorkerRunner(self, worker, Baton(client, self.stop), state))
         return self.workers
 
+    def hold_state_dir(self):
+        """One runner per state_dir: a second one's startup cleanup would withdraw grants the first is still using."""
+        fd = os.open(str(Path(self.config.state_dir) / "runner.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            raise ConfigError("another runner is already using this state_dir") from None
+        self.state_lock = fd
+
+    def release_state_dir(self):
+        fd, self.state_lock = self.state_lock, None
+        if fd is not None:
+            os.close(fd)
+
     def start(self):
-        for worker in self.prepare():
+        workers = self.prepare()
+        if workers:
+            self.hold_state_dir()
+        for worker in workers:
             worker.start()
             event(worker.principal, None, "started", concurrency=worker.worker.concurrency,
                   sandbox=worker.worker.sandbox.backend)
@@ -2100,6 +2242,8 @@ class Runner:
         for worker in self.workers:
             for thread in worker.threads:
                 thread.join(max(0.0, deadline - time.monotonic()))
+        if all(not thread.is_alive() for worker in self.workers for thread in worker.threads):
+            self.release_state_dir()
 
 
 def build_parser():
@@ -2137,6 +2281,11 @@ def grant_keepers(config):
 
 
 def grants_command(config, args):
+    if not os.path.isdir(config.state_dir):
+        if args.list_grants:
+            return EXIT_OK
+        log("error: no state directory, so no grants")
+        return EXIT_USAGE
     keepers = grant_keepers(config)
     if args.list_grants:
         for principal, keeper in sorted(keepers.items()):

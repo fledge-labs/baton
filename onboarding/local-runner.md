@@ -400,7 +400,7 @@ worker 字段：
 流程（同一任务、同一 epoch、同一租约、同一 worktree）：
 
 1. CLI 以非零退出结束（不含超时、被停止、租约丢失）。执行器在它的 stdout/stderr 里按该 CLI 的检测器表解析拒绝信息：被拒绝的程序（`tool`）、目录、原因。解析不出字段，但输出里有明确的审批措辞（`requires approval`、`not in the allow list`、`denied by policy`、`no prompt available` 等）时，仍发请求，`tool` 记为 `(unparsed)`，并附带一段**有界、已脱敏**的原始输出片段（至多 1500 字符，对令牌、`env_passthrough` 值、Keychain 值做字面脱敏）。普通的操作系统 `Permission denied` 不算。
-2. 执行器发 `request_permission`：任务保持 `claimed`，视图出现 `blocked.reason_code=waiting_input`（`input required: permission`），线程出现一条以 `[input required: permission]` 开头的评论（一行说明加一段结构化 JSON），并提及 `permissions.approvers`，选项是 `allow_once`、`allow_always`、`deny`。执行器每 `poll_seconds`（默认 5）读一次 `list_permissions`，等待期间续租线程继续续租，最多等 `wait_seconds`（默认 1800）；超时按普通失败处理（计一次失败，同一请求保持待决）。
+2. 执行器发 `request_permission`：任务保持 `claimed`，视图出现 `blocked.reason_code=waiting_input`（`input required: permission`），线程出现一条以 `[input required: permission]` 开头的评论（一行说明加一段结构化 JSON），并提及 `permissions.approvers`，选项是 `allow_once`、`allow_always`、`deny`。执行器每 `poll_seconds`（默认 5）读一次 `list_permissions`，等待期间续租线程继续续租，最多等 `wait_seconds`（默认 1800）；超时、被停止或丢失租约时，执行器会 `cancel_permission` 撤回自己的请求（请求也会随 epoch 变化或 TTL 自动 `expired`），所以任务之后还能再申请；超时按普通失败处理（计一次失败）。
 3. 决定必须由 approver 通过 Baton 做出：Space 根，或持有覆盖该任务的审批人委托的主体（与 gate 的规则相同）。执行器自己的 worker 身份永远不能决定自己的请求，执行器代码里也没有任何决定调用；`approvers` 配置里不能写 worker 自己。别的人（没有委托的 reviewer、别的 agent）得到 `403`。
 4. `allow_once` / `allow_always`：执行器在**该 CLI 自己的白名单文件**（`permissions.config_file`）里加一条规则，向 Baton 报告 `granted`，续租，在评论里说明，然后在**同一个 worktree** 里重新运行 CLI（上一次运行留下的改动还在）。每次重跑都有完整的 `task_timeout_seconds`；一个任务至多发 `max_requests`（默认 3）个请求。`allow_once` 的规则在整个任务运行结束后（成功或失败，提交结果之前）移除并报告 `revoked`；之后的任务会重新请求。`allow_always` 的规则一直保留，直到用下面的撤销命令移除。
 5. `deny`：执行器评论说明，释放租约并 `mark_blocked(reason_code="other", note="permission_denied: <tool> (request <id>)")`，不再自动重试，也不记入失败次数。`permission_denied` 写在 `note` 里而不是原因码，因为 `blocked_reason` 的数据库约束只允许五个固定原因码，本功能不改 schema。
@@ -429,7 +429,7 @@ worker 字段：
 | `config_file` | 该 CLI 白名单文件的绝对路径（`~` 会展开）。必须落在**这个 worker 自己的 `home_read` 之内**（按真实路径比较，符号链接绕不过去），不能同时落在 `extra_write_paths` 里（否则 CLI 自己能改写白名单），也不能和别的 worker 共用同一个文件。这样授权只影响该 worker，且沙箱不会为此放宽：沙箱里这个文件仍是只读的，只有执行器进程（在沙箱外）写它 |
 | `approvers` | 1 到 10 个 principal，请求里会提及他们；不能包含 worker 自己。它决定提醒谁，不决定谁有权批准 |
 | `wait_seconds` / `poll_seconds` / `max_requests` | 等待上限（默认 1800 秒）、轮询间隔（默认 5 秒）、每个任务的请求数上限（默认 3） |
-| `rule_template` | 可选：覆盖默认规则模板，必须是一行且含恰好一个 `{tool}`，例如 `Bash({tool} *)` |
+| `rule_template` | 可选：覆盖默认规则模板，必须是一行且含恰好一个 `{tool}`，可选地含至多一个 `{directory}`，例如 `Bash({tool} *)` |
 
 `home: "real"` 才有意义：授权写入的是操作者真实 `HOME` 下的 CLI 配置文件。用 `home: "task"`（临时 HOME）的 worker，CLI 读不到这个文件。
 
@@ -446,13 +446,18 @@ worker 字段：
 | `opencode` | JSON，`permission.bash` 映射（规则 → `"allow"`） | `{tool} *` | `permission requested: bash (<命令>); auto-rejecting`；`external_directory` 等非命令权限能解析但不授权 |
 | `dsh` | JSON，`permissions.allow` 数组 | `shell({tool})` | `dsh: shell command "<命令>" denied (policy=…, headless: no prompt available); cwd=<目录>` |
 
+账本先于配置文件写入：条目先以 `pending` 状态落盘，再把规则写进 CLI 配置，最后标为 `active`；写入后会回读确认规则确实在文件里。执行器在任何一步之间崩溃，都会留下一条 `pending` 记录，下次启动时 `settle_pending` 把它可能写下的规则撤回（操作者原有的规则和仍被别的授权使用的规则除外）。撤销同样回读确认规则已不在文件里，且要求配置文件仍在这个 worker 自己的 `home_read` 内；确认不了就保持 `active` 并报告失败，不会把一条仍然存在的规则标成已撤销。账本锁最长等待 10 秒，卡住的撤销命令不会拖死执行器（超时视为失败）。
+
+同一个 `state_dir` 同一时间只允许一个执行器（`state_dir/runner.lock`）：第二个启动的执行器会被拒绝，以免它的启动清理撤掉第一个还在使用的 `allow_once` 规则。`--list-grants`、撤销命令不受此限。
+
 写入只改这一条规则：JSON 文件原样保留其余内容（用标准库解析并以缩进 2 重写，所以原文件里的注释和排版不会保留；解析不了的文件、结构不符的文件直接拒绝，不改写），保留文件权限，原子替换。操作者本来就有的同名规则永远不会被撤销命令删除；同一规则被多个未撤销的授权共用时，要最后一个撤销才会删。
 
 ### 永远不会通过这条路径授权的东西
 
 - **任何沙箱设置。** 请求只会变成 CLI 白名单里的一条命令规则。`home_read`、`sandbox.*`（含网络）、`allow_keychain`、`extra_write_paths` 和配置里的其他项执行器都不会改（测试断言授权前后 worker 配置完全相同）。
-- **会放宽沙箱的程序：** shell 和解释器（`sh`、`bash`、`zsh`、`python*`、`node`、`perl`、`ruby`、`env`、`xargs`、`eval` 等）、网络客户端（`curl`、`wget`、`ssh`、`scp`、`nc`、`rsync` 等）、提权（`sudo`、`su`、`doas`）、Keychain 工具（`security`）、沙箱和容器工具（`bwrap`、`sandbox-exec`、`docker` 等）。这类拒绝不发请求，任务按普通失败处理，失败评论说明原因。
-- **非命令权限**（例如读写某个目录的权限）和**被拒绝目录落在这个 worker 自己的目录之外**（worktree、临时目录、`workdir_root`、`home_read`、`extra_write_paths`）的请求：同样不发请求，按普通失败处理。
+- **能运行任意程序或会放宽沙箱的程序：** shell 和解释器（`sh`、`bash`、`python`、`node`、`perl`、`ruby`、`php`、`java` 等）、通用执行器（`awk`、`find`、`xargs`、`env`、`busybox`、`timeout`、`nohup`、`make`、`npm`/`npx`、`pip`、`cargo`、`go`、`tar`、编辑器和分页器等）、网络客户端（`curl`、`wget`、`ssh`、`scp`、`nc`、`rsync` 等）、提权（`sudo`、`su`、`doas`）、Keychain 工具（`security`）、沙箱和容器工具（`bwrap`、`sandbox-exec`、`docker` 等），以及脚本文件（`*.sh`、`*.py` 等）。匹配前先取 basename、转小写并去掉版本后缀，所以 `python3.11`、`perl5.36`、`ruby3.2`、`node20`、`php8.2`、`/usr/bin/BASH` 都等同于对应的基础名。这类拒绝不发请求，任务按普通失败处理，失败评论说明原因。注意规则只按程序名放行（不限定参数），所以只有读、搜索类的普通程序（例如 `rg`、`grep`、`cat`、`jq`）才应批准。
+- **非命令权限**（例如读写某个目录的权限）的请求，以及**拿不到绝对目录，或目录落在这个 worker 自己的目录之外**（worktree、临时目录、`workdir_root`、`home_read`、`extra_write_paths`，按真实路径比较）的请求：同样不发请求，按普通失败处理（对目录“fail closed”：CLI 的拒绝信息没有报告目录，就不授权）。因此检测器样例里不带 `cwd` 的 opencode 拒绝信息和不带 `cwd` 的 dsh 信息都不会被授权；真实 CLI 输出里有绝对目录时才能用。
+- 默认规则只含程序名，不含目录范围：本仓库没有任何一个 CLI 的目录限定语法得到验证。需要把目录写进规则时用 `rule_template` 的可选占位符 `{directory}`（至多一次），例如 `run_command({tool} in {directory})`；此时目录只能含字母、数字和 `_ . / @ + : - 空格`，否则不授权。
 - 同一个程序已经授权过、CLI 却仍然拒绝：不再请求，按失败处理（避免循环）。
 
 ### 查看与撤销授权
@@ -466,11 +471,11 @@ python3 adapters/local_runner.py --config <CONFIG_FILE> --revoke-grant <GRANT_ID
 python3 adapters/local_runner.py --config <CONFIG_FILE> --revoke-worker <PRINCIPAL>
 ```
 
-`--list-grants` 每行输出一个 JSON（`worker`、`id`、`tool`、`rule`、`option`、`status`、`task_id`、`request_id`、`created`）。撤销会从白名单文件里删除规则（除非那条规则本来就是操作者的），把授权标为 `revoked`，并用该 worker 自己的令牌向 Baton 报告 `revoked`；Baton 暂时连不上时规则照样先删，报告记在账本里，执行器下次启动（或再次运行撤销命令）时补报。退出码：0 成功，1 有授权撤销失败，2 找不到该 id 或 worker。
+`--list-grants` 每行输出一个 JSON（`worker`、`id`、`tool`、`rule`、`option`、`status`、`task_id`、`request_id`、`created`）。撤销会从白名单文件里删除规则（除非那条规则本来就是操作者的），把授权标为 `revoked`，并用该 worker 自己的令牌向 Baton 报告 `revoked`；Baton 暂时连不上时规则照样先删，报告记在账本里，执行器下次启动（或再次运行撤销命令）时补报。退出码：0 成功，1 有授权撤销失败，2 找不到该 id 或 worker（`state_dir` 不存在时 `--list-grants` 输出为空并返回 0，撤销返回 2）。
 
 ### 审计
 
-每一步都有审计，且在任务线程里可见：`permission.requested`（谁、哪个 CLI、程序、目录、原因、点名的 approvers，excerpt 只存 SHA-256）、`permission.decided`（approver、选项、根或委托链）、`permission.granted`（执行器报告已写入）、`permission.revoked`。审计的 actor 分别是 worker、approver、worker、worker。无法向 Baton 报告 `granted` 的授权会被撤回并让任务失败，不会留下没有审计的规则；执行器崩溃后下次启动会撤回遗留的 `allow_once` 规则并补报未报告的事件。
+每一步都有审计，且在任务线程里可见：`permission.requested`（谁、哪个 CLI、程序、目录、原因、点名的 approvers，excerpt 只存 SHA-256）、`permission.decided`（approver、选项、根或委托链）、`permission.cancelled`（worker 或根撤回）、`permission.granted`（执行器报告已写入）、`permission.revoked`。审计的 actor 分别是 worker、approver、worker、worker。无法向 Baton 报告 `granted` 的授权会被撤回并让任务失败，不会留下没有审计的规则；执行器崩溃后下次启动会撤回遗留的 `allow_once` 规则并补报未报告的事件。
 
 ### 限制，请明确知晓
 
