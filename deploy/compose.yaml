@@ -119,6 +119,8 @@ services:
     # by the harness but inaccessible to model-generated tools.
     tmpfs: ["/tmp:size=64m,mode=1777", "/work:size=64m,uid=10001,gid=10001,mode=0700", "/home/agent/.codex/tmp:size=1m,uid=0,gid=0,mode=0555"]
     networks: [private, worker-egress]
+    mem_limit: ${CODEX_MEM_LIMIT:-640m}
+    memswap_limit: ${CODEX_MEM_LIMIT:-640m}
     pids_limit: 128
     depends_on:
       initialize: {condition: service_completed_successfully}

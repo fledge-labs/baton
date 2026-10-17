@@ -9,6 +9,8 @@ nginx 提供静态看板与反向代理；agentgateway 校验 bearer、区分 cl
 
 数据库与迁移器使用 UID/GID 999；bridge/worker 使用 10001。数据库仅位于独立 internal 网络，bridge 和 migrate 是其客户端；没有发布数据库端口。worker 只接入任务服务网络及自身 egress，不持数据库密码。TLS override 仅改变 edge 的公开入口。
 
+参考 D5 机型（2 vCPU、约 3.9 GiB 内存）上空闲 Compose 栈约 164 MiB 的观测值，codex 服务默认 `CODEX_MEM_LIMIT=640m`（`mem_limit` 与 `memswap_limit` 相同，禁止额外 swap）。worker 健康采样把 cgroup `memory.max` 暴露在 `/healthz` 的 `resources.memory.limit` 中；超限会由内核终止 Codex CLI，任务以 `WORKER_MEMORY_EXHAUSTED` 失败，而不是拖垮同机其他服务。可按模型与并发在 `.env` 中调高该上限。
+
 `baton_bootstrap` 的文件凭据只在 database/migrate 的管理秘密卷；它是运维 DBA，不能视作业务主体。schema、表和触发器由 `baton_owner NOLOGIN` 拥有。bridge 只拿 `baton_app` 的 JSON 配置：`host`、`port`、`dbname`、`user`、`password`；它不是 schema/table owner，没有创建 schema、管理角色、继承 owner 或变更审计触发器的权限。
 
 ## 数据与执行
