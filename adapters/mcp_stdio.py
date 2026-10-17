@@ -27,6 +27,9 @@ TOOLS = {"submit_task", "get_task", "list_tasks", "fetch_inbox", "wait_inbox", "
          "mention", "proposal_create", "proposal_review", "get_proposal", "list_proposals", "list_attribution",
          "create_task_block", "assign_task", "plan", "set_work_face", "set_priority", "mark_blocked", "ready", "claim", "renew", "submit_result", "handoff", "gate", "get_claim", "list_claims",
          "get_scopes", "list_audit", "delegation_create", "delegation_revoke", "delegation_list", "x_claim", "x_scope", "x_handoff", "x_gate", "x_audit"}
+DEPRECATION_NOTICE = "[deprecated] Baton no longer develops document collaboration; use tasks, comments and links instead."
+DEPRECATED_TOOLS = frozenset({"create_block", "get_block", "list_blocks", "update_block", "revert_block", "proposal_create",
+                              "proposal_review", "get_proposal", "list_proposals", "list_attribution"})
 STATUSES = {"queued", "working", "completed", "failed", "interrupted", "claimed", "awaiting_gate", "done"}
 DEFAULT_ALLOWED_TOOLS = frozenset({"submit_task", "get_task", "list_tasks", "fetch_inbox"})
 
@@ -130,6 +133,13 @@ def audit_rejection(path, agent, event, rejected_count):
     print(json.dumps(row), file=sys.stderr, flush=True)
 
 
+def mark_deprecated(tool):
+    """Descriptions only: a deprecated tool always starts with the notice, whatever the remote bridge version says."""
+    if tool.name not in DEPRECATED_TOOLS or (tool.description or "").startswith(DEPRECATION_NOTICE):
+        return tool
+    return tool.model_copy(update={"description": DEPRECATION_NOTICE + (" " + tool.description if tool.description else "")})
+
+
 def create_proxy_server(remote, *, agent_id, allow_tools=DEFAULT_ALLOWED_TOOLS, audit_file=None):
     safe_agent(agent_id)
     allow_tools = frozenset(allow_tools)
@@ -144,6 +154,7 @@ def create_proxy_server(remote, *, agent_id, allow_tools=DEFAULT_ALLOWED_TOOLS, 
         except Exception:
             raise RuntimeError("Baton remote tool discovery failed") from None
         allowed = [tool for tool in remote_tools if tool.name in allow_tools]
+        allowed = [mark_deprecated(tool) for tool in allowed]
         rejected_count = len(remote_tools) - len(allowed)
         if rejected_count:
             # One aggregate record per discovery response, never remote names.
