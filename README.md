@@ -93,7 +93,15 @@ docker compose run --rm --no-deps \
 
 ### 重新部署、冒烟与回滚
 
-在 Docker 主机上用 [`scripts/deploy.py`](scripts/deploy.py)（仅 Python 3 标准库）重建并替换运行中的实例，而不是手工 `up`。它先记录当前运行容器的镜像 ID，并给可恢复的本地镜像加 `baton-deploy-rollback:<id>` 保留标签；然后构建，执行 `docker compose … up -d --wait --force-recreate --remove-orphans`（使用你给的 `-f` 文件和项目名，所有服务一起重建，孤立容器被清除）；最后对入口做冒烟：`GET /board` 为 200、不带凭据的 `POST /mcp` 为 401，以及用冒烟令牌完成一次真实的 MCP `initialize`、`tools/list`、`fetch_inbox`。`up` 或任一冒烟失败时，它把之前的镜像重新打回原标签，再次 `up`（回滚），复测，并以非零状态退出。标准输出是 JSON 报告，进度写到标准错误。
+在 Docker 主机上用 [`scripts/deploy.py`](scripts/deploy.py)（仅 Python 3 标准库）重建并替换运行中的实例，而不是手工 `up`。每一步都有硬超时，超时按失败处理并进入回滚。顺序是：
+
+1. 预检：迁移 SQL（`bridge/space_schema.sql`）必须是向后兼容的 expand-only；Compose 文件不再声明的服务（孤立服务）必须用 `--allow-remove-orphans` 确认。任一不满足就在改动任何东西之前中止。
+2. 记录项目里**所有**容器（含已退出、已崩溃的）的镜像 ID，并给可恢复的本地镜像加 `baton-deploy-rollback:<id>` 保留标签，防止被垃圾回收。
+3. 用 `pg_dump`（custom 格式）备份数据库到 `--backup-dir`（目录 0700、文件 0600，密码只在数据库容器内读取，不出现在命令行）。备份失败、超时或文件头无效则中止。
+4. 构建，然后 `docker compose … up -d --wait --force-recreate --remove-orphans`（此时迁移已执行并提交）。
+5. 对入口做冒烟：`GET /board` 为 200、不带凭据的 `POST /mcp` 为 401，以及用冒烟令牌完成一次真实的 MCP `initialize`、`tools/list`、`fetch_inbox`。
+
+`up` 或冒烟失败（含超时）时，脚本把之前的镜像重新打回原标签，再次 `up`，逐个服务核对是否都回到了之前的镜像 ID，并复测冒烟；只有核对和冒烟都通过才报告 `rolled_back`。重打标签或回滚 `up` 失败不会提前返回：其余镜像照常恢复，仍会执行 `up`，`up` 失败再做一次尽力恢复（`up -d --remove-orphans`），最后在报告里给出手工恢复步骤并保留保留标签。标准输出是 JSON 报告，进度写到标准错误。
 
 冒烟令牌是一个普通客户端身份，只通过文件路径传入，从不打印；文件权限保持 0600，放在仓库外：
 
@@ -104,16 +112,31 @@ docker compose run --rm --no-deps \
   -v "$HOME/.config/baton:/delivery" admin issue deploy-smoke \
   --output /delivery/deploy-smoke.token --uid "$(id -u)" --gid "$(id -g)"
 python3 ../scripts/deploy.py -f compose.yaml -p baton \
-  --smoke-token-file "$HOME/.config/baton/deploy-smoke.token"
+  --smoke-token-file "$HOME/.config/baton/deploy-smoke.token" \
+  --backup-dir "$HOME/baton-backups"
 ```
 
 - 项目名与 `-f` 文件按你平时给 `docker compose` 的写法；TLS 实例加 `-f compose.tls.yaml`，并用 `--base-url https://<host>:<端口>`（私有 CA 用 `--ca-file`）。默认入口是 `http://127.0.0.1:8080`；明文 http 只允许回环地址，避免把令牌发往远端。
+- 超时：`--wait-timeout`（默认 300 秒，传给 `up --wait-timeout`，脚本在其后 120 秒强杀 `up` 的整个进程组）、`--build-timeout`（1800）、`--backup-timeout`（900）、`--command-timeout`（其余 docker 命令，120）；冒烟由 `--smoke-timeout` 和 `--request-timeout` 限定。回滚的 `up` 同样有超时。
 - `docker compose build` 没有网络参数；构建需要宿主网络时加 `--build-network host`，脚本会为带 `build` 的服务临时生成一个只含 `build.network` 的 Compose 覆盖文件，仅用于构建。`--no-build` 跳过构建。
-- `--dry-run` 只执行只读的 docker 查询，列出将要运行的命令，不构建、不重建、不发请求。
-- 退出码：0 已部署；1 失败但旧版本在运行（已回滚，或构建失败时从未被改动）；2 用法或配置错误；3 失败且旧版本没有恢复（回滚失败，或首次部署没有可恢复的版本）。
-- 回滚只恢复本地构建或本地标签的镜像（如 `baton-app:local`）；按 digest 固定的镜像由 Compose 文件决定，不会被改写。数据库 schema 不会回滚，迁移必须与上一版应用镜像兼容。回滚也失败时保留 `baton-deploy-rollback` 标签，可按报告手工恢复。
+- 孤立服务：`up --remove-orphans` 会删除 `-f` 文件集合之外的服务容器，回滚不会重建它们（只恢复镜像）。脚本在预检时列出这些服务（报告里的 `orphans`），没有 `--allow-remove-orphans` 就中止；先确认没有漏传某个 `-f` 文件。这正是移除某个 Compose 服务后需要加该参数的场景。
+- `--dry-run` 只执行只读的 docker 查询，列出将要运行的命令，不备份、不构建、不重建、不发请求。`--no-backup` 可以显式放弃备份（写入报告），例如首次部署之外数据库已停止且你另有备份时。
+- 退出码：0 已部署；1 失败但旧版本在运行（已回滚并核对，或预检、备份、构建阶段中止时从未被改动）；2 用法或配置错误；3 失败且旧版本没有核对通过（回滚失败或不完整，或首次部署没有可恢复的版本）。
 
-edge 的 nginx 每次请求通过 Docker 内置 DNS（`127.0.0.11`，缓存 10 秒）解析 `gateway`，所以重建 gateway 后无需重启 edge；以前 nginx 只在启动时解析上游，gateway 换了容器 IP 就会一直 502。edge 的健康检查除 `/board` 外还会对 `/mcp` 发一个不带凭据的 POST，必须得到 gateway 的 401，502/503/504 即不健康（`compose.tls.yaml` 的 edge 健康检查仍是 `nginx -t`）。注意：401 在 gateway 内部由鉴权策略直接产生，**不会**访问 bridge，所以它不能证明 gateway→bridge 链路通畅；gateway 镜像里没有 shell、wget 或 curl，也无法在它自己的容器里执行探测。gateway 到 bridge 这一段由 `deploy.py` 的带令牌 MCP 冒烟验证。
+**回滚的边界（务必先读）。** 回滚只恢复镜像：不恢复数据库，不恢复 Compose 拓扑。冒烟时迁移已经提交，所以旧镜像必须能在新 schema 上运行，即迁移必须向后兼容（expand/contract）：一个版本里只增加可空或带默认值的列和新表，不删除、重命名、改类型，也不对已有列加 `NOT NULL`；收缩（contract）放到再下一个版本，等旧镜像不再需要回滚之后。脚本在预检里静态检查迁移 SQL 是否含有 `DROP TABLE/COLUMN/…`、`TRUNCATE`、`DELETE FROM`、`RENAME`、改列类型、`SET NOT NULL`、无默认值的 `NOT NULL` 新列，发现就中止（`--allow-incompatible-migration` 可以越过，需要自行承担旧镜像无法回滚的后果）；这是常见收缩语句的静态防线，不是兼容性证明。若仍然破坏了兼容，应先停止服务，再用备份手工恢复，例如（在 `deploy/` 目录，密码在容器内读取）：
+
+```sh
+# SPDX-License-Identifier: Apache-2.0
+docker compose exec -T database sh -c \
+  'PGPASSWORD="$(cat /run/secrets/database-admin/postgres.password)" exec pg_restore -U baton_bootstrap -d baton --clean --if-exists' \
+  < "$HOME/baton-backups/<备份文件>.dump"
+```
+
+按 digest 固定的镜像（如 `edge`、`gateway`、`database`）由 Compose 文件决定，不会被重新打标签；回滚到这些镜像要部署文件的上一个版本。若新版本改动了这些固定值，回滚核对会发现服务没有回到之前的镜像 ID，并报告 `rollback_failed`，而不是冒充成功。
+
+edge 的 nginx 每次请求通过 Docker 内置 DNS（`127.0.0.11`，缓存 10 秒）解析 `gateway`，所以重建 gateway 后无需重启 edge；以前 nginx 只在启动时解析上游，gateway 换了容器 IP 就会一直 502。`proxy_pass $upstream$request_uri` 把客户端发来的原始 URI 原样转发，和原先静态 `proxy_pass http://gateway:3000;`（不带 URI）的行为一致，没有额外规范化。
+
+健康检查：bridge 容器内用 `GET http://127.0.0.1:9000/healthz`，它会读取数据库里的 schema 版本，数据库不可达或缺迁移时 bridge 即不健康（只有容器内回环地址的这一条 GET 免令牌，其他容器包括 gateway 仍需令牌）。edge 除 `/board` 外还会对 `/mcp` 发一个不带凭据的 POST，必须得到 gateway 的 401，502/503/504 即不健康；TLS 实例的 edge 检查同样的两个请求，经 `https://127.0.0.1:8443`，因此同时验证端口在监听、证书能完成握手（回环探测不校验证书链）、上游可达。注意：这个 401 在 gateway 内部由鉴权策略直接产生，**不会**访问 bridge，gateway 镜像里也没有 shell、wget 或 curl，无法在它自己的容器里探测；bridge 由它自己的 `/healthz` 保证（gateway `depends_on` bridge healthy），gateway 到 bridge 这一段由 `deploy.py` 的带令牌 MCP 冒烟验证。
 
 ### 升级旧实例
 

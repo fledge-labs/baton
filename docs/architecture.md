@@ -28,7 +28,11 @@ PostgreSQL 的 `baton` schema 保存 spaces、pages、blocks、分享、归属�
 
 ## 运维范围
 
-edge 的 nginx 用 Docker 内置 DNS（`resolver 127.0.0.11 valid=10s ipv6=off`）并通过变量（`set $upstream http://gateway:3000`）做 `proxy_pass`，每次请求重新解析 `gateway`，请求路径、查询串、请求头、超时和流式（SSE）设置保持不变；因此 gateway 被重建、换了容器 IP 后无需重启 edge。edge 的健康检查要求 `/board` 为 200，且不带凭据的 `POST /mcp` 经 nginx 到达 gateway 并得到 401；502/503/504 表示 edge→gateway 不通。该 401 由 gateway 的鉴权策略在转发前产生，不经过 bridge，gateway 镜像也没有可执行探测的 shell 或客户端，所以 gateway→bridge 由 `scripts/deploy.py` 在部署后用冒烟令牌走一次完整 MCP 流程（`initialize`、`tools/list`、`fetch_inbox`）验证；失败时它恢复之前的本地镜像并重新 `up`。该脚本不回滚数据库 schema。
+edge 的 nginx 用 Docker 内置 DNS（`resolver 127.0.0.11 valid=10s ipv6=off`）并通过变量（`set $upstream http://gateway:3000`）做 `proxy_pass $upstream$request_uri`，每次请求重新解析 `gateway`；客户端的原始请求 URI、请求头、超时和流式（SSE）设置与原先静态 `proxy_pass http://gateway:3000;` 完全一致（测试用同一批原始 URI 对比两种配置），gateway 被重建、换了容器 IP 后无需重启 edge。
+
+健康检查分层：bridge 调用自己的 `/healthz`（读取数据库 schema 版本；仅容器内回环地址的 GET 免令牌），所以数据库或迁移出问题时 bridge 不健康；edge（HTTP 与 TLS 变体）要求 `/board` 为 200，且不带凭据的 `POST /mcp` 经 nginx 到达 gateway 并得到 401，TLS 变体经 `https://127.0.0.1:8443`，同时验证监听与握手。该 401 由 gateway 的鉴权策略在转发前产生，不经过 bridge，gateway 镜像也没有可执行探测的 shell 或客户端，所以 gateway→bridge 由 `scripts/deploy.py` 在部署后用冒烟令牌走一次完整 MCP 流程（`initialize`、`tools/list`、`fetch_inbox`）验证。
+
+`scripts/deploy.py` 的部署顺序是：预检（迁移 SQL 必须 expand-only；孤立服务须确认）→ 记录全部容器镜像并加保留标签 → `pg_dump` 备份 → 构建 → `up --force-recreate --remove-orphans` → 冒烟；每步有硬超时。失败时只恢复镜像（不恢复数据库与 Compose 拓扑），逐服务核对镜像 ID 后才报告回滚成功；因此迁移必须让上一版镜像仍能运行，备份用于破坏了这一约束时的手工恢复。
 
 `x_audit` 的业务记录只允许应用追加/读取，并由所有者触发器拒绝修改、删除和清空。边缘、网关与 bridge 的 JSONL 另用于连接入口 request ID 与 task ID；这些文件不提供抗管理员篡改保证。数据库超级用户和 Docker 管理员属于可信边界。
 
