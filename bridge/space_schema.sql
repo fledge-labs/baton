@@ -93,6 +93,14 @@ ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS assignee text;
 ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS work_face jsonb;
 ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS require_work_face boolean NOT NULL DEFAULT false;
 ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS task_kind text NOT NULL DEFAULT 'construction' CHECK (task_kind IN ('construction','prep'));
+-- Response-time agreements: deadlines apply only to assigned (manual-path) tasks; timestamps use database time.
+ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS priority text NOT NULL DEFAULT 'normal' CHECK (priority IN ('urgent','normal','low'));
+ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS respond_by timestamptz;
+ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS responded_at timestamptz;
+ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS escalated_at timestamptz;
+ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS escalate_to text;
+ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS fallback_assignee text;
+CREATE INDEX IF NOT EXISTS tasks_overdue ON baton.tasks(respond_by) WHERE state IN ('queued','claimed') AND responded_at IS NULL AND escalated_at IS NULL AND respond_by IS NOT NULL;
 CREATE TABLE IF NOT EXISTS baton.task_dependencies (
     task_id uuid NOT NULL REFERENCES baton.tasks(id),
     depends_on uuid NOT NULL REFERENCES baton.tasks(id),

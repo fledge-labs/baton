@@ -20,6 +20,7 @@ Baton 的 HTTP/JSON、数据库结构和 `x_claim`、`x_scope`、`x_handoff`、`
 | 交接说明（x_handoff）、审批与关卡（x_gate）、追加审计（x_audit） | 已实现 |
 | 施工面清单（x_ready） | 已实现 |
 | 对外通知：事务性通知 outbox、webhook（HMAC 签名、至少一次）、`wait_inbox` 长轮询 | 已实现 |
+| 响应时效约定：按优先级设响应时限，超时通知负责人或改派给后备 agent | 已实现 |
 | 对外通知：MCP 推送通知；人通过网页或飞书提醒 | 计划 |
 | 空间内有权限范围和审计的私信 | 计划 |
 | MCP 服务（任务、讨论串、收件箱、认领、关卡等工具） | 已实现 |
@@ -125,6 +126,10 @@ WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --b
 ### 通知与异步送达
 
 不必再轮询 `fetch_inbox`：mention、指派、任务线程评论、进入 gate、gate 决定和交接会在业务事务内写入通知 outbox（只含标识符，不含正文）。`wait_inbox(after_seq, timeout_seconds≤55)` 长轮询返回当前仍可见的通知；`webhook_subscribe/webhook_list/webhook_delete` 让 bridge 向你的 https 端点投递带 HMAC 签名的通知，至少一次、指数退避、最多 8 次后 dead-letter，接收方按 `X-Baton-Delivery` 去重。URL 经过 SSRF 检查；运营者可用 `BATON_WEBHOOK_ALLOW_HOSTS` 豁免内部主机，默认 Compose 的 bridge 没有出站网络。细节见 [API](docs/api.md#通知与送达webhookwait_inbox) 与 [安全模型](docs/security-model.md)。适配器默认白名单不变，可用 `--allow-tools fetch_inbox,wait_inbox` 显式放行 `wait_inbox`。
+
+### 响应时效与超时升级
+
+指派给某个 agent 或人之后，任务按优先级获得响应时限（`urgent`/`normal`/`low`，默认 20/60/1440 分钟，可用 `BATON_RESPONSE_MINUTES="urgent=20,normal=60,low=1440"` 覆盖）。接收人领取任务，或在任务线程评论，就算响应；到期仍无响应时，bridge 的后台循环（每 30 秒，PostgreSQL 咨询锁单飞）会给负责人（`escalate_to`，默认 owner）写 `task.overdue` 通知，并在后备接收人（`fallback_assignee`）有 edit 权限且任务未被领取时把任务改派给它。已被领取的任务从不被改派。`set_priority` 调整优先级。细节见 [API](docs/api.md#响应时效与超时升级) 与 [规格 X20](docs/spec/space.md)。适配器默认白名单不变，`set_priority` 需用 `--allow-tools` 显式放行。
 
 ### 依赖图与就绪任务
 

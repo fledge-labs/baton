@@ -36,7 +36,7 @@ MESSAGES = {
     "rate_limited": "Too many requests",
 }
 NOTIFY_EVENTS = frozenset({"mention.created", "task.assigned", "comment.created", "task.awaiting_gate",
-                           "gate.decided", "task.handed_off", "task.failed"})
+                           "gate.decided", "task.handed_off", "task.failed", "task.overdue"})
 WEBHOOK_LIMIT = 10
 WEBHOOK_MAX_ATTEMPTS = 8
 # Delay after failed attempt n (1-based); the seven delays between eight attempts total about an hour.
@@ -44,12 +44,39 @@ WEBHOOK_BACKOFF_SECONDS = (30, 60, 120, 240, 480, 960, 1920)
 WEBHOOK_LEASE_SECONDS = 60
 NOTIFY_SCAN_BATCH = 200
 NOTIFY_SCAN_LIMIT = 1000
+PRIORITIES = ("urgent", "normal", "low")
+DEFAULT_RESPONSE_MINUTES = {"urgent": 20, "normal": 60, "low": 1440}
+RESPONSE_MINUTES_MAX = 525600
+# Distinct from LOCK_ID: this one only keeps escalation runners from queueing up behind each other.
+ESCALATION_LOCK_ID = 0x4241544F4F
+ESCALATION_BATCH = 100
 
 
 class StoreError(Exception):
     def __init__(self, code):
         self.code = code
         super().__init__(MESSAGES.get(code, MESSAGES["storage_unavailable"]))
+
+
+class _Busy(Exception):
+    """Another process holds a single-flight lock; the caller skips this round."""
+
+
+def parse_response_minutes(value):
+    """Merge a "urgent=20,normal=60,low=1440" override into the defaults. Unset or blank keeps the defaults."""
+    policy = dict(DEFAULT_RESPONSE_MINUTES)
+    if value is None or not value.strip():
+        return policy
+    seen = set()
+    for item in value.split(","):
+        name, separator, minutes = (part.strip() for part in item.partition("="))
+        if not separator or name not in PRIORITIES or name in seen or not minutes.isascii() or not minutes.isdecimal():
+            raise ValueError("Invalid response-time policy")
+        if not 1 <= int(minutes) <= RESPONSE_MINUTES_MAX:
+            raise ValueError("Invalid response-time policy")
+        seen.add(name)
+        policy[name] = int(minutes)
+    return policy
 
 
 def _identifier(value):
@@ -217,6 +244,33 @@ def _work_face_request(work_face, require_work_face, task_kind):
     return face, require_work_face, _task_kind(task_kind)
 
 
+def _priority(value):
+    if not isinstance(value, str) or value not in PRIORITIES:
+        raise StoreError("invalid")
+    return value
+
+
+def _response_request(priority, escalate_to, fallback_assignee, owner, assignee):
+    """Validate response-time options and return them with the digest entries for non-default values only."""
+    priority = _priority(priority)
+    if escalate_to is not None:
+        _identifier(escalate_to)
+    if fallback_assignee is not None:
+        _identifier(fallback_assignee)
+        if assignee is not None and fallback_assignee == assignee.principal:
+            raise StoreError("invalid")
+    if escalate_to == owner:
+        escalate_to = None
+    args = {}
+    if priority != "normal":
+        args["priority"] = priority
+    if escalate_to is not None:
+        args["escalate_to"] = escalate_to
+    if fallback_assignee is not None:
+        args["fallback_assignee"] = fallback_assignee
+    return priority, escalate_to, fallback_assignee, args
+
+
 def _dependency_ids(values):
     if values is None:
         return []
@@ -247,23 +301,28 @@ def _graph_entries(graph):
 
 
 class SpaceStore:
-    def __init__(self, config_path, directory=None):
+    def __init__(self, config_path, directory=None, response_minutes=None):
         self.config_path = Path(config_path)
+        self.response_minutes = {**DEFAULT_RESPONSE_MINUTES, **(response_minutes or {})}
         # directory(principal) -> Actor | None resolves principals the store only knows by name
         # (reviewers, assignees, mention targets) so notification recipients can be permission-checked.
         self.directory = directory
 
     @classmethod
     def from_env(cls, directory=None):
-        return cls(os.environ.get("BATON_DATABASE_CONFIG", "/run/secrets/database.json"), directory)
+        return cls(os.environ.get("BATON_DATABASE_CONFIG", "/run/secrets/database.json"), directory,
+                   parse_response_minutes(os.environ.get("BATON_RESPONSE_MINUTES")))
 
     @contextmanager
-    def _transaction(self, write=False):
+    def _transaction(self, write=False, single_flight=None):
         try:
             config = json.loads(self.config_path.read_text())
             if set(config) != {"host", "port", "dbname", "user", "password"}:
                 raise StoreError("storage_unavailable")
             with psycopg.connect(**config, connect_timeout=5, row_factory=dict_row) as conn:
+                # Taken before the global lock so a second runner skips instead of queueing behind the first.
+                if single_flight is not None and not conn.execute("SELECT pg_try_advisory_xact_lock(%s) AS ok", (single_flight,)).fetchone()["ok"]:
+                    raise _Busy()
                 lock = "pg_advisory_xact_lock" if write else "pg_advisory_xact_lock_shared"
                 conn.execute(f"SELECT {lock}(%s)", (LOCK_ID,))
                 yield conn
@@ -375,7 +434,8 @@ class SpaceStore:
         allowed = {"page_id", "block_id", "thread_id", "epoch", "revision", "proposal_id", "team_id", "subject_type",
                    "role", "decision", "backend", "a2a_task_id", "input_sha256", "output_sha256", "error_code",
                    "count", "target_type", "execution_mode", "old_epoch", "work_face_keys", "work_face_sha256", "stage",
-                   "subscription_id", "notification_id", "attempts", "http_status", "notify_event", "object_type"}
+                   "subscription_id", "notification_id", "attempts", "http_status", "notify_event", "object_type",
+                   "priority", "escalate_to", "from_assignee", "to_assignee"}
         if not set(metadata) <= allowed:
             raise StoreError("invalid")
         conn.execute("""INSERT INTO baton.x_audit(id,event,agent,actor_account,actor_kind,requested_by,performed_by,
@@ -451,7 +511,7 @@ class SpaceStore:
                 "mentions": "id comment_id target_type target_id action_requested requested_by created_at",
                 "proposals": "id block_id expected_revision proposed_content status revision",
                 "proposal_revisions": "proposal_id revision content author_principal",
-                "tasks": "id page_id block_id owner owner_account owner_kind assignee idempotency_key input_hash prompt execution_mode gate_mode reviewers scopes state epoch result_epoch result result_author result_author_account base_commit context evidence a2a_id backend dispatch_started_at error work_face require_work_face task_kind",
+                "tasks": "id page_id block_id owner owner_account owner_kind assignee idempotency_key input_hash prompt execution_mode gate_mode reviewers scopes state epoch result_epoch result result_author result_author_account base_commit context evidence a2a_id backend dispatch_started_at error work_face require_work_face task_kind priority respond_by responded_at escalated_at escalate_to fallback_assignee",
                 "task_dependencies": "task_id depends_on created_at",
                 "x_claim": "task_id holder holder_account holder_kind epoch lease_expires_at scopes scope_repository",
                 "x_handoff": "task_id old_epoch new_epoch base_commit context evidence",
@@ -657,6 +717,7 @@ class SpaceStore:
             self._audit(conn, actor, operation_id, "comment.created", space_id=page["space_id"], task_id=task["id"] if task else None,
                         page_id=page_id, thread_id=row["thread_id"])
             if task:
+                self._record_response(conn, actor, task)
                 parties = self._task_parties(conn, task)
                 self._enqueue(conn, actor, "comment.created", "comment", row["id"], page_id,
                               [parties["owner"], parties["assignee"], parties["holder"], *parties["reviewers"]], row["thread_id"])
@@ -882,6 +943,8 @@ class SpaceStore:
         row.update(submission_mail_status="sent", mail_status="sent" if reported else "not_ready", mail_error=None)
         row.update(submission_thread_status="sent", report_status="sent" if reported else "not_ready")
         row["work_face_missing"] = self._work_face_missing(row)
+        row["overdue"] = bool(row["respond_by"] is not None and row["responded_at"] is None and row["state"] not in {"done", "failed"}
+                              and conn.execute("SELECT %s<clock_timestamp() AS late", (row["respond_by"],)).fetchone()["late"])
         authority = self._authorization_context(actor, row)
         row["depends_on"], row["has_hidden_dependencies"] = self._visible_dependencies(conn, authority, task_id)
         return row
@@ -1097,7 +1160,8 @@ class SpaceStore:
 
     def _new_task(self, conn, actor, operation_id, page_id, prompt, scopes, mode, reviewers,
                   input_hash, idempotency_key=None, base_commit=None, context=None, evidence=None, assignee=None, depends_on=None,
-                  work_face=None, require_work_face=False, task_kind="construction"):
+                  work_face=None, require_work_face=False, task_kind="construction",
+                  priority="normal", escalate_to=None, fallback_assignee=None):
         if assignee is not None:
             if not isinstance(assignee, Actor):
                 raise StoreError("invalid")
@@ -1111,12 +1175,14 @@ class SpaceStore:
         self._revision(conn, actor, operation_id, block, content)
         conn.execute("UPDATE baton.pages SET revision=revision+1 WHERE id=%s", (page_id,))
         task = conn.execute("""INSERT INTO baton.tasks(id,page_id,block_id,owner,owner_account,owner_kind,assignee,idempotency_key,input_hash,prompt,
-            execution_mode,gate_mode,reviewers,scopes,base_commit,context,evidence,work_face,require_work_face,task_kind)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
+            execution_mode,gate_mode,reviewers,scopes,base_commit,context,evidence,work_face,require_work_face,task_kind,
+            priority,respond_by,escalate_to,fallback_assignee)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,clock_timestamp()+%s*interval '1 minute',%s,%s) RETURNING *""",
             (task_id, page_id, block_id, actor.principal, actor.account, actor.kind, assignee.principal if assignee else None,
              idempotency_key, input_hash, prompt, mode, "worker_success" if mode == "codex" else "reviewer", Jsonb(reviewers),
              Jsonb(scopes), base_commit, Jsonb(_items(context)), Jsonb(_items(evidence)),
-             None if work_face is None else Jsonb(work_face), require_work_face, task_kind)).fetchone()
+             None if work_face is None else Jsonb(work_face), require_work_face, task_kind,
+             priority, self.response_minutes[priority] if assignee else None, escalate_to or actor.principal, fallback_assignee)).fetchone()
         dependency_count = self._add_dependencies(conn, str(task_id), depends_on or [])
         self._require_acyclic(conn, str(task_id))
         self._task_audit(conn, actor, operation_id, "task.submitted", task, input_sha256=hashlib.sha256(prompt.encode()).hexdigest(), execution_mode=mode)
@@ -1141,7 +1207,8 @@ class SpaceStore:
         return args
 
     def submit_task(self, actor, operation_id, idempotency_key, prompt, page_id=None, scopes=None, assignee=None, depends_on=None,
-                    work_face=None, require_work_face=False, task_kind="construction"):
+                    work_face=None, require_work_face=False, task_kind="construction",
+                    priority="normal", escalate_to=None, fallback_assignee=None):
         _identifier(idempotency_key)
         _text(prompt)
         normalized = normalize_scopes(scopes)
@@ -1151,12 +1218,14 @@ class SpaceStore:
             raise StoreError("invalid")
         if assignee is not None and assignee.principal == actor.principal:
             raise StoreError("invalid")
+        priority, escalate_to, fallback_assignee, response_args = _response_request(priority, escalate_to, fallback_assignee, actor.principal, assignee)
         args = {"idempotency_key": idempotency_key, "prompt": prompt, "page_id": page_id, "scopes": normalized,
                 "assignee": asdict(assignee) if assignee else None}
         # Preserve v1 hashes for already-persisted submissions without dependencies.
         if dependencies:
             args["depends_on"] = dependencies
         args.update(self._work_face_args(face, require_work_face, task_kind))
+        args.update(response_args)
         digest = hashlib.sha256(_canonical(args).encode()).hexdigest()
         def authorize(conn):
             self._user(actor)
@@ -1176,13 +1245,15 @@ class SpaceStore:
             chosen = page_id or self._default_page(conn, actor, operation_id)
             return self._new_task(conn, actor, operation_id, chosen, prompt, normalized, "manual" if assignee else "codex",
                                   [actor.principal] if assignee else [], digest, idempotency_key=idempotency_key, assignee=assignee, depends_on=dependencies,
-                                  work_face=face, require_work_face=require_work_face, task_kind=task_kind)
+                                  work_face=face, require_work_face=require_work_face, task_kind=task_kind,
+                                  priority=priority, escalate_to=escalate_to, fallback_assignee=fallback_assignee)
         def replay(conn, old):
             return self._task_view(conn, actor, old["task_id"])
         return self._mutate(actor, operation_id, "submit_task", args, authorize, effect, replay)
 
     def create_task_block(self, actor, operation_id, page_id, prompt, scopes, reviewers, base_commit=None, context=None, evidence=None, assignee=None, depends_on=None,
-                          work_face=None, require_work_face=False, task_kind="construction"):
+                          work_face=None, require_work_face=False, task_kind="construction",
+                          priority="normal", escalate_to=None, fallback_assignee=None):
         _text(prompt)
         normalized = normalize_scopes(scopes)
         dependencies = _dependency_ids(depends_on)
@@ -1197,11 +1268,13 @@ class SpaceStore:
         _items(evidence)
         if assignee is not None and not isinstance(assignee, Actor):
             raise StoreError("invalid")
+        priority, escalate_to, fallback_assignee, response_args = _response_request(priority, escalate_to, fallback_assignee, actor.principal, assignee)
         args = {"page_id": page_id, "prompt": prompt, "scopes": normalized, "reviewers": reviewers,
                 "base_commit": base_commit, "context": context, "evidence": evidence, "assignee": asdict(assignee) if assignee else None}
         if dependencies:
             args["depends_on"] = dependencies
         args.update(self._work_face_args(face, require_work_face, task_kind))
+        args.update(response_args)
         digest = hashlib.sha256(_canonical(args).encode()).hexdigest()
         def authorize(conn):
             self._require(conn, actor, "page", page_id, "edit")
@@ -1211,7 +1284,8 @@ class SpaceStore:
                             authorize,
                             lambda conn: self._new_task(conn, actor, operation_id, page_id, prompt, normalized, "manual", reviewers, digest,
                                                         base_commit=base_commit, context=context, evidence=evidence, assignee=assignee, depends_on=dependencies,
-                                                        work_face=face, require_work_face=require_work_face, task_kind=task_kind),
+                                                        work_face=face, require_work_face=require_work_face, task_kind=task_kind,
+                                                        priority=priority, escalate_to=escalate_to, fallback_assignee=fallback_assignee),
                             lambda conn, old: self._task_view(conn, actor, old["task_id"]))
 
     def get_task(self, actor, task_id):
@@ -1288,6 +1362,8 @@ class SpaceStore:
             VALUES (%s,%s,%s,%s,%s,clock_timestamp()+%s*interval '1 second',%s)""",
             (task["id"], actor.principal, actor.account, actor.kind, epoch, lease_seconds, Jsonb(task["scopes"])))
         conn.execute("UPDATE baton.tasks SET state='claimed',epoch=%s,result_epoch=NULL,error=NULL WHERE id=%s", (epoch, task["id"]))
+        if task["assignee"] == actor.principal:
+            conn.execute("UPDATE baton.tasks SET responded_at=COALESCE(responded_at,clock_timestamp()) WHERE id=%s", (task["id"],))
         self._task_audit(conn, actor, operation_id, "worker.claimed" if task["execution_mode"] == "codex" else "task.claimed", task, epoch=epoch)
         return self._task_view(conn, actor, str(task["id"]), include_prompt=True)
 
@@ -1394,6 +1470,8 @@ class SpaceStore:
                 lease_expires_at=clock_timestamp()+%s*interval '1 second' WHERE task_id=%s""", (target.principal, target.account, target.kind, lease_seconds, task_id))
             conn.execute("UPDATE baton.tasks SET epoch=epoch+1,assignee=%s,base_commit=%s,context=%s,evidence=%s WHERE id=%s",
                          (target.principal, base, Jsonb(contexts), Jsonb(evidence_items), task_id))
+            if task["assignee"] != target.principal:
+                self._start_clock(conn, task)
             conn.execute("INSERT INTO baton.x_handoff(id,task_id,from_holder,to_holder,old_epoch,new_epoch,base_commit,context,evidence) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                          (uuid.uuid4(), task_id, actor.principal, target.principal, epoch, epoch + 1, base, Jsonb(contexts), Jsonb(evidence_items)))
             self._task_audit(conn, actor, operation_id, "task.handed_off", task, old_epoch=epoch, epoch=epoch + 1)
@@ -1406,6 +1484,31 @@ class SpaceStore:
         return self._mutate(actor, operation_id, "handoff", {"task_id": task_id, "epoch": epoch, "target": asdict(target), "base_commit": base_commit,
                             "context": context, "evidence": evidence, "lease_seconds": lease_seconds}, authorize, effect, replay)
 
+    def _start_clock(self, conn, task):
+        """Start a new response window for the task's current assignee, using database time."""
+        conn.execute("""UPDATE baton.tasks SET respond_by=clock_timestamp()+%s*interval '1 minute',responded_at=NULL,escalated_at=NULL
+            WHERE id=%s""", (self.response_minutes[task["priority"]], task["id"]))
+
+    @staticmethod
+    def _record_response(conn, actor, task):
+        """The first comment in the task thread by its assignee or live holder counts as the response."""
+        if task["respond_by"] is None or task["responded_at"] is not None:
+            return
+        responded = actor.principal == task["assignee"] or conn.execute("""SELECT 1 FROM baton.x_claim WHERE task_id=%s AND holder=%s
+            AND holder_account=%s AND lease_expires_at>clock_timestamp()""", (task["id"], actor.principal, actor.account)).fetchone()
+        if responded:
+            conn.execute("UPDATE baton.tasks SET responded_at=clock_timestamp() WHERE id=%s AND responded_at IS NULL", (task["id"],))
+
+    def _assign(self, conn, actor, operation_id, task, principal, account, event="task.assigned", default_reviewer=None, body="Task assigned", **metadata):
+        """Move an unclaimed task to a manual assignee. Shared by assign_task and the escalation runner."""
+        reviewers = task["reviewers"] or [default_reviewer or actor.principal]
+        conn.execute("UPDATE baton.tasks SET assignee=%s,execution_mode='manual',gate_mode='reviewer',reviewers=%s WHERE id=%s", (principal, Jsonb(reviewers), task["id"]))
+        if task["assignee"] != principal:
+            self._start_clock(conn, task)
+        self._task_audit(conn, actor, operation_id, event, task, **metadata)
+        self._notify_task(conn, actor, operation_id, task, "assigned", body, principal)
+        self._enqueue(conn, actor, "task.assigned", "task", task["id"], task["page_id"], [(principal, account)], task["id"])
+
     def assign_task(self, actor, operation_id, task_id, target):
         if not isinstance(target, Actor):
             raise StoreError("invalid")
@@ -1417,11 +1520,7 @@ class SpaceStore:
             task = self._row(conn, "tasks", task_id)
             if task["state"] != "queued" or task["dispatch_started_at"] is not None:
                 raise StoreError("stale_claim")
-            reviewers = task["reviewers"] or [actor.principal]
-            conn.execute("UPDATE baton.tasks SET assignee=%s,execution_mode='manual',gate_mode='reviewer',reviewers=%s WHERE id=%s", (target.principal, Jsonb(reviewers), task_id))
-            self._task_audit(conn, actor, operation_id, "task.assigned", task)
-            self._notify_task(conn, actor, operation_id, task, "assigned", "Task assigned", target.principal)
-            self._enqueue(conn, actor, "task.assigned", "task", task["id"], task["page_id"], [self._party(target)], task["id"])
+            self._assign(conn, actor, operation_id, task, target.principal, target.account)
             return self._task_view(conn, actor, task_id)
         def replay(conn, old):
             task = self._row(conn, "tasks", task_id)
@@ -1429,6 +1528,68 @@ class SpaceStore:
                 raise StoreError("stale_claim")
             return self._task_view(conn, actor, task_id)
         return self._mutate(actor, operation_id, "assign_task", {"task_id": task_id, "target": asdict(target)}, authorize, effect, replay)
+
+    def set_priority(self, actor, operation_id, task_id, priority):
+        priority = _priority(priority)
+        def authorize(conn):
+            task = self._task_for(conn, actor, task_id, "edit")
+            if not (task["owner"] == actor.principal and task["owner_account"] == actor.account) and actor.principal not in task["reviewers"]:
+                raise StoreError("forbidden")
+        def effect(conn):
+            task = self._row(conn, "tasks", task_id)
+            if task["priority"] != priority:
+                # The window keeps its original start: only its length follows the new priority.
+                conn.execute("""UPDATE baton.tasks SET priority=%s,respond_by=CASE WHEN respond_by IS NOT NULL AND responded_at IS NULL
+                    THEN respond_by+(%s-%s)*interval '1 minute' ELSE respond_by END WHERE id=%s""",
+                    (priority, self.response_minutes[priority], self.response_minutes[task["priority"]], task_id))
+                self._task_audit(conn, actor, operation_id, "task.priority_set", task, priority=priority)
+            return self._task_view(conn, actor, task_id)
+        return self._mutate(actor, operation_id, "set_priority", {"task_id": task_id, "priority": priority}, authorize, effect,
+                            lambda conn, old: self._task_view(conn, actor, task_id))
+
+    def escalate_overdue(self, actor, limit=ESCALATION_BATCH):
+        """One pass over overdue unanswered tasks; safe to run from several bridge replicas at once.
+
+        No operations row is written: escalated_at makes every transition happen once, and the pass has no caller to replay to.
+        """
+        self._service(actor)
+        _integer(limit, 1, 1000)
+        operation_id = uuid.uuid4()
+        escalated, reassigned = [], []
+        try:
+            with self._transaction(write=True, single_flight=ESCALATION_LOCK_ID) as conn:
+                self._expire(conn, operation_id)
+                due = conn.execute("""SELECT * FROM baton.tasks WHERE execution_mode='manual' AND state='queued' AND assignee IS NOT NULL
+                    AND respond_by<clock_timestamp() AND responded_at IS NULL AND escalated_at IS NULL
+                    ORDER BY respond_by,id LIMIT %s FOR UPDATE""", (limit,)).fetchall()
+                for task in due:
+                    self._escalate(conn, operation_id, task, escalated, reassigned)
+        except _Busy:
+            return {"skipped": True, "escalated": [], "reassigned": []}
+        return {"skipped": False, "escalated": escalated, "reassigned": reassigned}
+
+    def _escalate(self, conn, operation_id, task, escalated, reassigned):
+        target = task["escalate_to"] or task["owner"]
+        conn.execute("UPDATE baton.tasks SET escalated_at=clock_timestamp() WHERE id=%s", (task["id"],))
+        owner = (task["owner"], task["owner_account"])
+        responsible = owner if target == task["owner"] else self._directory_party(target)
+        self._task_audit(conn, SERVICE_ACTOR, operation_id, "task.escalated", task, priority=task["priority"], escalate_to=target)
+        self._enqueue(conn, SERVICE_ACTOR, "task.overdue", "task", task["id"], task["page_id"], [responsible, owner], task["id"])
+        escalated.append(str(task["id"]))
+        fallback = task["fallback_assignee"]
+        if not fallback or fallback == task["assignee"]:
+            return
+        party = self._directory_party(fallback)
+        if party is None or self._account_role(conn, party[1], "page", str(task["page_id"])) != "edit":
+            return
+        if conn.execute("SELECT 1 FROM baton.x_claim WHERE task_id=%s AND lease_expires_at>clock_timestamp()", (task["id"],)).fetchone():
+            return
+        if task["dispatch_started_at"] is not None:
+            return
+        self._assign(conn, SERVICE_ACTOR, operation_id, task, party[0], party[1], event="task.reassigned",
+                     default_reviewer=task["owner"], body="Task reassigned after the response deadline passed",
+                     from_assignee=task["assignee"], to_assignee=party[0])
+        reassigned.append(str(task["id"]))
 
     def submit_result(self, actor, operation_id, task_id, epoch, result, evidence=None):
         _text(result, 32000)

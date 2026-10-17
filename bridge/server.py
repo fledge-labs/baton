@@ -71,7 +71,8 @@ class SafeFastMCP(FastMCP):
                 raise BridgeError("invalid")
             if name in {"submit_task", "get_task", "list_tasks", "fetch_inbox"}:
                 allowed = {"submit_task": {"idempotency_key", "prompt", "page_id", "scopes", "assignee_principal", "depends_on",
-                                           "work_face", "require_work_face", "task_kind"}, "get_task": {"task_id"},
+                                           "work_face", "require_work_face", "task_kind", "priority", "escalate_to",
+                                           "fallback_assignee"}, "get_task": {"task_id"},
                            "list_tasks": set(), "fetch_inbox": set()}[name]
                 if not isinstance(arguments, dict) or set(arguments) - allowed:
                     raise BridgeError("invalid")
@@ -133,10 +134,13 @@ PUBLIC_OPERATIONS = {
     "list_proposals": (False, {"block_id": (str, ...)}),
     "list_attribution": (False, {"block_id": (str, ...)}),
     "create_task_block": (True, {"page_id": (str, ...), "prompt": (str, ...), "scopes": (list[dict], ...), "reviewers": (list[str], ...), "base_commit": (str | None, None), "context": (Any, None), "evidence": (Any, None), "assignee_principal": (str | None, None), "depends_on": (list[str] | None, None),
-                          "work_face": (dict[str, Any] | None, None), "require_work_face": (bool, False), "task_kind": (str, "construction")}),
+                          "work_face": (dict[str, Any] | None, None), "require_work_face": (bool, False), "task_kind": (str, "construction"),
+                          "priority": (str, "normal"), "escalate_to": (str | None, None), "fallback_assignee": (str | None, None)}),
     "submit_task": (True, {"idempotency_key": (str, ...), "prompt": (str, ...), "page_id": (str | None, None), "scopes": (list[dict] | None, None), "assignee_principal": (str | None, None), "depends_on": (list[str] | None, None),
-                    "work_face": (dict[str, Any] | None, None), "require_work_face": (bool, False), "task_kind": (str, "construction")}),
+                    "work_face": (dict[str, Any] | None, None), "require_work_face": (bool, False), "task_kind": (str, "construction"),
+                    "priority": (str, "normal"), "escalate_to": (str | None, None), "fallback_assignee": (str | None, None)}),
     "assign_task": (True, {"task_id": (str, ...), "target_principal": (str, ...)}),
+    "set_priority": (True, {"task_id": (str, ...), "priority": (str, ...)}),
     "plan": (True, {"graph": (list[GraphEntry], ...)}),
     "set_work_face": (True, {"task_id": (str, ...), "work_face": (dict[str, Any], ...), "base_commit": (str | None, None)}),
     "ready": (False, {"page_id": (str | None, None), "limit": (int, 50)}),
@@ -212,6 +216,7 @@ _WAITERS = {}
 WEBHOOK_BATCH = 20
 WEBHOOK_CONCURRENCY = 8
 WEBHOOK_IDLE_SECONDS = 1.0
+ESCALATION_SECONDS = 30
 _WEBHOOK_POOL = ThreadPoolExecutor(max_workers=WEBHOOK_CONCURRENCY, thread_name_prefix="baton-webhook")
 
 
@@ -331,7 +336,7 @@ async def invoke(operation, payload, request):
         if not result.get("replay"):
             audit("thread.submitted", task_id=result.get("task_id", result.get("id")),
                   thread_id=result.get("thread_id"), agent=actor.principal)
-    if operation in {"get_task", "submit_task", "create_task_block", "assign_task", "set_work_face", "claim", "renew", "handoff", "submit_result", "gate"}:
+    if operation in {"get_task", "submit_task", "create_task_block", "assign_task", "set_work_face", "set_priority", "claim", "renew", "handoff", "submit_result", "gate"}:
         return public_task(result)
     if operation in {"list_tasks", "ready"}:
         return [public_task(row) for row in result]
@@ -342,7 +347,8 @@ async def invoke(operation, payload, request):
 async def submit_task(idempotency_key: str, prompt: str, ctx: Context, page_id: str | None = None,
                       scopes: list[dict] | None = None, assignee_principal: str | None = None,
                       depends_on: list[str] | None = None, work_face: dict[str, Any] | None = None,
-                      require_work_face: bool = False, task_kind: str = "construction") -> dict:
+                      require_work_face: bool = False, task_kind: str = "construction", priority: str = "normal",
+                      escalate_to: str | None = None, fallback_assignee: str | None = None) -> dict:
     """Submit a task; a named assignee uses the manual claim/review path. Reuse keys on retry."""
     request = ctx.request_context.request
     actor = request_actor(request)
@@ -350,7 +356,8 @@ async def submit_task(idempotency_key: str, prompt: str, ctx: Context, page_id: 
     return await invoke("submit_task", {"operation_id": operation_id, "idempotency_key": idempotency_key,
                         "prompt": prompt, "page_id": page_id, "scopes": scopes,
                         "assignee_principal": assignee_principal, "depends_on": depends_on,
-                        "work_face": work_face, "require_work_face": require_work_face, "task_kind": task_kind}, request)
+                        "work_face": work_face, "require_work_face": require_work_face, "task_kind": task_kind,
+                        "priority": priority, "escalate_to": escalate_to, "fallback_assignee": fallback_assignee}, request)
 
 
 @mcp.tool()
@@ -559,6 +566,23 @@ async def webhook_loop():
         await asyncio.sleep(0.1 if busy else WEBHOOK_IDLE_SECONDS)
 
 
+async def escalation_pass():
+    try:
+        result = await store_call("escalate_overdue", SERVICE)
+    except BridgeError as exc:
+        audit("task.escalation_unavailable", error_code=exc.code)
+        return
+    if result["escalated"]:
+        WAKEUP.notify()
+
+
+async def escalation_loop():
+    """Escalate overdue assignments; the store's advisory lock keeps replicas from escalating twice."""
+    while True:
+        await escalation_pass()
+        await asyncio.sleep(ESCALATION_SECONDS)
+
+
 async def worker_loop():
     while True:
         try:
@@ -573,7 +597,7 @@ async def lifespan(app):
     await store_call("check_schema", SERVICE)
     await recover_auto()
     async with mcp.session_manager.run():
-        tasks = [asyncio.create_task(worker_loop()), asyncio.create_task(webhook_loop())]
+        tasks = [asyncio.create_task(worker_loop()), asyncio.create_task(webhook_loop()), asyncio.create_task(escalation_loop())]
         try:
             yield
         finally:

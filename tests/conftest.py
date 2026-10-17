@@ -51,6 +51,7 @@ def modules(tmp_path, monkeypatch):
     # never send a request to any external worker.
     monkeypatch.setattr(server, "worker_loop", idle_worker)
     monkeypatch.setattr(server, "webhook_loop", idle_worker)
+    monkeypatch.setattr(server, "escalation_loop", idle_worker)
     return common, server, codex_agent
 
 
