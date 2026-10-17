@@ -5,18 +5,23 @@
 
 与既有文档的关系：[roadmap.md](roadmap.md) 的“Owner onboarding”写的是飞书只发提醒、没有按钮，W3-1 写的是在 web 看板上批准；owner 2026-10-17 的决定改为“人通过聊天平台与 Baton 交互，看板保持只读运维视图”。roadmap 与 space-replica 的相应改写不在本次变更的范围内，列在第 10 章的后续事项里，3b 至 3e 的 PR 各自负责自己那部分文档。
 
-核验日期：2026-10-17。官方来源（本文对飞书行为的陈述只依据这些页面；没有从官方页面确认的，文中标为“待核实”）：
+核验日期：2026-10-17（北瓜调研与审查修订：2026-10-17）。官方来源（本文对飞书行为的陈述只依据这些页面；没有从官方页面确认的，文中标为“待核实”或 **NOT_PROVEN**）：
 
 - 飞书服务端 SDK（Node.js）“处理回调”：<https://open.feishu.cn/document/server-side-sdk/nodejs-sdk/handling-callbacks?lang=zh-CN>
 - 飞书服务端 SDK（Python）“处理回调”（同一页面的 Python 版）：<https://open.feishu.cn/document/server-side-sdk/python--sdk/handle-callbacks>
 - 卡片回传交互回调 `card.action.trigger`（回调与响应结构、3 秒限制、错误码）：<https://open.feishu.cn/document/feishu-cards/card-callback-communication?lang=zh-CN>
+- 卡片 JSON 2.0 结构、全量更新（`update_multi`、组件上限、频控）：<https://open.feishu.cn/document/uAjLw4CM/ukzMukzMukzM/feishu-cards/cardkit-components/introduction>
+- 全量更新卡片实体（`update_multi=true`、200 组件、10 次/秒/卡）：<https://open.feishu.cn/document/uAjLw4CM/ukzMukzMukzM/feishu-cards/cardkit-v1/card/update>
+- 流式更新卡片（审批卡不得使用流式模式）：<https://open.feishu.cn/document/uAjLw4CM/ukzMukzMukzM/feishu-cards/streaming-updates>
 - 更新已发送的消息卡片（`update_multi`、14 天、频控）：<https://open.feishu.cn/document/server-docs/im-v1/message-card/patch?lang=zh-CN>
 - 发送消息（权限、`uuid` 去重、频控、卡片 30 KB）：<https://open.feishu.cn/document/server-docs/im-v1/message/create?lang=zh-CN>
 - 接收事件（Encrypt Key 签名校验、事件解密、Verification Token）：<https://open.feishu.cn/document/server-docs/event-subscription-guide/event-subscription-configure-/encrypt-key-encryption-configuration-case?lang=zh-CN>
 - 获取事件出口 IP：<https://open.feishu.cn/document/server-docs/event-subscription-guide/list?lang=zh-CN>
 - 机器人被移出群事件：<https://open.feishu.cn/document/server-docs/group/chat-member/event/deleted?lang=zh-CN>
-- `lark-oapi` 在 PyPI 的元数据（版本、许可证、依赖）：<https://pypi.org/project/lark-oapi/>
-- Standard Webhooks 规范（W2-5 已采用）：<https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md>
+- 官方 **lark-channel-sdk（Python）**（`FeishuChannel`、WebSocket、`cardAction`）：<https://github.com/larksuite/channel-sdk-python>（README、`docs/reference.md`）
+- 官方 **lark-oapi（Python）**（OpenAPI，含按 `message_id` 更新卡片等 channel-sdk 未封装的路径）：<https://github.com/larksuite/oapi-sdk-python>；PyPI：<https://pypi.org/project/lark-oapi/>
+- Standard Webhooks 规范（W2-5 已合入 main）：<https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md>
+- HumanLayer（“声明式审批”模式参考，不假定其 API）：<https://github.com/humanlayer/humanlayer>
 
 ## 1. 目标与非目标
 
@@ -40,6 +45,8 @@
 - 不通过飞书做网页登录，也不依赖飞书是否签发 OIDC ID Token；人的身份绑定见第 5 章，OIDC 路径仍按 [identity-card.md](identity-card.md) 第 3 章单独处理。
 - 本阶段不实现 Slack、企业微信、邮件。第 2 章只保证接口对它们不是死路；它们各自的平台限制没有在这里核实，动手前必须各自核实。
 - 不做通道服务的多实例高可用（飞书长连接本身是“集群模式”，同一应用多个客户端只有随机一个收到消息，见第 7 章）。
+- 不把审批同步为飞书原生“审批”应用实例；Baton 的 gate 与 `x_gate` 是唯一事实来源（见第 7 章）。
+- `lark-cli`（`@larksuite/cli`）与 `lark-openapi-mcp` 留给 agent 或人在本机操作飞书文档/日程，**不进** Baton 服务依赖。
 
 总体结构：
 
@@ -49,6 +56,22 @@ Baton bridge ──(Standard Webhooks，之后是 /events 流)──► channels
      │                                                     │   └─ parse_action ◄── 卡片回调（长连接）
      └──(以点击者本人身份的 gate / comment 请求)────────────┘
 ```
+
+## 1.1 审批策略与渠道解耦
+
+**声明式审批（参考模式）。** 哪些操作需要人工放行、需要几位审批人、谁有权批准（根、被委托的 approver、两人确认），应声明在**任务/操作**一侧，与“从哪个聊天平台点按钮”无关。渠道只负责：把待办渲染成卡片或通知、把一次合规的点击带回 Baton；它不改变策略，也不保存审批状态。
+
+**在 Baton 上的映射（已实现或计划中的字段，不新增第二套策略引擎）。**
+
+| 声明式概念 | Baton 中的对应 |
+| --- | --- |
+| 是否需要人工 gate | 任务的 `gate_mode`、`reviewers`、`approvals_required`（1 或 2）、以及 owner 级策略 |
+| 谁可以批准 | 根；或持有有效 **approver 委托链** 的人类（与 [api.md](../api.md) 中 `gate` 一致） |
+| 两人确认 | `approvals_required=2`：两位**不同**审批人各计一票，第一票后任务仍为 `awaiting_gate`，卡片显示进度（第 4.2 节） |
+| 权限类请求 | `request_permission` / `decide_permission`（X26）；卡片按钮映射为 `allow_once` / `deny`，不提供 `allow_always` |
+| 通道呈现 | 核心按事件选模板（第 4.2 节）；`CardSpec` 与按钮回传值不含身份或策略 |
+
+**参考实现（模式层面）。** [HumanLayer](https://github.com/humanlayer/humanlayer) 把“需要人批准的操作”与“通知/收集批准的具体通道”分开；Baton 采用同一分离：bridge 里的 gate 与委托链是权威，Slack/飞书/邮件只是未来的 `ChannelAdapter`。本文不复述 HumanLayer 的 API 细节。
 
 ## 2. `ChannelAdapter` 接口
 
@@ -102,14 +125,17 @@ class RawInbound:           # 平台送来的原始请求或事件，适配器�
 @dataclass(frozen=True)
 class ActionEvent:          # 只有校验与解密通过后才会被构造
     channel: str
+    instance: str                   # 如 feishu:<app_id>，与绑定表一致
     external_user_id: str           # 飞书 operator.open_id
     action: ActionName
     value: Mapping[str, object]     # 按钮绑定的回传对象，见下文“按钮回传值”
     comment: Optional[str]          # request_changes 的输入框文字；其他动作为 None
-    dedupe_token: str               # 动作令牌的 SHA-256 十六进制；原始令牌不出适配器
+    event_id: str                   # 平台每次回调唯一的 id（飞书 header.event_id）；幂等权威键
+    dedupe_token: str               # SHA-256(event_id) 十六进制；与 event_id 一一对应，写入审计
     external_message_id: str        # 被点击的消息（飞书 context.open_message_id）
     external_chat_id: Optional[str] = None   # 附加：被点击消息所在会话，供核心校验
     event_time: Optional[datetime] = None    # 附加：平台给出的事件时间，供核心判断过期
+    card_update_token: Optional[str] = None  # 飞书 event.token：仅用于（可选）延时更新卡片，不参与幂等
 
 
 class AdapterError(Exception): ...
@@ -148,8 +174,10 @@ class ChannelAdapter(ABC):
     def parse_action(self, raw: RawInbound) -> ActionEvent:
         """校验签名并解密后转成 ActionEvent；校验失败抛 BadSignature，其他无法识别的抛 Undecodable。"""
 
-    def resolve_identity(self, channel: str, external_user_id: str) -> Optional[Principal]:
+    def resolve_identity(self, channel: str, instance: str, external_user_id: str,
+                         space_id: str) -> Optional[Principal]:
         """基类的具体实现：转发给核心注入的 Baton 绑定查询；适配器不得覆盖。
+        space_id 由核心从 object_ref 解析出的任务所在 Space 决定，调用方不得传入任意 space 冒充。
         没有有效绑定返回 None，不区分“未绑定”“已撤销”“已过期”。"""
 
     @abstractmethod
@@ -226,7 +254,7 @@ class CardSpec:
 | `rejected` | 已由 {by_display_name} 于 {HH:MM} 拒绝 |
 | `changes_requested` | 已由 {by_display_name} 于 {HH:MM} 要求修改 |
 
-终态之后服务端依然对 `dedupe_token` 幂等：重复到达的同一次点击得到与第一次相同的应答（第 4 章第 3 步），不会再次写 Baton，也不会改卡片。
+终态之后服务端依然对 **`event_id`** 幂等：重复到达的同一次回调得到与第一次相同的应答（第 4 章），不会再次写 Baton，也不会改卡片。
 
 两个实例（示意，值为占位）：
 
@@ -277,10 +305,8 @@ class CardSpec:
 
 核心通过 `EventSource` 接收 Baton 事件，有两种实现：
 
-- `StandardWebhookSource`（3c）：W2-5 的 Standard Webhooks 订阅。核心验证 `webhook-id`、`webhook-timestamp`、`webhook-signature`（五分钟容差、常数时间比较、两个密钥同时有效，与 W2-5 在 [api.md](../api.md) 里描述的接收方校验一致），按 `webhook-id` 去重，把事件**持久化到本地队列后立刻返回 2xx**（bridge 每次尝试有 10 秒超时，失败最多重试 8 次后进入 dead-letter），再由工作线程处理。
+- `StandardWebhookSource`（3c）：W2-5 已合入 main 的 Standard Webhooks 订阅。核心验证 `webhook-id`、`webhook-timestamp`、`webhook-signature`（五分钟容差、常数时间比较、轮换宽限期内两个 `v1` 签名任一匹配即可，与 [api.md](../api.md) “接收方校验与时间戳容差”一致），按 `webhook-id` 去重，把事件**持久化到本地队列后立刻返回 2xx**（bridge 每次尝试有 10 秒超时，失败最多重试 8 次后进入 dead-letter），再由工作线程处理。Baton 在并行弃用期内仍发送旧 `X-Baton-*` 头至 **2027-01-31**；通道核心**只**实现 Standard Webhooks 校验，不依赖已弃用的 `X-Baton-Signature`（无时间戳、无重放保护）。
 - `EventsStreamSource`（之后）：`/events` 流，由核心主动拉取，届时可以去掉下面的内部监听端口。
-
-W2-5 在撰写本文时位于分支 `cursor/w2-5-standard-webhooks`，尚未合入 main；3c 依赖它合入。
 
 **“不新增入口”的准确含义。** bridge 的 webhook 只允许 https，并拒绝私有地址，除非运营者用 `BATON_WEBHOOK_ALLOW_HOSTS` 精确豁免主机名、用 `BATON_WEBHOOK_CA_BUNDLE` 提供内部 CA（见 [security-model.md](../security-model.md)）。所以在 `/events` 流出现之前，核心需要一个**只在内部网络上、带内部 CA 证书的 TLS 监听端口**给 bridge 投递，不发布到宿主机，也不经过公共入口。飞书方向则没有任何入站：长连接由核心主动外连。
 
@@ -323,7 +349,13 @@ CREATE TABLE card (
   PRIMARY KEY (object_ref, channel, target_id)
 );
 CREATE TABLE seen_event  (webhook_id TEXT PRIMARY KEY, at INTEGER NOT NULL);
-CREATE TABLE seen_action (dedupe_token TEXT PRIMARY KEY, outcome TEXT NOT NULL, at INTEGER NOT NULL);
+CREATE TABLE seen_action (
+  event_id TEXT PRIMARY KEY,           -- 飞书 header.event_id；重复投递 id 不变
+  dedupe_token TEXT NOT NULL UNIQUE,   -- sha256(event_id)，供审计与 Baton x_channel_action 对齐
+  outcome TEXT NOT NULL,               -- 已序列化的同步应答（toast + 可选 card）
+  baton_committed INTEGER NOT NULL,    -- 1 仅当 Baton 已提交终态或 operations 重放命中
+  at INTEGER NOT NULL
+);
 CREATE TABLE queue (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, due INTEGER NOT NULL, tries INTEGER NOT NULL);
 ```
 
@@ -338,17 +370,18 @@ CREATE TABLE queue (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT
 适配器的 `start(handler)` 把每个回调交给核心的 `handle_inbound(raw)`；总预算 2.0 秒（给飞书的 3 秒留 1 秒余量，可配置），Baton 调用本身的超时 1.5 秒。
 
 1. `adapter.parse_action(raw)`：失败抛 `BadSignature` 或 `Undecodable` → 核心写一条核心侧元数据审计 `channel.action_refused`（不含原始载荷），应答 error toast，**不调用 Baton**。
-2. 查 `seen_action[dedupe_token]`：命中则直接返回当时保存的应答（含终态卡片），不再调用 Baton。
+2. 查 `seen_action[event_id]`：仅当 `baton_committed=1` 时命中并直接返回当时保存的应答（含终态卡片或“已通过 1/2”），**不再调用 Baton**。未提交的行不存在——超时路径不得预先写入（见下行）。
 3. 校验 `value`：`v == 1`；`o` 在映射里且 `external_message_id`、`k` 与映射一致；`external_chat_id` 等于映射里的目标会话（被转发或合并转发到别处的卡片因此无效）；`event_time` 距今不超过 10 分钟。任一不符 → error toast“卡片无效或已过期”，记 `channel.action_refused`。
-4. 调用 Baton 的 `channel_act`（3b 引入，见 4.5）：携带 `operation_id = uuid5(命名空间, dedupe_token)`，这样重放会命中 Baton 已有的 operation 幂等。
-5. 按结果生成应答并写入 `seen_action`：
+4. 调用 Baton 的 `channel_act`（3b 引入，见 4.5）：`operation_id = uuid5(命名空间, event_id)`（与 `dedupe_token` 不同源，见 4.5 子操作）。飞书重复投递携带**相同** `event_id`，Baton `operations` 表按 `(principal, operation_id)` 返回首次结果，不会二次 gate。
+5. 按结果生成应答；**仅当**下表“写入 `seen_action`”为“是”时才持久化（`baton_committed=1`）：
 
-| Baton 结果 | 对点击者 | 卡片 |
-| --- | --- | --- |
-| 成功（含重放） | success toast | 同步返回终态卡片（或两人确认时的“已通过 1/2”） |
-| 未绑定、无委托（`delegation_required`）或无权（`forbidden`） | error toast“无权放行”；未绑定时附“尚未绑定，请联系空间所有者” | **不变**，任务不变 |
-| `stale_claim`（epoch 已变、已被他人处理、已完成） | warning toast“已有结论，已刷新” | 核心取当前状态后原位刷新 |
-| 超过 2.0 秒预算 | info toast“已收到，处理中” | 后台继续同一个 `operation_id`，完成后用 `upsert_card` 原位更新 |
+| Baton 结果 | 对点击者 | 卡片 | 写入 `seen_action` |
+| --- | --- | --- | --- |
+| 成功（含 operations 重放） | success toast | 同步返回终态卡片，或两人确认时“已通过 1/2”且仍有按钮 | 是 |
+| 未绑定 | error toast“无权放行”，附“尚未绑定，请联系空间所有者” | **不变** | 是（结果固定，可安全重放） |
+| 无委托（`delegation_required`）或无权（`forbidden`） | error toast“无权放行” | **不变** | 是 |
+| `stale_claim`（epoch 已变、同一人重复票、任务已终态） | warning toast“已有结论，已刷新” | 核心取当前状态后原位刷新 | 是 |
+| 超过 2.0 秒预算（gate 尚未返回） | info toast“已收到，处理中” | 后台继续**同一** `operation_id` 调用，完成后 `upsert_card` | **否**（飞书重试须再次调用 Baton，直至提交或命中 operations 重放） |
 
 “原位提示”的含义：owner 要求未绑定或无权的点击者得到原位的“无权放行”提示。这里把它实现为**只对点击者显示的 toast**，而不是改写共享卡片：卡片对所有群成员是同一张（`update_multi`），若把它替换成“无权放行”，群里任何一个没有权限的人都能让有权限的人看不到按钮，等于一个无成本的拒绝服务。任务不变与卡片不变是同一个意思。这是对 owner 措辞的一种解释，列在第 12 章问题 3 里等确认。
 
@@ -359,17 +392,18 @@ CREATE TABLE queue (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT
 核心**不**用自己的权限做决定，也不持有任何人的令牌。bridge 新增一个窄接口：
 
 ```
-channel_act(operation_id, channel, instance, external_user_id, dedupe_token, event_time,
+channel_act(operation_id, channel, instance, external_user_id, event_id, dedupe_token, event_time,
             object_ref, expected_epoch, action, comment=None)
 ```
 
 bridge 内部：
 
 1. 认证调用者：必须是被离线管理员标记为“通道核心”的主体（登记表新字段，只有离线管理员能设置，与 `kind`、`account` 同级）；否则 `403 forbidden`。
-2. 用 `(channel, instance, external_user_id, space_id)` 查**有效绑定**（第 5 章）。没有 → `403 unbound`，写审计 `channel.action_denied`；绑定对应的 principal、account、kind 必须仍然与登记表里的人完全一致，否则同样拒绝。
-3. 以该人类 `Actor(principal, account, "human")` 在**同一个数据库事务**里执行既有路径：`approve` → `gate(decision="pass")`；`reject` → `gate(decision="fail", reason="rejected via channel")`；`request_changes` → 在任务线程里写一条评论（作者是这个人）再 `gate(decision="fail", reason=<comment>)`；权限请求则映射到 `decide_permission` 的 `allow_once` 与 `deny`。因为沿用既有 gate 路径，所有现有规则原样适用：根的权威、有效的审批人委托及整条链、不能批准自己提交或执行的工作、同一人不能重复通过、两人确认策略。根批准自己提交或执行的工作需要显式的 `self_approval=true`，**卡片永远不设置它**；根要自批只能走看板之外的显式路径。
-4. 在事务内以 `dedupe_token`（已哈希）做唯一插入；重复则返回第一次的结果。
-5. 写审计：既有的 `gate.reviewed` 等事件，外加 `channel.action`，带 `channel`、`instance`、`external_user_id`、`dedupe_token`、动作、结果；审计的 requested_by 是这个人，performed_by 是核心主体，沿用 `_audit` 已有的 requested/performed 区分（operator 委托已经这样用）。被拒绝的点击同样写 `channel.action_denied`，同一 `external_user_id` 对同一对象每分钟最多写一条，防止审计被刷。
+2. 从 `object_ref` 解析任务并读取其 **`space_id`**（只读查表）；`space_id` **不得**由调用方传入，防止跨 Space 绑定混淆。用 `(channel, instance, external_user_id, space_id)` 查**有效绑定**（第 5 章：`revoked_at` 为空且未过期）。没有 → `403 unbound`，写审计 **`channel.unbound_click`**（含 `external_user_id`、`event_id`，同一 `external_user_id` 每小时最多一条）；绑定对应的 principal、account、kind 必须仍然与登记表里的人完全一致，否则同样拒绝并写 `channel.action_denied`。
+3. 以该人类 `Actor(principal, account, "human")` 在**同一个数据库事务**里执行既有路径：`approve` → `gate(decision="pass", operation_id=operation_id)`；`reject` → `gate(decision="fail", reason="rejected via channel", operation_id=operation_id)`；`request_changes` → 先 `add_comment` 再 `gate`，二者使用**不同** `operation_id`（见下）；权限请求则映射到 `decide_permission` 的 `allow_once` 与 `deny`。因为沿用既有 gate 路径，所有现有规则原样适用：根的权威、有效的审批人委托及整条链、不能批准自己提交或执行的工作、同一人不能重复通过、两人确认策略。根批准自己提交或执行的工作需要显式的 `self_approval=true`，**卡片永远不设置它**；根要自批只能走看板之外的显式路径。
+4. **`request_changes` 的子操作 id。** `baton.operations` 按 `(principal, operation_id)` 去重且校验请求摘要。评论与 gate 是两次 `_mutate`，必须拆键：`operation_id_comment = uuid5(命名空间, event_id + ":comment")`，`operation_id_gate = uuid5(命名空间, event_id + ":gate")`。对外仍只暴露一个 `event_id`；`x_channel_action` 一行对应整次点击，记 gate 的 `operation_id`。
+5. 在事务内以 `dedupe_token`（`sha256(event_id)`）插入 `x_channel_action`；重复则返回第一次的结果（与 `operations` 重放一致）。
+6. 写审计：既有的 `gate.reviewed` 等事件，外加 `channel.action`，带 `channel`、`instance`、`external_user_id`、`event_id`、`dedupe_token`、动作、结果；审计的 requested_by 是这个人，performed_by 是核心主体。无委托/无权（已绑定）写 `channel.action_denied`（限速同上）。未绑定只用 `channel.unbound_click`（与第 5 章、C3 一致）。
 
 关键不变量，3b 的测试逐条覆盖：核心主体自己调用 `gate` 仍然被拒（“没有任何服务写入的 gate”这条规则不变，`channel_act` 是唯一的例外，且必须经过一个有效绑定）；核心主体拿到的任何成功响应，其授权都来自被绑定的那个人。
 
@@ -393,9 +427,12 @@ CREATE TABLE baton.x_channel_binding (
   revoked_at timestamptz, revoked_by text, revoke_reason text
 );
 CREATE UNIQUE INDEX channel_binding_active
-  ON baton.x_channel_binding(channel, instance, external_user_id, space_id) WHERE revoked_at IS NULL;
+  ON baton.x_channel_binding(channel, instance, external_user_id, space_id)
+  WHERE revoked_at IS NULL
+    AND (expires_at IS NULL OR expires_at > now());
 CREATE TABLE baton.x_channel_action (
-  dedupe_token text PRIMARY KEY,      -- 动作令牌的 SHA-256 十六进制
+  event_id text PRIMARY KEY,          -- 平台回调 id（飞书 header.event_id）
+  dedupe_token text NOT NULL UNIQUE,  -- sha256(event_id)
   channel text NOT NULL, instance text NOT NULL, external_user_id text NOT NULL,
   principal text, task_id uuid, action text NOT NULL, outcome text NOT NULL,
   operation_id uuid NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
@@ -410,7 +447,7 @@ CREATE TABLE baton.x_channel_action (
 - **被绑定的必须是人。** 目标必须是登记表里已连接的人类主体，principal、account、kind 三者与登记表完全一致，并且对该 Space 有成员身份。这样根 A 不能把一个平台账号绑到一个只在别的 Space 有权限的人身上。绑定带 `space_id`，只对该 Space 内的任务有效。
 - **怎么拿到对方的 open_id。** 飞书的回调不带姓名，只带 `open_id`（需要 `user_id` 还要额外权限，本设计不申请）。流程：根请这个人在工作群里点一下“绑定确认”卡片按钮（或者任意卡片上的按钮）；此时点击被判定为未绑定，核心写入审计 `channel.unbound_click`（含 `external_user_id`，同一账号每小时最多一条）；根从 `list_audit` 看到刚刚出现的那条，与对方当面或在别的渠道核对后，用上面的命令绑定。绑定不由点击者自己发起，所以不存在“自己认领身份”。
 - **解绑。** 根执行 `unbind`（API 或操作员路径）：设置 `revoked_at`、`revoked_by`、`revoke_reason`，行保留作历史。每次点击都重新查绑定，所以下一次点击立即生效；已经提交的决定不受影响。解绑写审计。
-- **可选过期。** `expires_at` 用于外部人员或临时授权；过期等同撤销，不需要后台任务。
+- **可选过期。** `expires_at` 用于外部人员或临时授权；过期等同撤销，**不**依赖定时任务扫库。部分唯一索引（上式）在 `expires_at <= now()` 时不再约束该行，根可立即为同一 `(channel, instance, external_user_id, space_id)` 新建绑定。`bind` 事务内还应把“已过期且 `revoked_at` 仍为空”的旧行写上 `revoked_at` 与 `revoke_reason='expired'`，保留审计历史。
 - **与 Identity Card 对齐。** W2-3 落地后，同一对（发行方，主体）作为人类卡片 `external_identities` 的一项出现，`issuer` 为 `feishu-channel:<app_id>`，用不同的 `issuer` 字符串与 OIDC 登录绑定区分开，两者不会互相冒充；绑定表在迁移时成为这些条目的来源，规则不变。在那之前绑定表是唯一记录。
 - **平台账号是应用内标识。** 飞书的 `open_id` 按应用区分（来自飞书的用户身份概述，**待核实**官方原文），所以 `instance` 里带 `app_id`；owner 重建应用后，所有旧绑定自然不再匹配，需要重新绑定，这是设计上的安全行为。适配器还要求回调里的 `tenant_key` 与 `app_id` 等于配置的值，其他租户（例如外部群里的外部成员）的点击一律当作未绑定。
 - **人离开群。** 绑定的是“人与 Baton 身份”，不是“人与群”。人被移出群后看不到也点不了那个群里的卡片；若有人保留了转发过的卡片，核心的会话校验（4.4 第 3 步）会拒绝来自别的会话的点击。真正撤销权限靠的是 Baton 侧：根解绑、撤销或让委托过期，这些在下一次点击就生效。飞书是否提供“成员被移出群”的事件、需要什么权限，**没有从官方页面核实**，本设计不订阅也不依赖它；如果以后采用，它只能用来**收紧**（例如把绑定标记为暂停），不能用来放行。人离职时的清单是：根解绑，撤销其审批人委托，必要时从群里移除。
@@ -429,6 +466,7 @@ https://baton.example.com/board/o/task/6f1c2d9e-0000-4000-8000-000000000001?exp=
 - **范围。** 一个对象、只读。链接对应两个路由：页面 `GET /board/o/{type}/{id}` 与同一对象的 `GET /board/o/{type}/{id}/data`；其他任何路径、方法、对象都不接受这个签名。链接模式的页面没有 token 输入框，也不发 MCP 或写请求；服务端靠路由而不是靠前端保证只读。
 - **有效期。** 默认 15 分钟，`exp` 是 Unix 秒，运营者设置上限（默认不超过 24 小时）。
 - **不是一次性的。** 聊天平台会为链接生成预览，预览抓取会消耗一次性链接，所以链接在有效期内可重复打开。
+- **预览与正文分离（3e）。** 聊天预览机器人通常发不带 Bearer 的 GET。对 `/board/o/...` 的链接模式请求，bridge 在验签通过后区分**预览**与**人读**：若 `Sec-Fetch-Dest: image` 或 User-Agent 命中配置的预览 bot 列表（飞书、Slack 等，3e 维护），响应**仅**含对象标题与“在浏览器中打开以查看详情”的提示 HTML，**不**渲染任务说明、结果正文、`list_comments` 线程或 diff（避免第 11 章“细节不进入第三方”被预览抵消）。正常人读（浏览器地址栏或点击）仍走完整只读对象页。两种响应都带 `Referrer-Policy: no-referrer`、`Cache-Control: private, no-store`。
 - **签名。** `sig = HMAC-SHA256(key[kv], "baton-link-v1\nGET\n" + path + "\n" + object_type + "\n" + object_id + "\n" + exp + "\n" + kv)`，`path` 是对象的规范路径 `/board/o/{type}/{id}`（`/data` 子资源按同一规范路径验证）。签名同时覆盖路径、对象 id、过期时间和密钥版本，所以改任何一项都会使它失效。服务端用常数时间比较；所有失败（签名、对象、格式）返回同样的 404，不泄漏对象是否存在；只有签名**有效**但已过期时才显示“链接已过期，请回到群里刷新卡片”，因为这时已经证明是我们签的。
 - **签发与密钥。** 密钥只在 bridge 里：bridge 新增 `link_sign(object_type, object_id, ttl_seconds=900)`，调用者必须对该对象有 view 权限，返回 `{url, expires_at}`；核心通过它取链接，适配器和核心都碰不到密钥。密钥表 `x_link_key(version, key, created_at, retired_at)`，同一时刻最多两把有效。**轮换沿用 W2-5 的 webhook 密钥轮换办法**：`python -m bridge.links rotate` 生成新密钥（只由 bridge 使用，不返回、不记录），旧密钥继续验证到宽限期结束（默认 24 小时，运营者用 `BATON_LINK_ROTATION_GRACE_SECONDS` 设置 0 到 30 天；这个名字沿用 `BATON_WEBHOOK_ROTATION_GRACE_SECONDS` 的格式，3e 定稿），宽限期内再次轮换立即丢弃最旧的一把。怀疑泄漏时把宽限期设为 0，所有已发出的链接立即失效。宽限期不应小于链接上限，否则轮换会让合法链接提前失效。
 - **URL 里没有令牌。** URL 不含 Baton 令牌、webhook 密钥、会话标识或任何能换取别的访问的东西。`sig` 只证明“bridge 为这个对象在这个时间窗口签过”，换不到其他对象，也换不到写权限。它仍然是不记名的：拿到链接的人在有效期内都能读这个对象，第 11 章按这个事实建模。
@@ -439,37 +477,45 @@ https://baton.example.com/board/o/task/6f1c2d9e-0000-4000-8000-000000000001?exp=
 
 ## 7. 飞书适配器（`adapters/channels/feishu.py`）
 
-### 7.1 传输：长连接
+### 7.1 实现基础：`lark-channel-sdk`（Python）
 
-官方文档（Node.js 与 Python 两版“处理回调”）写明：服务端 SDK 封装了长连接，应用与开放平台建立 WebSocket 全双工通道，**回调（包括卡片回传交互 `card.action.trigger`）也可以通过长连接接收**；服务器只需要能访问公网，不需要公网 IP、域名、防火墙白名单。卡片回传交互回调的官方页面给出了回调结构（`schema` 固定 `2.0`）与响应结构。因此默认方案是长连接，Baton 不新增任何对外可达的入口。
+**决定：** 飞书适配器基于官方 **[lark-channel-sdk（Python）](https://github.com/larksuite/channel-sdk-python)**（包名 `lark_channel`，MIT AND BSD-3-Clause），**不**自行实现 WebSocket 长连接帧协议。主入口 **`FeishuChannel`**，默认 `transport="websocket"`（与文档中的 longconn 同义）；可选 `transport="webhook"` 作后备（第 7.7 节）。
 
-官方页面里与设计相关的限制：
+| 官方组件 | Baton 中的角色 |
+| --- | --- |
+| `lark-channel-sdk` / `FeishuChannel` | 长连接、订阅 `cardAction`（`CardActionEvent`）、SDK 层 dedup（`DedupStore` + `ICache`）、安全模式（`SecurityConfig`: `compat` / `audit` / **`strict`**）、可选 `BotLoopGuardConfig`（默认关） |
+| `lark-oapi` | **仅** channel-sdk 未封装的 OpenAPI（例如按 `message_id` 全量 PATCH 卡片）；旧版 `lark_oapi.channel` 仅兼容，新 Channel 能力在 channel-sdk |
+| `lark-cli`、`lark-openapi-mcp` | agent/人本机工具，**不进** Baton 服务（第 1 节） |
 
-- 长连接只支持企业自建应用；
-- “消息卡片回传交互（旧）”回调不支持长连接，只能用新版 `card.action.trigger`（本设计只用新版，卡片全部用 JSON 2.0，因为交互前是 2.0 的卡片，应答里的卡片也必须是 2.0，否则错误码 200830）；
-- 每个应用最多 50 个连接，每初始化一个 client 算一个；
-- **长连接是集群模式、不广播**：同一应用部署多个客户端，只有随机一个收到消息。所以每个环境只能跑**一个**通道服务实例，测试与生产必须使用**不同的飞书应用**，否则测试进程会抢走生产的点击；
-- 收到消息后需要在 **3 秒内**处理完成（卡片回调的页面同样要求 3 秒内响应，且不能用 3xx 重定向应答，超时用户端会看到错误码 200341）；
-- SDK 只在建连时鉴权，之后的推送是明文，无需解密与验签。
+控制台须订阅 **`card.action.trigger`** 并选长连接（或 webhook 后备），否则按钮无效。收其他 bot @ 本 bot 需 `im:message.group_at_msg.include_bot:readonly`，否则**静默收不到**（本设计默认不依赖该路径）。
 
-### 7.2 Python 长连接客户端是否需要 `lark-oapi`
+官方 Node/Java“处理回调”页与卡片回传页仍说明：`card.action.trigger`（schema `2.0`）可走长连接，**3 秒内**须返回 toast 或更新后的卡片，长连接会**重复投递**（见上列 GitHub 与 <https://open.feishu.cn/document/feishu-cards/card-callback-communication?lang=zh-CN>）。
 
-**决定：需要，用官方 `lark-oapi`，作为仅本适配器使用的可选依赖；Baton 核心与 bridge 保持零第三方依赖。**
+**CardKit 硬约束（审批卡必须遵守）：**
 
-依据：
+- 卡片 **JSON 2.0** 要求客户端 **≥ 7.20**，低版本提示升级。
+- 全量更新须 `update_multi=true`；单卡最多 **200** 组件；每张卡 **10 次/秒** 操作上限（见 CardKit 全量更新文档）。
+- **审批类卡片禁止流式模式**：流式卡用户点击后服务端**无法立即**更新该卡（官方“流式更新卡片”页）；流式仅用于进度类 `status.*` 可选模板。
+- 回调响应中的卡片结构须保持 2.0，不得退回 1.0（错误码 200830）。
 
-- 官方 Python 版“处理回调”页给出了长连接示例：`lark.ws.Client(app_id, app_secret, event_handler=...)`，用 `lark.EventDispatcherHandler.builder("", "").register_p2_card_action_trigger(...)` 注册卡片回调，处理函数返回 `P2CardActionTriggerResponse`。所以官方文档**确实写了** Python 的长连接接收卡片回调。
-- 长连接的帧协议没有在官方页面里公开，只能由 SDK 实现；自己写 WebSocket 协议（需要逆向 SDK）风险太大，不采用。
-- 退而求其次的 HTTPS 回调方式也绕不开依赖：飞书的加密事件用 AES-256-CBC，Python 标准库没有 AES，而不配置 Encrypt Key 就只能用明文的 Verification Token 校验（官方页面明说这种方式安全性较低）。所以无论走哪条路径，适配器都需要一个第三方包；用官方 SDK 的好处是把长连接、令牌管理与解密都交给它。
-- `lark-oapi` 在 PyPI 的元数据（核验日期当天最新为 1.7.5，MIT 许可，要求 Python 不低于 3.8）：直接依赖 `requests`、`requests_toolbelt`、`pycryptodome`、`websockets`（11 至 15）、`httpx`。依赖面不小，这是把它隔离在可选依赖里的理由。
+**安全与去重（两层，权威在 Baton）：**
 
-隔离方式：适配器的依赖放在 `adapters/channels/requirements-feishu.in` 与带哈希的 `requirements-feishu.txt`，按 [CONTRIBUTING.md](../../CONTRIBUTING.md) 的锁文件规则生成与安装（`--require-hashes --only-binary=:all:`），只装进通道服务自己的镜像或虚拟环境；通道服务没有数据库凭据，也不读 bridge 的任何秘密。`feishu.py` 在导入 `lark_oapi` 之前不依赖它，缺少依赖时给出明确错误，核心与 fake 适配器照常运行。3d 要同步更新 [THIRD_PARTY.md](../THIRD_PARTY.md)。
+1. SDK：`SecurityConfig(mode="strict")` 生产默认；上线前可用 `audit` 观察。显式设置 `max_concurrent_ws_handlers` 等并发上限（SDK 默认不限）。
+2. SDK dedup + 核心 **`seen_action[event_id]`** + bridge **`x_channel_action`**：**Baton 以每次回调唯一的 `header.event_id` 为权威幂等键**（`dedupe_token = sha256(event_id)`）。`event.token` 仅是 CardKit 更新凭证（约 30 分钟、最多更新 2 次），写入 `ActionEvent.card_update_token`，**不得**参与 `seen_action` 或双人第二票去重。
+3. `BotLoopGuardConfig` 仅为启发式兜底；权威防循环仍由 Baton B4-2（轮次/花费）负责。
 
-**待核实（verify against official docs）。**
+**可选依赖隔离：** `requirements-feishu.in` / 带哈希的 `requirements-feishu.txt` 锁定 `lark-channel-sdk` 及按需的 `lark-oapi` 版本；只装进通道服务镜像。核心与 bridge 零第三方依赖。3d 更新 [THIRD_PARTY.md](../THIRD_PARTY.md)。
 
-- 具体的 Python SDK 支持细节没有逐项从官方页面确认：回调处理函数在 SDK 的哪个线程或事件循环里被调用、阻塞时会不会拖住心跳、应答回写的线格式（SDK 自己的 ACK）。
-- 社区仓库 `larksuite/oapi-sdk-python` 的 issue #126 报告过 `lark-oapi` 1.6.4 的 WebSocket 客户端丢弃 `CARD` 帧、导致按钮回调不触发；报告人随后说重新发布应用配置后恢复正常并关闭了 issue，所以结论不明。官方页面当然写了支持，但**必须用真机验证**：3d 把 `lark-oapi` 版本固定下来，并在 owner 创建的测试应用上做一次点击冒烟（点击到达、3 秒内应答、卡片原位更新、重复投递），冒烟没通过之前不得启用生产。
-- “动作令牌”在重复投递与不同点击之间的行为：下面用 `event.token` 的哈希作为 `dedupe_token`，核心同时记录 `header.event_id`，两者任一命中即视为重复；真机冒烟要确认同一次点击的重复投递两者都不变，不同点击两者都不同。如果 `event.token` 实际是按卡片而不是按点击生成的，就改以 `event_id` 为准。
+**NOT_PROVEN（留 3d PR 对照官方源码/文档核实）：** channel-sdk 要求的 Python 最低版本、是否硬依赖 `lark-oapi`、`cardAction` 处理器返回 toast/卡片的确切 API（README、`docs/webhook-server.md`、`docs/cardkit-streaming.md`）；2026-07–10 飞书 changelog 动态页未抓取；`lark-openapi-mcp` 版本与工具数（镜像站信息）。
+
+### 7.2 传输：WebSocket 默认
+
+沿用官方限制（与旧版 7.1 相同，来源见 Node/Python“处理回调”页）：
+
+- 企业自建应用；只用新版 `card.action.trigger`，不用旧版卡片回传；
+- 每应用最多 50 连接；**集群模式、不广播** → 每环境**一个**通道实例，测试/生产**不同**飞书应用；
+- **3 秒**回调预算（第 4.4、7.4 节）；禁止 3xx 应答；
+- WebSocket 建连后推送明文，纵深靠 `app_id`/`tenant_key` 字段校验与第 11 章威胁模型。
 
 ### 7.3 `card.action.trigger` 到 `ActionEvent`
 
@@ -478,10 +524,13 @@ https://baton.example.com/board/o/task/6f1c2d9e-0000-4000-8000-000000000001?exp=
 | `ActionEvent` | 来源 |
 | --- | --- |
 | `channel` | 固定 `"feishu"` |
+| `instance` | 配置中的 `feishu:<app_id>` |
 | `external_user_id` | `event.operator.open_id` |
 | `action`、`value` | `event.action.value`（对象；`a` 给出动作） |
 | `comment` | `event.action.form_value[<输入框 name>]`（表单容器内的输入框；不在表单里的输入框用 `action.input_value`） |
-| `dedupe_token` | `sha256(event.token)` 十六进制；`event.token` 是更新卡片用的凭证（30 分钟、最多更新 2 次），原始值不出适配器，也不写日志，本设计不使用延时更新接口 |
+| `event_id` | `header.event_id`（每次回调唯一；重复投递不变） |
+| `dedupe_token` | `sha256(event_id)` 十六进制，供审计与 `x_channel_action` |
+| `card_update_token` | `event.token`（CardKit 更新凭证；可选保存，**不参与**幂等；原始值不出适配器、不写日志） |
 | `external_message_id` | `event.context.open_message_id` |
 | `external_chat_id` | `event.context.open_chat_id` |
 | `event_time` | `header.create_time`（微秒级时间戳） |
@@ -499,8 +548,8 @@ https://baton.example.com/board/o/task/6f1c2d9e-0000-4000-8000-000000000001?exp=
 }
 ```
 
-- 长连接下重复投递会发生。去重在两层：核心的 `seen_action`（`dedupe_token` 与 `event_id`）返回当时的应答；Baton 的 `x_channel_action` 唯一键与 `operation_id` 幂等保证即使核心丢了本地库也不会重复决定。
-- 三种“看上去重复”的情况各有归宿：同一次点击重复投递 → 去重命中；同一个人连点两次（两个令牌）→ 第二次被 Baton 以“已通过”或 `stale_claim` 处理；两个人几乎同时点 → 先到者生效，后到者得到“已有结论”并刷新。
+- 长连接下重复投递会发生。SDK `DedupStore` 是第一道；**权威**是核心的 `seen_action[event_id]`（仅 `baton_committed=1`）与 Baton `x_channel_action` / `operations`（`operation_id` 由 `event_id` 派生）。
+- 几种“看上去重复”的情况：**同一次点击重复投递**（相同 `event_id`）→ `seen_action` 或 operations 重放，应答与首次一致；**同一人连点两次**（两个 `event_id`）→ 第二票被 Baton 拒绝（同一人不能重复通过）或 `stale_claim`，不是“已有结论”误伤；**两人确认、两位不同审批人几乎同时各点一次**（两个 `event_id`）→ 两票都应计入，第一票后卡片仍为 `pending`（“已通过 1/2”），第二票成功后终态；**任务已终态后**再点 → `stale_claim` 与刷新（C11 覆盖顺序票，3c 加并发双 `event_id` 用例）。
 
 ### 7.5 发送与更新
 
@@ -552,14 +601,16 @@ https://baton.example.com/board/o/task/6f1c2d9e-0000-4000-8000-000000000001?exp=
 
 ### 7.7 后备方式：HTTPS 回调
 
-长连接被禁止或不可用时，改用“将回调发送至开发者服务器”：飞书向配置的地址 POST。地址经**既有的 JB 443 公共入口**（部署侧概念，本仓库不记录其地址）转发到通道服务的内部监听端口，路径 `/channels/feishu/callback`。官方页面把两种订阅方式作为二选一的配置项列出，本设计按“不能同时使用”理解（**待核实**）；切换在开发者后台手工完成，并且要先让 SDK 建立好长连接才能保存长连接模式。
+长连接被禁止或不可用时，改用 `FeishuChannel(transport="webhook")` 或等价 HTTPS 监听：飞书向配置的地址 POST。地址经**既有的 JB 443 公共入口**（部署侧概念，本仓库不记录其地址）转发到通道服务的内部监听端口，路径 `/channels/feishu/callback`。官方页面把两种订阅方式作为二选一的配置项列出，本设计按“不能同时使用”理解（**待核实**）；切换在开发者后台手工完成。
 
-这条路径必须**同时**做来源 IP 白名单与签名校验，任何一项都不能单独成立：
+**后备方式启动条件：** `encrypt_key` 与 `verification_token` 文件**必须**存在且非空；缺少任一项则**拒绝启动** webhook 传输（Verification Token  alone 不绑定正文，泄漏后可伪造 `operator`，不可作为唯一认证）。
+
+这条路径必须**同时**做来源 IP 白名单与 **Encrypt Key 正文签名校验**，任何一项都不能单独成立：
 
 1. **IP 白名单**（入口层）：官方“获取事件出口 IP”接口 `GET /open-apis/event/v1/outbound_ip` 返回开放平台推送所用的 IP，页面提醒 IP 可能变化、应定期拉取并更新防火墙规则。它需要额外权限 `event:ip_list`，只有启用后备方式时才申请。该接口列出的是“事件”出口，是否也覆盖卡片回调**待核实**，3d 在启用后备方式前确认。白名单只是缩小面，不是认证。
-2. **签名校验**（通道服务）：配置了 Encrypt Key 就按官方方式校验：`X-Lark-Signature` 应等于 `sha256(X-Lark-Request-Timestamp + X-Lark-Request-Nonce + encrypt_key + 原始正文)` 的十六进制（注意这是对拼接内容的 SHA-256，不是 HMAC，且要用原始正文字节，不要先解析再计算）；用常数时间比较；再对时间戳加五分钟容差（飞书页面没有写容差，这是本设计自己的规则，与 W2-5 一致，**待用真实流量核实**）。
-3. **解密**：Encrypt Key 开启时正文是加密的：密钥为 `sha256(encrypt_key)`，AES-256-CBC，前 16 字节是 IV，整体 base64。官方页面给了测试向量（密钥 `test key`、密文 `P37w+VZImNgPEO1RBhJ6RtKl7n6zymIbEG1pReEzghk=`、明文 `hello world`），3d 的单元测试直接用它。
-4. 解密后再检查 `header.token` 等于 Verification Token、`header.app_id` 与 `tenant_key` 等于配置、`schema == "2.0"`。
+2. **签名校验**（通道服务，**强制**）：`X-Lark-Signature` 应等于 `sha256(X-Lark-Request-Timestamp + X-Lark-Request-Nonce + encrypt_key + 原始正文)` 的十六进制（注意这是对拼接内容的 SHA-256，不是 HMAC，且要用原始正文字节，不要先解析再计算）；用常数时间比较；再对时间戳加五分钟容差（飞书页面没有写容差，这是本设计自己的规则，与 W2-5 一致，**待用真实流量核实**）。未通过则 **400**，不解析正文、不调用 Baton。
+3. **解密**：正文加密时密钥为 `sha256(encrypt_key)`，AES-256-CBC，前 16 字节是 IV，整体 base64。官方页面给了测试向量（密钥 `test key`、密文 `P37w+VZImNgPEO1RBhJ6RtKl7n6zymIbEG1pReEzghk=`、明文 `hello world`），3d 的单元测试直接用它。
+4. 解密后再检查 `header.token` 等于 Verification Token（**附加**一致性检查，不能替代第 2 步）、`header.app_id` 与 `tenant_key` 等于配置、`schema == "2.0"`。
 5. 其余：只接受 `POST` 与 `application/json`，正文上限 64 KiB，同样的 2.0 秒预算，永远不返回 3xx，响应头不带内部信息。URL 校验请求（配置回调地址时的握手）按官方文档处理，3d 里补全。
 
 多实例在 HTTPS 方式下技术上可行，但本阶段仍然只跑一个实例；若以后跑多个，`seen_action` 与队列需要共享存储。
@@ -582,21 +633,22 @@ https://baton.example.com/board/o/task/6f1c2d9e-0000-4000-8000-000000000001?exp=
 | C1 | 完整审批流：提交任务并派发 → 事件到达 → 核心发出一张 `pending` 卡片 → 已绑定且有委托的批准人点 `approve` → gate 通过 → 卡片原位变为 `approved` 终态 | 同一 `external_message_id` 被更新；终态文字含批准人 display_name 与 HH:MM；`x_gate` 一行；审计里有 `channel.action`（含 `channel`、`external_user_id`、`dedupe_token`）；任务 done |
 | C2 | 未授权点击：已绑定但没有委托的人点 `approve` | toast“无权放行”；任务状态不变、没有 `x_gate` 行；卡片不变；审计 `channel.action_denied` |
 | C3 | 未绑定点击 | 同上，toast 附“尚未绑定”；审计 `channel.unbound_click` |
-| C4 | 重复点击：同一 `dedupe_token` 投递两次 | 只有一次 gate；两次应答相同；`seen_action` 与 `x_channel_action` 各一行 |
-| C5 | 重复点击：同一人两个不同令牌 | 第二次得到“已有结论”，卡片仍为终态 |
+| C4 | 重复投递：同一 `event_id` 两次 | 只有一次 gate；两次应答相同；`seen_action` 与 `x_channel_action` 各一行 |
+| C5 | 同一人两个不同 `event_id` | 第二票被 Baton 拒绝；卡片仍为 pending 或终态（视第一票而定），不是误报“已有结论” |
+| C5b | 两人确认：两位审批人并发两个 `event_id` | 两票都计入；第一票后“1/2”；第二票后终态 |
 | C6 | `request_changes`：带文字 | 线程里出现一条作者是点击者的评论；gate 记 fail，`reason` 为该文字；任务回到 `queued`；卡片终态“要求修改” |
 | C7 | `request_changes`：文字为空或超过 1000 字符 | 被拒绝（invalid），任务不变 |
 | C8 | 坏签名：`parse_action` 抛 `BadSignature` | 核心不调用 Baton；写 `channel.action_refused`；error toast |
 | C9 | 伪造的 `value`：`k` 不匹配、对象不在映射、`external_chat_id` 不符、`event_time` 太旧 | 全部拒绝，不调用 Baton |
 | C10 | epoch 过期：任务被重新提交后点旧卡片 | `stale_claim` → warning toast，卡片刷新为新 epoch |
 | C11 | 两人确认：第一位批准 | 卡片进度“已通过 1/2”，仍有按钮；同一人再点被拒绝；第二位批准后进入终态 |
-| C12 | 预算：Baton 调用被测试桩拖到 2 秒以上 | 在预算内返回“处理中”；后台完成后卡片更新；仍然只决定一次 |
+| C12 | 预算：Baton 调用被测试桩拖到 2 秒以上 | 在预算内返回“处理中”，**不**写 `seen_action`；飞书用相同 `event_id` 重试后完成 gate；仍然只决定一次 |
 | C13 | 核心主体自己调用 `gate` | 被拒绝（`forbidden`），`channel_act` 是唯一路径 |
 | C14 | 绑定在点击前被撤销、或已过期 | 视为未绑定 |
 | C15 | webhook 事件重复（相同 `webhook-id`）、签名坏、时间戳超出五分钟、两个密钥轮换期 | 重复只处理一次；坏签名与过期被拒；两个密钥都能通过 |
 | C16 | 核心重启后（本地库保留 / 丢失） | 保留：卡片继续更新同一消息；丢失：待办对象得到新卡，旧卡点击被 Baton 的幂等或 epoch 规则挡住，没有双重决定 |
 
-3b 另有桥侧测试：绑定只能由根创建、被绑定者必须是登记表里一致的人类且是该 Space 成员、绑定带 `space_id` 且跨 Space 无效、解绑与过期立即生效、`channel_act` 的每个授权分支（根、有委托、委托过期或被撤销、自批需要显式标志而卡片不给、双人确认）与既有 `gate` 的结果完全一致、`dedupe_token` 唯一。3e 另有链接测试：签名覆盖路径、对象 id、过期时间与密钥版本（改任一项都失败）、过期、15 分钟默认、上限、非一次性（连续多次打开都成功）、只读（POST 与其他路径被拒）、轮换（两把密钥、宽限期、宽限为 0 立即失效）、`/board/data` 仍然需要令牌、响应头。
+3b 另有桥侧测试：绑定只能由根创建、被绑定者必须是登记表里一致的人类且是该 Space 成员、绑定带 `space_id` 且跨 Space 无效、`channel_act` 从任务解析 `space_id`（调用方不能伪造）、过期后唯一索引可重新绑定、`bind` 清理过期行、解绑与过期立即生效、`channel_act` 的每个授权分支（根、有委托、委托过期或被撤销、自批需要显式标志而卡片不给、双人确认）与既有 `gate` 的结果完全一致、`event_id`/`dedupe_token` 唯一、`request_changes` 的 comment/gate 子 `operation_id` 不冲突。3e 另有链接测试：签名覆盖路径、对象 id、过期时间与密钥版本（改任一项都失败）、过期、15 分钟默认、上限、非一次性（连续多次打开都成功）、**预览 bot 只收到标题页**、人读仍得全文、只读（POST 与其他路径被拒）、轮换（两把密钥、宽限期、宽限为 0 立即失效）、`/board/data` 仍然需要令牌、响应头。
 
 飞书适配器单元测试（3d）用官方样例载荷，不联网：
 
@@ -614,7 +666,7 @@ https://baton.example.com/board/o/task/6f1c2d9e-0000-4000-8000-000000000001?exp=
 | --- | --- | --- |
 | **3a** | 本设计文档，加 `docs/architecture.md` 的一行链接 | 无 |
 | **3b** | 身份绑定与代点击授权（bridge）：`x_channel_binding`、`x_channel_action`；离线管理员 `python -m bridge.channels bind/unbind/list`；`channel_act`（gate、权限请求、评论，在点击者本人权限下、单事务）；登记表“通道核心”标志；审计事件；更新 `docs/api.md`、`docs/security-model.md`；测试见第 9 章 | 审批人委托与 gate（已合入）；权限请求分支合入后才接 `decide_permission` |
-| **3c** | 核心加假适配器与契约测试：`adapters/channels/core.py`、`fake.py`、事件源、映射与队列、模板、本地状态；bridge 的“观察者订阅”；本核心的内部 TLS 监听 | 3b；W2-5（Standard Webhooks）合入；观察者订阅的决定（第 12 章问题 1） |
+| **3c** | 核心加假适配器与契约测试：`adapters/channels/core.py`、`fake.py`、事件源、映射与队列、模板、本地状态；bridge 的“观察者订阅”；本核心的内部 TLS 监听 | 3b；W2-5 已合入 main；观察者订阅的决定（第 12 章问题 1） |
 | **3d** | 飞书适配器：`adapters/channels/feishu.py`，可选依赖锁文件，`THIRD_PARTY.md`，compose 里的通道服务（不发布端口），凭据加载，告警名，后备 HTTPS 回调，单元测试与真机冒烟清单 | 3c；owner 创建的专用飞书应用、测试应用与工作群 |
 | **3e** | 带签名的只读链接：`link_sign`、`x_link_key`、`python -m bridge.links rotate`、`/board/o/` 路由与链接模式页面、网关与 nginx 路由、轮换与测试 | 无（只动 bridge、board、deploy）；密钥轮换沿用 W2-5 的做法 |
 
@@ -634,12 +686,12 @@ https://baton.example.com/board/o/task/6f1c2d9e-0000-4000-8000-000000000001?exp=
 
 | 威胁 | 做法 | 控制 | 覆盖与残余 |
 | --- | --- | --- | --- |
-| **伪造回调** | 攻击者直接向回调地址 POST 一个看起来像 `card.action.trigger` 的请求，冒充某人点击 | 默认长连接：没有入站回调地址可打；SDK 在建连时用 `app_id`、`app_secret` 鉴权。后备 HTTPS：入口 IP 白名单加 `X-Lark-Signature` 签名（Encrypt Key）加解密加 `header.token`、`app_id`、`tenant_key` 检查加五分钟时间戳；全部失败都不调用 Baton | 默认路径没有可伪造的入口。残余：信任飞书平台与 TLS；`app_secret` 泄漏后攻击者能再开一条连接，吞掉随机一半点击并看到回调内容（集群模式），但**不能**制造被 Baton 接受的点击——身份仍来自飞书对点击者的认证，且需要有效绑定 |
-| **重放** | 重放截获的回调或 webhook | 核心 `seen_action`、Baton `x_channel_action` 唯一键与 `operation_id` 幂等；点击有 10 分钟新鲜度；状态机本身让旧 `approve` 无害（epoch 与状态不符即 `stale_claim`）；webhook 用 `webhook-id` 去重加五分钟时间戳 | 覆盖重复提交、重放与重复投递。残余：10 分钟内对同一张仍待办的卡片重放同一个有效点击，结果与第一次点击相同，没有额外效果 |
+| **伪造回调** | 攻击者直接向回调地址 POST 一个看起来像 `card.action.trigger` 的请求，冒充某人点击 | 默认 WebSocket：无入站回调；建连用 `app_id`、`app_secret`。后备 HTTPS：**必须**配置 Encrypt Key；IP 白名单 + `X-Lark-Signature`（正文绑定）+ 解密 + `app_id`/`tenant_key`；缺 Encrypt Key 的配置拒绝启动；Verification Token 仅作附加检查 | 默认路径没有可伪造的入口。残余：信任飞书与 TLS；`app_secret` 泄漏见下行 |
+| **重放** | 重放截获的回调或 webhook | 权威键 **`event_id`** → `seen_action`（仅已提交）+ `x_channel_action` + `operations`；`dedupe_token=sha256(event_id)`；点击 10 分钟新鲜度；epoch/`stale_claim`；webhook Standard Webhooks 时间戳 + `webhook-id` | 同 `event_id` 重放只得到首次结果。残余：10 分钟内重放仍待办卡上的**新**点击（新 `event_id`）仍是一次真实 gate（需绑定与委托） |
 | **点击者冒名** | 甲想以乙的权限放行；群里的人使用别人的卡片；卡片被转发 | 点击者只来自平台认证后的 `operator.open_id`，`value` 里没有身份；绑定只能由根创建、按 Space 隔离、绑定的人必须与登记表一致；每次点击现查绑定与权限，不缓存；`k`、`o`、会话校验挡住伪造和转发；租户校验挡住外部租户 | 覆盖“冒名”与“越权”。残余：他人使用乙已解锁的设备；根绑错了人（靠绑定审计与确认流程发现）；平台账号被盗；**核心被攻破**时可替已绑定且有权限的人伪造点击（4.5 的残余与收敛手段） |
-| **链接泄漏** | 带签名的链接被转发、被预览抓取、留在浏览器历史或访问日志里 | 一个对象、只读、默认 15 分钟、有上限；非一次性（预览不会耗掉它）；`Referrer-Policy: no-referrer`、`no-store`、`noindex`；失败统一 404；轮换密钥并把宽限期设为 0 是总开关；URL 里没有令牌 | 把泄漏的影响限制在“有效期内、一个对象、只读”。残余：群成员与拿到链接的人都能在有效期内读这个对象，这是 owner 接受的信任边界；边缘日志里有完整 URL；没有按对象单独撤销（第 12 章问题 2 附带讨论） |
+| **链接泄漏** | 带签名的链接被转发、被预览抓取、留在浏览器历史或访问日志里 | 一个对象、只读、默认 15 分钟、有上限；非一次性；**预览响应仅标题**（第 6 章）；人读才得全文；`Referrer-Policy: no-referrer`、`no-store`、`noindex`；失败统一 404；轮换 + 宽限期 0；URL 无令牌 | 预览不再把线程/diff 发给第三方。残余：有效期内拿到链接的人读全文；边缘日志可能有完整 URL（第 12 章问题 2） |
 | **群聊里的卡片仿冒** | 群成员或别的机器人发一张长得一样的卡片，附上钓鱼链接，或发“已批准”的文字 | 只有我们的应用能让按钮触发我们的回调，仿冒卡片改变不了 Baton；真正的状态以 Baton 为准；卡片里的链接只指向配置的 `PUBLIC_URL`；卡片从不要求输入凭据；只有核心能更新我们的卡片；群成员与机器人由 owner 管理，群里不放其他机器人 | 仿冒不能产生任何 Baton 效果。残余：用户被外观骗去点钓鱼链接、被假文字误导；缓解靠群管理和统一的机器人名称与头像。群是否有“限制添加机器人”的设置**未核实**，3d 的群设置清单里核对 |
-| **凭据暴露** | 飞书应用凭据、Encrypt Key、Verification Token、核心的 Baton 令牌、链接密钥被读走、写进日志或提交进仓库 | 凭据只放文件（`root:root 0600`），按路径读取，不进仓库、环境变量、命令行或日志；`Secret` 包装；SDK 日志级别受控；专用应用，不是告警中继应用，只有发送消息一项权限；`encrypt_key` 与 `verification_token` 在长连接模式不加载；核心的 Baton 令牌只存哈希、权限仅限 view 与 `channel_act`；链接密钥只存在 bridge，不返回；`lark-oapi` 哈希锁定、只装进无数据库凭据的通道服务；`check_public_tree.py` 继续阻止邮箱、非示例 IP 与个人路径，3d 再为夹具补充凭据形状的检查 | 覆盖仓库与日志泄漏。残余：宿主机 root 与镜像管理员属于可信边界（与 [architecture.md](../architecture.md) 一致）。**泄漏响应**：重置应用密钥与相关密钥、更新文件并重启、核对绑定与审计、必要时 `BATON_LINK_ROTATION_GRACE_SECONDS=0` 轮换链接密钥、撤销核心令牌并重新签发 |
+| **凭据暴露 / 卡片篡改** | `app_secret` 等泄漏；攻击者用同一应用凭据 PATCH 消息卡片，把真卡改成“已通过”，与 Baton `x_gate` 不一致 | 凭据 `root:root 0600` 文件、不进仓库/环境变量/日志；长连接不加载 encrypt 凭据；专用最小权限应用；channel-sdk `strict`；**泄漏响应**：立即轮换 `app_secret`、重启、用 `get_task`/`x_gate` **对照**群内卡片与 Baton 事实，必要时强制 `upsert_card` 刷新；审计 `channel.action` 与 gate 以 Baton 为准；用户以终态 toast + 刷新链接为准 | 不能伪造被 Baton 接受的点击（仍要飞书 `operator` + 绑定）。残余：`app_secret` 泄漏可**视觉上**篡改卡片，直到刷新；缓解靠轮换、对照 gate、短 TTL 链接 |
 | **拒绝服务与骚扰** | 群里有人狂点按钮；事件风暴；被限频 | 令牌桶与按对象合并更新、审计限速、预算超时后异步完成；错误按平台限频退避；单点击幂等 | 覆盖基本的放大。残余：飞书限频是群内机器人共享的，其他机器人刷屏会拖慢更新 |
 | **内容外泄到第三方平台** | 卡片内容留在飞书 | 卡片只放结论，细节是链接；字段长度上限；明文邮箱、手机号替换；工作群只有 owner 管理的成员 | 减小暴露面。残余：结论文字本身由平台保存，不适合放进卡片的内容不要写进任务结论 |
 
@@ -649,8 +701,8 @@ https://baton.example.com/board/o/task/6f1c2d9e-0000-4000-8000-000000000001?exp=
 2. **15 分钟与长寿命卡片。** 默认 15 分钟的链接对放几个小时的待办卡片会过期。选项：待办卡片的链接取 `min(响应时限, 运营者上限)`；每次更新重新签发；增加“刷新链接”按钮。默认值不动。
 3. **“原位无权放行提示”的解释。** 实现为只对点击者可见的 toast，而不是改写共享卡片（理由见 4.4）。请确认。
 4. **根自批不经卡片。** 卡片永远不带 `self_approval`；根批准自己提交或执行的工作只能走显式路径。请确认。
-5. **`dedupe_token` 取 `event.token` 的哈希，同时记录 `event_id`。** 令牌在重复投递与不同点击之间的行为待真机核实（7.2）。
-6. **Python SDK 长连接收卡片回调的真机验证**是启用生产的前置条件（7.2）。
+5. **`event_id` 权威幂等**已写入全文；3d 真机确认重复投递 `event_id` 不变、不同点击 `event_id` 不同；`event.token` 行为记入 NOT_PROVEN（7.1）。
+6. **`lark-channel-sdk` + CardKit 真机冒烟**（点击、3 秒应答、原位更新、并发两票）是启用生产的前置条件（7.1、7.4）。
 7. **高风险范围是否允许经通道决定。** 例如在两人确认策略之外，再给 `x_approval_policy` 增加“不允许通道决定”的开关。
 8. **结论的来源。** 卡片“结论”暂定取结果文本的首段并截断；若 W2-4 的 Ask 带有结构化的 `message`，应改用它。
 9. **`im.chat.member.bot.deleted_v1` 事件是否多申请一项权限**（5 章最后一条）。
