@@ -318,7 +318,11 @@ def catalog(drop_column=False):
     return {"columns": columns, "relations": ["baton.tasks:r"],
             "constraints": [{"t": "baton.tasks", "name": "tasks_pkey", "def": "PRIMARY KEY (id)", "cols": ["id"]}],
             "indexes": [{"t": "baton.tasks", "name": "tasks_pkey", "def": "CREATE UNIQUE INDEX tasks_pkey", "unique": True, "cols": ["id"]}],
-            "triggers": [], "functions": [], "types": []}
+            "triggers": [], "functions": [], "types": [], "policies": [],
+            "row_security": [{"t": "baton.tasks", "enabled": False, "forced": False}],
+            "privileges": [{"t": "baton.tasks", "acl": ""}], "column_privileges": [],
+            "schema_privileges": [{"n": "baton", "acl": ""}], "function_privileges": [],
+            "database_privileges": [{"acl": ""}]}
 
 
 class FakeDocker:
@@ -499,6 +503,12 @@ def hold(service, image_id=OLD_APP):
 
 
 APP_SERVICES = ("bridge", "initialize", "migrate")
+
+
+@pytest.fixture(autouse=True)
+def isolated_deploy_lock(tmp_path, monkeypatch):
+    """Each test gets its own lock directory, so a leaked flock cannot stall the rest of the suite."""
+    monkeypatch.setattr(deploy, "LOCK_DIR", tmp_path / "deploy-locks")
 
 
 @pytest.fixture
@@ -756,9 +766,39 @@ def test_database_is_backed_up_before_the_build_and_the_migration(files, tmp_pat
 
 def test_backup_directory_and_files_are_private(files):
     docker = FakeDocker()
-    run(files, docker, FakeGateway(docker, good_image=NEW_APP))
+    previous = os.umask(0)
+    try:
+        code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP))
+    finally:
+        os.umask(previous)
     directory = files[0].parent / "backups"
+    path = Path(report["backup"]["path"])
+    assert code == 0 and directory.stat().st_mode & 0o777 == 0o700
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert re.fullmatch(r"baton-demo-\d{8}T\d{6}Z-[0-9a-f]{16}\.dump", path.name)
+
+
+def test_an_existing_backup_directory_is_tightened_and_two_dumps_do_not_share_a_name(files):
+    directory = files[0].parent / "backups"
+    directory.mkdir(mode=0o755)
+    docker = FakeDocker()
+    _, first, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP))
+    docker = FakeDocker()
+    _, second, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP))
     assert directory.stat().st_mode & 0o777 == 0o700
+    assert Path(first["backup"]["path"]).name != Path(second["backup"]["path"]).name
+
+
+def test_a_symlink_backup_directory_is_refused_and_not_followed(files, tmp_path):
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    (files[0].parent / "backups").symlink_to(target)
+    docker = FakeDocker()
+    code, report, _ = run(files, docker, FakeGateway(docker))
+    assert code == 1 and report["status"] == "aborted"
+    assert "symbolic link" in report["backup"]["error"]
+    assert list(target.iterdir()) == []
+    assert not dump_calls(docker)
 
 
 @pytest.mark.parametrize("dump", ["fail", "timeout", "garbage"])
@@ -836,6 +876,11 @@ def test_backup_dir_is_required_unless_no_backup_is_given(files, capsys):
     "ALTER TABLE baton.t ALTER COLUMN a SET DATA TYPE text;", "ALTER TABLE baton.t ALTER COLUMN a SET NOT NULL;",
     "ALTER TABLE baton.t ADD COLUMN IF NOT EXISTS a text NOT NULL;", "TRUNCATE baton.t;", "DELETE FROM baton.t;",
     "drop schema baton cascade;", "DROP FUNCTION baton.f();", "DROP VIEW baton.v;",
+    "GRANT SELECT ON baton.t TO baton_app;", "REVOKE ALL ON TABLE baton.t FROM PUBLIC;",
+    "DROP POLICY p ON baton.t;", "CREATE POLICY p ON baton.t USING (true);",
+    "ALTER POLICY p ON baton.t USING (false);", "ALTER TABLE baton.t ENABLE ROW LEVEL SECURITY;",
+    "ALTER TABLE baton.t FORCE ROW LEVEL SECURITY;", "ALTER TABLE baton.t NO FORCE ROW LEVEL SECURITY;",
+    "ALTER TABLE baton.t DISABLE ROW LEVEL SECURITY;",
 ])
 def test_migration_lint_flags_contract_statements_a_previous_image_cannot_survive(statement):
     assert deploy.unsafe_migration_statements("CREATE TABLE IF NOT EXISTS baton.t(a int);\n" + statement + "\n")
@@ -1130,6 +1175,23 @@ def column(name, **fields):
     (altered(triggers=lambda t: t.append({"t": "baton.tasks", "name": "g", "def": "CREATE TRIGGER g"})),
      "adds trigger g to the existing table baton.tasks"),
     (altered(types=lambda t: t.append({"name": "baton.k", "def": "e:a"})), None),
+    (altered(privileges=[{"t": "baton.tasks", "acl": "{=r/baton_owner}"}]), "changes privileges on baton.tasks"),
+    (altered(column_privileges=[{"t": "baton.tasks", "c": "assignee", "acl": "{=r/baton_owner}"}]),
+     "changes privileges on baton.tasks.assignee"),
+    (altered(schema_privileges=[{"n": "baton", "acl": "{=U/baton_owner}"}]), "changes privileges on schema baton"),
+    (altered(database_privileges=[{"acl": "{=C/baton_owner}"}]), "changes database privileges"),
+    (altered(row_security=[{"t": "baton.tasks", "enabled": True, "forced": False}]),
+     "changes row level security on baton.tasks"),
+    (altered(row_security=[{"t": "baton.tasks", "enabled": False, "forced": True}]),
+     "changes row level security on baton.tasks"),
+    (altered(policies=[{"t": "baton.tasks", "name": "p", "permissive": True, "cmd": "*", "roles": "",
+                        "qual": "true", "with_check": None}]),
+     "adds policy p to the existing table baton.tasks"),
+    (altered(relations=lambda r: r.append("baton.notes:r"),
+             privileges=lambda p: p.append({"t": "baton.notes", "acl": "{=r/baton_owner}"}),
+             row_security=lambda rows: rows.append({"t": "baton.notes", "enabled": True, "forced": True}),
+             policies=[{"t": "baton.notes", "name": "p", "permissive": True, "cmd": "*", "roles": "",
+                        "qual": "true", "with_check": None}]), None),
 ])
 def test_schema_diff_flags_everything_a_previous_image_could_not_survive(after, expected):
     changes = deploy.schema_breaking_changes(base_snapshot(), after)
@@ -1149,6 +1211,26 @@ def test_schema_diff_covers_dropped_or_changed_triggers_functions_and_types():
     gone = altered()
     assert deploy.schema_breaking_changes(before, gone) == ["drops trigger g on baton.tasks", "drops function baton.f()",
                                                             "drops type baton.k"]
+
+
+def test_schema_diff_flags_policy_edits_and_fails_closed_without_privilege_sections():
+    before = altered(policies=[{"t": "baton.tasks", "name": "p", "permissive": True, "cmd": "*", "roles": "",
+                                "qual": "true", "with_check": None}])
+    changed = altered(policies=[{"t": "baton.tasks", "name": "p", "permissive": True, "cmd": "r", "roles": "",
+                                 "qual": "false", "with_check": None}])
+    assert deploy.schema_breaking_changes(before, changed) == ["changes policy p on baton.tasks"]
+    assert deploy.schema_breaking_changes(before, base_snapshot()) == ["drops policy p on baton.tasks"]
+    after = base_snapshot()
+    del after["policies"]
+    del after["row_security"]
+    assert deploy.schema_breaking_changes(base_snapshot(), after) == ["catalog snapshot is missing policies, row_security"]
+
+
+def test_comments_and_strings_do_not_count_as_privilege_changes():
+    assert deploy.unsafe_migration_statements("-- GRANT SELECT ON baton.t TO PUBLIC;\nCREATE TABLE baton.n(id int);") == []
+    assert deploy.unsafe_migration_statements("SELECT 'REVOKE ALL ON baton.t FROM PUBLIC';") == []
+    hidden = "DO $$ BEGIN EXECUTE 'GRANT SELECT ON baton.t TO PUBLIC'; END $$;"
+    assert deploy.unsafe_migration_statements(hidden) == [], "a string hides the statement; the catalog diff is authoritative"
 
 
 def test_schema_diff_accepts_purely_additive_changes():
@@ -1216,6 +1298,15 @@ def test_catalog_sql_and_diff_on_a_real_postgres_accept_the_shipped_schema_and_c
                  "makes baton.tasks.blocked_by NOT NULL"),
                 ("ALTER TABLE baton.tasks ADD COLUMN df18_required text NOT NULL DEFAULT 'x'", None),
                 ("DO $$ BEGIN EXECUTE 'ALTER TABLE baton.tasks DROP COLUMN assignee'; END $$", "drops column baton.tasks.assignee"),
+                ("GRANT SELECT ON TABLE baton.tasks TO PUBLIC", "changes privileges on baton.tasks"),
+                ("REVOKE SELECT ON TABLE baton.tasks FROM PUBLIC", "changes privileges on baton.tasks"),
+                ("GRANT SELECT (id) ON TABLE baton.tasks TO PUBLIC", "changes privileges on baton.tasks.id"),
+                ("GRANT USAGE ON SCHEMA baton TO PUBLIC", "changes privileges on schema baton"),
+                ("ALTER TABLE baton.tasks ENABLE ROW LEVEL SECURITY", "changes row level security on baton.tasks"),
+                ("ALTER TABLE baton.tasks FORCE ROW LEVEL SECURITY", "changes row level security on baton.tasks"),
+                ("CREATE POLICY df18_p ON baton.tasks USING (true)", "adds policy df18_p to the existing table baton.tasks"),
+                ("DROP POLICY df18_p ON baton.tasks", "drops policy df18_p on baton.tasks"),
+                ("DO $$ BEGIN EXECUTE 'GRANT SELECT ON TABLE baton.tasks TO PUBLIC'; END $$", "changes privileges on baton.tasks"),
             ]:
                 before = snapshot()
                 apply(statement)
@@ -1384,18 +1475,136 @@ def test_subprocess_runner_feeds_stdin_text_to_the_command(tmp_path):
 
 def test_subprocess_runner_streams_stdout_to_a_private_file_and_reports_missing_commands(tmp_path):
     target = tmp_path / "out.bin"
-    result = deploy.SubprocessRunner()([sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'PGDMP\\x00\\xff'); sys.stderr.write('warn')"],
-                                       timeout=20, stdout_path=str(target))
+    previous = os.umask(0)
+    try:
+        result = deploy.SubprocessRunner()([sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'PGDMP\\x00\\xff'); sys.stderr.write('warn')"],
+                                           timeout=20, stdout_path=str(target))
+    finally:
+        os.umask(previous)
     assert result.returncode == 0 and result.stderr == "warn" and target.read_bytes() == b"PGDMP\x00\xff"
     assert target.stat().st_mode & 0o777 == 0o600
     assert deploy.SubprocessRunner()(["definitely-not-a-command-xyz"], timeout=5).returncode == 127
+
+
+def test_private_output_refuses_an_existing_file_and_does_not_follow_a_symlink(tmp_path):
+    loose = tmp_path / "loose"
+    loose.write_bytes(b"keep-me")
+    loose.chmod(0o644)
+    result = deploy.SubprocessRunner()([sys.executable, "-c", "import sys; sys.stdout.write('PGDMP')"],
+                                       timeout=20, stdout_path=str(loose))
+    assert result.returncode != 0 and result.stderr.startswith(deploy.PRIVATE_OUTPUT_ERROR)
+    assert loose.read_bytes() == b"keep-me" and loose.stat().st_mode & 0o777 == 0o644
+    secret = tmp_path / "secret"
+    secret.write_text("x_webhook.secret")
+    link = tmp_path / "dump"
+    link.symlink_to(secret)
+    result = deploy.SubprocessRunner()([sys.executable, "-c", "import sys; sys.stdout.write('PGDMP-LEAK')"],
+                                       timeout=20, stdout_path=str(link))
+    assert result.returncode != 0 and result.stderr.startswith(deploy.PRIVATE_OUTPUT_ERROR)
+    assert link.is_symlink() and secret.read_text() == "x_webhook.secret"
+
+
+def test_backup_database_does_not_overwrite_or_remove_a_planted_symlink(tmp_path):
+    secret = tmp_path / "secret"
+    secret.write_text("x_webhook.secret")
+    link = tmp_path / "backups" / "fixed.dump"
+    link.parent.mkdir()
+    link.symlink_to(secret)
+    monkey_path = link
+
+    def fixed_path(backup_dir, project):
+        return monkey_path
+
+    original = deploy.backup_dump_path
+    deploy.backup_dump_path = fixed_path
+    try:
+        compose = tmp_path / "compose.yaml"
+        compose.write_text("services: {}\n")
+        config = deploy.Config([compose], project="demo", backup_dir=str(link.parent))
+        docker = deploy.Docker(deploy.SubprocessRunner(), config, lambda message: None)
+        report, ok = deploy.backup_database(docker, config, "demo", {"state": "running", "ok": True})
+    finally:
+        deploy.backup_dump_path = original
+    assert not ok and "existing backup path" in report["error"]
+    assert link.is_symlink() and secret.read_text() == "x_webhook.secret" and not secret.read_text().startswith("PGDMP")
+
+
+def test_deploy_lock_times_out_without_tagging_and_is_held_through_rollback(files, tmp_path, monkeypatch):
+    monkeypatch.setattr(deploy, "LOCK_DIR", tmp_path / "locks")
+    held = deploy.DeployLock(deploy.lock_file("demo"), 5, time.monotonic, time.sleep)
+    held.acquire()
+    try:
+        docker = FakeDocker()
+        code, report, _ = run(files, docker, FakeGateway(docker), "--lock-timeout", "1")
+    finally:
+        held.close()
+    assert code == 1 and report["status"] == "aborted"
+    assert "another deploy holds the lock" in report["rollback"]["reason"]
+    assert not [c for c in docker.calls if c[:2] == ["docker", "tag"]]
+    assert not dump_calls(docker) and not docker.ups()
+    docker = FakeDocker(up_results=[1, 0])
+    seen = {}
+
+    class Watching:
+        def __call__(self, argv, timeout=None, stdout_path=None, stdin_text=None):
+            if argv[:2] == ["docker", "tag"] and not str(argv[-1]).startswith(deploy.HOLD_REPOSITORY):
+                seen["rollback"] = _lock_held(deploy.lock_file("demo"))
+            if stdout_path:
+                seen["dump"] = _lock_held(deploy.lock_file("demo"))
+            return FakeDocker.__call__(docker, argv, timeout=timeout, stdout_path=stdout_path, stdin_text=stdin_text)
+
+    code, report, _ = run(files, Watching(), FakeGateway(docker, good_image=OLD_APP), "--lock-timeout", "5")
+    assert code == 1 and report["status"] == "rolled_back"
+    assert seen.get("dump") is True and seen.get("rollback") is True
+    assert _lock_held(deploy.lock_file("demo")) is False
+
+
+def _lock_held(path):
+    import fcntl
+    fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def test_deploy_lock_blocks_a_second_waiter_until_the_deadline(tmp_path):
+    path = tmp_path / "locks" / "demo.lock"
+    state = {"now": 0}
+
+    def clock():
+        return state["now"]
+
+    def sleep(seconds):
+        state["now"] += seconds
+
+    first = deploy.DeployLock(path, 5, clock, sleep)
+    first.acquire()
+    second = deploy.DeployLock(path, 1, clock, sleep)
+    with pytest.raises(deploy.UsageError, match="another deploy holds the lock"):
+        second.acquire()
+    assert state["now"] >= 1
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+    first.close()
+    second.acquire()
+    second.close()
+    link = tmp_path / "linked-locks"
+    link.symlink_to(path.parent)
+    with pytest.raises(deploy.UsageError, match="symbolic link"):
+        deploy.DeployLock(link / "other.lock", 1, clock, sleep).acquire()
 
 
 def test_rollback_limits_are_documented_next_to_the_commands():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     section = readme.split("### 重新部署、冒烟与回滚")[1].split("### 升级旧实例")[0]
     for needle in ("expand", "pg_dump", "--backup-dir", "迁移", "不恢复数据库", "--allow-remove-orphans", "超时", "孤立",
-                   "临时数据库", "已停止", "数据卷", "--schema-file", "保留标签"):
+                   "临时数据库", "已停止", "数据卷", "--schema-file", "保留标签", "符号链接", "互斥", "行级安全", "GRANT"):
         assert needle in section, needle
     assert "expand-only" in deploy.__doc__ and "backup" in deploy.__doc__ and "orphans" in deploy.__doc__
 

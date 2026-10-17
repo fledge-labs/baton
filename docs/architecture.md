@@ -32,7 +32,7 @@ edge 的 nginx 用 Docker 内置 DNS（`resolver 127.0.0.11 valid=10s ipv6=off`�
 
 健康检查分层：bridge 调用自己的 `/healthz`（读取数据库 schema 版本；仅容器内回环地址的 GET 免令牌），所以数据库或迁移出问题时 bridge 不健康；edge（HTTP 与 TLS 变体）要求 `/board` 为 200，且不带凭据的 `POST /mcp` 经 nginx 到达 gateway 并得到 401，TLS 变体经 `https://127.0.0.1:8443`，同时验证监听与握手。该 401 由 gateway 的鉴权策略在转发前产生，不经过 bridge，gateway 镜像也没有可执行探测的 shell 或客户端，所以 gateway→bridge 由 `scripts/deploy.py` 在部署后用冒烟令牌走一次完整 MCP 流程（`initialize`、`tools/list`、`fetch_inbox`）验证。
 
-`scripts/deploy.py` 的部署顺序是：预检（迁移 SQL 必须存在；将要构建时，已跟踪且会进入构建上下文的路径必须对其它用户可读，`.dockerignore` 排除的私有文件除外，否则在任何 docker 命令之前拒绝；孤立服务须确认）→ 记录全部容器（含已停止的）镜像并按服务加保留标签 → 只要数据卷存在就确保数据库可连接（应用容器全停或已删也照样启动数据库）→ 在临时数据库上对克隆的当前 schema 应用待部署迁移并对比 `pg_catalog`，任何破坏性变化或预检失败都中止（fail closed）→ `pg_dump` 备份 → 构建（镜像在 `COPY` 之后 `chmod -R a+rX /app`，不加写，使 uid 999 的 migrate 能读到 schema）→ `up --force-recreate --remove-orphans` → 冒烟；每步有硬超时，恢复路径也有。失败时只恢复镜像（不恢复数据库与 Compose 拓扑），逐服务核对镜像 ID 后才报告回滚成功；因此迁移必须让上一版镜像仍能运行，备份用于破坏了这一约束时的手工恢复。
+`scripts/deploy.py` 的部署顺序是：预检（迁移 SQL 必须存在；将要构建时，已跟踪且会进入构建上下文的路径必须对其它用户可读，`.dockerignore` 排除的私有文件除外，否则在任何 docker 命令之前拒绝；孤立服务须确认）→ 用 `flock` 锁住该项目（等到 `--lock-timeout` 为止，持有到进程返回，含回滚重打标签）→ 记录全部容器（含已停止的）镜像并按服务加保留标签 → 只要数据卷存在就确保数据库可连接（应用容器全停或已删也照样启动数据库）→ 在临时数据库上对克隆的当前 schema 应用待部署迁移并对比 `pg_catalog`（含权限、策略和行级安全），任何破坏性变化或预检失败都中止（fail closed）→ `pg_dump` 备份（目录 0700、文件 `O_EXCL|O_NOFOLLOW` 加 `fchmod` 0600、随机文件名，符号链接拒绝且不跟随）→ 构建（镜像在 `COPY` 之后 `chmod -R a+rX /app`，不加写，使 uid 999 的 migrate 能读到 schema）→ `up --force-recreate --remove-orphans` → 冒烟；每步有硬超时，恢复路径也有。失败时只恢复镜像（不恢复数据库、已提交的授权或行级安全，也不恢复 Compose 拓扑），逐服务核对镜像 ID 后才报告回滚成功；因此迁移必须让上一版镜像仍能运行，备份用于破坏了这一约束时的手工恢复。
 
 `x_audit` 的业务记录只允许应用追加/读取，并由所有者触发器拒绝修改、删除和清空。边缘、网关与 bridge 的 JSONL 另用于连接入口 request ID 与 task ID；这些文件不提供抗管理员篡改保证。数据库超级用户和 Docker 管理员属于可信边界。
 

@@ -13,16 +13,20 @@ Steps, each with a hard timeout (the recovery path too):
      other users (files need o+r, directories o+rx), before any docker command. Paths excluded by
      .dockerignore, including deploy/.env, may stay private. --no-build skips this check. Services that the
      Compose files no longer declare (orphans) must be acknowledged with --allow-remove-orphans;
-  2. record the image of every container of the project, running or not, and tag each local image per service as
+  2. take an exclusive flock for this project (wait is bounded by --lock-timeout). Two deploys cannot interleave
+     tagging, pg_dump, up, or a rollback's docker tag. The lock is held until this process returns;
+  3. record the image of every container of the project, running or not, and tag each local image per service as
      `baton-deploy-rollback:<service>-<id>` so it cannot be garbage-collected;
-  3. if a database volume exists, make sure the database container is up (even when every application container
+  4. if a database volume exists, make sure the database container is up (even when every application container
      is stopped or gone), then (a) precheck the migration: apply it to a throwaway copy of the live schema and diff
-     the catalogs; any breaking change, or any step that fails, aborts (fail closed); and (b) back up the database
-     with pg_dump (custom format, mode 0600) into --backup-dir; a failed dump aborts;
-  4. build (optionally with --build-network host). The image itself also runs `chmod -R a+rX /app` after COPY,
+     the catalogs, including privileges and row level security; any breaking change, or any step that fails, aborts
+     (fail closed); and (b) back up the database with pg_dump (custom format) into --backup-dir. The dump file is
+     created with O_EXCL|O_NOFOLLOW and fchmod 0600 under an unpredictable name; an existing file or symbolic link
+     is left untouched and the backup fails. A failed dump aborts;
+  5. build (optionally with --build-network host). The image itself also runs `chmod -R a+rX /app` after COPY,
      so a 0600 checkout cannot leave migrate (uid 999) unable to read the schema;
-  5. `docker compose up -d --wait --force-recreate --remove-orphans` (this also runs the migration);
-  6. smoke-test the public entry point: GET /board is 200, an unauthenticated POST /mcp is 401, and one real MCP
+  6. `docker compose up -d --wait --force-recreate --remove-orphans` (this also runs the migration);
+  7. smoke-test the public entry point: GET /board is 200, an unauthenticated POST /mcp is 401, and one real MCP
      initialize + tools/list + fetch_inbox succeeds with the smoke token.
 If `up` or a smoke check fails or times out, the previous images are re-tagged and `up` runs again (rollback). The
 rollback only reports success when every service is verified to run its previous image again and the smoke checks
@@ -31,9 +35,10 @@ what to restore by hand. A JSON report goes to stdout; progress goes to stderr.
 
 What a rollback does not do: it restores images, not the database and not the Compose topology. The migration has
 already been applied when the smoke test runs, so the previous image must work against the new schema: migrations
-are expand-only (add nullable or defaulted columns and tables; never drop, rename, retype or tighten in the same
-release), which the throwaway-database precheck enforces. The backup is for a manual restore if that discipline was
-broken. Images pinned by digest come from the Compose files; to roll those back, deploy the previous revision of the
+are expand-only (add nullable or defaulted columns and tables; never drop, rename, retype, tighten, change
+privileges, or enable row level security in the same release), which the throwaway-database precheck enforces.
+A rollback does not undo GRANT, REVOKE, policies, or row level security that already committed. The backup is for a
+manual restore if that discipline was broken. Images pinned by digest come from the Compose files; to roll those back, deploy the previous revision of the
 files. Removed orphans are not recreated. If every container was removed there is no previous image to restore.
 The smoke token is read from a file, sent only as a bearer header and never printed.
 
@@ -44,6 +49,7 @@ not verified to be running (rollback failed or incomplete, or there was nothing 
 Python 3.9+ standard library only.
 """
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -76,6 +82,9 @@ DUMP_MAGIC = b'PGDMP'
 SCHEMA_FILE = Path(__file__).resolve().parents[1] / 'bridge/space_schema.sql'
 UP_GRACE = 120
 TIMEOUT_RETURNCODE = 124
+PRIVATE_OUTPUT_ERROR = 'cannot create a private output file'
+LOCK_DIR = Path(tempfile.gettempdir()) / 'baton-deploy-locks'
+BACKUP_CREATE_ATTEMPTS = 3
 
 # Early warning only: textual patterns for statements a previous image cannot survive. The authoritative check is
 # the throwaway-database catalog diff (precheck_migration); this just fails fast on the obvious cases.
@@ -88,6 +97,11 @@ INCOMPATIBLE_SQL = (
     ('renames an object', r'\bRENAME\b'),
     ('changes a column type', r'\bALTER\s+(?:COLUMN\s+)?' + IDENT + r'\s+(?:SET\s+DATA\s+)?TYPE\b'),
     ('makes an existing column NOT NULL', r'\bSET\s+NOT\s+NULL\b'),
+    # A rollback re-tags images; it does not undo privileges or row level security that already committed.
+    ('changes privileges', r'\b(?:GRANT|REVOKE)\b'),
+    ('changes a row level security policy', r'\b(?:CREATE|ALTER|DROP)\s+POLICY\b'),
+    ('changes row level security',
+     r'\b(?:NO\s+FORCE|ENABLE|DISABLE|FORCE)\s+ROW\s+LEVEL\s+SECURITY\b'),
 )
 ADD_CLAUSE = re.compile(r'\bADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?'
                         r'(?!CONSTRAINT\b|PRIMARY\b|UNIQUE\b|CHECK\b|FOREIGN\b|LIKE\b|EXCLUDE\b)([^;]*?)'
@@ -131,10 +145,36 @@ CATALOG_SQL = """SELECT json_build_object(
    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.prokind IN ('f','p') AND %(system)s),
  'types', (SELECT coalesce(json_agg(json_build_object('name', n.nspname||'.'||t.typname,
      'def', t.typtype::text||':'||coalesce((SELECT string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid = t.oid), ''))), '[]'::json)
-   FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typtype IN ('e','d') AND %(system)s)
+   FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typtype IN ('e','d') AND %(system)s),
+ 'policies', (SELECT coalesce(json_agg(json_build_object('t', n.nspname||'.'||c.relname, 'name', p.polname,
+     'permissive', p.polpermissive, 'cmd', p.polcmd::text, 'roles', coalesce(p.polroles::text, ''),
+     'qual', pg_get_expr(p.polqual, p.polrelid), 'with_check', pg_get_expr(p.polwithcheck, p.polrelid))), '[]'::json)
+   FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE %(system)s),
+ 'row_security', (SELECT coalesce(json_agg(json_build_object('t', n.nspname||'.'||c.relname,
+     'enabled', c.relrowsecurity, 'forced', c.relforcerowsecurity)), '[]'::json)
+   FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE c.relkind IN ('r','p') AND %(system)s),
+ 'privileges', (SELECT coalesce(json_agg(json_build_object('t', n.nspname||'.'||c.relname,
+     'acl', coalesce(c.relacl::text, ''))), '[]'::json)
+   FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE c.relkind IN ('r','p','v','m','S','f') AND %(system)s),
+ 'column_privileges', (SELECT coalesce(json_agg(json_build_object('t', n.nspname||'.'||c.relname, 'c', a.attname,
+     'acl', a.attacl::text)), '[]'::json)
+   FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE a.attnum > 0 AND NOT a.attisdropped AND a.attacl IS NOT NULL AND c.relkind IN ('r','p','v','m') AND %(system)s),
+ 'schema_privileges', (SELECT coalesce(json_agg(json_build_object('n', n.nspname,
+     'acl', coalesce(n.nspacl::text, ''))), '[]'::json)
+   FROM pg_namespace n WHERE n.nspname !~ '^(pg_|information_schema$)'),
+ 'function_privileges', (SELECT coalesce(json_agg(json_build_object('sig', p.oid::regprocedure::text,
+     'acl', coalesce(p.proacl::text, ''))), '[]'::json)
+   FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.prokind IN ('f','p') AND %(system)s),
+ 'database_privileges', (SELECT coalesce(json_agg(json_build_object('acl', coalesce(d.datacl::text, ''))), '[]'::json)
+   FROM pg_database d WHERE d.datname = current_database())
 );
 """ % {'system': SYSTEM_SCHEMAS}
-SNAPSHOT_KEYS = ('columns', 'relations', 'constraints', 'indexes', 'triggers', 'functions', 'types')
+SNAPSHOT_KEYS = ('columns', 'relations', 'constraints', 'indexes', 'triggers', 'functions', 'types',
+                 'policies', 'row_security', 'privileges', 'column_privileges', 'schema_privileges',
+                 'function_privileges', 'database_privileges')
 
 
 class UsageError(Exception):
@@ -176,7 +216,12 @@ class SubprocessRunner:
         sink = None
         try:
             if stdout_path:
-                sink = os.fdopen(os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'wb')
+                try:
+                    sink = os.fdopen(open_private_file(stdout_path), 'wb')
+                except UsageError:
+                    raise
+                except OSError as exc:
+                    return Result(1, '', '%s: %s' % (PRIVATE_OUTPUT_ERROR, exc.strerror or exc.errno))
             try:
                 proc = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
                                         stdout=sink or subprocess.PIPE, stderr=subprocess.PIPE,
@@ -214,7 +259,7 @@ class Config:
                  build_network=None, wait_timeout=300, build_timeout=1800, command_timeout=120, backup_timeout=900,
                  backup_dir=None, no_backup=False, allow_remove_orphans=False, allow_incompatible_migration=False,
                  schema_file=None, precheck_timeout=300, base_url='http://127.0.0.1:8080', ca_file=None, smoke_token_file=None,
-                 smoke_timeout=60, request_timeout=20, dry_run=False):
+                 smoke_timeout=60, request_timeout=20, dry_run=False, lock_timeout=None):
         self.compose_files, self.project, self.env_file = compose_files, project, env_file
         self.project_directory, self.profiles, self.build = project_directory, list(profiles), build
         self.build_network, self.wait_timeout, self.build_timeout = build_network, wait_timeout, build_timeout
@@ -224,6 +269,15 @@ class Config:
         self.precheck_timeout = precheck_timeout
         self.base_url, self.ca_file, self.smoke_token_file = base_url, ca_file, smoke_token_file
         self.smoke_timeout, self.request_timeout, self.dry_run = smoke_timeout, request_timeout, dry_run
+        self.lock_timeout = lock_timeout
+
+    @property
+    def lock_wait(self):
+        """How long a second deploy may wait for the project lock before it aborts without changing anything."""
+        if self.lock_timeout is not None:
+            return self.lock_timeout
+        return (self.build_timeout + self.backup_timeout + self.precheck_timeout + self.up_timeout
+                + self.smoke_timeout + self.command_timeout)
 
     @property
     def up_timeout(self):
@@ -521,8 +575,14 @@ def schema_breaking_changes(before, after):
     """Differences between two catalog snapshots that a previous application image may not survive.
 
     Dropped or changed objects, narrowed columns, and constraints, unique indexes or triggers that tighten
-    something that already existed are all flagged. Only genuinely additive changes pass.
+    something that already existed are all flagged. Privilege, policy, and row-level-security changes on objects
+    the previous image already used are flagged too: a rollback does not undo them. Only genuinely additive
+    changes pass. A snapshot missing any section fails closed.
     """
+    missing = [key for key in SNAPSHOT_KEYS
+               if not isinstance(before.get(key), list) or not isinstance(after.get(key), list)]
+    if missing:
+        return ['catalog snapshot is missing %s' % ', '.join(missing)]
     changes = []
 
     def keyed(snapshot, section, key):
@@ -587,6 +647,88 @@ def schema_breaking_changes(before, after):
             changes.append('drops type %s' % name)
         elif new_types[name]['def'] != item['def']:
             changes.append('changes type %s' % name)
+    changes.extend(privilege_and_rls_changes(before, after, keyed))
+    return changes
+
+
+def privilege_and_rls_changes(before, after, keyed):
+    """Privilege, policy, and row-level-security differences a rollback cannot undo.
+
+    Changes on relations that already existed are breaking. A new table's default ACL is not: the previous image
+    never referenced it.
+    """
+    changes = []
+    old_relations = {relation.rsplit(':', 1)[0] for relation in before['relations']}
+    old_columns = {(item['t'], item['c']) for item in before['columns']}
+    relations_after = {relation.rsplit(':', 1)[0] for relation in after['relations']}
+
+    old_priv, new_priv = keyed(before, 'privileges', lambda i: i['t']), keyed(after, 'privileges', lambda i: i['t'])
+    for name, item in sorted(old_priv.items()):
+        now = new_priv.get(name)
+        if name in old_relations and now is not None and now['acl'] != item['acl']:
+            changes.append('changes privileges on %s' % name)
+    for name, item in sorted(new_priv.items()):
+        if name in old_relations and name not in old_priv and item['acl']:
+            changes.append('changes privileges on %s' % name)
+
+    old_cols, new_cols = (keyed(before, 'column_privileges', lambda i: (i['t'], i['c'])),
+                          keyed(after, 'column_privileges', lambda i: (i['t'], i['c'])))
+    for key, item in sorted(old_cols.items()):
+        now = new_cols.get(key)
+        if now is None:
+            if key[0] in relations_after:
+                changes.append('changes privileges on %s.%s' % key)
+        elif now['acl'] != item['acl']:
+            changes.append('changes privileges on %s.%s' % key)
+    for key in sorted(set(new_cols) - set(old_cols)):
+        if key in old_columns:
+            changes.append('changes privileges on %s.%s' % key)
+
+    old_schema, new_schema = (keyed(before, 'schema_privileges', lambda i: i['n']),
+                              keyed(after, 'schema_privileges', lambda i: i['n']))
+    for name, item in sorted(old_schema.items()):
+        now = new_schema.get(name)
+        if now is not None and now['acl'] != item['acl']:
+            changes.append('changes privileges on schema %s' % name)
+
+    old_functions = {item['sig'] for item in before['functions']}
+    old_fn, new_fn = (keyed(before, 'function_privileges', lambda i: i['sig']),
+                      keyed(after, 'function_privileges', lambda i: i['sig']))
+    for signature, item in sorted(old_fn.items()):
+        now = new_fn.get(signature)
+        if now is not None and now['acl'] != item['acl']:
+            changes.append('changes privileges on function %s' % signature)
+    for signature, item in sorted(new_fn.items()):
+        if signature in old_functions and signature not in old_fn and item['acl']:
+            changes.append('changes privileges on function %s' % signature)
+
+    if sorted(item.get('acl', '') for item in before['database_privileges']) != \
+            sorted(item.get('acl', '') for item in after['database_privileges']):
+        changes.append('changes database privileges')
+
+    old_rs, new_rs = keyed(before, 'row_security', lambda i: i['t']), keyed(after, 'row_security', lambda i: i['t'])
+    for name, item in sorted(old_rs.items()):
+        now = new_rs.get(name)
+        if now is not None and (now['enabled'] != item['enabled'] or now['forced'] != item['forced']):
+            changes.append('changes row level security on %s' % name)
+    for name, item in sorted(new_rs.items()):
+        if name in old_relations and name not in old_rs and (item['enabled'] or item['forced']):
+            changes.append('changes row level security on %s' % name)
+
+    def policy_signature(item):
+        return (item.get('permissive'), item.get('cmd'), item.get('roles'), item.get('qual'), item.get('with_check'))
+
+    old_pol, new_pol = (keyed(before, 'policies', lambda i: (i['t'], i['name'])),
+                        keyed(after, 'policies', lambda i: (i['t'], i['name'])))
+    for key, item in sorted(old_pol.items()):
+        now = new_pol.get(key)
+        if now is None:
+            changes.append('drops policy %s on %s' % (key[1], key[0]))
+        elif policy_signature(now) != policy_signature(item):
+            changes.append('changes policy %s on %s' % (key[1], key[0]))
+    for key in sorted(set(new_pol) - set(old_pol)):
+        if key[0] in old_relations:
+            changes.append('adds policy %s to the existing table %s' % (key[1], key[0]))
     return changes
 
 
@@ -809,11 +951,134 @@ def project_snapshot(docker, project):
     return parse_inspect(inspected.stdout)
 
 
+def no_follow_flag():
+    flag = getattr(os, 'O_NOFOLLOW', None)
+    if flag is None:
+        raise UsageError('this platform cannot refuse symbolic links')
+    return flag
+
+
+def open_private_file(path):
+    """Create a new regular file and force mode 0600. Never follows or truncates an existing path.
+
+    O_EXCL refuses a file that is already there. O_NOFOLLOW refuses a symbolic link. The mode argument of
+    open is masked by umask, so fchmod sets 0600 on the fd afterwards. An existing looser file is left unchanged.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow_flag(), 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
+            raise OSError('backup mode could not be set to 0600')
+    except OSError:
+        os.close(fd)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    return fd
+
+
+def path_has_symlink(path):
+    """True when path or an existing ancestor is a symbolic link."""
+    path = Path(path)
+    if path.is_absolute():
+        current, parts = Path(path.anchor), path.parts[1:]
+    else:
+        current, parts = Path('.'), path.parts
+    if current.is_symlink():
+        return True
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+        if not current.exists():
+            return False
+    return False
+
+
+def private_directory(path, label):
+    """Create a real directory and force mode 0700. A symbolic link is refused, never followed."""
+    path = Path(path)
+    if path_has_symlink(path):
+        return '%s is a symbolic link' % label
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError:
+        return 'cannot create %s' % label
+    if path.is_symlink() or not path.is_dir():
+        return '%s is a symbolic link' % label
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | no_follow_flag())
+    except OSError:
+        return '%s is a symbolic link or cannot be opened' % label
+    try:
+        try:
+            os.fchmod(fd, 0o700)
+        except OSError:
+            return '%s mode could not be set to 0700' % label
+        mode = stat.S_IMODE(os.fstat(fd).st_mode)
+    finally:
+        os.close(fd)
+    if mode != 0o700:
+        return '%s mode could not be set to 0700' % label
+    return None
+
+
+def private_output_refused(result):
+    return (result.stderr or '').startswith(PRIVATE_OUTPUT_ERROR)
+
+
+def seal_private_file(path):
+    """Force mode 0600 on a regular file and return (size, header). An error string means do not trust the path.
+
+    The open uses O_NOFOLLOW, so a symbolic link is not chmod'd and its target is not read.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | no_follow_flag())
+    except OSError as exc:
+        return exc.strerror or 'cannot open backup'
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return 'backup is not a regular file'
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            return 'backup mode could not be set to 0600'
+        if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
+            return 'backup mode could not be set to 0600'
+        return info.st_size, os.read(fd, len(DUMP_MAGIC))
+    finally:
+        os.close(fd)
+
+
+def discard_regular(path):
+    """Remove a regular file this deploy created. A symbolic link is left in place."""
+    path = Path(path)
+    if path.is_symlink():
+        return
+    try:
+        if path.is_file():
+            path.unlink()
+    except OSError:
+        pass
+
+
+def backup_dump_path(backup_dir, project):
+    """Dump path whose second-resolution stamp is not enough to predict the name."""
+    stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '_', project) or 'project'
+    return Path(backup_dir) / ('baton-%s-%s-%s.dump' % (safe, stamp, secrets.token_hex(8)))
+
+
 def backup_database(docker, config, project, database):
     """pg_dump the database straight from its container before the migration can run. Returns (report, ok).
 
     `database` is the ensure_database() report: the dump happens whenever a database volume exists, including
-    when every application container is stopped or removed.
+    when every application container is stopped or removed. The directory is mode 0700 and is not a symlink.
+    Each attempt uses a new unpredictable name and O_EXCL|O_NOFOLLOW; an existing file or link is not overwritten,
+    not chmod'd, and not removed.
     """
     if config.no_backup:
         return {'skipped': True, 'reason': 'disabled by --no-backup'}, True
@@ -821,29 +1086,86 @@ def backup_database(docker, config, project, database):
         return {'skipped': True, 'reason': database['reason']}, True
     if not database['ok']:
         return {'ok': False, 'error': database['error']}, False
-    stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
-    path = Path(config.backup_dir) / ('baton-%s-%s.dump' % (re.sub(r'[^A-Za-z0-9_.-]', '_', project), stamp))
     argv = config.compose_base() + ['exec', '-T', DATABASE_SERVICE, 'sh', '-c', DUMP_SCRIPT]
     if config.dry_run:
+        path = backup_dump_path(config.backup_dir, project)
         docker.run(argv, mutating=True, timeout=config.backup_timeout, stdout_path=str(path))
         return {'planned': True, 'path': str(path)}, True
-    try:
-        Path(config.backup_dir).mkdir(mode=0o700, parents=True, exist_ok=True)
-    except OSError:
-        return {'ok': False, 'error': 'cannot create --backup-dir'}, False
-    result = docker.run(argv, mutating=True, timeout=config.backup_timeout, stdout_path=str(path))
+    error = private_directory(config.backup_dir, 'backup directory')
+    if error:
+        return {'ok': False, 'error': error}, False
+    result, path, refused = None, None, None
+    for _attempt in range(BACKUP_CREATE_ATTEMPTS):
+        path = backup_dump_path(config.backup_dir, project)
+        result = docker.run(argv, mutating=True, timeout=config.backup_timeout, stdout_path=str(path))
+        if not private_output_refused(result):
+            refused = None
+            break
+        refused = result
     report = {'path': str(path), 'ok': False}
-    try:
-        size = path.stat().st_size
-        header = path.open('rb').read(len(DUMP_MAGIC))
-    except OSError:
-        size, header = 0, b''
-    if result.returncode != 0 or size == 0 or header != DUMP_MAGIC:
-        report['error'] = 'pg_dump failed' + (' (timed out)' if result.timed_out else ': ' + tail(result.stderr, 300))
-        path.unlink(missing_ok=True)
+    if refused is not None:
+        report['error'] = 'refusing to follow or overwrite an existing backup path'
         return report, False
-    report.update(ok=True, bytes=size)
+    sealed = seal_private_file(path)
+    if isinstance(sealed, str) or result.returncode != 0 or sealed[0] == 0 or sealed[1] != DUMP_MAGIC:
+        if result.returncode != 0:
+            report['error'] = 'pg_dump failed' + (' (timed out)' if result.timed_out else ': ' + tail(result.stderr, 300))
+        elif isinstance(sealed, str):
+            report['error'] = sealed
+        else:
+            report['error'] = 'pg_dump output is empty or not a custom-format dump'
+        discard_regular(path)
+        return report, False
+    report.update(ok=True, bytes=sealed[0])
     return report, True
+
+
+def lock_file(project):
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '_', project) or 'project'
+    return Path(LOCK_DIR) / ('%s.lock' % safe)
+
+
+class DeployLock:
+    """Exclusive flock around one project's deploy, including rollback retagging.
+
+    The wait is bounded. The lock file itself is created with O_NOFOLLOW and mode 0600, in a 0700 directory.
+    """
+
+    def __init__(self, path, timeout, clock, sleep):
+        self.path, self.timeout, self.clock, self.sleep = Path(path), timeout, clock, sleep
+        self.fd = None
+
+    def acquire(self):
+        error = private_directory(self.path.parent, 'deploy lock directory')
+        if error:
+            raise UsageError(error)
+        try:
+            self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | no_follow_flag(), 0o600)
+            os.fchmod(self.fd, 0o600)
+        except OSError as exc:
+            self.close()
+            raise UsageError('cannot open the deploy lock: %s' % (exc.strerror or exc.errno)) from None
+        deadline = self.clock() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                if self.clock() >= deadline:
+                    self.close()
+                    raise UsageError('another deploy holds the lock for this project; timed out after %ss' % self.timeout)
+                remaining = deadline - self.clock()
+                self.sleep(remaining if remaining < 0.05 else 0.05)
+
+    def close(self):
+        fd, self.fd = self.fd, None
+        if fd is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
 
 
 def run_build(docker, config, model):
@@ -1143,86 +1465,97 @@ def deploy(config, runner, http=None, log=None, clock=time.monotonic, sleep=time
 
     model = compose_model(docker, config)
     project = report['project'] = model['project']
-    previous = project_snapshot(docker, project)
-    report['previous_images'] = previous
-    log('recorded %d service image(s), running or stopped' % len(previous))
+    lock = DeployLock(lock_file(project), config.lock_wait, clock, sleep)
+    acquired = False
+    try:
+        try:
+            lock.acquire()
+            acquired = True
+        except UsageError as exc:
+            return stop('aborted', str(exc))
+        previous = project_snapshot(docker, project)
+        report['previous_images'] = previous
+        log('recorded %d service image(s), running or stopped' % len(previous))
 
-    orphans = sorted(set(previous) - set(model['services']))
-    report['orphans'] = [dict(info, service=name) for name, info in sorted(previous.items()) if name in orphans]
-    if orphans and not config.allow_remove_orphans:
-        return stop('aborted', 'the Compose files do not declare %s, and up --remove-orphans would delete %s; nothing '
-                    'was changed. Check that every -f file is passed, or acknowledge with --allow-remove-orphans'
-                    % (', '.join(orphans), 'it' if len(orphans) == 1 else 'them'))
+        orphans = sorted(set(previous) - set(model['services']))
+        report['orphans'] = [dict(info, service=name) for name, info in sorted(previous.items()) if name in orphans]
+        if orphans and not config.allow_remove_orphans:
+            return stop('aborted', 'the Compose files do not declare %s, and up --remove-orphans would delete %s; nothing '
+                        'was changed. Check that every -f file is passed, or acknowledge with --allow-remove-orphans'
+                        % (', '.join(orphans), 'it' if len(orphans) == 1 else 'them'))
 
-    core = {name: info for name, info in previous.items() if name not in orphans}
-    holds = hold_previous_images(docker, core)
-    report['held_images'] = holds
-    if not all(hold['ok'] for hold in holds):
-        return stop('aborted', 'could not protect the previous images; nothing was changed')
+        core = {name: info for name, info in previous.items() if name not in orphans}
+        holds = hold_previous_images(docker, core)
+        report['held_images'] = holds
+        if not all(hold['ok'] for hold in holds):
+            return stop('aborted', 'could not protect the previous images; nothing was changed')
 
-    database = ensure_database(docker, config, project, previous)
-    report['database'] = database
-    if not database['ok'] and not (config.no_backup and config.allow_incompatible_migration):
-        return stop('aborted', 'the database cannot be reached, so it can be neither checked nor backed up (%s); '
-                    'nothing else was changed' % database['error'])
-    if not database['ok'] or database['state'] == 'none':
-        report['precheck'] = {'skipped': True, 'reason': database.get('reason') or 'database unavailable'}
-    else:
-        log('prechecking the migration on a throwaway database')
-        precheck = report['precheck'] = precheck_migration(docker, config, migration_sql)
-        if not precheck['ok'] and not config.allow_incompatible_migration:
-            detail = ('the precheck could not be completed (%s); treated as incompatible' % precheck['error']
-                      if precheck['error'] else 'it would break the previous image: ' + '; '.join(precheck['changes']))
-            return stop('aborted', 'the migration is not backward compatible: %s; nothing was changed. Split it into an '
-                        'expand release and a later contract release, or pass --allow-incompatible-migration' % detail)
+        database = ensure_database(docker, config, project, previous)
+        report['database'] = database
+        if not database['ok'] and not (config.no_backup and config.allow_incompatible_migration):
+            return stop('aborted', 'the database cannot be reached, so it can be neither checked nor backed up (%s); '
+                        'nothing else was changed' % database['error'])
+        if not database['ok'] or database['state'] == 'none':
+            report['precheck'] = {'skipped': True, 'reason': database.get('reason') or 'database unavailable'}
+        else:
+            log('prechecking the migration on a throwaway database')
+            precheck = report['precheck'] = precheck_migration(docker, config, migration_sql)
+            if not precheck['ok'] and not config.allow_incompatible_migration:
+                detail = ('the precheck could not be completed (%s); treated as incompatible' % precheck['error']
+                          if precheck['error'] else 'it would break the previous image: ' + '; '.join(precheck['changes']))
+                return stop('aborted', 'the migration is not backward compatible: %s; nothing was changed. Split it into an '
+                            'expand release and a later contract release, or pass --allow-incompatible-migration' % detail)
 
-    backup, backup_ok = backup_database(docker, config, project, database)
-    report['backup'] = backup
-    if not backup_ok:
-        return stop('aborted', 'the database backup failed; nothing was changed')
+        backup, backup_ok = backup_database(docker, config, project, database)
+        report['backup'] = backup
+        if not backup_ok:
+            return stop('aborted', 'the database backup failed; nothing was changed')
 
-    if config.build:
-        log('building')
-        build = run_build(docker, config, model)
-        report['build'] = command_report(build, [token], config.dry_run)
-        if build.returncode != 0:
-            return stop('build_failed', 'the build failed or timed out before any container was changed')
-    else:
-        report['build'] = {'skipped': True}
+        if config.build:
+            log('building')
+            build = run_build(docker, config, model)
+            report['build'] = command_report(build, [token], config.dry_run)
+            if build.returncode != 0:
+                return stop('build_failed', 'the build failed or timed out before any container was changed')
+        else:
+            report['build'] = {'skipped': True}
 
-    log('docker compose up --wait --force-recreate --remove-orphans')
-    up = docker.run(up_command(config), mutating=True, timeout=config.up_timeout)
-    report['up'] = command_report(up, [token], config.dry_run)
+        log('docker compose up --wait --force-recreate --remove-orphans')
+        up = docker.run(up_command(config), mutating=True, timeout=config.up_timeout)
+        report['up'] = command_report(up, [token], config.dry_run)
 
-    if config.dry_run:
-        retag, skipped = plan_rollback(core, {})
-        report.update(status='dry_run', ok=True, smoke={'skipped': True, 'checks': list(SMOKE_STEPS)},
-                      rollback={'attempted': False, 'would_retag_if_changed': retag, 'skipped': skipped},
-                      commands=docker.commands)
+        if config.dry_run:
+            retag, skipped = plan_rollback(core, {})
+            report.update(status='dry_run', ok=True, smoke={'skipped': True, 'checks': list(SMOKE_STEPS)},
+                          rollback={'attempted': False, 'would_retag_if_changed': retag, 'skipped': skipped},
+                          commands=docker.commands)
+            return report
+
+        smoke = None
+        if up.returncode == 0:
+            log('smoke tests')
+            smoke = run_smoke(http, token, config.smoke_timeout, clock, sleep)
+            report['smoke'] = smoke
+        else:
+            report['smoke'] = {'skipped': True, 'reason': 'docker compose up %s' % ('timed out' if up.timed_out else 'failed')}
+
+        action = decide(up.returncode == 0, smoke, core)
+        if action == 'deployed':
+            report.update(status='deployed', ok=True, rollback={'attempted': False})
+        elif action == 'fail':
+            report.update(status='failed', ok=False, rollback={'attempted': False, 'reason': 'no previous deployment existed'})
+        else:
+            log('deployment failed; rolling back')
+            rollback = roll_back(docker, config, project, previous, orphans, http, token, backup, holds, log, clock, sleep)
+            report['rollback'] = rollback
+            report.update(status='rolled_back' if rollback['ok'] else 'rollback_failed', ok=False)
+        if report['status'] != 'rollback_failed':
+            release_holds(docker, holds)
+        report['commands'] = docker.commands
         return report
-
-    smoke = None
-    if up.returncode == 0:
-        log('smoke tests')
-        smoke = run_smoke(http, token, config.smoke_timeout, clock, sleep)
-        report['smoke'] = smoke
-    else:
-        report['smoke'] = {'skipped': True, 'reason': 'docker compose up %s' % ('timed out' if up.timed_out else 'failed')}
-
-    action = decide(up.returncode == 0, smoke, core)
-    if action == 'deployed':
-        report.update(status='deployed', ok=True, rollback={'attempted': False})
-    elif action == 'fail':
-        report.update(status='failed', ok=False, rollback={'attempted': False, 'reason': 'no previous deployment existed'})
-    else:
-        log('deployment failed; rolling back')
-        rollback = roll_back(docker, config, project, previous, orphans, http, token, backup, holds, log, clock, sleep)
-        report['rollback'] = rollback
-        report.update(status='rolled_back' if rollback['ok'] else 'rollback_failed', ok=False)
-    if report['status'] != 'rollback_failed':
-        release_holds(docker, holds)
-    report['commands'] = docker.commands
-    return report
+    finally:
+        if acquired:
+            lock.close()
 
 
 def positive(value):
@@ -1256,7 +1589,11 @@ def parse_args(argv):
     parser.add_argument('--command-timeout', type=positive, default=120, metavar='SECONDS',
                         help='hard timeout for every other docker command')
     parser.add_argument('--backup-dir', metavar='DIR',
-                        help='directory for the pre-deploy pg_dump (created with mode 0700, files 0600)')
+                        help='directory for the pre-deploy pg_dump (mode 0700, files 0600, unpredictable names; '
+                             'an existing file or symbolic link is refused)')
+    parser.add_argument('--lock-timeout', type=positive, default=None, metavar='SECONDS',
+                        help='how long to wait for another deploy of this project (default: the sum of the '
+                             'build, backup, precheck, up, smoke and command budgets)')
     parser.add_argument('--no-backup', action='store_true', help='deploy without a database backup (recorded in the report)')
     parser.add_argument('--backup-timeout', type=positive, default=900, metavar='SECONDS', help='hard timeout for pg_dump')
     parser.add_argument('--allow-remove-orphans', action='store_true',
@@ -1295,7 +1632,7 @@ def main(argv=None, runner=None, http=None, stdout=None, stderr=None, clock=time
                         args.build, args.build_network, args.wait_timeout, args.build_timeout, args.command_timeout,
                         args.backup_timeout, args.backup_dir, args.no_backup, args.allow_remove_orphans,
                         args.allow_incompatible_migration, args.schema_file, args.precheck_timeout, parse_base_url(args.base_url), args.ca_file,
-                        args.smoke_token_file, args.smoke_timeout, args.request_timeout, args.dry_run)
+                        args.smoke_token_file, args.smoke_timeout, args.request_timeout, args.dry_run, args.lock_timeout)
         report = deploy(config, runner or SubprocessRunner(), http, log, clock, sleep)
     except UsageError as exc:
         print(json.dumps({'status': 'error', 'ok': False, 'error': str(exc)}, indent=2), file=stdout)
