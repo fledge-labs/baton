@@ -29,7 +29,7 @@ Acceptance criteria are written as checks that can be run or observed; each mile
 ### W2-2 R1 safeguards
 - Work: approver delegation (in progress); loop guard with `traceparent` lineage; budgets per thread and per agent with 80% and 100% warnings.
 - Acceptance:
-  - an agent approver without an auditable delegation from a human is refused at the gate, and self-approval is refused;
+  - only the space owner (root) or a principal holding an approver delegation from that root's chain may approve; delegations cannot exceed the grantor's scope and cyclic delegations are refused; nobody but the root approves their own work, and the root's self-approval is accepted only when explicitly marked and audited; scopes configured for two-party confirmation complete only after two distinct approvers, with the root's decision final when required (DECISIONS 287, 291);
   - an agent-to-agent chain is paused automatically after more than N turns, and the pause is visible in the thread and audit;
   - every call carries `traceparent`, and the audit can reconstruct the lineage of a chain;
   - message-count and spend budgets stop further turns at 100%, and a human is warned at 80% and at 100%.
