@@ -6,6 +6,8 @@
 
 **Owner 决定（已执行）：移除内置 Codex worker。** Baton 是通信与协作层，不执行任务；执行属于通过 MCP、HTTP、A2A 或适配器连接的外部 agent。因此下文凡与自动 worker 相关的条目（自动派发、`claim_next`、`worker_success` gate、`fail_auto`/`finish_auto`/`interrupt_auto`、dispatcher 服务主体、worker 健康与失败分类）一律标为“按 owner 决定移除”，编号保留、不再存在对应实现。`execution_mode='codex'`、`gate_mode='worker_success'` 以及 `a2a_id`、`backend`、`dispatch_started_at` 列是**历史值**：旧行仍可读取，schema 的检查约束继续允许它们以便旧数据库迁移，但没有任何路径写入、领取或批准这些行。不带接收人的 `submit_task` 现在创建手工、未指派的任务（见 X12）。
 
+**Owner 决定（2026-10-17）：产品范围收窄为通信与任务协作。** “Baton 不做文档协作，就做通信与任务协作平台。”页面（page）在产品上呈现为 channel（频道）：消息、评论与任务的容器，API 名称（`create_page`/`get_page`/`list_pages`）不变。下文 O2 中关于页面块、以及块编辑、提案与署名历史（`create_block`、`update_block`、`revert_block`、`proposal_*`、`list_attribution`、`comment.selection`）的条目描述的是已有实现，现已标为弃用，只做标记、行为不变；`kind='task'` 的块通过 `get_block`/`list_blocks` 永久受支持。弃用清单、替代和响应标记见 [API 的 Deprecated 一节](../api.md#deprecated)。
+
 范围：替换 Agent Mail 为 Baton 自有的空间、页面、评论、提及、任务与协作协议。采用 PostgreSQL，优先实现数据库与 HTTP 行为；不连接真实 ChatGPT 空间，不做同步、导入既有账户或协议互操作。
 
 ## 证据与标记

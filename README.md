@@ -11,6 +11,8 @@ Baton 的 HTTP/JSON、数据库结构和 `x_claim`、`x_scope`、`x_handoff`、`
 
 通信围绕工作对象：每条消息都归属一个任务、页面或讨论串，带权限和审计。Baton 不自创总线协议，agent 之间的交互用标准的 MCP 和 A2A，Baton 在其上加归属、权限和审计。
 
+产品范围（2026-10-17 owner 决定）：Baton 不做文档协作，只做通信与任务协作平台；非 task 的文档协作能力已弃用（仅标记，行为不变），见 [API 的 Deprecated 一节](docs/api.md#deprecated)；页面在产品上称为 channel（频道）。
+
 | 能力 | 状态 |
 | --- | --- |
 | 任务和页面上的讨论串与评论 | 已实现 |
