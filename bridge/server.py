@@ -243,6 +243,8 @@ PUBLIC_OPERATIONS = {
     "webhook_subscribe": (True, {"url": (str, ...), "events": (list[str] | None, None), "include_preview": (bool, False)}),
     "webhook_list": (False, {}),
     "webhook_delete": (True, {"subscription_id": (str, ...)}),
+    "webhook_rotate_secret": (True, {"subscription_id": (str, ...)}),
+    "webhook_revoke_previous_secret": (True, {"subscription_id": (str, ...)}),
     "claim": (True, {"task_id": (str, ...), "lease_seconds": (int, 300)}),
     "renew": (True, {"task_id": (str, ...), "epoch": (int, ...), "lease_seconds": (int, 300)}),
     "submit_result": (True, {"task_id": (str, ...), "epoch": (int, ...), "result": (str, ...), "evidence": (Any, None)}),
@@ -526,13 +528,30 @@ for tool_name in sorted(PUBLIC_OPERATIONS.keys() | ALIASES.keys()):
         register_space_tool(tool_name, tool_name)
 
 
+def webhook_headers(item, keys, body, now):
+    """Standard Webhooks headers, signed for this attempt, plus the deprecated X-Baton-* set (newest secret only)."""
+    return {"Content-Type": "application/json", "User-Agent": "baton-webhook/1",
+            **webhooks.standard_headers(keys, item["notification_id"], now, body),
+            "X-Baton-Event": item["payload"]["event"], "X-Baton-Delivery": item["notification_id"],
+            "X-Baton-Signature": webhooks.sign(keys[0], body)}
+
+
 async def deliver_webhook(item, gate):
     body = webhooks.encode(item["payload"])
-    headers = {"Content-Type": "application/json", "User-Agent": "baton-webhook/1", "X-Baton-Event": item["payload"]["event"],
-               "X-Baton-Delivery": item["notification_id"], "X-Baton-Signature": webhooks.sign(item["secret"], body)}
     started = time.monotonic()
     async with gate:
         try:
+            # Secrets are read now, not at claim time, so a rotation or revocation after the claim applies to this
+            # attempt. The remaining window is the time between this read and the request leaving.
+            keys = await store_call("webhook_signing_secrets", SERVICE, item["subscription_id"])
+        except BridgeError as exc:
+            # Nothing was sent and no attempt is recorded: the claim lease expires and the delivery is claimed again.
+            audit("webhook.queue_unavailable", error_code=exc.code)
+            return
+        if keys is None:
+            return
+        try:
+            headers = webhook_headers(item, keys, body, int(time.time()))
             outcome, status = await asyncio.get_running_loop().run_in_executor(_WEBHOOK_POOL, webhooks.post, item["url"], body, headers)
         except Exception:
             outcome, status = "network_error", None

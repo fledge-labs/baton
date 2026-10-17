@@ -18,7 +18,7 @@ Communication is anchored to work objects: every message belongs to a task, page
 | Claim and lease (x_claim), scope conflict checks (x_scope), dependency graph (x_graph) | implemented |
 | Handoff notes (x_handoff), approval and gates (x_gate), append-only audit (x_audit) | implemented |
 | Work-face checklist (x_ready) | implemented |
-| Outbound notifications: transactional outbox, webhooks (HMAC-signed, at-least-once), wait_inbox long poll | implemented |
+| Outbound notifications: transactional outbox, webhooks (signed per Standard Webhooks, secret rotation, at-least-once), wait_inbox long poll | implemented |
 | Outbound notifications: MCP push notifications | planned |
 | Owner integration: a human identity for the owner (root of delegation chains), read-only board access, Feishu reminders only for matters reserved to the owner (money and subscriptions; personal or client data; irreversible deletion of production data or backups; placing or moving credentials), none for daily tasks | planned (next week) |
 | Approver gate (R1): the space owner is the root approver; only principals holding an approver delegation (human or agent) may otherwise approve, nobody but the root approves work they submitted or executed, and policy can require two-party confirmation (`x_delegation`, `x_approval_policy`) | implemented |
@@ -32,7 +32,7 @@ Communication is anchored to work objects: every message belongs to a task, page
 | Sync outcomes written back to the task or thread as minutes when a real-time conversation ends | planned (with the real-time layer, R4) |
 | Response-time agreements per priority with escalation or reassignment on timeout | in progress |
 | Unified Ask object (kind, message, responseSchema, expiresAt, escalateTo; reply accept/decline/cancel/edit/respond/ignore) as the base for web, Slack and Feishu approvals | planned (W2), [roadmap](roadmap.md) |
-| Outbound webhooks signed per the Standard Webhooks specification (today: `X-Baton-Signature` HMAC) | planned (W2), [roadmap](roadmap.md) |
+| Outbound webhooks signed per the Standard Webhooks specification: `webhook-id`, `webhook-timestamp`, `webhook-signature` (`v1,<base64 HMAC-SHA256>` over `{id}.{unix seconds}.{body}`, space-separated list), `whsec_<base64>` secrets, rotation with a grace period (default 24 h) and immediate revoke (`webhook_revoke_previous_secret`); the legacy `X-Baton-*` headers are still sent and are removed on 2027-01-31 | implemented (W2-5), [roadmap](roadmap.md) |
 | People in the space: human identity, web board (tasks, threads, audit), approve / reject / edit in the task | planned (W3), [roadmap](roadmap.md) |
 | Presence (online / idle / offline / needs-wake-up) with wake-up adapters and "disturb only when needed" (priority, quiet hours, escalation on timeout) | planned (W3), [roadmap](roadmap.md) |
 | Mobile via Feishu and Slack bridges: notifications, inline replies, button approvals | planned (W4), [roadmap](roadmap.md) |
@@ -217,7 +217,9 @@ This implements response-time agreements on the web: a deadline is the interrupt
 
 **6. Webhooks signed per Standard Webhooks.**
 - Outbound webhooks move to the Standard Webhooks headers `webhook-id`, `webhook-timestamp` and `webhook-signature` (a space-delimited signature list, which allows secret rotation without downtime). Source: <https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md>. The same scheme is used by the MCP Events draft and by ChatGPT's webhook mode: <https://developers.openai.com/plugins/build/mcp-events>, <https://hookdeck.com/webhooks/guides/add-mcp-events-to-mcp-server>.
-- Today (implemented): HMAC-SHA256 over the raw body in `X-Baton-Signature`, with `X-Baton-Delivery` for deduplication ([docs/api.md](../api.md#通知与送达webhookwait_inbox)). The migration to Standard Webhooks is planned (W2-5); the open question is the compatibility window for existing receivers.
+- Implemented (W2-5): every delivery attempt carries `webhook-id` (the notification id, unchanged across retries), `webhook-timestamp` (Unix seconds of that attempt) and `webhook-signature`. The signed content is `{webhook-id}.{webhook-timestamp}.{raw body}`; the signature is HMAC-SHA256 with the standard-base64 digest, written `v1,<signature>`. The header holds one entry normally and several, space-separated, while a rotation grace period is active. Secrets use the `whsec_<base64>` format (the key is the base64-decoded part, 32 bytes). Receivers should check the timestamp within 5 minutes and deduplicate on `webhook-id` ([docs/api.md](../api.md#通知与送达webhookwait_inbox), [security model](../security-model.md)).
+- Secret rotation: `webhook_rotate_secret` returns a new secret once; the replaced secret keeps signing for a grace period (default 24 h, `BATON_WEBHOOK_ROTATION_GRACE_SECONDS`, read at startup), so two `v1` entries are sent. `webhook_revoke_previous_secret` ends the grace period immediately and is the emergency path for a leaked old secret.
+- Compatibility: the legacy headers `X-Baton-Event`, `X-Baton-Delivery` and `X-Baton-Signature` (HMAC-SHA256 over the raw body, current secret only) are still sent next to the Standard Webhooks headers. They are deprecated and are removed on 2027-01-31; receivers should switch to Standard Webhooks verification now.
 - Inbound: Baton accepts A2A push authentication, that is the `AuthenticationInfo` the peer registers with its push config: <https://a2a-protocol.org/latest/specification/>.
 
 **7. Identity.**
