@@ -6,6 +6,7 @@ HTTPS server with a throw-away certificate; no external network is used.
 """
 
 import asyncio
+import base64
 import datetime
 import hashlib
 import hmac
@@ -15,6 +16,7 @@ import json
 import ssl
 import threading
 import time
+import types
 import uuid
 
 import pytest
@@ -261,9 +263,10 @@ def test_wait_inbox_is_a_schema_operation_and_mcp_tool(team, api):
     schema = client.get("/v1/space/schema", headers={"Authorization": "Bearer " + tokens["owner"]}).json()["operations"]
     assert schema["wait_inbox"]["mutation"] is False
     assert schema["webhook_subscribe"]["mutation"] and schema["webhook_delete"]["mutation"] and not schema["webhook_list"]["mutation"]
+    assert schema["webhook_rotate_secret"]["mutation"]
     headers = {"Authorization": "Bearer " + tokens["worker"], "Host": "bridge", "Accept": "application/json, text/event-stream"}
     listing = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).json()["result"]["tools"]
-    assert {"wait_inbox", "webhook_subscribe", "webhook_list", "webhook_delete"} <= {tool["name"] for tool in listing}
+    assert {"wait_inbox", "webhook_subscribe", "webhook_list", "webhook_delete", "webhook_rotate_secret"} <= {tool["name"] for tool in listing}
     make_task(call, team[1], team[3])
     response = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
         "name": "wait_inbox", "arguments": {"after_seq": 0, "timeout_seconds": 0}}}).json()["result"]
@@ -341,8 +344,40 @@ def due_now(store):
 
 def subscribe(call, label, url, events=None):
     result = call(label, "webhook_subscribe", operation_id=op(), url=url, events=events)
-    assert set(result) == {"subscription_id", "signing_secret", "replay"} and len(result["signing_secret"]) == 64
-    return result["subscription_id"], bytes.fromhex(result["signing_secret"])
+    assert set(result) == {"subscription_id", "signing_secret", "replay"}
+    return result["subscription_id"], key_of(result["signing_secret"])
+
+
+def key_of(secret):
+    """Signing key bytes from a whsec_<base64> secret, as the Standard Webhooks libraries read it."""
+    assert secret.startswith("whsec_") and len(base64.b64decode(secret[6:], validate=True)) == 32
+    return base64.b64decode(secret[len("whsec_"):])
+
+
+class InvalidWebhook(Exception):
+    pass
+
+
+def standard_webhooks_verify(secret, headers, body, now=None, tolerance=300):
+    """The Standard Webhooks reference algorithm (spec repo, python-libs `Webhook.verify`) re-implemented.
+
+    secret is the "whsec_<base64>" text. Headers are matched case-insensitively. Returns the parsed body or raises.
+    """
+    headers = {name.lower(): value for name, value in headers.items()}
+    try:
+        message_id, timestamp, signatures = headers["webhook-id"], headers["webhook-timestamp"], headers["webhook-signature"]
+        sent = int(timestamp)
+    except (KeyError, ValueError):
+        raise InvalidWebhook("missing or malformed headers") from None
+    if abs((time.time() if now is None else now) - sent) > tolerance:
+        raise InvalidWebhook("timestamp outside tolerance")
+    key = base64.b64decode(secret[len("whsec_"):]) if secret.startswith("whsec_") else secret.encode()
+    expected = base64.b64encode(hmac.new(key, f"{message_id}.{timestamp}.".encode() + body, hashlib.sha256).digest()).decode()
+    for entry in signatures.split(" "):
+        version, _, signature = entry.partition(",")
+        if version == "v1" and hmac.compare_digest(signature.encode(), expected.encode()):
+            return json.loads(body)
+    raise InvalidWebhook("no matching signature")
 
 
 def public_dns(monkeypatch, mapping=None):
@@ -361,6 +396,8 @@ def test_signed_delivery_carries_metadata_only_and_only_the_callers_notification
     approver(pg_store, identities["reviewer"], by=identities["owner"])
     worker_id, worker_secret = subscribe(call, "worker", receiver.url("/worker"), ["task.assigned", "gate.decided"])
     reviewer_id, reviewer_secret = subscribe(call, "reviewer", receiver.url("/reviewer"))
+    secret_text = {worker_secret: "whsec_" + base64.b64encode(worker_secret).decode(),
+                   reviewer_secret: "whsec_" + base64.b64encode(reviewer_secret).decode()}
     task = make_task(call, identities, page)
     claim = call("worker", "claim", operation_id=op(), task_id=task["task_id"])
     call("worker", "submit_result", operation_id=op(), task_id=task["task_id"], epoch=claim["epoch"], result=RESULT)
@@ -385,10 +422,15 @@ def test_signed_delivery_carries_metadata_only_and_only_the_callers_notification
             expected = "sha256=" + hmac.new(secret, request["body"], hashlib.sha256).hexdigest()
             assert hmac.compare_digest(request["headers"]["X-Baton-Signature"], expected)
             assert request["headers"]["Content-Type"] == "application/json"
+            assert request["headers"]["webhook-id"] == payload["id"]
+            assert standard_webhooks_verify(secret_text[secret], request["headers"], request["body"]) == payload
+            assert len(request["headers"]["webhook-signature"].split(" ")) == 1
             assert payload["recipient"] == identities["worker" if path == "/worker" else "reviewer"]["agent"]
             assert not any(text.encode() in request["body"] for text in PRIVATE_TEXT)
     wrong = "sha256=" + hmac.new(worker_secret, by_path["/reviewer"][0]["body"], hashlib.sha256).hexdigest()
     assert wrong != by_path["/reviewer"][0]["headers"]["X-Baton-Signature"]
+    with pytest.raises(InvalidWebhook):
+        standard_webhooks_verify(secret_text[worker_secret], by_path["/reviewer"][0]["headers"], by_path["/reviewer"][0]["body"])
 
     audit = query(pg_store, "SELECT event,metadata,requested_by,agent FROM baton.x_audit WHERE event='webhook.delivered'")
     assert len(audit) == 3 and {row["agent"] for row in audit} == {SERVICE_ACTOR.principal}
@@ -417,7 +459,7 @@ def test_webhook_previews_are_opt_in_per_subscription_and_checked_at_delivery(te
     assert set(detailed) == PAYLOAD_KEYS | PREVIEW_KEYS and detailed["object_id"] == task["task_id"]
     assert detailed["actor"] == {"principal": identities["owner"]["agent"], "kind": "human"}
     assert detailed["subject"] == "[assigned] " + PROMPT and detailed["body_preview"] == PROMPT
-    expected = "sha256=" + hmac.new(bytes.fromhex(opted["signing_secret"]), by_path["/preview"]["body"], hashlib.sha256).hexdigest()
+    expected = "sha256=" + hmac.new(key_of(opted["signing_secret"]), by_path["/preview"]["body"], hashlib.sha256).hexdigest()
     assert hmac.compare_digest(by_path["/preview"]["headers"]["X-Baton-Signature"], expected)
     audit = json.dumps(query(pg_store, "SELECT metadata FROM baton.x_audit WHERE event='webhook.delivered'"))
     assert PROMPT not in audit
@@ -546,7 +588,7 @@ def test_signing_secret_is_returned_once_and_never_listed_stored_in_results_or_a
     body = dict(operation_id=operation_id, url="https://hooks.example.test/hook?token=query-secret-value", events=["task.assigned"])
     first = call("worker", "webhook_subscribe", **body)
     secret = first["signing_secret"]
-    assert len(bytes.fromhex(secret)) == 32 and first["replay"] is False
+    assert len(key_of(secret)) == 32 and first["replay"] is False
     replay = call("worker", "webhook_subscribe", **body)
     assert replay == {"subscription_id": first["subscription_id"], "replay": True}
     assert call("worker", "webhook_subscribe", 409, **{**body, "events": None})["code"] == "operation_conflict"
@@ -567,7 +609,7 @@ def test_signing_secret_is_returned_once_and_never_listed_stored_in_results_or_a
     ])
     assert secret not in persisted and second["signing_secret"] not in persisted and "query-secret-value" not in persisted
     stored = query(pg_store, "SELECT secret FROM baton.x_webhook WHERE id=%s", (first["subscription_id"],))[0]["secret"]
-    assert bytes(stored) == bytes.fromhex(secret)
+    assert bytes(stored) == key_of(secret)
     output = capsys.readouterr()
     assert secret not in output.out + output.err
 
@@ -600,3 +642,121 @@ def test_delivery_internals_are_service_only_and_timeouts_are_enforced(team, rec
     receiver.delay = 0
     assert webhooks.post(receiver.url(), b"{}", {"Content-Type": "application/json"}, timeout=5) == ("delivered", 200)
     assert webhooks.sign(b"k", b"body") == "sha256=" + hmac.new(b"k", b"body", hashlib.sha256).hexdigest()
+
+
+def test_standard_webhooks_signature_matches_the_published_test_vector():
+    secret, message_id, timestamp, body = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw", "msg_p5jXN8AQM9LWM0D4loKWxJek", 1614265330, b'{"test": 2432232314}'
+    expected = "v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE="
+    assert webhooks.standard_signature(webhooks.parse_secret(secret), message_id, timestamp, body) == expected
+    headers = {"webhook-id": message_id, "webhook-timestamp": str(timestamp), "webhook-signature": expected}
+    assert standard_webhooks_verify(secret, headers, body, now=timestamp + 60) == {"test": 2432232314}
+    for now in (timestamp + 301, timestamp - 301):
+        with pytest.raises(InvalidWebhook):
+            standard_webhooks_verify(secret, headers, body, now=now)
+    with pytest.raises(InvalidWebhook):
+        standard_webhooks_verify(secret, {**headers, "webhook-id": "msg_other"}, body, now=timestamp)
+    with pytest.raises(InvalidWebhook):
+        standard_webhooks_verify(secret, headers, body + b" ", now=timestamp)
+    assert webhooks.format_secret(webhooks.parse_secret(secret)) == secret
+    with pytest.raises(ValueError):
+        webhooks.parse_secret("not-a-whsec")
+
+
+def test_rotation_signs_with_both_secrets_during_the_grace_period_and_keeps_the_deprecated_headers(team, receiver, modules, pg_store, capsys):
+    call, identities, space, page = team
+    subscription = call("worker", "webhook_subscribe", operation_id=op(), url=receiver.url(), events=["task.assigned"])
+    old_secret = subscription["signing_secret"]
+    make_task(call, identities, page)
+    assert deliver(modules) == 1
+    before = receiver.requests.pop()
+    assert len(before["headers"]["webhook-signature"].split(" ")) == 1
+
+    rotation_id = op()
+    rotated = call("worker", "webhook_rotate_secret", operation_id=rotation_id, subscription_id=subscription["subscription_id"])
+    new_secret = rotated["signing_secret"]
+    assert set(rotated) == {"subscription_id", "signing_secret", "previous_secret_expires_at", "replay"} and rotated["replay"] is False
+    assert new_secret != old_secret and key_of(new_secret) != key_of(old_secret)
+    grace_ends = datetime.datetime.fromisoformat(rotated["previous_secret_expires_at"])
+    assert datetime.timedelta(hours=23, minutes=59) < grace_ends - datetime.datetime.now(datetime.timezone.utc) <= datetime.timedelta(hours=24)
+
+    replay = call("worker", "webhook_rotate_secret", operation_id=rotation_id, subscription_id=subscription["subscription_id"])
+    assert replay["replay"] is True and "signing_secret" not in replay
+    assert call("worker", "webhook_rotate_secret", 409, operation_id=rotation_id, subscription_id=str(uuid.uuid4()))["code"] == "operation_conflict"
+    assert call("reviewer", "webhook_rotate_secret", 404, operation_id=op(), subscription_id=subscription["subscription_id"])["code"] == "not_found"
+    assert call("worker", "webhook_rotate_secret", 404, operation_id=op(), subscription_id=str(uuid.uuid4()))["code"] == "not_found"
+    assert call("worker", "webhook_rotate_secret", 422, operation_id=op(), subscription_id="not-a-uuid")["code"] == "invalid"
+    assert len(call("worker", "webhook_list")) == 1
+
+    task = make_task(call, identities, page)
+    assert deliver(modules) == 1
+    request = receiver.requests.pop()
+    headers = request["headers"]
+    entries = headers["webhook-signature"].split(" ")
+    assert len(entries) == 2 and all(entry.startswith("v1,") for entry in entries)
+    payload = json.loads(request["body"])
+    assert payload["object_id"] == task["task_id"] and headers["webhook-id"] == payload["id"]
+    assert abs(int(headers["webhook-timestamp"]) - time.time()) < 60
+    assert standard_webhooks_verify(new_secret, headers, request["body"]) == payload, "a receiver on the new secret verifies"
+    assert standard_webhooks_verify(old_secret, headers, request["body"]) == payload, "a receiver still on the old secret verifies"
+    assert entries[0] == webhooks.standard_signature(key_of(new_secret), payload["id"], int(headers["webhook-timestamp"]), request["body"])
+    assert entries[1] == webhooks.standard_signature(key_of(old_secret), payload["id"], int(headers["webhook-timestamp"]), request["body"])
+    assert hmac.compare_digest(headers["X-Baton-Signature"], webhooks.sign(key_of(new_secret), request["body"]))
+    assert headers["X-Baton-Event"] == "task.assigned" and headers["X-Baton-Delivery"] == payload["id"]
+
+    execute(pg_store, "UPDATE baton.x_webhook SET previous_secret_expires_at=clock_timestamp()-interval '1 second'")
+    make_task(call, identities, page)
+    assert deliver(modules) == 1
+    request = receiver.requests.pop()
+    assert len(request["headers"]["webhook-signature"].split(" ")) == 1
+    assert standard_webhooks_verify(new_secret, request["headers"], request["body"])
+    with pytest.raises(InvalidWebhook):
+        standard_webhooks_verify(old_secret, request["headers"], request["body"])
+    assert query(pg_store, "SELECT previous_secret,previous_secret_expires_at FROM baton.x_webhook")[0] == {
+        "previous_secret": None, "previous_secret_expires_at": None}, "an expired secret is discarded, not kept"
+
+    audit = query(pg_store, "SELECT event,metadata FROM baton.x_audit WHERE event='webhook.secret_rotated'")
+    assert len(audit) == 1 and audit[0]["metadata"]["grace_seconds"] == 24 * 3600
+    persisted = json.dumps([query(pg_store, "SELECT result::text AS t FROM baton.operations"),
+                            query(pg_store, "SELECT metadata::text AS t FROM baton.x_audit")])
+    assert old_secret not in persisted and new_secret not in persisted
+    output = capsys.readouterr()
+    assert new_secret not in output.out + output.err
+
+
+def test_rotating_twice_in_the_grace_period_retires_the_oldest_secret_and_the_grace_is_configurable(team, receiver, modules, pg_store, monkeypatch):
+    call, identities, space, page = team
+    subscription = call("worker", "webhook_subscribe", operation_id=op(), url=receiver.url(), events=["task.assigned"])
+    first = subscription["signing_secret"]
+    monkeypatch.setenv("BATON_WEBHOOK_ROTATION_GRACE_SECONDS", "3600")
+    second = call("worker", "webhook_rotate_secret", operation_id=op(), subscription_id=subscription["subscription_id"])
+    monkeypatch.delenv("BATON_WEBHOOK_ROTATION_GRACE_SECONDS")
+    third = call("worker", "webhook_rotate_secret", operation_id=op(), subscription_id=subscription["subscription_id"])
+    ends = datetime.datetime.fromisoformat(third["previous_secret_expires_at"]) - datetime.datetime.now(datetime.timezone.utc)
+    assert datetime.timedelta(hours=23) < ends <= datetime.timedelta(hours=24)
+    make_task(call, identities, page)
+    assert deliver(modules) == 1
+    request = receiver.requests.pop()
+    assert len(request["headers"]["webhook-signature"].split(" ")) == 2
+    assert standard_webhooks_verify(third["signing_secret"], request["headers"], request["body"])
+    assert standard_webhooks_verify(second["signing_secret"], request["headers"], request["body"])
+    with pytest.raises(InvalidWebhook):
+        standard_webhooks_verify(first, request["headers"], request["body"])
+
+
+def test_retries_keep_the_webhook_id_and_sign_each_attempt_with_a_fresh_timestamp(team, receiver, modules, pg_store, monkeypatch):
+    call, identities, space, page = team
+    _, secret = subscribe(call, "worker", receiver.url(), ["task.assigned"])
+    make_task(call, identities, page)
+    receiver.statuses = [500, 200]
+    clock = iter([1_800_000_000, 1_800_000_100])
+    monkeypatch.setattr(modules[1], "time", types.SimpleNamespace(time=lambda: next(clock), monotonic=time.monotonic))
+    assert deliver(modules) == 1
+    due_now(pg_store)
+    assert deliver(modules) == 1
+    first, second = receiver.requests
+    assert first["headers"]["webhook-id"] == second["headers"]["webhook-id"] == json.loads(first["body"])["id"]
+    assert (first["headers"]["webhook-timestamp"], second["headers"]["webhook-timestamp"]) == ("1800000000", "1800000100")
+    for request in (first, second):
+        text = "whsec_" + base64.b64encode(secret).decode()
+        assert standard_webhooks_verify(text, request["headers"], request["body"], now=int(request["headers"]["webhook-timestamp"]))
+    assert first["headers"]["webhook-signature"] != second["headers"]["webhook-signature"]

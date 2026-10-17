@@ -5,6 +5,7 @@ Nothing here logs or returns URLs, headers, response bodies or secrets. Failures
 reduced to a small fixed vocabulary so callers can persist them without leaking data.
 """
 
+import base64
 import hashlib
 import hmac
 import http.client
@@ -20,6 +21,7 @@ TIMEOUT_SECONDS = 10
 MAX_URL_LENGTH = 2048
 ALLOW_HOSTS_ENV = "BATON_WEBHOOK_ALLOW_HOSTS"
 CA_BUNDLE_ENV = "BATON_WEBHOOK_CA_BUNDLE"
+SECRET_PREFIX = "whsec_"
 METADATA_ADDRESSES = frozenset(
     [ipaddress.ip_address(".".join(map(str, parts))) for parts in ((169, 254, 169, 254), (169, 254, 170, 2), (100, 100, 100, 200), (192, 0, 0, 192))]
     + [ipaddress.ip_address("fd00:ec2::254")])
@@ -109,7 +111,32 @@ def check_url(url):
 
 
 def sign(secret, body):
+    """Deprecated X-Baton-Signature value, kept for one release alongside the Standard Webhooks headers."""
     return "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest()
+
+
+def format_secret(raw):
+    """Standard Webhooks secret text: "whsec_" plus the base64 of the raw signing key."""
+    return SECRET_PREFIX + base64.b64encode(raw).decode("ascii")
+
+
+def parse_secret(text):
+    """Raw signing key bytes from a "whsec_<base64>" secret."""
+    if not isinstance(text, str) or not text.startswith(SECRET_PREFIX):
+        raise ValueError("secret must start with whsec_")
+    return base64.b64decode(text[len(SECRET_PREFIX):], validate=True)
+
+
+def standard_signature(secret, message_id, timestamp, body):
+    """One "v1,<base64 HMAC-SHA256>" entry over "{id}.{timestamp}.{body}" (Standard Webhooks)."""
+    signed = f"{message_id}.{timestamp}.".encode("ascii") + body
+    return "v1," + base64.b64encode(hmac.new(secret, signed, hashlib.sha256).digest()).decode("ascii")
+
+
+def standard_headers(secrets, message_id, timestamp, body):
+    """webhook-id, webhook-timestamp and webhook-signature; one space-separated v1 entry per active secret."""
+    return {"webhook-id": message_id, "webhook-timestamp": str(int(timestamp)),
+            "webhook-signature": " ".join(standard_signature(secret, message_id, int(timestamp), body) for secret in secrets)}
 
 
 def encode(payload):

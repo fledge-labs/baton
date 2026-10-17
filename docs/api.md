@@ -75,6 +75,7 @@ with urlopen(request) as response:
 - `webhook_subscribe(operation_id: str, url: str, events: list[str] | None = None, include_preview: bool = False)` — 写入；仅此一次返回 `signing_secret`。`include_preview` 见下文“webhook 预览”。
 - `webhook_list()` — 读取。
 - `webhook_delete(operation_id: str, subscription_id: str)` — 写入。
+- `webhook_rotate_secret(operation_id: str, subscription_id: str)` — 写入；仅此一次返回新的 `signing_secret`，旧密钥在宽限期内继续参与签名。见“密钥轮换”。
 - `claim(operation_id: str, task_id: str, lease_seconds: int = 300)` — 写入。
 - `renew(operation_id: str, task_id: str, epoch: int, lease_seconds: int = 300)` — 写入。
 - `submit_result(operation_id: str, task_id: str, epoch: int, result: str, evidence: Any = None)` — 写入。
@@ -209,29 +210,58 @@ Baton 不会执行 `acceptance_command`。它只是显示给领取人和 gate �
 
 ### webhook 订阅与投递
 
-- `webhook_subscribe(operation_id, url, events=None)` 返回 `{"subscription_id","signing_secret","replay"}`。`events` 为空（null）表示全部事件，否则是上表事件名的非空子集。签名密钥由服务端生成（32 个随机字节，以 64 位十六进制返回），只在首次成功响应中出现：它不写入 operations 重放结果、审计或日志，`webhook_list` 与同 operation_id 的重放都不再返回。丢失密钥时删除订阅并重建。每个 principal 最多 10 个订阅，超出返回 `429 rate_limited`。
+- `webhook_subscribe(operation_id, url, events=None)` 返回 `{"subscription_id","signing_secret","replay"}`。`events` 为空（null）表示全部事件，否则是上表事件名的非空子集。签名密钥由服务端生成（32 个随机字节），按 [Standard Webhooks](https://www.standardwebhooks.com/) 的格式以 `whsec_<base64>` 返回（旧版本返回 64 位十六进制，见下文“迁移”），只在首次成功响应中出现：它不写入 operations 重放结果、审计或日志，`webhook_list` 与同 operation_id 的重放都不再返回。丢失密钥时用 `webhook_rotate_secret` 换一个新密钥，或删除订阅并重建。每个 principal 最多 10 个订阅，超出返回 `429 rate_limited`。
 - `webhook_list()` 只列调用者自己的订阅：`subscription_id`、`url`、`events`、`created_at` 和 pending/delivered/dead 计数，没有密钥。`webhook_delete(operation_id, subscription_id)` 只能删除自己的订阅（否则 `404`），并取消其待投递项。
 - 订阅只投递调用者自己的、订阅创建之后产生的通知；不回放历史，历史用 `wait_inbox` 读取。
 
-投递是对订阅 URL 的 `POST`，正文是紧凑 JSON（键排序）`{id, seq, event, object_type, object_id, thread_id, created_at, recipient}`（默认只含元数据，见下文“webhook 预览”），请求头：
+投递是对订阅 URL 的 `POST`，正文是紧凑 JSON（键排序）`{id, seq, event, object_type, object_id, thread_id, created_at, recipient}`（默认只含元数据，见下文“webhook 预览”）。签名遵循 [Standard Webhooks](https://www.standardwebhooks.com/) 规范（[规范仓库](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md)），请求头：
 
-- `X-Baton-Event`：事件名。
-- `X-Baton-Delivery`：通知 id（所有重试相同）。
-- `X-Baton-Signature`：`sha256=<十六进制 HMAC-SHA256>`，密钥是 `signing_secret` 十六进制解码得到的 32 字节，消息是未经改动的原始正文字节。
+- `webhook-id`：通知 id（所有重试相同，接收方据此去重）。
+- `webhook-timestamp`：本次尝试发送时的 Unix 时间（秒，十进制整数）。重试时每次重新取值并重新签名。
+- `webhook-signature`：空格分隔的签名列表，每项形如 `v1,<base64>`，其中 base64 是 `HMAC-SHA256(key, "{webhook-id}.{webhook-timestamp}.{原始正文}")` 的结果。平时只有一项；轮换宽限期内有两项（新密钥在前，旧密钥在后）。接收方只要有一项匹配即通过，应忽略版本不是 `v1` 的项。
+- `Content-Type: application/json`、`User-Agent: baton-webhook/1`。
+
+密钥格式是 `whsec_<base64>`：去掉 `whsec_` 前缀后做 base64 解码得到 `key`（32 字节），**不是**把整个字符串当作密钥。消息中的 `{原始正文}` 是未经改动的原始正文字节，不要先解析再重新序列化。官方各语言库（`standardwebhooks`）直接接受 `signing_secret`。
+
+**接收方校验与时间戳容差。** 接收方应：(1) 三个头缺一即拒绝；(2) 检查 `webhook-timestamp` 与本地时间相差不超过 **5 分钟**（正负两个方向），超出即拒绝，以防重放；这要求接收方时钟与 NTP 同步，且 Baton 每次重试都使用新的时间戳，所以合法的延迟重试不会因超出容差被拒；(3) 用常数时间比较签名；(4) 按 `webhook-id` 去重，因为送达是至少一次。
 
 ```python
 # SPDX-License-Identifier: Apache-2.0
+import base64
 import hashlib
 import hmac
+import time
 
-def verify(secret_hex: str, raw_body: bytes, header: str) -> bool:
-    expected = "sha256=" + hmac.new(bytes.fromhex(secret_hex), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, header)
+TOLERANCE_SECONDS = 300
+
+def verify(signing_secret: str, headers: dict, raw_body: bytes) -> bool:
+    message_id = headers["webhook-id"]
+    timestamp = headers["webhook-timestamp"]
+    if abs(time.time() - int(timestamp)) > TOLERANCE_SECONDS:
+        return False
+    key = base64.b64decode(signing_secret.removeprefix("whsec_"))
+    signed = f"{message_id}.{timestamp}.".encode() + raw_body
+    expected = base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
+    for entry in headers["webhook-signature"].split(" "):
+        version, _, signature = entry.partition(",")
+        if version == "v1" and hmac.compare_digest(signature, expected):
+            return True
+    return False
 ```
+
+**密钥轮换。** `webhook_rotate_secret(operation_id, subscription_id)` 为自己的订阅生成新密钥，返回 `{"subscription_id","signing_secret","previous_secret_expires_at","replay"}`；新的 `whsec_` 密钥只在首次成功响应中出现，不写入重放结果、审计或日志。订阅不存在或不属于调用者返回 `404`。此后每次投递同时用新旧两个密钥签名（`webhook-signature` 里两项 `v1`），直到 `previous_secret_expires_at`（默认 24 小时，运营者可用 `BATON_WEBHOOK_ROTATION_GRACE_SECONDS` 设置 0 到 30 天的秒数）；到期后旧密钥被清除，只剩一项。推荐流程：轮换，把新密钥部署到接收端（接收端可同时接受新旧两个密钥），确认新密钥通过后让旧密钥过期。宽限期内再次轮换会让最旧的密钥立即失效：任何时刻最多两个密钥签名。审计事件 `webhook.secret_rotated` 只记录订阅标识和宽限秒数。
+
+**迁移：已弃用的 `X-Baton-*` 头。** 为兼容现有接收端，这些旧头再保留一个版本，同时与 `webhook-*` 头一起发送；它们已弃用，下个版本会被移除，请迁移到上面的 `webhook-*` 头：
+
+- `X-Baton-Event`（已弃用）：事件名。
+- `X-Baton-Delivery`（已弃用）：通知 id，与 `webhook-id` 相同。
+- `X-Baton-Signature`（已弃用）：`sha256=<十六进制 HMAC-SHA256>`，密钥与 `webhook-signature` 的密钥是同一串字节，消息是未经改动的原始正文字节（不含 id 和时间戳，因此没有重放保护）。轮换期间它只用当前（新）密钥，不会出现两个签名。
+
+旧版本订阅返回的 64 位十六进制密钥就是同一串 32 字节，所以现有订阅不需要重建，旧签名也不变；要换成 Standard Webhooks 校验，把十六进制转换为 `"whsec_" + base64(bytes.fromhex(secret_hex))` 即可，或者直接轮换一次拿到新的 `whsec_` 密钥。
 
 **webhook 预览（`include_preview`，默认 `false`）。** webhook 默认保持只含元数据。订阅时设置 `include_preview=true`，该订阅的每次投递才在正文里多带 `wait_inbox` 同样的 `actor`、`subject`、`body_preview`；它们在投递时现算，并且是在重新检查收件人 view 权限之后，失权的投递仍直接 dead-letter。预览是评论或任务说明的片段，会离开 Baton 发往订阅 URL，只对你信任的端点开启。`webhook_list` 返回每个订阅的 `include_preview`；该选项只在为 `true` 时计入幂等请求摘要，不带它的旧请求重放不变，同一 operation_id 换了取值返回 `409 operation_conflict`。审计与日志仍不含预览内容。
 
-**至少一次语义。** 2xx 视为成功；其他状态码、超时或网络错误都会重试（不跟随 3xx 重定向，3xx 记为失败）。同一通知可能重复到达，也不保证跨通知的顺序；接收方必须按 `X-Baton-Delivery` 去重，并在处理前验证签名。每次尝试 10 秒超时，最多 8 次，第 n 次失败后的等待为 30、60、120、240、480、960、1920 秒（总计约 64 分钟），之后进入 dead-letter，不再重试。投递前重新检查收件人的 view 权限，失权的投递直接 dead-letter（`forbidden`），不发出请求。
+**至少一次语义。** 2xx 视为成功；其他状态码、超时或网络错误都会重试（不跟随 3xx 重定向，3xx 记为失败）。同一通知可能重复到达，也不保证跨通知的顺序；接收方必须按 `webhook-id` 去重，并在处理前验证签名与时间戳。每次尝试 10 秒超时，最多 8 次，第 n 次失败后的等待为 30、60、120、240、480、960、1920 秒（总计约 64 分钟），之后进入 dead-letter，不再重试。投递前重新检查收件人的 view 权限，失权的投递直接 dead-letter（`forbidden`），不发出请求。
 
 每次尝试写入 `x_webhook_attempt`（序号、结果、HTTP 状态、耗时）；每个最终结果写一条审计 `webhook.delivered` 或 `webhook.dead_lettered`，只含订阅/通知标识、事件名、尝试次数、状态码和错误类别，不含 URL（含查询串）、请求头、响应或密钥。
 

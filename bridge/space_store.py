@@ -52,6 +52,8 @@ WEBHOOK_MAX_ATTEMPTS = 8
 # Delay after failed attempt n (1-based); the seven delays between eight attempts total about an hour.
 WEBHOOK_BACKOFF_SECONDS = (30, 60, 120, 240, 480, 960, 1920)
 WEBHOOK_LEASE_SECONDS = 60
+WEBHOOK_ROTATION_GRACE_ENV = "BATON_WEBHOOK_ROTATION_GRACE_SECONDS"
+WEBHOOK_ROTATION_GRACE_SECONDS = 24 * 3600
 NOTIFY_SCAN_BATCH = 200
 NOTIFY_SCAN_LIMIT = 1000
 PRIORITIES = ("urgent", "normal", "low")
@@ -606,7 +608,7 @@ class SpaceStore:
                    "subscription_id", "notification_id", "attempts", "http_status", "notify_event", "object_type",
                    "priority", "escalate_to", "from_assignee", "to_assignee", "reason_code", "delegation_id", "grantor", "scope",
                    "created_via", "chain", "owner_kind", "self_approval", "root", "approvals", "approvals_required",
-                   "required_approvals", "root_required", "scope_kind", "approver", "reason", "original_sha256", "edited_sha256"}
+                   "required_approvals", "root_required", "scope_kind", "approver", "reason", "original_sha256", "edited_sha256", "grace_seconds"}
         if not set(metadata) <= allowed:
             raise StoreError("invalid")
         conn.execute("""INSERT INTO baton.x_audit(id,event,agent,actor_account,actor_kind,requested_by,performed_by,
@@ -694,7 +696,7 @@ class SpaceStore:
                 "operations": "principal operation_id request_hash method result",
                 "x_audit": "id time event agent actor_account actor_kind requested_by performed_by operation_id space_id task_id metadata",
                 "x_notify": "id recipient recipient_account event object_type object_id thread_id created_at seq actor actor_kind result_epoch result_author",
-                "x_webhook": "id principal account url events secret created_at include_preview",
+                "x_webhook": "id principal account url events secret created_at include_preview previous_secret previous_secret_expires_at",
                 "x_webhook_delivery": "subscription_id notification_id state attempts next_attempt_at created_at finished_at",
                 "x_webhook_attempt": "id subscription_id notification_id attempt outcome http_status duration_ms created_at",
             }
@@ -2344,7 +2346,7 @@ class SpaceStore:
             conn.execute("INSERT INTO baton.x_webhook(id,principal,account,url,events,secret,include_preview) VALUES (%s,%s,%s,%s,%s,%s,%s)",
                          (identity, actor.principal, actor.account, url, None if events is None else Jsonb(events), secret, include_preview))
             self._audit(conn, actor, operation_id, "webhook.subscribed", subscription_id=identity)
-            return {"subscription_id": identity, "_once": {"signing_secret": secret.hex()}}
+            return {"subscription_id": identity, "_once": {"signing_secret": webhooks.format_secret(secret)}}
         # The default is left out of the digest so requests recorded before the option existed replay unchanged.
         args = {"url": url, "events": events, **({"include_preview": True} if include_preview else {})}
         return self._mutate(actor, operation_id, "webhook_subscribe", args, lambda conn: self._user(actor), effect)
@@ -2370,6 +2372,32 @@ class SpaceStore:
             self._audit(conn, actor, operation_id, "webhook.deleted", subscription_id=subscription_id)
             return {"subscription_id": subscription_id, "deleted": True}
         return self._mutate(actor, operation_id, "webhook_delete", {"subscription_id": subscription_id}, lambda conn: self._user(actor), effect)
+
+    @staticmethod
+    def _rotation_grace_seconds():
+        try:
+            value = int(os.environ.get(WEBHOOK_ROTATION_GRACE_ENV, WEBHOOK_ROTATION_GRACE_SECONDS))
+        except ValueError:
+            return WEBHOOK_ROTATION_GRACE_SECONDS
+        return value if 0 <= value <= 30 * 24 * 3600 else WEBHOOK_ROTATION_GRACE_SECONDS
+
+    def webhook_rotate_secret(self, actor, operation_id, subscription_id):
+        """Replace the signing secret. The new one is returned once; the old one keeps signing for the grace period."""
+        _uuid(subscription_id, "subscription_id")
+        grace = self._rotation_grace_seconds()
+        def effect(conn):
+            secret = secrets.token_bytes(32)
+            # A second rotation inside the grace period retires the oldest secret: at most two sign at any time.
+            row = conn.execute("""UPDATE baton.x_webhook SET previous_secret=secret,
+                previous_secret_expires_at=clock_timestamp()+%s*interval '1 second', secret=%s
+                WHERE id=%s AND principal=%s AND account=%s RETURNING id,previous_secret_expires_at""",
+                (grace, secret, subscription_id, actor.principal, actor.account)).fetchone()
+            if not row:
+                raise StoreError("not_found")
+            self._audit(conn, actor, operation_id, "webhook.secret_rotated", subscription_id=subscription_id, grace_seconds=grace)
+            return {"subscription_id": subscription_id, "previous_secret_expires_at": row["previous_secret_expires_at"],
+                    "_once": {"signing_secret": webhooks.format_secret(secret)}}
+        return self._mutate(actor, operation_id, "webhook_rotate_secret", {"subscription_id": subscription_id}, lambda conn: self._user(actor), effect)
 
     def _settle_delivery(self, conn, delivery, outcome, http_status, duration_ms):
         """Record one attempt and move the delivery to its next state. Only final outcomes are audited."""
@@ -2402,7 +2430,10 @@ class SpaceStore:
         self._service(actor)
         _integer(limit, 1, 100)
         with self._transaction(write=True) as conn:
-            rows = conn.execute("""SELECT d.subscription_id,d.notification_id,d.attempts,w.url,w.secret,w.account,w.include_preview,n.seq,n.event,
+            conn.execute("""UPDATE baton.x_webhook SET previous_secret=NULL,previous_secret_expires_at=NULL
+                WHERE previous_secret_expires_at<=clock_timestamp()""")
+            rows = conn.execute("""SELECT d.subscription_id,d.notification_id,d.attempts,w.url,w.secret,w.account,w.include_preview,
+                CASE WHEN w.previous_secret_expires_at>clock_timestamp() THEN w.previous_secret END AS previous_secret,n.seq,n.event,
                 n.object_type,n.object_id,n.thread_id,n.created_at,n.recipient,n.recipient_account,n.actor,n.actor_kind,
                 n.result_epoch,n.result_author
                 FROM baton.x_webhook_delivery d JOIN baton.x_webhook w ON w.id=d.subscription_id
@@ -2424,7 +2455,8 @@ class SpaceStore:
                 # Previews are opt-in per subscription and read now, after the permission check above, never stored.
                 preview = self._notification_preview(conn, row) if row["include_preview"] else {}
                 claimed.append({"subscription_id": str(row["subscription_id"]), "notification_id": str(row["notification_id"]),
-                                "attempts": row["attempts"], "url": row["url"], "secret": bytes(row["secret"]),
+                                "attempts": row["attempts"], "url": row["url"],
+                                "secrets": [bytes(row["secret"])] + ([bytes(row["previous_secret"])] if row["previous_secret"] is not None else []),
                                 "payload": _json({"id": row["notification_id"], "seq": row["seq"], "event": row["event"],
                                                   "object_type": row["object_type"], "object_id": row["object_id"],
                                                   "thread_id": row["thread_id"], "created_at": row["created_at"],
