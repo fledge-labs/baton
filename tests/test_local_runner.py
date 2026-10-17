@@ -2453,6 +2453,40 @@ def test_a_pending_request_expires_after_its_ttl_and_when_the_lease_is_gone(brid
     assert task_view(space, task_id)["blocked"] is None
 
 
+def test_two_readers_write_permission_expired_once(bridge, space, monkeypatch):
+    from bridge.space_store import SpaceStore
+    task_id = assign(space, bridge, "worker", scopes=[{"kind": "none"}])
+    claimed = claim_for(bridge, "worker", task_id)
+    ask(bridge, "worker", task_id, claimed["epoch"], ttl_seconds=1)
+    time.sleep(1.3)
+    gate = threading.Barrier(2)
+    real = SpaceStore._task_audit
+
+    def wrapped(self, conn, actor, operation_id, event, task, *, once=False, **metadata):
+        if event == "permission.expired":
+            gate.wait(5)
+        return real(self, conn, actor, operation_id, event, task, once=once, **metadata)
+
+    monkeypatch.setattr(SpaceStore, "_task_audit", wrapped)
+    errors = []
+
+    def read(method):
+        try:
+            space.owner.read(method, task_id=task_id)
+        except Exception as error:
+            errors.append(repr(error))
+
+    threads = [threading.Thread(target=read, args=(method,)) for method in ("list_permissions", "get_task")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+        assert not thread.is_alive()
+    assert errors == []
+    assert events_of(space, task_id).count("permission.expired") == 1
+    assert permissions_of(space, task_id)[0]["status"] == "expired"
+
+
 def test_an_expired_request_does_not_clear_a_later_waiting_input_from_the_same_worker(bridge, space):
     task_id = assign(space, bridge, "worker", scopes=[{"kind": "none"}])
     claimed = claim_for(bridge, "worker", task_id, lease=1)
@@ -2600,6 +2634,41 @@ def test_rg_ignores_a_ripgrep_config_that_injects_pre(tmp_path, monkeypatch):
     assert direct.returncode != 0, "without --no-config the same file makes rg run the preprocessor"
     ran = subprocess.run([record["shim"], "hello", "hello.txt"], cwd=work, env=env, capture_output=True, text=True)
     assert ran.returncode == 0 and "hello" in ran.stdout
+
+
+def test_the_shim_does_not_run_python_startup_hooks(tmp_path, monkeypatch):
+    _, keeper, _ = keeper_for(tmp_path, monkeypatch)
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "hello.txt").write_text("hello\n", encoding="utf-8")
+    record = keeper.grant(request_view("r-iso"), "rg", str(work))
+    text = Path(record["shim"]).read_text(encoding="utf-8")
+    shebang, body = text.split("\n", 1)
+    interpreter, flag = shebang[2:].rsplit(" ", 1)
+    assert flag == "-IS" and interpreter.startswith("/") and os.path.isfile(interpreter)
+    assert "import os, sys" in body.split("def _note", 1)[0]
+    assert "import json" not in body.split("def _note", 1)[0]
+    home = tmp_path / "home"
+    marker = tmp_path / "ran"
+    site = subprocess.run([interpreter, "-c", "import site; print(site.getusersitepackages())"],
+                          env={"HOME": str(home), "PATH": "/usr/bin:/bin"}, capture_output=True, text=True, check=True)
+    user_site = Path(site.stdout.strip())
+    user_site.mkdir(parents=True)
+    hook = "open(%r, 'a', encoding='utf-8').write('hit\\n')\n" % str(marker)
+    (user_site / "usercustomize.py").write_text(hook, encoding="utf-8")
+    startup = tmp_path / "startup.py"
+    startup.write_text(hook, encoding="utf-8")
+    planted = tmp_path / "pythonpath"
+    planted.mkdir()
+    (planted / "os.py").write_text(hook, encoding="utf-8")
+    (planted / "json.py").write_text(hook, encoding="utf-8")
+    plain = {"HOME": str(home), "PATH": "/usr/bin:/bin"}
+    control = subprocess.run([interpreter, "-c", "print('ok')"], env=plain, capture_output=True, text=True)
+    assert control.returncode == 0 and marker.is_file() and "hit" in marker.read_text(encoding="utf-8")
+    marker.unlink()
+    env = {**plain, "PYTHONPATH": str(planted), "PYTHONSTARTUP": str(startup)}
+    ran = subprocess.run([record["shim"], "hello", "hello.txt"], cwd=work, env=env, capture_output=True, text=True)
+    assert ran.returncode == 0 and "hello" in ran.stdout and not marker.exists()
 
 
 def test_a_fifo_swapped_in_after_lstat_and_a_device_symlink_are_not_read(tmp_path, monkeypatch):

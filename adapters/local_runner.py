@@ -1432,6 +1432,8 @@ def _exec_env():
 
 
 def _note(grant, reason):
+    # json and time are imported only after the argv check has already refused the call.
+    import json, time
     record = {"grant_id": grant.get("id"), "request_id": grant.get("request_id"), "task_id": grant.get("task_id"),
               "tool": TOOL, "reason": reason, "argv": sys.argv[1:][:40], "time": time.time()}
     name = "%d-%d-%s.json" % (time.time_ns(), os.getpid(), os.urandom(4).hex())
@@ -1478,19 +1480,36 @@ if __name__ == "__main__":
 """
 
 
+def shim_interpreter():
+    """Absolute python3 baked into the shim when the grant is written. -IS is applied by the shebang."""
+    for candidate in ("/usr/bin/python3", sys.executable):
+        if not isinstance(candidate, str) or not candidate or not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
+            continue
+        real = os.path.realpath(candidate)
+        if os.path.isfile(real) and os.access(real, os.X_OK) and ".." not in real.split("/"):
+            return real
+    raise RunnerError("python3 is not installed, so a shim cannot be written")
+
+
 def shim_script(tool, real, spool, grants):
-    """A read-only standard-library program. It never imports the runner and never carries a Baton token."""
-    interpreter = "/usr/bin/python3" if os.path.isfile("/usr/bin/python3") and os.access("/usr/bin/python3", os.X_OK) else sys.executable
+    """A read-only standard-library program. It never imports the runner and never carries a Baton token.
+
+    The shebang is the interpreter resolved now, with -IS: isolated mode ignores PYTHON* and the user site, and -S
+    does not import site, so usercustomize cannot run. Argument checks use only os and sys. json and time are
+    imported later, and only when a call has already been refused.
+    """
+    interpreter = shim_interpreter()
     rows = [{"id": grant["id"], "request_id": grant["request_id"], "task_id": grant["task_id"],
              "worktree": grant.get("directory"), "option": grant.get("option")} for grant in grants]
     parts = [
-        "#!%s" % interpreter,
+        "#!%s -IS" % interpreter,
         "# SPDX-License-Identifier: Apache-2.0",
         "# Baton runner shim for %s. The worker can read this file and cannot write it." % tool,
         "# Every call checks argv, then execve's the real program at the absolute path fixed when the grant was written.",
-        "# The environment is replaced (PATH=/usr/bin:/bin plus HOME, LANG, LC_*, TERM). rg is always passed --no-config.",
+        "# The interpreter is isolated (-IS). The environment passed to the real program is replaced",
+        "# (PATH=/usr/bin:/bin plus HOME, LANG, LC_*, TERM). rg is always passed --no-config.",
         "# Policy: %s" % POLICY_ARGS[tool],
-        "import json, os, sys, time",
+        "import os, sys",
         "TOOL = %r" % tool,
         "REAL = %r" % real,
         "SPOOL = %r" % spool,

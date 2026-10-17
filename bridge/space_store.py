@@ -774,7 +774,8 @@ class SpaceStore:
         return task
 
     @staticmethod
-    def _audit(conn, actor, operation_id, event, space_id=None, task_id=None, requested_by=None, performed_by=None, **metadata):
+    def _audit(conn, actor, operation_id, event, space_id=None, task_id=None, requested_by=None, performed_by=None,
+               once=False, **metadata):
         allowed = {"page_id", "block_id", "thread_id", "epoch", "revision", "proposal_id", "team_id", "subject_type",
                    "role", "decision", "input_sha256", "output_sha256", "error_code",
                    "count", "target_type", "execution_mode", "old_epoch", "work_face_keys", "work_face_sha256",
@@ -786,8 +787,12 @@ class SpaceStore:
                    "sla_minutes", "wait_minutes", "request_id", "permission"}
         if not set(metadata) <= allowed:
             raise StoreError("invalid")
-        conn.execute("""INSERT INTO baton.x_audit(id,event,agent,actor_account,actor_kind,requested_by,performed_by,
-            operation_id,space_id,task_id,metadata) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+        statement = """INSERT INTO baton.x_audit(id,event,agent,actor_account,actor_kind,requested_by,performed_by,
+            operation_id,space_id,task_id,metadata) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"""
+        if once:
+            # Matches audit_permission_expired_once. A second reader inserts nothing instead of a duplicate row.
+            statement += " ON CONFLICT (task_id, (metadata->>'request_id')) WHERE event = 'permission.expired' DO NOTHING"
+        conn.execute(statement,
             (uuid.uuid4(), event, actor.principal, actor.account, actor.kind, requested_by or actor.principal,
              performed_by or actor.principal, operation_id, space_id, task_id, Jsonb(_json(metadata))))
 
@@ -1583,10 +1588,10 @@ class SpaceStore:
         return self._mutate(actor, operation_id, "set_work_face", {"task_id": task_id, "work_face": face, "base_commit": base_commit},
                             authorize, effect, lambda conn, old: view(conn))
 
-    def _task_audit(self, conn, actor, operation_id, event, task, **metadata):
+    def _task_audit(self, conn, actor, operation_id, event, task, *, once=False, **metadata):
         page = self._row(conn, "pages", str(task["page_id"]))
         self._audit(conn, actor, operation_id, event, space_id=page["space_id"], task_id=task["id"],
-                    requested_by=task["owner"], thread_id=task["id"], **metadata)
+                    requested_by=task["owner"], thread_id=task["id"], once=once, **metadata)
 
     def _notify_task(self, conn, actor, operation_id, task, phase, body, recipient=None):
         row = self._comment(conn, actor, operation_id, str(task["page_id"]), body, str(task["id"]),
@@ -2125,10 +2130,11 @@ class SpaceStore:
         """A pending request is only live while the claim it was made under is: it expires when the epoch moves on, the
         holder's lease is gone, or its own time-to-live passes.
 
-        The first time that happens, one `permission.expired` audit row is written. Later reads see that terminal
-        event and do not clear `waiting_input` again. The clear itself only matches a marker whose `blocked_at` is
-        not after the request (the marker this request set). A later `mark_blocked` by the same worker stays.
-        Cancel of an already-expired request stays `stale_claim`.
+        The first time that happens, one `permission.expired` audit row is written. A unique index on the request id
+        makes a concurrent reader insert nothing instead of a second row. Later reads see that terminal event and do
+        not clear `waiting_input` again. The clear itself only matches a marker whose `blocked_at` is not after the
+        request (the marker this request set). A later `mark_blocked` by the same worker stays. Cancel of an
+        already-expired request stays `stale_claim`.
         """
         pending = [view for view in views.values() if view["status"] == "pending"]
         if not pending:
@@ -2148,7 +2154,7 @@ class SpaceStore:
                 continue
             actor = Actor(view["worker"], view["worker_account"], "agent")
             operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "baton/permission-expired/" + view["request_id"]))
-            self._task_audit(conn, actor, operation_id, "permission.expired", task, epoch=view["epoch"],
+            self._task_audit(conn, actor, operation_id, "permission.expired", task, once=True, epoch=view["epoch"],
                              request_id=view["request_id"])
             view["status"] = "expired"
             if any(other["status"] == "pending" for other in views.values()):
