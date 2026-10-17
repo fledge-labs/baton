@@ -112,20 +112,28 @@ INCOMPATIBLE_SQL = (
     ('changes row level security',
      r'\b(?:NO\s+FORCE|ENABLE|DISABLE|FORCE)\s+ROW\s+LEVEL\s+SECURITY\b'),
     ('disables a trigger', r'\bDISABLE\s+TRIGGER\b'),
-    # Trust boundary: repository migrations are reviewed code. These are accidental hazards the catalog snapshot
-    # does not record (server settings, program side effects, anonymous blocks). Reject them here so the same file
-    # is not replayed on the live database. ON CONFLICT DO NOTHING is not a DO block.
-    # Any SET/RESET whose target is the role or session authorization, with LOCAL/SESSION in either order.
-    # set_config('role'|...) is matched separately, before strings are blanked.
-    ('switches role',
-     r'(?:^|;)\s*(?:set|reset)\s+(?:(?:local|session)\s+)*?(?:role|session\s+authorization|session_authorization)\b'),
-    ('changes server configuration', r'\bALTER\s+SYSTEM\b'),
-    ('changes database settings', r'\bALTER\s+DATABASE\b'),
-    ('changes roles', r'\b(?:ALTER|CREATE|DROP)\s+ROLE\b'),
-    ('runs a program from COPY', r'\bCOPY\b[^;]*\b(?:TO|FROM)\s+PROGRAM\b'),
-    ('creates an extension', r'\bCREATE\s+EXTENSION\b'),
-    # DO blocks and transaction control are decided by _statement_hazards(), which sees the body literal
-    # before strings are blanked and ignores PL/pgSQL inside dollar quotes.
+)
+# Crude on purpose. Comments are blanked; strings, dollar quotes and quoted identifiers are kept.
+# Each hit names the token and the line. This does not parse SQL.
+COMMENT_ONLY = re.compile(r'--[^\n]*|/\*.*?\*/', re.DOTALL)
+CRUDE_TOKENS = (
+    ('alter system', re.compile(r'\balter\s+system\b', re.IGNORECASE)),
+    ('alter database', re.compile(r'\balter\s+database\b', re.IGNORECASE)),
+    ('create extension', re.compile(r'\bcreate\s+extension\b', re.IGNORECASE)),
+    ('start transaction', re.compile(r'\bstart\s+transaction\b', re.IGNORECASE)),
+    ('prepare transaction', re.compile(r'\bprepare\s+transaction\b', re.IGNORECASE)),
+    ('copy program', re.compile(r'\bcopy\b[^;]*\bprogram\b', re.IGNORECASE)),
+    ('set_config', re.compile(r'\bset_config\b', re.IGNORECASE)),
+    ('session_authorization', re.compile(r'\bsession_authorization\b', re.IGNORECASE)),
+    ('authorization', re.compile(r'\bauthorization\b', re.IGNORECASE)),
+    ('role', re.compile(r'\brole\b', re.IGNORECASE)),
+    ('do', re.compile(r'\bdo\b', re.IGNORECASE)),
+    ('commit', re.compile(r'\bcommit\b', re.IGNORECASE)),
+    ('rollback', re.compile(r'\brollback\b', re.IGNORECASE)),
+    ('abort', re.compile(r'\babort\b', re.IGNORECASE)),
+    ('end', re.compile(r'\bend\b', re.IGNORECASE)),
+    ('savepoint', re.compile(r'\bsavepoint\b', re.IGNORECASE)),
+    ('release', re.compile(r'\brelease\b', re.IGNORECASE)),
 )
 ADD_CLAUSE = re.compile(r'\bADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?'
                         r'(?!CONSTRAINT\b|PRIMARY\b|UNIQUE\b|CHECK\b|FOREIGN\b|LIKE\b|EXCLUDE\b)([^;]*?)'
@@ -728,314 +736,37 @@ def psql_meta_command(sql):
     return False
 
 
-_TXN_WORDS = frozenset(('commit', 'rollback', 'abort', 'savepoint', 'release'))
-_PLPGSQL_END = frozenset(('if', 'loop', 'case', 'while'))
+def _blank_comments(sql):
+    """Replace comments with spaces, keeping newlines so a later match still has the original line number."""
+    return COMMENT_ONLY.sub(lambda match: re.sub(r'[^\n]', ' ', match.group(0)), sql)
 
 
-def _skip_ws_comments(sql, index):
-    length = len(sql)
-    while index < length:
-        char = sql[index]
-        if char.isspace():
-            index += 1
-            continue
-        if char == '-' and index + 1 < length and sql[index + 1] == '-':
-            newline = sql.find('\n', index)
-            index = length if newline < 0 else newline + 1
-            continue
-        if char == '/' and index + 1 < length and sql[index + 1] == '*':
-            end = sql.find('*/', index + 2)
-            index = length if end < 0 else end + 2
-            continue
-        break
-    return index
+def crude_fail_closed(sql):
+    """Token hits that make a migration incompatible. Fail closed, and do not try to parse SQL.
 
-
-def _keyword_at(sql, index):
-    if index >= len(sql) or not (sql[index].isalpha() or sql[index] == '_'):
-        return None, index
-    end = index + 1
-    while end < len(sql) and (sql[end].isalnum() or sql[end] == '_'):
-        end += 1
-    return sql[index:end].lower(), end
-
-
-def _skip_double_quoted(sql, index):
-    index += 1
-    length = len(sql)
-    while index < length:
-        if sql[index] == '"':
-            if index + 1 < length and sql[index + 1] == '"':
-                index += 2
-                continue
-            return index + 1
-        index += 1
-    return length
-
-
-def _starts_string_literal(sql, index):
-    """A SQL string body: plain quotes, ``E'...'`` / ``e'...'``, or ``U&'...'``."""
-    if index >= len(sql):
-        return False
-    prev_ok = index == 0 or not (sql[index - 1].isalnum() or sql[index - 1] == '_')
-    if sql[index] == "'":
-        return True
-    if prev_ok and sql[index] in 'eE' and index + 1 < len(sql) and sql[index + 1] == "'":
-        return True
-    if prev_ok and sql[index] in 'uU' and index + 2 < len(sql) and sql[index + 1] == '&' and sql[index + 2] == "'":
-        return True
-    return False
-
-
-def _skip_string_literal(sql, index):
-    if sql[index] in 'uU':
-        return _skip_quoted(sql, index + 2, escape=False)
-    if sql[index] in 'eE':
-        return _skip_quoted(sql, index + 1, escape=True)
-    return _skip_quoted(sql, index, escape=False)
-
-
-def _skip_identifier(sql, index):
-    index = _skip_ws_comments(sql, index)
-    if index < len(sql) and sql[index] == '"':
-        return _skip_double_quoted(sql, index)
-    _, after = _keyword_at(sql, index)
-    return after
-
-
-def _do_block_at(sql, index):
-    """True when ``DO`` is followed by a body literal, before that literal is blanked.
-
-    ``DO E'...'`` and ``DO U&'...'`` survive here. ``ON CONFLICT DO NOTHING`` is not a statement-level ``DO``.
+    The search runs on comment-stripped text and still sees string literals, dollar quotes and quoted
+    identifiers. ``END`` inside ``BEGIN ATOMIC`` or a ``CASE`` expression counts. The first line of each
+    token is reported so a reviewer can pass ``--allow-incompatible-migration`` after reading it.
     """
-    index = _skip_ws_comments(sql, index)
-    word, after = _keyword_at(sql, index)
-    if word == 'language':
-        index = _skip_ws_comments(sql, _skip_identifier(sql, after))
-    return _starts_string_literal(sql, index) or _dollar_delimiter(sql, index) is not None
-
-
-def _skip_code_atom(sql, index):
-    """Move past one comment, quote, dollar quote or character. Used inside ``BEGIN ATOMIC`` bodies."""
-    length = len(sql)
-    if index >= length:
-        return length
-    char = sql[index]
-    if char == '-' and index + 1 < length and sql[index + 1] == '-':
-        newline = sql.find('\n', index)
-        return length if newline < 0 else newline + 1
-    if char == '/' and index + 1 < length and sql[index + 1] == '*':
-        end = sql.find('*/', index + 2)
-        return length if end < 0 else end + 2
-    if char == '$':
-        delimiter = _dollar_delimiter(sql, index)
-        if delimiter:
-            end = sql.find(delimiter, index + len(delimiter))
-            return length if end < 0 else end + len(delimiter)
-    if char == '"':
-        return _skip_double_quoted(sql, index)
-    if _starts_string_literal(sql, index):
-        return _skip_string_literal(sql, index)
-    return index + 1
-
-
-def _atomic_body_end(sql, index):
-    """Index just after the ``END`` that closes a ``BEGIN ATOMIC`` body starting at index.
-
-    The body is SQL, so internal semicolons are not statement boundaries for the migration. Nested
-    ``BEGIN ATOMIC`` blocks are counted. ``END IF`` does not close the body.
-    """
-    depth = 1
-    length = len(sql)
-    while index < length and depth:
-        index = _skip_ws_comments(sql, index)
-        if index >= length:
-            return length
-        word, after = _keyword_at(sql, index)
-        if word == 'begin':
-            nxt, nxt_end = _keyword_at(sql, _skip_ws_comments(sql, after))
-            if nxt == 'atomic':
-                depth += 1
-                index = nxt_end
-                continue
-        if word == 'end':
-            nxt, _ = _keyword_at(sql, _skip_ws_comments(sql, after))
-            if nxt not in _PLPGSQL_END:
-                depth -= 1
-                if depth == 0:
-                    return after
-                index = after
-                continue
-        index = _skip_code_atom(sql, index)
-    return index
-
-
-def _begin_atomic_at(sql, index):
-    """If a ``BEGIN ATOMIC`` starts at index, return the index just after its closing ``END``. Otherwise None."""
-    if index > 0 and (sql[index - 1].isalnum() or sql[index - 1] == '_'):
-        return None
-    word, after = _keyword_at(sql, index)
-    if word != 'begin':
-        return None
-    nxt, nxt_end = _keyword_at(sql, _skip_ws_comments(sql, after))
-    if nxt != 'atomic':
-        return None
-    return _atomic_body_end(sql, nxt_end)
-
-
-def _string_literal_text(sql, index):
-    """The decoded text of a string or dollar literal at index, and the index just after it."""
-    if index >= len(sql):
-        return None, index
-    if sql[index] == '$':
-        delimiter = _dollar_delimiter(sql, index)
-        if delimiter is None:
-            return None, index
-        start = index + len(delimiter)
-        end = sql.find(delimiter, start)
-        if end < 0:
-            return sql[start:], len(sql)
-        return sql[start:end], end + len(delimiter)
-    escape = False
-    start = index
-    if sql[index] in 'eE' and index + 1 < len(sql) and sql[index + 1] == "'":
-        escape = True
-        start = index + 1
-    elif sql[index] in 'uU' and index + 2 < len(sql) and sql[index + 1] == '&' and sql[index + 2] == "'":
-        start = index + 2
-    elif sql[index] != "'":
-        return None, index
-    chars = []
-    cursor, length = start + 1, len(sql)
-    while cursor < length:
-        if escape and sql[cursor] == '\\' and cursor + 1 < length:
-            chars.append(sql[cursor + 1])
-            cursor += 2
-            continue
-        if sql[cursor] == "'":
-            if cursor + 1 < length and sql[cursor + 1] == "'":
-                chars.append("'")
-                cursor += 2
-                continue
-            return ''.join(chars), cursor + 1
-        chars.append(sql[cursor])
-        cursor += 1
-    return ''.join(chars), length
-
-
-def _set_config_switches_role(sql):
-    """True when a call passes ``role`` or ``session_authorization`` to ``set_config``.
-
-    The argument is a string literal, so this looks at the source before strings are blanked. Calls inside
-    comments, ordinary strings or dollar quotes are not calls the migration runs while it is applied.
-    """
-    index, length = 0, len(sql)
-    while index < length:
-        index = _skip_ws_comments(sql, index)
-        if index >= length:
-            return False
-        word, after = _keyword_at(sql, index)
-        if word == 'set_config' and (index == 0 or not (sql[index - 1].isalnum() or sql[index - 1] == '_')):
-            nxt = _skip_ws_comments(sql, after)
-            if nxt < length and sql[nxt] == '(':
-                text, _ = _string_literal_text(sql, _skip_ws_comments(sql, nxt + 1))
-                if text is not None and text.lower() in ('role', 'session_authorization'):
-                    return True
-        index = _skip_code_atom(sql, index)
-    return False
-
-
-def _statement_hazards(sql):
-    """Top-level transaction control and ``DO`` blocks.
-
-    Dollar quotes, comments, string literals and ``BEGIN ATOMIC`` bodies are skipped, so ``BEGIN``/``END``
-    inside a function or procedure body are not transaction control. A ``COMMIT``/``ROLLBACK``/``END``/``ABORT``
-    at statement level ends ``SET LOCAL ROLE``; later statements then run as the superuser. Migrations must
-    not manage transactions.
-    """
-    do_block = False
-    manages = False
-    index, length = 0, len(sql)
-    at_start = True
-    while index < length:
-        if at_start:
-            index = _skip_ws_comments(sql, index)
-            if index >= length:
-                break
-            word, after = _keyword_at(sql, index)
-            if word == 'do' and _do_block_at(sql, after):
-                do_block = True
-            elif word == 'begin':
-                atomic_end = _begin_atomic_at(sql, index)
-                if atomic_end is not None:
-                    index = atomic_end
-                    continue
-                manages = True
-            elif word == 'end':
-                nxt, _ = _keyword_at(sql, _skip_ws_comments(sql, after))
-                if nxt not in _PLPGSQL_END:
-                    manages = True
-            elif word == 'start':
-                nxt, _ = _keyword_at(sql, _skip_ws_comments(sql, after))
-                if nxt == 'transaction':
-                    manages = True
-            elif word == 'prepare':
-                nxt, _ = _keyword_at(sql, _skip_ws_comments(sql, after))
-                if nxt == 'transaction':
-                    manages = True
-            elif word in _TXN_WORDS:
-                manages = True
-            at_start = False
-        atomic_end = _begin_atomic_at(sql, index)
-        if atomic_end is not None:
-            index = atomic_end
-            continue
-        char = sql[index]
-        if char == ';':
-            at_start = True
-            index += 1
-            continue
-        if char == '-' and index + 1 < length and sql[index + 1] == '-':
-            newline = sql.find('\n', index)
-            index = length if newline < 0 else newline + 1
-            continue
-        if char == '/' and index + 1 < length and sql[index + 1] == '*':
-            end = sql.find('*/', index + 2)
-            index = length if end < 0 else end + 2
-            continue
-        if char == '$':
-            delimiter = _dollar_delimiter(sql, index)
-            if delimiter:
-                end = sql.find(delimiter, index + len(delimiter))
-                index = length if end < 0 else end + len(delimiter)
-                continue
-        if char == '"':
-            index = _skip_double_quoted(sql, index)
-            continue
-        if _starts_string_literal(sql, index):
-            index = _skip_string_literal(sql, index)
-            continue
-        index += 1
-    found = []
-    if do_block:
-        found.append('contains a DO block')
-    if manages:
-        found.append('manages a transaction')
-    return found
+    text = _blank_comments(sql)
+    hits = []
+    for name, pattern in CRUDE_TOKENS:
+        match = pattern.search(text)
+        if match:
+            hits.append((text.count('\n', 0, match.start()), name))
+    hits.sort()
+    return ['%s on line %d' % (name, line + 1) for line, name in hits]
 
 
 def unsafe_migration_statements(sql):
     """Early warning: textual descriptions of statements that a previous image could not survive.
 
-    Comments and string literals are blanked in a single pass, so a comment marker inside one cannot hide a
-    statement. A psql meta-command is reported from the raw script, because blanking strings must not hide
-    ``\\c`` that sits outside them and must not invent one that sits inside them. Role switches, ``ALTER SYSTEM``,
-    ``ALTER DATABASE``, role DDL, ``COPY ... PROGRAM``, ``CREATE EXTENSION``, ``DO`` blocks and transaction
-    control are rejected here: the catalog snapshot does not record their server-side side effects, and
-    ``deploy/migrate.py`` would replay the same file on the live database. ``DO`` is matched from its body
-    literal (quotes, ``E'...'``, ``U&'...'``, dollar quotes) before strings are blanked. ``BEFORE UPDATE ON``
-    and ``ON UPDATE`` foreign-key actions are not rewrites. This is not a proof of compatibility;
-    precheck_migration() is the authoritative check for what the catalog can see.
+    Comments and string literals are blanked before the catalog-shaped patterns, so a comment marker inside
+    one cannot hide a ``DROP`` or ``GRANT``. A psql meta-command is reported from the raw script. Separately,
+    ``crude_fail_closed`` only strips comments: a token inside a string, a dollar quote or a quoted identifier
+    still counts, and the finding names that token and its line. ``BEFORE UPDATE ON`` and ``ON UPDATE``
+    foreign-key actions are not rewrites. This is not a proof of compatibility; precheck_migration() is the
+    authoritative check for what the catalog can see.
     """
     text = FK_ACTION.sub(' ', NOISE.sub(' ', sql))
     found = [label for label, pattern in INCOMPATIBLE_SQL if re.search(pattern, text, re.IGNORECASE)]
@@ -1045,9 +776,7 @@ def unsafe_migration_statements(sql):
             break
     if psql_meta_command(sql):
         found.append('contains a psql meta-command')
-    if _set_config_switches_role(sql) and 'switches role' not in found:
-        found.append('switches role')
-    found.extend(_statement_hazards(sql))
+    found.extend(crude_fail_closed(sql))
     return found
 
 

@@ -937,9 +937,16 @@ def test_backup_dir_is_required_unless_no_backup_is_given(files, capsys):
     "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;", "DO $$ BEGIN NULL; END $$;",
     "DO LANGUAGE plpgsql $$ BEGIN NULL; END $$;", "DO 'BEGIN NULL; END';",
     "DO E'BEGIN NULL; END';", "DO U&'BEGIN NULL; END';", "do language plpgsql e'BEGIN NULL; END';",
-    "COMMIT;", "COMMIT WORK;", "BEGIN;", "BEGIN TRANSACTION;", "START TRANSACTION;",
+    "COMMIT;", "COMMIT WORK;", "START TRANSACTION;",
     "END;", "END WORK;", "ROLLBACK;", "ROLLBACK TO SAVEPOINT s;", "ABORT;",
     "SAVEPOINT s;", "RELEASE SAVEPOINT s;", "RELEASE s;", "PREPARE TRANSACTION 'x';",
+    'SET "role" = \'x\';', 'RESET "role";', 'SET "session_authorization" = \'x\';',
+    "INSERT INTO baton.t(a) VALUES (1) ON CONFLICT DO NOTHING;",
+    "COPY program TO stdout;",
+    "SELECT CASE WHEN true THEN 1 ELSE 0 END;",
+    "SELECT 'SET ROLE baton_owner';",
+    "SELECT 'COPY baton.t TO PROGRAM ''id''';",
+    "SELECT 'DO $$ BEGIN NULL; END $$';",
 ])
 def test_migration_lint_flags_contract_statements_a_previous_image_cannot_survive(statement):
     assert deploy.unsafe_migration_statements("CREATE TABLE IF NOT EXISTS baton.t(a int);\n" + statement + "\n")
@@ -953,9 +960,9 @@ def test_migration_lint_flags_contract_statements_a_previous_image_cannot_surviv
     "CREATE TRIGGER x BEFORE INSERT OR UPDATE OF parent_id ON baton.t FOR EACH ROW EXECUTE FUNCTION f();",
     "CREATE TRIGGER x BEFORE UPDATE ON baton.t FOR EACH ROW EXECUTE FUNCTION f();",
     "CREATE TRIGGER y BEFORE TRUNCATE ON baton.t FOR EACH STATEMENT EXECUTE FUNCTION f();",
-    "INSERT INTO baton.schema_version(singleton, version) VALUES (true, 1) ON CONFLICT DO NOTHING;",
     "COPY baton.t TO stdout;",
-    "COPY program TO stdout;",
+    "BEGIN;",
+    "BEGIN TRANSACTION;",
     "ALTER TABLE baton.child ADD COLUMN parent_id int REFERENCES baton.parent(id) "
     "ON UPDATE CASCADE ON DELETE SET NULL;",
     "ALTER TABLE baton.child ADD COLUMN parent_id int REFERENCES baton.parent(id) "
@@ -963,35 +970,65 @@ def test_migration_lint_flags_contract_statements_a_previous_image_cannot_surviv
     "ALTER TABLE baton.child ADD COLUMN parent_id int REFERENCES baton.parent(id) "
     "ON UPDATE RESTRICT ON DELETE NO ACTION;",
     "ALTER TABLE baton.child ADD COLUMN parent_id int REFERENCES baton.parent(id) ON UPDATE NO ACTION;",
-    "CREATE FUNCTION baton.f() RETURNS void LANGUAGE plpgsql AS $$ BEGIN NULL; END; $$;",
-    "CREATE PROCEDURE baton.p() LANGUAGE plpgsql AS $$ BEGIN COMMIT; END; $$;",
-    "CREATE FUNCTION baton.f(a int) RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT a; END;",
-    "CREATE PROCEDURE baton.p() LANGUAGE sql BEGIN ATOMIC SELECT 1; END;",
-    "CREATE FUNCTION baton.f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; SELECT 2; END;",
-    "CREATE FUNCTION baton.g() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; COMMIT; END;",
     "SET statement_timeout = '1s';",
     "SET session_replication_role = 'replica';",
-    "SELECT 'SET role = baton_owner; set_config(''role'', ''x'', true)';",
-    "-- SET LOCAL role TO baton_owner\nSELECT 1;",
-    "SELECT 'COMMIT; BEGIN; ROLLBACK; DO E''BEGIN END'';';",
-    "-- COMMIT\n/* START TRANSACTION; */ SELECT 1;",
+    "-- COMMIT\n/* START TRANSACTION; END; role */ SELECT 1;",
     "-- DROP TABLE baton.commented;\n/* DELETE FROM baton.t; UPDATE baton.t SET a = 1; */ SELECT 1;",
     "-- RESET ROLE\n/* ALTER SYSTEM SET x = 1; ALTER DATABASE baton SET y = 1; */\n"
-    "SELECT 'SET ROLE baton_owner'; SELECT 'COPY baton.t TO PROGRAM ''id''';\n"
-    "SELECT 'DO $$ BEGIN NULL; END $$';\nCREATE TABLE baton.n(id int);",
+    "CREATE TABLE baton.n(id int);",
 ])
 def test_migration_lint_accepts_expand_only_statements(statement):
     assert deploy.unsafe_migration_statements(statement) == []
 
 
-def test_assigning_a_column_named_role_is_a_rewrite_and_not_a_role_switch():
-    assert deploy.unsafe_migration_statements("UPDATE baton.t SET role = 'x';") == ["rewrites rows"]
+def test_assigning_a_column_named_role_is_a_rewrite_and_names_the_token():
+    assert deploy.unsafe_migration_statements("UPDATE baton.t SET role = 'x';") == [
+        "rewrites rows", "role on line 1"]
+
+
+def test_crude_tokens_name_the_line_for_every_role_escape_and_for_end():
+    samples = (
+        ('SET "role" = \'x\';\n', "role on line 1"),
+        ('RESET "role";\n', "role on line 1"),
+        ('SET "Role" TO x;\n', "role on line 1"),
+        ('SET "session_authorization" = \'x\';\n', "session_authorization on line 1"),
+        ("SET SESSION AUTHORIZATION baton_owner;\n", "authorization on line 1"),
+        ("CREATE FUNCTION baton.f() RETURNS void LANGUAGE sql SET role = 'x' AS $$ SELECT 1; $$;\n",
+         "role on line 1"),
+        ("CREATE FUNCTION baton.f() RETURNS void LANGUAGE plpgsql AS $$\nSET role = 'x';\n$$\n", "role on line 2"),
+        ("CREATE FUNCTION baton.f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n"
+         "  PERFORM set_config('role', 'x', true);\nEND;\n$$\n", "set_config on line 3"),
+        ("CREATE FUNCTION baton.f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n"
+         "  PERFORM set_config('session_authorization', 'x', true);\nEND;\n$$\n", "session_authorization on line 3"),
+        ("CREATE FUNCTION baton.f() RETURNS void LANGUAGE sql AS $$\nRESET ROLE;\nSELECT 1;\n$$\n", "role on line 2"),
+        ("CREATE FUNCTION baton.f(a int) RETURNS int LANGUAGE sql\nBEGIN ATOMIC\n  SELECT a;\nEND;\n", "end on line 4"),
+        ("SELECT CASE WHEN true THEN 1 ELSE 0 END;\n", "end on line 1"),
+        ("SELECT 'SET ROLE baton_owner';\nSELECT 'COPY baton.t TO PROGRAM ''id''';\n"
+         "SELECT 'DO $$ BEGIN NULL; END $$';\n", "role on line 1"),
+        ("SELECT 'SET ROLE baton_owner';\nSELECT 'COPY baton.t TO PROGRAM ''id''';\n"
+         "SELECT 'DO $$ BEGIN NULL; END $$';\n", "copy program on line 2"),
+        ("SELECT 'SET ROLE baton_owner';\nSELECT 'COPY baton.t TO PROGRAM ''id''';\n"
+         "SELECT 'DO $$ BEGIN NULL; END $$';\n", "do on line 3"),
+        ("SELECT 'SET ROLE baton_owner';\nSELECT 'COPY baton.t TO PROGRAM ''id''';\n"
+         "SELECT 'DO $$ BEGIN NULL; END $$';\n", "end on line 3"),
+    )
+    for sql, expected in samples:
+        found = deploy.unsafe_migration_statements(sql)
+        assert expected in found, (expected, found)
+
+
+def test_a_plain_expand_migration_passes_the_crude_token_rules():
+    sql = ("CREATE TABLE baton.note (id int);\n"
+           "ALTER TABLE baton.note ADD COLUMN note text NULL;\n"
+           "CREATE INDEX note_id ON baton.note (id);\n")
+    assert deploy.unsafe_migration_statements(sql) == []
 
 
 def test_the_shipped_migration_sql_is_expand_only_except_its_backfill_update():
     schema = ROOT / "bridge/space_schema.sql"
-    assert deploy.unsafe_migration_statements(schema.read_text(encoding="utf-8")) == [
-        "rewrites rows", "contains a DO block"]
+    found = deploy.unsafe_migration_statements(schema.read_text(encoding="utf-8"))
+    assert "rewrites rows" in found
+    assert "do on line 7" in found and "role on line 51" in found and "end on line 21" in found
     assert "UPDATE baton.spaces" in schema.read_text(encoding="utf-8")
 
 
@@ -1175,12 +1212,12 @@ def test_the_migration_is_applied_in_an_isolated_container_never_to_the_live_dat
 
 def test_a_role_change_is_caught_on_the_isolated_cluster_and_never_sent_to_the_live_database(files, tmp_path, monkeypatch):
     migration_file(tmp_path, monkeypatch, "RESET ROLE;\nALTER ROLE baton_app NOLOGIN;\nALTER ROLE baton_app CONNECTION LIMIT 0;\n")
-    assert "switches role" in deploy.unsafe_migration_statements("RESET ROLE;\n")
-    assert "changes roles" in deploy.unsafe_migration_statements("ALTER ROLE baton_app NOLOGIN;\n")
+    assert "role on line 1" in deploy.unsafe_migration_statements("RESET ROLE;\n")
+    assert "role on line 1" in deploy.unsafe_migration_statements("ALTER ROLE baton_app NOLOGIN;\n")
     docker = FakeDocker(precheck="role")
     code, report, _ = run(files, docker, FakeGateway(docker))
     assert code == 1 and report["status"] == "aborted" and not docker.calls
-    assert "switches role" in report["rollback"]["reason"] and "changes roles" in report["rollback"]["reason"]
+    assert "role on line 1" in report["rollback"]["reason"]
     docker = FakeDocker(precheck="role")
     code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--allow-incompatible-migration")
     assert code == 0 and "changes role baton_app" in report["precheck"]["changes"]
@@ -1440,7 +1477,9 @@ def test_comments_and_strings_do_not_count_as_privilege_changes():
     assert deploy.unsafe_migration_statements("-- GRANT SELECT ON baton.t TO PUBLIC;\nCREATE TABLE baton.n(id int);") == []
     assert deploy.unsafe_migration_statements("SELECT 'REVOKE ALL ON baton.t FROM PUBLIC';") == []
     hidden = "DO $$ BEGIN EXECUTE 'GRANT SELECT ON baton.t TO PUBLIC'; END $$;"
-    assert deploy.unsafe_migration_statements(hidden) == ["contains a DO block"]
+    found = deploy.unsafe_migration_statements(hidden)
+    assert "do on line 1" in found and "end on line 1" in found
+    assert not any("privileges" in item for item in found)
 
 
 def test_schema_diff_accepts_purely_additive_changes():
