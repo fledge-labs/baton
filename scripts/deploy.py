@@ -4,27 +4,41 @@
 
 Run it on the machine that runs Docker, from the directory your Compose files are addressed from:
 
-    python3 scripts/deploy.py -f deploy/compose.yaml -p baton --smoke-token-file ~/.config/baton/smoke.token
+    python3 scripts/deploy.py -f deploy/compose.yaml -p baton \\
+        --smoke-token-file ~/.config/baton/smoke.token --backup-dir ~/baton-backups
 
-Steps: record the images of the containers that are running now; build (optionally with --build-network host);
-`docker compose up -d --wait --force-recreate --remove-orphans`; then smoke-test the public entry point:
-GET /board is 200, an unauthenticated POST /mcp is 401, and one real MCP initialize + tools/list + fetch_inbox
-succeeds with the smoke token. If the `up` or any smoke check fails, the previous images are re-tagged, `up` runs
-again (rollback) and the exit status is non-zero. A JSON report goes to stdout; progress goes to stderr.
+Steps, each with a hard timeout:
+  1. preflight: the migration SQL must be backward compatible (expand-only); services that the Compose files no
+     longer declare (orphans) must be acknowledged with --allow-remove-orphans;
+  2. record the image of every container of the project, running or not; tag each restorable local image
+     `baton-deploy-rollback:<id>` so it cannot be garbage-collected;
+  3. back up the database with pg_dump (custom format, mode 0600) into --backup-dir;
+  4. build (optionally with --build-network host);
+  5. `docker compose up -d --wait --force-recreate --remove-orphans` (this also runs the migration);
+  6. smoke-test the public entry point: GET /board is 200, an unauthenticated POST /mcp is 401, and one real MCP
+     initialize + tools/list + fetch_inbox succeeds with the smoke token.
+If `up` or a smoke check fails or times out, the previous images are re-tagged and `up` runs again (rollback). The
+rollback only reports success when every service is verified to run its previous image again and the smoke checks
+pass; otherwise a best-effort recovery `up` is attempted and the report lists what to restore by hand. A JSON
+report goes to stdout; progress goes to stderr.
 
-Before the build, each previous local image gets a `baton-deploy-rollback:<id>` tag so it cannot be garbage-collected;
-the tags are removed again once the deployment is settled. Only locally built or tagged images are restored. Images pinned by digest are defined by the Compose files, and the
-database schema is not rolled back, so migrations must stay compatible with the previous application image.
-The smoke token is read from a file, sent only as a bearer header and never printed.
+What a rollback does not do: it restores images, not the database and not the Compose topology. The migration has
+already been applied when the smoke test runs, so the previous image must work against the new schema: migrations
+are expand-only (add nullable or defaulted columns and tables; never drop, rename, retype or tighten in the same
+release), which the preflight enforces. The backup is for a manual restore if that discipline was broken. Images
+pinned by digest come from the Compose files; to roll those back, deploy the previous revision of the files.
+Removed orphans are not recreated. The smoke token is read from a file, sent only as a bearer header and never printed.
 
 Exit codes: 0 deployed; 1 failed, with the previous deployment running (restored by the rollback, or untouched
-because the build failed); 2 usage or configuration error; 3 failed and the previous deployment is not running
-(rollback failed, or there was nothing to restore).
+because preflight, backup or build failed); 2 usage or configuration error; 3 failed and the previous deployment is
+not verified to be running (rollback failed or incomplete, or there was nothing to restore).
 Python 3.9+ standard library only.
 """
 import argparse
 import json
+import os
 import re
+import signal
 import ssl
 import subprocess
 import sys
@@ -36,12 +50,32 @@ from urllib.parse import urlsplit
 
 EXIT_OK, EXIT_ROLLED_BACK, EXIT_USAGE, EXIT_UNRECOVERED = 0, 1, 2, 3
 SERVICE_LABEL = 'com.docker.compose.service'
+PROJECT_LABEL = 'com.docker.compose.project'
+ONEOFF_LABEL = 'com.docker.compose.oneoff'
 LOCAL_HOSTS = frozenset({'localhost', '127.0.0.1', '::1'})
 SMOKE_STEPS = ('board', 'mcp_unauthenticated', 'mcp_initialize', 'mcp_list_tools', 'mcp_fetch_inbox')
 MCP_PROTOCOL = '2025-06-18'
 HOLD_REPOSITORY = 'baton-deploy-rollback'
 OUTPUT_TAIL = 2000
-QUERY_TIMEOUT = 120
+DATABASE_SERVICE = 'database'
+DUMP_SCRIPT = ('PGPASSWORD="$(cat /run/secrets/database-admin/postgres.password)" '
+               'exec pg_dump -U baton_bootstrap -d baton -Fc')
+DUMP_MAGIC = b'PGDMP'
+SCHEMA_FILE = Path(__file__).resolve().parents[1] / 'bridge/space_schema.sql'
+UP_GRACE = 120
+TIMEOUT_RETURNCODE = 124
+
+# Statements that an already-running previous image cannot tolerate after the migration has run.
+INCOMPATIBLE_SQL = (
+    ('drops a table, schema, column, view, type, sequence or function',
+     r'\bDROP\s+(?:TABLE|SCHEMA|COLUMN|VIEW|MATERIALIZED\s+VIEW|TYPE|SEQUENCE|FUNCTION)\b'),
+    ('truncates a table', r'(?:^|;)\s*TRUNCATE\b'),
+    ('deletes rows', r'\bDELETE\s+FROM\b'),
+    ('renames an object', r'\bRENAME\b'),
+    ('changes a column type', r'\bALTER\s+COLUMN\s+\S+\s+(?:SET\s+DATA\s+)?TYPE\b'),
+    ('makes an existing column NOT NULL', r'\bALTER\s+COLUMN\s+\S+\s+SET\s+NOT\s+NULL\b'),
+)
+ADD_COLUMN = re.compile(r'\bADD\s+COLUMN\b([^;]*)', re.IGNORECASE)
 
 
 class UsageError(Exception):
@@ -53,8 +87,8 @@ class SmokeError(Exception):
 
 
 class Result:
-    def __init__(self, returncode, stdout='', stderr=''):
-        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+    def __init__(self, returncode, stdout='', stderr='', timed_out=False):
+        self.returncode, self.stdout, self.stderr, self.timed_out = returncode, stdout, stderr, timed_out
 
 
 class Response:
@@ -62,27 +96,60 @@ class Response:
         self.status, self.headers, self.body = status, headers, body
 
 
+def kill_group(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        proc.kill()
+
+
 class SubprocessRunner:
-    def __call__(self, argv, timeout=None):
+    """Runs a command with a hard timeout; on expiry the whole process group is killed."""
+
+    def __call__(self, argv, timeout=None, stdout_path=None):
+        sink = None
         try:
-            done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-        except FileNotFoundError:
-            return Result(127, '', 'command not found: ' + argv[0])
-        except subprocess.TimeoutExpired:
-            return Result(124, '', 'timed out')
-        return Result(done.returncode, done.stdout, done.stderr)
+            if stdout_path:
+                sink = os.fdopen(os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'wb')
+            try:
+                proc = subprocess.Popen(argv, stdout=sink or subprocess.PIPE, stderr=subprocess.PIPE,
+                                        text=not sink, start_new_session=True)
+            except FileNotFoundError:
+                return Result(127, '', 'command not found: ' + argv[0])
+            try:
+                out, err = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                kill_group(proc)
+                proc.communicate()
+                return Result(TIMEOUT_RETURNCODE, '', 'timed out after %ss' % timeout, timed_out=True)
+            if sink:
+                err = err.decode('utf-8', errors='replace')
+            return Result(proc.returncode, out or '', err or '')
+        finally:
+            if sink:
+                sink.close()
 
 
 class Config:
-    def __init__(self, compose_files, project, env_file, project_directory, profiles, build, build_network,
-                 wait_timeout, base_url, ca_file, smoke_token_file, smoke_timeout, request_timeout, dry_run):
+    def __init__(self, compose_files, project=None, env_file=None, project_directory=None, profiles=(), build=True,
+                 build_network=None, wait_timeout=300, build_timeout=1800, command_timeout=120, backup_timeout=900,
+                 backup_dir=None, no_backup=False, allow_remove_orphans=False, allow_incompatible_migration=False,
+                 schema_file=SCHEMA_FILE, base_url='http://127.0.0.1:8080', ca_file=None, smoke_token_file=None,
+                 smoke_timeout=60, request_timeout=20, dry_run=False):
         self.compose_files, self.project, self.env_file = compose_files, project, env_file
-        self.project_directory, self.profiles, self.build = project_directory, profiles, build
-        self.build_network, self.wait_timeout, self.base_url = build_network, wait_timeout, base_url
-        self.ca_file, self.smoke_token_file, self.smoke_timeout = ca_file, smoke_token_file, smoke_timeout
-        self.request_timeout, self.dry_run = request_timeout, dry_run
+        self.project_directory, self.profiles, self.build = project_directory, list(profiles), build
+        self.build_network, self.wait_timeout, self.build_timeout = build_network, wait_timeout, build_timeout
+        self.command_timeout, self.backup_timeout, self.backup_dir = command_timeout, backup_timeout, backup_dir
+        self.no_backup, self.allow_remove_orphans = no_backup, allow_remove_orphans
+        self.allow_incompatible_migration, self.schema_file = allow_incompatible_migration, schema_file
+        self.base_url, self.ca_file, self.smoke_token_file = base_url, ca_file, smoke_token_file
+        self.smoke_timeout, self.request_timeout, self.dry_run = smoke_timeout, request_timeout, dry_run
 
-    def compose_base(self, extra_files=()):
+    @property
+    def up_timeout(self):
+        return self.wait_timeout + UP_GRACE
+
+    def compose_base(self, extra_files=(), extra_profiles=()):
         argv = ['docker', 'compose']
         if self.project_directory:
             argv += ['--project-directory', self.project_directory]
@@ -92,27 +159,31 @@ class Config:
             argv += ['-f', str(path)]
         if self.project:
             argv += ['-p', self.project]
-        for profile in self.profiles:
+        for profile in self.profiles + list(extra_profiles):
             argv += ['--profile', profile]
         return argv
 
 
 class Docker:
-    """Runs docker commands and records every one. In dry-run mode only read-only queries execute."""
+    """Runs docker commands with a timeout and records every one. In dry-run only read-only queries execute."""
 
-    def __init__(self, runner, dry_run=False, log=None):
-        self.runner, self.dry_run, self.log = runner, dry_run, log or (lambda message: None)
+    def __init__(self, runner, config, log=None):
+        self.runner, self.config, self.log = runner, config, log or (lambda message: None)
         self.commands = []
 
-    def run(self, argv, mutating=False, timeout=None):
-        entry = {'argv': list(argv), 'mutating': mutating, 'executed': True}
+    def run(self, argv, mutating=False, timeout=None, stdout_path=None):
+        timeout = timeout or self.config.command_timeout
+        entry = {'argv': list(argv), 'mutating': mutating, 'executed': True, 'timeout': timeout}
         self.commands.append(entry)
-        if mutating and self.dry_run:
+        if mutating and self.config.dry_run:
             entry['executed'] = False
             return Result(0)
         self.log('$ ' + ' '.join(argv))
-        result = self.runner(argv, timeout=timeout if timeout is not None else (None if mutating else QUERY_TIMEOUT))
+        kwargs = {'stdout_path': stdout_path} if stdout_path else {}
+        result = self.runner(argv, timeout=timeout, **kwargs)
         entry['returncode'] = result.returncode
+        if result.timed_out:
+            entry['timed_out'] = True
         return result
 
 
@@ -128,7 +199,10 @@ def command_report(result, secrets=(), dry_run=False):
     for secret in secrets:
         if secret:
             out = out.replace(secret, '[redacted]')
-    return {'ok': result.returncode == 0, 'returncode': result.returncode, 'output_tail': out}
+    report = {'ok': result.returncode == 0, 'returncode': result.returncode, 'output_tail': out}
+    if result.timed_out:
+        report['timed_out'] = True
+    return report
 
 
 def read_token(path):
@@ -327,8 +401,32 @@ def run_smoke(http, token, timeout, clock=time.monotonic, sleep=time.sleep, inte
         sleep(interval)
 
 
+
+def unsafe_migration_statements(sql):
+    """Return descriptions of statements in the migration SQL that a previous image could not survive."""
+    text = re.sub(r'/\*.*?\*/', ' ', re.sub(r'--[^\n]*', ' ', sql), flags=re.DOTALL)
+    found = [label for label, pattern in INCOMPATIBLE_SQL if re.search(pattern, text, re.IGNORECASE)]
+    for clause in ADD_COLUMN.findall(text):
+        if re.search(r'\bNOT\s+NULL\b', clause, re.IGNORECASE) and not re.search(r'\bDEFAULT\b', clause, re.IGNORECASE):
+            found.append('adds a NOT NULL column without a default')
+            break
+    return found
+
+
+def check_migration(config):
+    try:
+        sql = Path(config.schema_file).read_text(encoding='utf-8')
+    except OSError:
+        return {'checked': False, 'reason': 'migration SQL not found', 'unsafe': []}
+    unsafe = unsafe_migration_statements(sql)
+    return {'checked': True, 'file': str(config.schema_file), 'unsafe': unsafe}
+
+
 def parse_inspect(text):
-    """Map service -> {container, image, image_id} for the running containers in `docker inspect` JSON."""
+    """Map service -> {container, image, image_id, running, created}, one entry per service.
+
+    Running containers win over stopped ones; among stopped ones the newest wins. Run-once containers are skipped.
+    """
     try:
         items = json.loads(text)
     except ValueError:
@@ -336,11 +434,15 @@ def parse_inspect(text):
     services = {}
     for item in items if isinstance(items, list) else []:
         config = item.get('Config') or {}
-        service = (config.get('Labels') or {}).get(SERVICE_LABEL)
-        if not service or not (item.get('State') or {}).get('Running'):
+        labels = config.get('Labels') or {}
+        service = labels.get(SERVICE_LABEL)
+        if not service or labels.get(ONEOFF_LABEL) == 'True':
             continue
-        services[service] = {'container': item.get('Id', '')[:12], 'image': config.get('Image', ''),
-                             'image_id': item.get('Image', '')}
+        entry = {'container': item.get('Id', '')[:12], 'image': config.get('Image', ''), 'image_id': item.get('Image', ''),
+                 'running': bool((item.get('State') or {}).get('Running')), 'created': item.get('Created', '')}
+        known = services.get(service)
+        if known is None or (entry['running'], entry['created']) > (known['running'], known['created']):
+            services[service] = entry
     return services
 
 
@@ -348,25 +450,37 @@ def plan_rollback(previous, current_ids):
     """Decide which image references to re-tag. current_ids maps image reference -> image ID now.
 
     Returns (retag, skipped). Digest-pinned references are immutable and come from the Compose files, so they are
-    skipped; references whose running services disagreed about the image cannot be restored unambiguously.
+    skipped; references whose running services disagree about the image cannot be restored unambiguously. When no
+    service using a reference is running, the newest stopped container decides.
     """
     by_ref = {}
     for service, info in sorted(previous.items()):
-        by_ref.setdefault(info['image'], {'ids': set(), 'services': []})
-        by_ref[info['image']]['ids'].add(info['image_id'])
-        by_ref[info['image']]['services'].append(service)
+        by_ref.setdefault(info['image'], []).append((service, info))
     retag, skipped = [], []
-    for ref, entry in sorted(by_ref.items()):
-        services = entry['services']
+    for ref, members in sorted(by_ref.items()):
+        services = [service for service, _ in members]
+        running = [info for _, info in members if info.get('running', True)]
+        basis = running or [max((info for _, info in members), key=lambda info: info.get('created', ''))]
+        ids = {info['image_id'] for info in basis}
         if '@' in ref:
             skipped.append({'image': ref, 'services': services, 'reason': 'pinned by digest'})
-        elif len(entry['ids']) != 1:
+        elif len(ids) != 1:
             skipped.append({'image': ref, 'services': services, 'reason': 'running services used different images'})
         else:
-            image_id = next(iter(entry['ids']))
+            image_id = next(iter(ids))
             if current_ids.get(ref) != image_id:
                 retag.append({'image': ref, 'image_id': image_id, 'services': services})
     return retag, skipped
+
+
+def verify_restored(previous, now):
+    """Every previously recorded service must run its previous image again; returns the mismatches."""
+    mismatches = []
+    for service, info in sorted(previous.items()):
+        actual = (now.get(service) or {}).get('image_id')
+        if actual != info['image_id']:
+            mismatches.append({'service': service, 'expected': info['image_id'], 'actual': actual})
+    return mismatches
 
 
 def hold_tag(image_id):
@@ -403,13 +517,31 @@ def decide(up_ok, smoke, previous):
 
 def exit_code(status):
     return {'deployed': EXIT_OK, 'dry_run': EXIT_OK, 'rolled_back': EXIT_ROLLED_BACK,
-                                'build_failed': EXIT_ROLLED_BACK, 'aborted': EXIT_ROLLED_BACK}.get(status, EXIT_UNRECOVERED)
+            'build_failed': EXIT_ROLLED_BACK, 'aborted': EXIT_ROLLED_BACK}.get(status, EXIT_UNRECOVERED)
 
 
-def snapshot_running(docker, config):
-    listed = docker.run(config.compose_base() + ['ps', '-q'])
+def compose_model(docker, config):
+    """Project name, every declared service (all profiles) and the services that have a build section."""
+    shown = docker.run(config.compose_base(extra_profiles=['*']) + ['config', '--format', 'json'])
+    if shown.returncode != 0:
+        raise UsageError('docker compose config failed: ' + tail(shown.stderr, 300))
+    try:
+        model = json.loads(shown.stdout)
+        services = model.get('services', {})
+    except (ValueError, AttributeError):
+        raise UsageError('unexpected docker compose config output') from None
+    project = config.project or model.get('name')
+    if not project:
+        raise UsageError('cannot determine the Compose project name; pass -p')
+    return {'project': project, 'services': sorted(services),
+            'build': sorted(name for name, spec in services.items() if isinstance(spec, dict) and 'build' in spec)}
+
+
+def project_snapshot(docker, project):
+    """Images of every container of the project, running or not (run-once `docker compose run` containers excluded)."""
+    listed = docker.run(['docker', 'ps', '-a', '-q', '--filter', 'label=%s=%s' % (PROJECT_LABEL, project)])
     if listed.returncode != 0:
-        raise UsageError('docker compose ps failed: ' + tail(listed.stderr, 300))
+        raise UsageError('docker ps failed: ' + tail(listed.stderr, 300))
     ids = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
     if not ids:
         return {}
@@ -419,36 +551,57 @@ def snapshot_running(docker, config):
     return parse_inspect(inspected.stdout)
 
 
-def build_services(docker, config):
-    shown = docker.run(config.compose_base() + ['config', '--format', 'json'])
-    if shown.returncode != 0:
-        raise UsageError('docker compose config failed: ' + tail(shown.stderr, 300))
+def backup_database(docker, config, project, previous):
+    """pg_dump the live database before the migration can run. Returns (report, ok)."""
+    if config.no_backup:
+        return {'skipped': True, 'reason': 'disabled by --no-backup'}, True
+    if not previous:
+        return {'skipped': True, 'reason': 'first deployment: no existing containers'}, True
+    database = previous.get(DATABASE_SERVICE)
+    if not database or not database['running']:
+        return {'ok': False, 'error': 'the database service is not running, so it cannot be backed up; start it, '
+                                      'or pass --no-backup to deploy without a backup'}, False
+    stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+    path = Path(config.backup_dir) / ('baton-%s-%s.dump' % (re.sub(r'[^A-Za-z0-9_.-]', '_', project), stamp))
+    argv = config.compose_base() + ['exec', '-T', DATABASE_SERVICE, 'sh', '-c', DUMP_SCRIPT]
+    if config.dry_run:
+        docker.run(argv, mutating=True, timeout=config.backup_timeout, stdout_path=str(path))
+        return {'planned': True, 'path': str(path)}, True
     try:
-        services = json.loads(shown.stdout).get('services', {})
-    except ValueError:
-        raise UsageError('unexpected docker compose config output') from None
-    return sorted(name for name, spec in services.items() if isinstance(spec, dict) and 'build' in spec)
+        Path(config.backup_dir).mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError:
+        return {'ok': False, 'error': 'cannot create --backup-dir'}, False
+    result = docker.run(argv, mutating=True, timeout=config.backup_timeout, stdout_path=str(path))
+    report = {'path': str(path), 'ok': False}
+    try:
+        size = path.stat().st_size
+        header = path.open('rb').read(len(DUMP_MAGIC))
+    except OSError:
+        size, header = 0, b''
+    if result.returncode != 0 or size == 0 or header != DUMP_MAGIC:
+        report['error'] = 'pg_dump failed' + (' (timed out)' if result.timed_out else ': ' + tail(result.stderr, 300))
+        path.unlink(missing_ok=True)
+        return report, False
+    report.update(ok=True, bytes=size)
+    return report, True
 
 
-def run_build(docker, config):
+def run_build(docker, config, model):
     """`docker compose build` has no network flag, so --build-network goes in as a throw-away override file."""
-    if not config.build_network:
-        return docker.run(config.compose_base() + ['build'], mutating=True)
-    names = build_services(docker, config)
-    if not names:
-        return docker.run(config.compose_base() + ['build'], mutating=True)
-    text = 'services:\n' + ''.join('  %s:\n    build:\n      network: %s\n' % (name, config.build_network) for name in names)
+    plain = config.compose_base() + ['build']
+    if not config.build_network or not model['build']:
+        return docker.run(plain, mutating=True, timeout=config.build_timeout)
+    text = 'services:\n' + ''.join('  %s:\n    build:\n      network: %s\n' % (name, config.build_network)
+                                   for name in model['build'])
     with tempfile.TemporaryDirectory(prefix='baton-deploy-') as directory:
         override = Path(directory) / 'build-network.yaml'
         override.write_text(text)
-        return docker.run(config.compose_base([override]) + ['build'], mutating=True)
+        return docker.run(config.compose_base([override]) + ['build'], mutating=True, timeout=config.build_timeout)
 
 
 def up_command(config):
-    argv = config.compose_base() + ['up', '-d', '--wait']
-    if config.wait_timeout:
-        argv += ['--wait-timeout', str(config.wait_timeout)]
-    return argv + ['--force-recreate', '--remove-orphans']
+    return config.compose_base() + ['up', '-d', '--wait', '--wait-timeout', str(config.wait_timeout),
+                                    '--force-recreate', '--remove-orphans']
 
 
 def current_image_ids(docker, refs):
@@ -460,98 +613,155 @@ def current_image_ids(docker, refs):
     return ids
 
 
-def roll_back(docker, config, previous, http, token, log, clock, sleep):
-    """Re-tag previous images, run `up` again and smoke-test the restored deployment."""
-    refs = sorted({info['image'] for info in previous.values()})
-    retag, skipped = plan_rollback(previous, current_image_ids(docker, refs))
-    report = {'attempted': True, 'retagged': [], 'skipped': skipped, 'ok': False}
+def manual_recovery(previous, backup):
+    steps = ['docker tag <image-id> <image-reference>   # for each image listed under rollback.retagged / held_images',
+             'docker compose <your -f and -p options> up -d --wait --force-recreate']
+    if backup and backup.get('path') and backup.get('ok'):
+        steps.append('restore the database only if the schema is incompatible: pg_restore --clean --if-exists from ' + backup['path'])
+    return steps
+
+
+def roll_back(docker, config, project, previous, orphans, http, token, backup, log, clock, sleep):
+    """Re-tag previous images, run `up` again, verify and smoke-test; keep trying to recover on failure."""
+    core = {name: info for name, info in previous.items() if name not in orphans}
+    refs = sorted({info['image'] for info in core.values()})
+    retag, skipped = plan_rollback(core, current_image_ids(docker, refs))
+    report = {'attempted': True, 'retagged': [], 'skipped': skipped, 'ok': False, 'errors': [], 'warnings': []}
     for item in retag:
         log('restoring %s -> %s' % (item['image'], item['image_id']))
         result = docker.run(['docker', 'tag', item['image_id'], item['image']], mutating=True)
         report['retagged'].append(dict(item, ok=result.returncode == 0))
         if result.returncode != 0:
-            report['error'] = 'could not re-tag ' + item['image'] + ': ' + tail(result.stderr, 300)
-            return report
+            report['errors'].append('could not re-tag %s: %s' % (item['image'], tail(result.stderr, 300)))
     log('rollback: docker compose up')
-    up = docker.run(up_command(config), mutating=True)
+    up = docker.run(up_command(config), mutating=True, timeout=config.up_timeout)
     report['up'] = command_report(up, [token])
-    if up.returncode != 0:
-        report['error'] = 'docker compose up failed after restoring the previous images'
-        return report
-    report['smoke'] = run_smoke(http, token, config.smoke_timeout, clock, sleep)
-    report['ok'] = report['smoke']['ok']
+    serving = up.returncode == 0
+    if not serving:
+        message = 'docker compose up %s during rollback' % ('timed out' if up.timed_out else 'failed')
+        log('rollback up failed; trying a best-effort recovery up')
+        recovery = docker.run(config.compose_base() + ['up', '-d', '--remove-orphans'], mutating=True,
+                              timeout=config.up_timeout)
+        report['recovery_up'] = command_report(recovery, [token])
+        serving = recovery.returncode == 0
+        report['warnings' if serving else 'errors'].append(message)
+    try:
+        now = project_snapshot(docker, project)
+    except UsageError as exc:
+        now = {}
+        report['errors'].append('cannot verify the restored images: ' + str(exc))
+    report['mismatches'] = verify_restored(core, now)
+    if report['mismatches']:
+        report['errors'].append('services are not running their previous image: ' +
+                                ', '.join(item['service'] for item in report['mismatches']))
+    if serving:
+        report['smoke'] = run_smoke(http, token, config.smoke_timeout, clock, sleep)
+        if not report['smoke']['ok']:
+            report['errors'].append('the restored deployment fails the smoke checks')
+    report['ok'] = serving and not report['errors'] and report['smoke']['ok']
     if not report['ok']:
-        report['error'] = 'the restored deployment also fails the smoke checks'
+        report['manual_recovery'] = manual_recovery(previous, backup)
     return report
 
 
 def deploy(config, runner, http=None, log=None, clock=time.monotonic, sleep=time.sleep):
     log = log or (lambda message: None)
-    docker = Docker(runner, config.dry_run, log)
+    docker = Docker(runner, config, log)
     token = read_token(config.smoke_token_file)
     if http is None and not config.dry_run:
         http = HttpClient(config.base_url, config.ca_file, config.request_timeout)
     report = {'status': None, 'ok': False, 'dry_run': config.dry_run, 'project': config.project,
               'compose_files': [str(path) for path in config.compose_files], 'base_url': config.base_url,
               'warnings': token_file_warnings(config.smoke_token_file)}
+    holds = []
 
-    previous = snapshot_running(docker, config)
-    report['previous_images'] = previous
-    log('recorded %d running service image(s)' % len(previous))
-
-    holds = hold_previous_images(docker, previous)
-    report['held_images'] = holds
-    if not all(hold['ok'] for hold in holds):
-        report.update(status='aborted', ok=False, commands=docker.commands,
-                      rollback={'attempted': False, 'reason': 'could not protect the previous images; nothing was changed'})
+    def stop(status, reason, release=True):
+        if release:
+            release_holds(docker, holds)
+        report.update(status=status, ok=False, commands=docker.commands,
+                      rollback={'attempted': False, 'reason': reason})
         return report
 
-    build = None
+    migration = check_migration(config)
+    report['migration'] = migration
+    if migration['unsafe'] and not config.allow_incompatible_migration:
+        return stop('aborted', 'the migration SQL is not backward compatible (%s); nothing was changed; a rollback '
+                    'could not restore the previous image. Split it into an expand release and a later contract '
+                    'release, or pass --allow-incompatible-migration' % '; '.join(migration['unsafe']))
+
+    model = compose_model(docker, config)
+    project = report['project'] = model['project']
+    previous = project_snapshot(docker, project)
+    report['previous_images'] = previous
+    log('recorded %d service image(s), running or stopped' % len(previous))
+
+    orphans = sorted(set(previous) - set(model['services']))
+    report['orphans'] = [dict(info, service=name) for name, info in sorted(previous.items()) if name in orphans]
+    if orphans and not config.allow_remove_orphans:
+        return stop('aborted', 'the Compose files do not declare %s, and up --remove-orphans would delete %s; nothing '
+                    'was changed. Check that every -f file is passed, or acknowledge with --allow-remove-orphans'
+                    % (', '.join(orphans), 'it' if len(orphans) == 1 else 'them'))
+
+    core = {name: info for name, info in previous.items() if name not in orphans}
+    holds = hold_previous_images(docker, core)
+    report['held_images'] = holds
+    if not all(hold['ok'] for hold in holds):
+        return stop('aborted', 'could not protect the previous images; nothing was changed')
+
+    backup, backup_ok = backup_database(docker, config, project, previous)
+    report['backup'] = backup
+    if not backup_ok:
+        return stop('aborted', 'the database backup failed; nothing was changed')
+
     if config.build:
         log('building')
-        build = run_build(docker, config)
+        build = run_build(docker, config, model)
         report['build'] = command_report(build, [token], config.dry_run)
         if build.returncode != 0:
-            report.update(status='build_failed', ok=False,
-                          rollback={'attempted': False, 'reason': 'the build failed before any container was changed'})
-            report['commands'] = docker.commands
-            release_holds(docker, holds)
-            return report
+            return stop('build_failed', 'the build failed or timed out before any container was changed')
     else:
         report['build'] = {'skipped': True}
 
     log('docker compose up --wait --force-recreate --remove-orphans')
-    up = docker.run(up_command(config), mutating=True)
+    up = docker.run(up_command(config), mutating=True, timeout=config.up_timeout)
     report['up'] = command_report(up, [token], config.dry_run)
 
-    smoke = None
     if config.dry_run:
-        retag, skipped = plan_rollback(previous, {})
+        retag, skipped = plan_rollback(core, {})
         report.update(status='dry_run', ok=True, smoke={'skipped': True, 'checks': list(SMOKE_STEPS)},
-                      rollback={'attempted': False, 'would_retag_if_changed': retag, 'skipped': skipped})
-        report['commands'] = docker.commands
+                      rollback={'attempted': False, 'would_retag_if_changed': retag, 'skipped': skipped},
+                      commands=docker.commands)
         return report
+
+    smoke = None
     if up.returncode == 0:
         log('smoke tests')
         smoke = run_smoke(http, token, config.smoke_timeout, clock, sleep)
         report['smoke'] = smoke
     else:
-        report['smoke'] = {'skipped': True, 'reason': 'docker compose up failed'}
+        report['smoke'] = {'skipped': True, 'reason': 'docker compose up %s' % ('timed out' if up.timed_out else 'failed')}
 
-    action = decide(up.returncode == 0, smoke, previous)
+    action = decide(up.returncode == 0, smoke, core)
     if action == 'deployed':
         report.update(status='deployed', ok=True, rollback={'attempted': False})
     elif action == 'fail':
-        report.update(status='failed', ok=False, rollback={'attempted': False, 'reason': 'no previous deployment was running'})
+        report.update(status='failed', ok=False, rollback={'attempted': False, 'reason': 'no previous deployment existed'})
     else:
         log('deployment failed; rolling back')
-        rollback = roll_back(docker, config, previous, http, token, log, clock, sleep)
+        rollback = roll_back(docker, config, project, previous, orphans, http, token, backup, log, clock, sleep)
         report['rollback'] = rollback
         report.update(status='rolled_back' if rollback['ok'] else 'rollback_failed', ok=False)
     if report['status'] != 'rollback_failed':
         release_holds(docker, holds)
     report['commands'] = docker.commands
     return report
+
+
+def positive(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError('must be at least 1')
+    return number
 
 
 def non_negative(value):
@@ -572,17 +782,32 @@ def parse_args(argv):
     parser.add_argument('--build-network', metavar='MODE',
                         help='network for image builds, for example host; applied through a temporary Compose override')
     parser.add_argument('--no-build', dest='build', action='store_false', help='skip the build step')
-    parser.add_argument('--wait-timeout', type=non_negative, default=0, metavar='SECONDS', help='docker compose up --wait-timeout')
+    parser.add_argument('--wait-timeout', type=positive, default=300, metavar='SECONDS',
+                        help='docker compose up --wait-timeout; the script also kills `up` %d s later' % UP_GRACE)
+    parser.add_argument('--build-timeout', type=positive, default=1800, metavar='SECONDS', help='hard timeout for the build')
+    parser.add_argument('--command-timeout', type=positive, default=120, metavar='SECONDS',
+                        help='hard timeout for every other docker command')
+    parser.add_argument('--backup-dir', metavar='DIR',
+                        help='directory for the pre-deploy pg_dump (created with mode 0700, files 0600)')
+    parser.add_argument('--no-backup', action='store_true', help='deploy without a database backup (recorded in the report)')
+    parser.add_argument('--backup-timeout', type=positive, default=900, metavar='SECONDS', help='hard timeout for pg_dump')
+    parser.add_argument('--allow-remove-orphans', action='store_true',
+                        help='acknowledge that containers of services the Compose files no longer declare are deleted')
+    parser.add_argument('--allow-incompatible-migration', action='store_true',
+                        help='deploy even though the migration SQL has statements the previous image cannot survive')
     parser.add_argument('--base-url', default='http://127.0.0.1:8080', help='public entry point to smoke-test')
     parser.add_argument('--ca-file', help='CA bundle for an https --base-url')
     parser.add_argument('--smoke-token-file', required=True, metavar='PATH',
                         help='file holding a client token for the MCP smoke test; never printed')
     parser.add_argument('--smoke-timeout', type=non_negative, default=60, metavar='SECONDS',
                         help='how long smoke checks may keep retrying before they count as failed')
-    parser.add_argument('--request-timeout', type=non_negative, default=20, metavar='SECONDS', help='per-request timeout')
+    parser.add_argument('--request-timeout', type=positive, default=20, metavar='SECONDS', help='per-request timeout')
     parser.add_argument('--dry-run', action='store_true',
                         help='run only read-only docker queries and report the commands that would run')
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not args.backup_dir and not args.no_backup:
+        parser.error('--backup-dir is required (or pass --no-backup to deploy without a database backup)')
+    return args
 
 
 def main(argv=None, runner=None, http=None, stdout=None, stderr=None, clock=time.monotonic, sleep=time.sleep):
@@ -594,7 +819,9 @@ def main(argv=None, runner=None, http=None, stdout=None, stderr=None, clock=time
             if not Path(path).is_file():
                 raise UsageError('Compose file not found: ' + path)
         config = Config(args.compose_files, args.project, args.env_file, args.project_directory, args.profiles,
-                        args.build, args.build_network, args.wait_timeout, parse_base_url(args.base_url), args.ca_file,
+                        args.build, args.build_network, args.wait_timeout, args.build_timeout, args.command_timeout,
+                        args.backup_timeout, args.backup_dir, args.no_backup, args.allow_remove_orphans,
+                        args.allow_incompatible_migration, SCHEMA_FILE, parse_base_url(args.base_url), args.ca_file,
                         args.smoke_token_file, args.smoke_timeout, args.request_timeout, args.dry_run)
         report = deploy(config, runner or SubprocessRunner(), http, log, clock, sleep)
     except UsageError as exc:
