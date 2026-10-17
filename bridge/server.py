@@ -27,7 +27,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 
 from bridge import a2a_public, common, webhooks
 from bridge.common import AuthMiddleware, audit, safe_id, transport_origins, uuid_id
-from bridge.space_store import SERVICE_ACTOR, Actor, SpaceStore, StoreError
+from bridge.space_store import SERVICE_ACTOR, Actor, StoreError
 
 PROTOCOL = common.SPACE_PROTOCOL
 SERVICE = SERVICE_ACTOR
@@ -289,7 +289,7 @@ def principal_directory(principal):
 def get_store():
     global _STORE
     if _STORE is None:
-        _STORE = SpaceStore.from_env(principal_directory)
+        _STORE = a2a_public.CancelAwareStore.from_env(principal_directory)
     return _STORE
 
 
@@ -355,15 +355,6 @@ async def store_call(method, *args, **kwargs):
     if method in PUBLIC_OPERATIONS and PUBLIC_OPERATIONS[method][0]:
         WAKEUP.notify()
     return result
-
-
-async def a2a_canceled(task_id):
-    try:
-        return await a2a_public.is_canceled(get_store(), task_id)
-    except StoreError as exc:
-        raise BridgeError(exc.code, exc.details) from None
-    except Exception:
-        raise BridgeError("storage_unavailable") from None
 
 
 async def wait_inbox(actor, after_seq, timeout_seconds, limit):
@@ -459,10 +450,6 @@ async def invoke(operation, payload, request):
         raise BridgeError("invalid") from None
     if operation == "wait_inbox":
         return await wait_inbox(actor, **arguments)
-    if operation in a2a_public.CANCEL_GUARDED and await a2a_canceled(arguments["task_id"]):
-        # A task the caller cannot see stays "not found"; only a visible canceled task reports the cancellation.
-        await store_call("get_task", actor, arguments["task_id"])
-        raise BridgeError("task_canceled")
     result = await store_call(operation, actor, **arguments)
     if operation == "submit_task":
         audit("task.replay" if result.get("replay") else "task.submitted",
@@ -646,12 +633,12 @@ async def space_schema():
 
 @app.post(a2a_public.RPC_PATH)
 async def a2a_rpc(request: Request):
-    return await a2a_public.handle_rpc(request, store=get_store(), call=store_call, actor=request_actor(request))
+    return await a2a_public.handle_rpc(request, store=get_store(), call=store_call, actor=request_actor(request), waker=WAKEUP)
 
 
 @app.get(a2a_public.DIRECTORY_PATH)
 async def a2a_directory(request: Request):
-    return await a2a_public.directory_response(a2a_public.Context(get_store(), store_call, request_actor(request)))
+    return await a2a_public.directory_response(a2a_public.Context(get_store(), store_call, request_actor(request), waker=WAKEUP))
 
 
 @app.get("/board/data")
