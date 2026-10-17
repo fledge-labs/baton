@@ -255,7 +255,7 @@ def verify(signing_secret: str, headers: dict, raw_body: bytes) -> bool:
 **立即作废旧密钥。** `webhook_revoke_previous_secret(operation_id, subscription_id)` 清除订阅正在宽限期内的旧密钥，返回 `{"subscription_id","revoked","replay"}`（没有旧密钥时 `revoked` 为 `false`，调用仍成功）；订阅不存在或不属于调用者返回 `404`。签名密钥在每次投递尝试发出前才读取，所以此后新发出的尝试只用当前密钥签名，已经排队或重试中的投递也一样；唯一残留的窗口是读取密钥到请求发出之间的几毫秒到数秒，作废前已发出的请求不会撤回。怀疑旧密钥泄漏时：先 `webhook_rotate_secret`，再立即 `webhook_revoke_previous_secret`，并把新密钥部署到接收端；这期间接收端还在用旧密钥会验证失败并触发重试，部署新密钥后重试即可通过。审计事件 `webhook.previous_secret_revoked` 只记录订阅标识。
 审计事件 `webhook.secret_rotated` 只记录订阅标识和宽限秒数。
 
-**迁移：已弃用的 `X-Baton-*` 头。** 为兼容现有接收端，这些旧头再保留一个版本，同时与 `webhook-*` 头一起发送；它们已弃用，下个版本会被移除，请迁移到上面的 `webhook-*` 头：
+**迁移：已弃用的 `X-Baton-*` 头。** 为兼容现有接收端，这些旧头与 `webhook-*` 头一起发送，直到 **2027-01-31**（一个季度的并行期）；它们已弃用，将在 **2027-01-31** 移除，此前两套头都会发送。接收方应现在就改用 Standard Webhooks 校验（上面的 `webhook-*` 头）：
 
 - `X-Baton-Event`（已弃用）：事件名。
 - `X-Baton-Delivery`（已弃用）：通知 id，与 `webhook-id` 相同。

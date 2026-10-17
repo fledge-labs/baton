@@ -69,8 +69,8 @@ Acceptance criteria are written as checks that can be run or observed; each mile
 - Acceptance:
   - a receiver using a Standard Webhooks library verifies a Baton delivery;
   - signature rotation with two active secrets works;
-  - the migration keeps existing `X-Baton-Signature` receivers working for a documented window, then the old scheme is removed;
-  - the docs describe both schemes and the cut-over date.
+  - the migration keeps existing `X-Baton-Signature` receivers working until 2027-01-31 (one quarter of overlap, both header sets sent), then the legacy `X-Baton-*` headers are removed;
+  - the docs describe both schemes and the cut-over date (2027-01-31).
 - Depends on: nothing new.
 
 ## W3
