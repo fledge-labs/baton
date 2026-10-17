@@ -25,6 +25,11 @@ Communication is anchored to work objects: every message belongs to a task, page
 | Real-time layer: web WebSocket threads, A2A/MCP streaming forwarded per thread, wake-up for offline agents (Cursor followup first, then Claude Routines /fire, then A2A push notifications) | planned (from next week) |
 | Sync outcomes written back to the task or thread as minutes when a real-time conversation ends | planned (with the real-time layer, R4) |
 | Response-time agreements per priority with escalation or reassignment on timeout | in progress |
+| Unified Ask object (kind, message, responseSchema, expiresAt, escalateTo; reply accept/decline/cancel/edit/respond/ignore) as the base for web, Slack and Feishu approvals | planned (W2), [roadmap](roadmap.md) |
+| Outbound webhooks signed per the Standard Webhooks specification (today: `X-Baton-Signature` HMAC) | planned (W2), [roadmap](roadmap.md) |
+| People in the space: human identity, web board (tasks, threads, audit), approve / reject / edit in the task | planned (W3), [roadmap](roadmap.md) |
+| Presence (online / idle / offline / needs-wake-up) with wake-up adapters and "disturb only when needed" (priority, quiet hours, escalation on timeout) | planned (W3), [roadmap](roadmap.md) |
+| Mobile via Feishu and Slack bridges: notifications, inline replies, button approvals | planned (W4), [roadmap](roadmap.md) |
 
 Out of scope:
 
@@ -147,6 +152,130 @@ Standards:
   - The human gate's "owner-authorized reviewer identity" (milestone R1) is expressed as a delegation on this chain. An agent can hold a gate only with an auditable delegation from a human.
 - **Migration.** The current token issuer stays the default for self-hosted test instances. OAuth token exchange is opt-in configuration.
 - **Policy.** Authorization decisions stay in Baton's store. An optional Cedar policy hook is a later step.
+
+## Protocols
+
+Status: design decisions, planned. Nothing in this chapter is implemented unless the capability table at the top says so. Milestones are in [roadmap.md](roadmap.md).
+
+Basis: two research surveys of 2026-10-17 (agent-to-agent protocols; agent-to-human protocols). Every external claim below was re-checked by fetching the cited page on 2026-10-17, except where the text carries "(UNVERIFIED)" exactly as in the surveys. Where an UNVERIFIED item could be confirmed from an official page, the tag was replaced with the citation. Versions and dates not stated here were not established.
+
+Classes: ADOPT = implement or integrate; BORROW = take named ideas, own implementation; WATCH = track, build nothing yet (or only behind a switch); IGNORE = no action.
+
+Deployment: Baton sits behind agentgateway (a proxy for MCP, A2A and LLM traffic with authorization and rate limits) and does not reimplement policy enforcement. Source: <https://agentgateway.dev>.
+
+### ADOPT
+
+**1. A2A v1.0.x.** JSON-RPC and HTTP+JSON bindings (gRPC is not in the first cut), a signed Agent Card at `/.well-known/agent-card.json`, push notification configs, and A2A extensions.
+- The spec defines the JSON-RPC, gRPC and HTTP+JSON bindings, the well-known card location, JWS signing over a JCS-canonicalized card, `TaskPushNotificationConfig` and `AuthenticationInfo` for push, and the `A2A-Extensions` header. Extensions are inactive by default and must be activated by the client. Sources: <https://a2a-protocol.org/latest/specification/>, <https://a2a-protocol.org/latest/topics/extensions/>.
+- The latest release is v1.0.1 on top of v1.0.0 (2026-03-12). Source: <https://github.com/a2aproject/A2A/releases>.
+- Baton's A2A work-object binding is described in "Baton A2A integration" above (planned, W2-1).
+
+**2. MCP 2026-07-28 stateless core and the Tasks extension.**
+- Build on the stateless core and Multi Round-Trip Requests (a server returns `resultType: "input_required"` with `inputRequests`; the client retries with `inputResponses`). Source: <https://modelcontextprotocol.io/specification/2026-07-28/changelog>.
+- Do not build on features deprecated in that release: Sampling (with Roots and Logging), server-initiated elicitation (replaced by multi round-trip requests), the HTTP+SSE transport, and Dynamic Client Registration (client registration moves to Client ID Metadata Documents). Sources: the same changelog and <https://modelcontextprotocol.io/specification/2026-07-28/client/elicitation>.
+- Tasks is an official extension: a task has a durable `taskId` and the states `working`, `input_required`, `completed`, `failed`, `cancelled`; input is supplied with `tasks/update`, cancellation is cooperative with `tasks/cancel`. Sources: <https://modelcontextprotocol.io/extensions/tasks/overview>, <https://github.com/modelcontextprotocol/ext-tasks>, extensions overview <https://modelcontextprotocol.io/extensions/overview>.
+- Baton's approval gate (`x_gate`) maps to `input_required` answered through `tasks/update`. Planned (W4).
+
+**3. AG-UI as the real-time layer to the web.** A run ends with an interrupt outcome; the next run on the same thread carries `resume` entries. Baton adopts these rules:
+- a resume covers all open interrupts (partial resumes are not supported);
+- a resume is idempotent on the interrupt, status and payload;
+- an expired interrupt (`expiresAt` passed) is refused: a stale resume produces `RunError`.
+
+This implements response-time agreements on the web: a deadline is the interrupt's `expiresAt`, and escalation or reassignment follows when it passes. Sources: <https://github.com/ag-ui-protocol/ag-ui>, <https://raw.githubusercontent.com/ag-ui-protocol/ag-ui/main/docs/concepts/interrupts.mdx>. Planned (W3).
+
+**4. Slack bridge (and Feishu on the same design).** Slack agent session API: entry by DM or `app_mention`; streaming with `chat.startStream` / `appendStream` / `stopStream`; the Stop button, which appears while a session is `processing` and arrives as the `agent_session_stopped` event, is mapped to Baton cancel; Block Kit messages carry the Asks (section "Ask object"). The Feishu bridge follows the same design; no Feishu API claim is made here. Source: <https://docs.slack.dev/ai/developing-agents/>; Block Kit: <https://docs.slack.dev/block-kit/>. Slack rate limits for non-Marketplace apps (UNVERIFIED): check before building. Planned (W4).
+
+**5. Web Push (VAPID) as an optional wake-up channel.** Open and vendor-neutral: Generic Event Delivery Using HTTP Push (RFC 8030), Message Encryption for Web Push (RFC 8291) and VAPID (RFC 8292); Safari 18.4 added Declarative Web Push. Sources: <https://www.rfc-editor.org/rfc/rfc8030>, <https://www.rfc-editor.org/rfc/rfc8291>, <https://www.rfc-editor.org/rfc/rfc8292>, <https://webkit.org/blog/16574/>. It complements the chat bridges and never replaces them. Planned (W3).
+
+**6. Webhooks signed per Standard Webhooks.**
+- Outbound webhooks move to the Standard Webhooks headers `webhook-id`, `webhook-timestamp` and `webhook-signature` (a space-delimited signature list, which allows secret rotation without downtime). Source: <https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md>. The same scheme is used by the MCP Events draft and by ChatGPT's webhook mode: <https://developers.openai.com/plugins/build/mcp-events>, <https://hookdeck.com/webhooks/guides/add-mcp-events-to-mcp-server>.
+- Today (implemented): HMAC-SHA256 over the raw body in `X-Baton-Signature`, with `X-Baton-Delivery` for deduplication ([docs/api.md](../api.md#通知与送达webhookwait_inbox)). The migration to Standard Webhooks is planned (W2-5); the open question is the compatibility window for existing receivers.
+- Inbound: Baton accepts A2A push authentication, that is the `AuthenticationInfo` the peer registers with its push config: <https://a2a-protocol.org/latest/specification/>.
+
+**7. Identity.**
+- MCP enterprise-managed authorization (`io.modelcontextprotocol/enterprise-managed-authorization`) with the IETF Identity Assertion JWT Authorization Grant (ID-JAG), currently draft-04 (2026-05-21), an Active Internet-Draft of the OAuth WG. Sources: <https://modelcontextprotocol.io/extensions/auth/enterprise-managed-authorization>, <https://datatracker.ietf.org/doc/draft-ietf-oauth-identity-assertion-authz-grant/>. The extension has no published version number: the ext-auth repository has no tags or releases and only `specification/draft` and `specification/stable` directories (checked 2026-10-17, <https://github.com/modelcontextprotocol/ext-auth>).
+- Baton registers as an MCP client with Client ID Metadata Documents, not Dynamic Client Registration (changelog above).
+- Workload identity follows SPIFFE and the IETF WIMSE agent-identity work: `draft-ietf-wimse-aims` is an Active WIMSE WG Internet-Draft (-00, replacing `draft-klrc-aiagent-auth`). Sources: <https://spiffe.io/docs/latest/spiffe-about/overview/>, <https://datatracker.ietf.org/doc/draft-ietf-wimse-aims/>, <https://www.ietf.org/archive/id/draft-klrc-aiagent-auth-03.html>. The drafts are a design basis; code targets the OAuth and SPIFFE primitives.
+- Phase 1 (W2-3) covers the delegation chain, short-lived tokens and signed cards, with only an interface for ID-JAG and token exchange. The full exchange is later. See "Baton identity layer (planned)".
+
+### BORROW
+
+**8. A unified Ask object.** One internal object for every "waiting on a person" case:
+
+| Field | Meaning |
+| --- | --- |
+| `kind` | what is asked (inform, collect, authorize, escalate) |
+| `message` | the question or request |
+| `responseSchema` | restricted JSON Schema for the answer |
+| `expiresAt` | deadline; after it the Ask is refused for answers and escalates |
+| `escalateTo` | who is asked next on timeout |
+
+Reply vocabulary: `accept`, `decline`, `cancel`, `edit`, `respond`, `ignore`.
+
+| Surface | Baton Ask maps to |
+| --- | --- |
+| MCP | `input_required` result or task state; reply `accept` / `decline` / `cancel` ([elicitation](https://modelcontextprotocol.io/specification/2026-07-28/client/elicitation)) |
+| A2A | task state `INPUT_REQUIRED` ([spec](https://a2a-protocol.org/latest/specification/)) |
+| AG-UI | interrupt with `responseSchema` and `expiresAt`; resume status resolved or cancelled ([interrupts](https://raw.githubusercontent.com/ag-ui-protocol/ag-ui/main/docs/concepts/interrupts.mdx)) |
+| Slack / Feishu | interactive message (Block Kit on Slack; Feishu on the same design) |
+| Review-type Asks | `accept` / `edit` / `respond` / `ignore`, the four responses of the archived LangChain Agent Inbox ([repo](https://github.com/langchain-ai/agent-inbox)) |
+
+Baton converts the synchronous-looking MCP elicitation into a durable Ask. The kinds and the answer statuses (open, answered, declined, cancelled, expired) come from the agent-to-human survey and are a design proposal, not a standard. Planned (W2-4).
+
+**9. A2A to MCP task-state mapping.** A2A has `SUBMITTED`, `AUTH_REQUIRED` and `REJECTED`, which MCP Tasks lacks. Baton keeps the superset as its source of truth and projects it to each protocol; the exact Baton state travels in a Baton-defined metadata field so that the projection can be reversed (whether and where the MCP Tasks extension allows such metadata is to be confirmed at implementation).
+
+| Baton state | A2A (`TASK_STATE_*`) | MCP Tasks |
+| --- | --- | --- |
+| `submitted` | `SUBMITTED` | `working` (no counterpart) |
+| `working` | `WORKING` | `working` |
+| `input_required` | `INPUT_REQUIRED` | `input_required` |
+| `auth_required` | `AUTH_REQUIRED` | `input_required` (no counterpart) |
+| `completed` | `COMPLETED` | `completed` |
+| `failed` | `FAILED` | `failed` |
+| `canceled` | `CANCELED` | `cancelled` (spelling differs) |
+| `rejected` | `REJECTED` | `failed` (no counterpart) |
+
+Sources: A2A states <https://a2a-protocol.org/latest/specification/>; MCP states <https://modelcontextprotocol.io/extensions/tasks/overview>. Planned (W2-1 for A2A, W4 for MCP Tasks).
+
+**10. Linear's ownership model.** The agent is the delegate and the human stays accountable (assigning an issue to an agent sets the agent as delegate, not assignee). Session states: `pending`, `active`, `awaitingInput`, `complete`, `error`, `stale`. An agent acknowledges a new session within about 10 s (Linear: emit a `thought` within 10 seconds). Sources: <https://linear.app/developers/agents>, <https://linear.app/developers/agent-interaction>. Linear's agent API is a Developer Preview. Planned.
+
+**11. Approval evidence.**
+- CHAP-style override events: a structured event with diff, reason and content hash, instead of an edit that vanishes into a chat thread. Source: <https://arxiv.org/abs/2606.09751>, <https://github.com/BrightbeamAI/chap>.
+- A2H-style one-time approvals with idempotency (message idempotency, nonce binding, single-use approval links). Source: <https://www.twilio.com/en-us/blog/products/introducing-a2h-agent-to-human-communication-protocol>, <https://github.com/twilio-labs/Agent2Human>.
+- An append-only log (`x_audit` already is one).
+- Approver role: a human or an agent, by delegation from a human, never self-approval (see "Baton identity layer (planned)" and the R1 safeguards).
+
+**12. Wake only the @mentioned agent, and speech-act intents.** Coral's model: threads are the unit of conversation, agents post with mentions, and an agent can suspend until it is mentioned in a thread (`coral_wait_for_mention`). Source: <https://docs.coralos.ai/concepts/threads>. Thread messages also carry an intent from the FIPA speech acts (communicative acts): `request`, `inform`, `propose`, `agree`, `refuse`. Sources: FIPA Communicative Act Library, SC00037J (fipa.org itself answered 403 to the check, so the archived copy was read: <https://web.archive.org/web/2023/http://www.fipa.org/specs/fipa00037/SC00037J.html>); background paper from the survey: <https://userpages.cs.umbc.edu/finin/papers/fss97.pdf>.
+
+**13. Loop guard and budgets.**
+- Lineage: record the call lineage with W3C `traceparent`. MCP defines `traceparent`, `tracestate` and `baggage` in `_meta` (SEP-414): <https://modelcontextprotocol.io/specification/2026-07-28/changelog>; trace context format: <https://www.w3.org/TR/trace-context/>. A2A's enterprise guidance says to propagate W3C Trace Context headers: <https://a2a-protocol.org/latest/topics/enterprise-ready/>. A separately named A2A tracing extension was not found in the official documentation, so none is assumed.
+- Budgets: inspired by x402's `upto` scheme (a pre-authorized ceiling; the seller settles actual usage up to that cap, <https://github.com/x402-foundation/x402>) and AP2's open to closed mandates (open captures constraints, closed captures the final authorization, <https://ap2-protocol.org/index.md>).
+- Human warnings at 80% and 100% of a budget, as in Rovo (Atlassian: admins are notified at 80% and 100% usage): <https://support.atlassian.com/jira-software-cloud/docs/collaborate-on-work-items-with-ai-agents/>.
+- Agent output is private first and published after human confirmation (Rovo: agent activity is visible only to the person until they choose to share it, same page).
+- Planned (W2-2).
+
+**14. Discovery.** Publish and consume `/.well-known/ai-catalog.json`; A2A does not prescribe a standard API for curated registries ([discovery topic](https://a2a-protocol.org/latest/topics/agent-discovery/)). AI Catalog / ARD is a draft specification (updated 2026-07-31) that lists MCP servers and A2A agents from one fetch ([spec](https://specification.website/spec/agent-readiness/agentic-resource-discovery.md), [AAIF post](https://aaif.io/blog/before-agents-can-work-together-they-have-to-find-each-other)). Skills are classified with AGNTCY OASF, which annotates records with skills and domains: <https://github.com/agntcy/oasf>. Planned (W2-1).
+
+**15. The inbox is not a separate product.** It stays a view over work objects, assignments and Asks. LangChain's Agent Inbox repository was archived on 2026-09-20: <https://github.com/langchain-ai/agent-inbox>. The current inbox (`fetch_inbox`, `wait_inbox`) is implemented; the Ask view of it is planned (W2-4, shown on the board in W3).
+
+### WATCH
+
+- **MCP Apps**: official extension for interactive UI (`ui://` resources); a possible later channel to show Baton cards inside MCP hosts. <https://modelcontextprotocol.io/extensions/apps/overview>.
+- **A2UI**: current release v0.9.1, v1.0 is a candidate; revisit at v1.0. <https://a2ui.org/>.
+- **Matrix**: a plausible optional bridge; MSC4564 (agent status in room messages) is an open proposal. <https://github.com/matrix-org/matrix-spec-proposals/pull/4564>.
+- **Zed Agent Client Protocol**: editor to coding agent over JSON-RPC; JetBrains IDEs are listed as clients. Relevant only if Baton embeds in editors. <https://agentclientprotocol.com/overview/introduction>.
+- **MCP Events (SEP-3415)**: still an open proposal (pull request, not merged). Ship a webhook-mode switch first, because ChatGPT already speaks webhook mode. <https://github.com/modelcontextprotocol/modelcontextprotocol/pull/3415>, <https://developers.openai.com/plugins/build/mcp-events>.
+- **CHAP and A2H**: young drafts from single vendors or authors; revisit at v1.0 or when a second implementation exists. <https://github.com/BrightbeamAI/chap>, <https://github.com/twilio-labs/Agent2Human>.
+
+### IGNORE
+
+- **MCP-UI**: its packages now implement MCP Apps. <https://github.com/MCP-UI-Org/mcp-ui>.
+- **ChatKit**: OpenAI's UI kit tied to its backend, not an interoperable protocol. <https://github.com/openai/chatkit-js>.
+- **XMPP**: the survey found no 2026 agent-specific standard. <https://xmpp.org/about/compliance-suites/>.
+- **ActivityPub**: public social federation, no approval semantics. <https://www.w3.org/TR/activitypub/>.
+- **JMAP and email**: email is out of scope. <https://jmap.io/spec.html>.
+- **ChatGPT Projects and Claude Projects**: no open API found. <https://support.claude.com/en/articles/9517075-what-are-projects>; see also "API reality check" below.
+- **IBM ACP**: merged into A2A; the repository is archived (2025-08-27). <https://github.com/i-am-bee/acp>.
 
 ## Order of work
 1. `docs/spec/space.md`: the semantics above, each rule with its official source URL and marked "official" or "x_ extension".
