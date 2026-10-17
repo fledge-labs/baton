@@ -98,7 +98,9 @@ INCOMPATIBLE_SQL = (
      r'\bDROP\b(?!\s+(?:CONSTRAINT|TRIGGER|INDEX|POLICY|DEFAULT|RULE|STATISTICS)\b)'),
     ('truncates a table', r'(?:^|;)\s*TRUNCATE\b'),
     ('deletes rows', r'\bDELETE\s+FROM\b'),
-    # Data rewrites are invisible to a schema-only catalog. Trigger clauses (BEFORE UPDATE ON/OR/OF) are not statements.
+    # Data rewrites are invisible to a schema-only catalog. Trigger clauses (BEFORE UPDATE ON/OR/OF) are not
+    # statements. Foreign-key actions are removed by FK_ACTION before this runs, so ON UPDATE CASCADE / SET
+    # NULL / SET DEFAULT / RESTRICT / NO ACTION do not look like UPDATE. ON CONFLICT DO UPDATE still does.
     ('rewrites rows', r'\bUPDATE\s+(?:ONLY\s+)?(?!OR\b|OF\b|ON\b)(?:[\w."]+\.)?[\w."]+'),
     ('merges rows', r'\bMERGE\s+INTO\b'),
     ('renames an object', r'\bRENAME\b'),
@@ -119,12 +121,15 @@ INCOMPATIBLE_SQL = (
     ('changes roles', r'\b(?:ALTER|CREATE|DROP)\s+ROLE\b'),
     ('runs a program from COPY', r'\bCOPY\b[^;]*\b(?:TO|FROM)\s+PROGRAM\b'),
     ('creates an extension', r'\bCREATE\s+EXTENSION\b'),
-    ('contains a DO block', r"(?:^|;)\s*DO\s*(?:LANGUAGE\b|\$[A-Za-z0-9_]*\$|;|$)"),
+    # DO blocks and transaction control are decided by _statement_hazards(), which sees the body literal
+    # before strings are blanked and ignores PL/pgSQL inside dollar quotes.
 )
 ADD_CLAUSE = re.compile(r'\bADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?'
                         r'(?!CONSTRAINT\b|PRIMARY\b|UNIQUE\b|CHECK\b|FOREIGN\b|LIKE\b|EXCLUDE\b)([^;]*?)'
                         r'(?=,\s*(?:ADD|ALTER|DROP)\b|;|$)', re.IGNORECASE | re.DOTALL)
 NOISE = re.compile(r"--[^\n]*|/\*.*?\*/|'(?:[^']|'')*'", re.DOTALL)
+FK_ACTION = re.compile(
+    r'\bON\s+(?:UPDATE|DELETE)\s+(?:CASCADE|RESTRICT|NO\s+ACTION|SET\s+(?:NULL|DEFAULT))\b', re.IGNORECASE)
 PRECHECK_PREFIX = 'baton-precheck-'
 MAX_SMOKE_BODY = 1024 * 1024
 ROLES_DUMP = ('PGPASSWORD="$(cat /run/secrets/database-admin/postgres.password)" '
@@ -155,7 +160,7 @@ CATALOG_SQL = """SELECT json_build_object(
    FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid JOIN pg_class c ON c.oid = i.indrelid
    JOIN pg_namespace n ON n.oid = c.relnamespace WHERE %(system)s),
  'triggers', (SELECT coalesce(json_agg(json_build_object('t', n.nspname||'.'||c.relname, 'name', g.tgname,
-     'def', pg_get_triggerdef(g.oid), 'enabled', g.tgenabled)), '[]'::json)
+     'def', pg_get_triggerdef(g.oid), 'enabled', g.tgenabled, 'internal', g.tgisinternal)), '[]'::json)
    FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
    WHERE %(system)s),
  'functions', (SELECT coalesce(json_agg(json_build_object('sig', p.oid::regprocedure::text, 'def', pg_get_functiondef(p.oid))), '[]'::json)
@@ -720,18 +725,177 @@ def psql_meta_command(sql):
     return False
 
 
+_TXN_WORDS = frozenset(('commit', 'rollback', 'abort', 'savepoint', 'release'))
+_PLPGSQL_END = frozenset(('if', 'loop', 'case', 'while'))
+
+
+def _skip_ws_comments(sql, index):
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        if char.isspace():
+            index += 1
+            continue
+        if char == '-' and index + 1 < length and sql[index + 1] == '-':
+            newline = sql.find('\n', index)
+            index = length if newline < 0 else newline + 1
+            continue
+        if char == '/' and index + 1 < length and sql[index + 1] == '*':
+            end = sql.find('*/', index + 2)
+            index = length if end < 0 else end + 2
+            continue
+        break
+    return index
+
+
+def _keyword_at(sql, index):
+    if index >= len(sql) or not (sql[index].isalpha() or sql[index] == '_'):
+        return None, index
+    end = index + 1
+    while end < len(sql) and (sql[end].isalnum() or sql[end] == '_'):
+        end += 1
+    return sql[index:end].lower(), end
+
+
+def _skip_double_quoted(sql, index):
+    index += 1
+    length = len(sql)
+    while index < length:
+        if sql[index] == '"':
+            if index + 1 < length and sql[index + 1] == '"':
+                index += 2
+                continue
+            return index + 1
+        index += 1
+    return length
+
+
+def _starts_string_literal(sql, index):
+    """A SQL string body: plain quotes, ``E'...'`` / ``e'...'``, or ``U&'...'``."""
+    if index >= len(sql):
+        return False
+    prev_ok = index == 0 or not (sql[index - 1].isalnum() or sql[index - 1] == '_')
+    if sql[index] == "'":
+        return True
+    if prev_ok and sql[index] in 'eE' and index + 1 < len(sql) and sql[index + 1] == "'":
+        return True
+    if prev_ok and sql[index] in 'uU' and index + 2 < len(sql) and sql[index + 1] == '&' and sql[index + 2] == "'":
+        return True
+    return False
+
+
+def _skip_string_literal(sql, index):
+    if sql[index] in 'uU':
+        return _skip_quoted(sql, index + 2, escape=False)
+    if sql[index] in 'eE':
+        return _skip_quoted(sql, index + 1, escape=True)
+    return _skip_quoted(sql, index, escape=False)
+
+
+def _skip_identifier(sql, index):
+    index = _skip_ws_comments(sql, index)
+    if index < len(sql) and sql[index] == '"':
+        return _skip_double_quoted(sql, index)
+    _, after = _keyword_at(sql, index)
+    return after
+
+
+def _do_block_at(sql, index):
+    """True when ``DO`` is followed by a body literal, before that literal is blanked.
+
+    ``DO E'...'`` and ``DO U&'...'`` survive here. ``ON CONFLICT DO NOTHING`` is not a statement-level ``DO``.
+    """
+    index = _skip_ws_comments(sql, index)
+    word, after = _keyword_at(sql, index)
+    if word == 'language':
+        index = _skip_ws_comments(sql, _skip_identifier(sql, after))
+    return _starts_string_literal(sql, index) or _dollar_delimiter(sql, index) is not None
+
+
+def _statement_hazards(sql):
+    """Top-level transaction control and ``DO`` blocks.
+
+    Dollar quotes, comments and string literals are skipped, so ``BEGIN``/``END`` inside a function body are
+    not transaction control. A ``COMMIT``/``ROLLBACK``/``END``/``ABORT`` at statement level ends ``SET LOCAL
+    ROLE``; later statements then run as the superuser. Migrations must not manage transactions.
+    """
+    do_block = False
+    manages = False
+    index, length = 0, len(sql)
+    at_start = True
+    while index < length:
+        if at_start:
+            index = _skip_ws_comments(sql, index)
+            if index >= length:
+                break
+            word, after = _keyword_at(sql, index)
+            if word == 'do' and _do_block_at(sql, after):
+                do_block = True
+            elif word == 'begin':
+                manages = True
+            elif word == 'end':
+                nxt, _ = _keyword_at(sql, _skip_ws_comments(sql, after))
+                if nxt not in _PLPGSQL_END:
+                    manages = True
+            elif word == 'start':
+                nxt, _ = _keyword_at(sql, _skip_ws_comments(sql, after))
+                if nxt == 'transaction':
+                    manages = True
+            elif word == 'prepare':
+                nxt, _ = _keyword_at(sql, _skip_ws_comments(sql, after))
+                if nxt == 'transaction':
+                    manages = True
+            elif word in _TXN_WORDS:
+                manages = True
+            at_start = False
+        char = sql[index]
+        if char == ';':
+            at_start = True
+            index += 1
+            continue
+        if char == '-' and index + 1 < length and sql[index + 1] == '-':
+            newline = sql.find('\n', index)
+            index = length if newline < 0 else newline + 1
+            continue
+        if char == '/' and index + 1 < length and sql[index + 1] == '*':
+            end = sql.find('*/', index + 2)
+            index = length if end < 0 else end + 2
+            continue
+        if char == '$':
+            delimiter = _dollar_delimiter(sql, index)
+            if delimiter:
+                end = sql.find(delimiter, index + len(delimiter))
+                index = length if end < 0 else end + len(delimiter)
+                continue
+        if char == '"':
+            index = _skip_double_quoted(sql, index)
+            continue
+        if _starts_string_literal(sql, index):
+            index = _skip_string_literal(sql, index)
+            continue
+        index += 1
+    found = []
+    if do_block:
+        found.append('contains a DO block')
+    if manages:
+        found.append('manages a transaction')
+    return found
+
+
 def unsafe_migration_statements(sql):
     """Early warning: textual descriptions of statements that a previous image could not survive.
 
     Comments and string literals are blanked in a single pass, so a comment marker inside one cannot hide a
     statement. A psql meta-command is reported from the raw script, because blanking strings must not hide
     ``\\c`` that sits outside them and must not invent one that sits inside them. Role switches, ``ALTER SYSTEM``,
-    ``ALTER DATABASE``, role DDL, ``COPY ... PROGRAM``, ``CREATE EXTENSION`` and ``DO`` blocks are rejected here:
-    the catalog snapshot does not record their server-side side effects, and ``deploy/migrate.py`` would replay
-    the same file on the live database. ``BEFORE UPDATE ON`` is a trigger clause, not a rewrite. This is not a
-    proof of compatibility; precheck_migration() is the authoritative check for what the catalog can see.
+    ``ALTER DATABASE``, role DDL, ``COPY ... PROGRAM``, ``CREATE EXTENSION``, ``DO`` blocks and transaction
+    control are rejected here: the catalog snapshot does not record their server-side side effects, and
+    ``deploy/migrate.py`` would replay the same file on the live database. ``DO`` is matched from its body
+    literal (quotes, ``E'...'``, ``U&'...'``, dollar quotes) before strings are blanked. ``BEFORE UPDATE ON``
+    and ``ON UPDATE`` foreign-key actions are not rewrites. This is not a proof of compatibility;
+    precheck_migration() is the authoritative check for what the catalog can see.
     """
-    text = NOISE.sub(' ', sql)
+    text = FK_ACTION.sub(' ', NOISE.sub(' ', sql))
     found = [label for label, pattern in INCOMPATIBLE_SQL if re.search(pattern, text, re.IGNORECASE)]
     for clause in ADD_CLAUSE.findall(text):
         if re.search(r'\bNOT\s+NULL\b', clause, re.IGNORECASE) and not re.search(r'\bDEFAULT\b', clause, re.IGNORECASE):
@@ -739,6 +903,7 @@ def unsafe_migration_statements(sql):
             break
     if psql_meta_command(sql):
         found.append('contains a psql meta-command')
+    found.extend(_statement_hazards(sql))
     return found
 
 
@@ -843,7 +1008,9 @@ def schema_breaking_changes(before, after):
             if name in before_items or (section == 'indexes' and not item['unique']):
                 continue
             if section == 'triggers':
-                if item['t'] in old_tables:
+                # A new foreign key adds RI_ConstraintTrigger rows on tables that already exist. Only the
+                # enabled state of a trigger that was already there is breaking; the new internal row is not.
+                if item['t'] in old_tables and not item.get('internal'):
                     changes.append('adds trigger %s to the existing table %s' % (name[1], name[0]))
             elif tightens(item, old_tables):
                 changes.append('adds %s %s that constrains existing columns of %s' % (label, name[1], name[0]))

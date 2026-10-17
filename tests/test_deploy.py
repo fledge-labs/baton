@@ -911,6 +911,7 @@ def test_backup_dir_is_required_unless_no_backup_is_given(files, capsys):
     "ALTER TABLE baton.t ALTER COLUMN a SET DATA TYPE text;", "ALTER TABLE baton.t ALTER COLUMN a SET NOT NULL;",
     "ALTER TABLE baton.t ADD COLUMN IF NOT EXISTS a text NOT NULL;", "TRUNCATE baton.t;", "DELETE FROM baton.t;",
     "UPDATE baton.t SET a = 1;", "UPDATE ONLY baton.t SET a = 1;",
+    "INSERT INTO baton.t(a) VALUES (1) ON CONFLICT DO UPDATE SET a = 1;",
     "MERGE INTO baton.t USING baton.s ON true WHEN MATCHED THEN DELETE;",
     "drop schema baton cascade;", "DROP FUNCTION baton.f();", "DROP VIEW baton.v;",
     "GRANT SELECT ON baton.t TO baton_app;", "REVOKE ALL ON TABLE baton.t FROM PUBLIC;",
@@ -927,6 +928,10 @@ def test_backup_dir_is_required_unless_no_backup_is_given(files, capsys):
     "DROP ROLE extra;", "COPY baton.t TO PROGRAM 'id';", "COPY baton.t FROM PROGRAM 'id';",
     "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;", "DO $$ BEGIN NULL; END $$;",
     "DO LANGUAGE plpgsql $$ BEGIN NULL; END $$;", "DO 'BEGIN NULL; END';",
+    "DO E'BEGIN NULL; END';", "DO U&'BEGIN NULL; END';", "do language plpgsql e'BEGIN NULL; END';",
+    "COMMIT;", "COMMIT WORK;", "BEGIN;", "BEGIN TRANSACTION;", "START TRANSACTION;",
+    "END;", "END WORK;", "ROLLBACK;", "ROLLBACK TO SAVEPOINT s;", "ABORT;",
+    "SAVEPOINT s;", "RELEASE SAVEPOINT s;", "RELEASE s;", "PREPARE TRANSACTION 'x';",
 ])
 def test_migration_lint_flags_contract_statements_a_previous_image_cannot_survive(statement):
     assert deploy.unsafe_migration_statements("CREATE TABLE IF NOT EXISTS baton.t(a int);\n" + statement + "\n")
@@ -943,6 +948,17 @@ def test_migration_lint_flags_contract_statements_a_previous_image_cannot_surviv
     "INSERT INTO baton.schema_version(singleton, version) VALUES (true, 1) ON CONFLICT DO NOTHING;",
     "COPY baton.t TO stdout;",
     "COPY program TO stdout;",
+    "ALTER TABLE baton.child ADD COLUMN parent_id int REFERENCES baton.parent(id) "
+    "ON UPDATE CASCADE ON DELETE SET NULL;",
+    "ALTER TABLE baton.child ADD COLUMN parent_id int REFERENCES baton.parent(id) "
+    "ON UPDATE SET DEFAULT ON DELETE RESTRICT;",
+    "ALTER TABLE baton.child ADD COLUMN parent_id int REFERENCES baton.parent(id) "
+    "ON UPDATE RESTRICT ON DELETE NO ACTION;",
+    "ALTER TABLE baton.child ADD COLUMN parent_id int REFERENCES baton.parent(id) ON UPDATE NO ACTION;",
+    "CREATE FUNCTION baton.f() RETURNS void LANGUAGE plpgsql AS $$ BEGIN NULL; END; $$;",
+    "CREATE PROCEDURE baton.p() LANGUAGE plpgsql AS $$ BEGIN COMMIT; END; $$;",
+    "SELECT 'COMMIT; BEGIN; ROLLBACK; DO E''BEGIN END'';';",
+    "-- COMMIT\n/* START TRANSACTION; */ SELECT 1;",
     "-- DROP TABLE baton.commented;\n/* DELETE FROM baton.t; UPDATE baton.t SET a = 1; */ SELECT 1;",
     "-- RESET ROLE\n/* ALTER SYSTEM SET x = 1; ALTER DATABASE baton SET y = 1; */\n"
     "SELECT 'SET ROLE baton_owner'; SELECT 'COPY baton.t TO PROGRAM ''id''';\n"
@@ -1339,8 +1355,21 @@ def test_schema_diff_flags_a_changed_predicate_or_column_list_on_an_existing_ind
     assert deploy.schema_breaking_changes(before, base_snapshot()) == []
 
 
+def test_a_new_internal_foreign_key_trigger_on_an_existing_table_is_not_breaking():
+    internal = {"t": "baton.tasks", "name": "RI_ConstraintTrigger_a",
+                "def": "CREATE CONSTRAINT TRIGGER RI_ConstraintTrigger_a", "enabled": "O", "internal": True}
+    assert deploy.schema_breaking_changes(base_snapshot(), altered(triggers=[internal])) == []
+    user = {"t": "baton.tasks", "name": "audit", "def": "CREATE TRIGGER audit", "enabled": "O", "internal": False}
+    assert deploy.schema_breaking_changes(base_snapshot(), altered(triggers=[user])) == [
+        "adds trigger audit to the existing table baton.tasks"]
+    before = altered(triggers=[internal])
+    assert deploy.schema_breaking_changes(before, altered(triggers=[dict(internal, enabled="D")])) == [
+        "disables trigger RI_ConstraintTrigger_a on baton.tasks"]
+
+
 def test_catalog_sql_keeps_internal_triggers_and_a_disabled_one_is_breaking():
-    assert "tgenabled" in deploy.CATALOG_SQL and "tgisinternal" not in deploy.CATALOG_SQL
+    assert "tgenabled" in deploy.CATALOG_SQL and "g.tgisinternal" in deploy.CATALOG_SQL
+    assert "NOT g.tgisinternal" not in deploy.CATALOG_SQL
     firing = {"t": "baton.child", "name": "RI_ConstraintTrigger_a",
               "def": "CREATE CONSTRAINT TRIGGER RI_ConstraintTrigger_a", "enabled": "O"}
     before = altered(triggers=[firing])
@@ -1491,6 +1520,14 @@ def test_catalog_sql_and_diff_on_a_real_postgres_accept_the_shipped_schema_and_c
             apply("CREATE TABLE baton.df18_parent (id int PRIMARY KEY)")
             apply("CREATE TABLE baton.df18_child (parent_id int REFERENCES baton.df18_parent(id))")
             assert deploy.schema_breaking_changes(before, snapshot()) == []
+            before = snapshot()
+            apply("ALTER TABLE baton.tasks ADD COLUMN df18_parent_id int REFERENCES baton.df18_parent(id) "
+                  "ON UPDATE CASCADE ON DELETE SET NULL")
+            after = snapshot()
+            assert deploy.schema_breaking_changes(before, after) == []
+            added = [item for item in after["triggers"] if item["name"] not in {old["name"] for old in before["triggers"]}]
+            assert added and all(item["internal"] and item["enabled"] == "O" for item in added)
+            assert {"baton.tasks", "baton.df18_parent"} <= {item["t"] for item in added}
             before = snapshot()
             internal = [item for item in before["triggers"] if item["t"] == "baton.df18_child"]
             assert internal and all(item["enabled"] == "O" for item in internal)
