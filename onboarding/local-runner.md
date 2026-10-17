@@ -456,13 +456,16 @@ worker 字段：
 
 ### 允许列表与参数约束
 
-授权不是“按程序名放行”。只有下面三个程序能被写入白名单，而且命令行必须落在写死的参数形态里。不在列表上的程序（shell、解释器、`mksh`、`grep`、`cat`、`python3.11`、网络客户端、`security`、脚本文件，以及任何没写在这里的名字）一律不发请求，任务按普通失败处理。匹配时只取 basename 并转小写，**不**去掉版本后缀：`python3.11` 不是 `python`，也不是允许列表里的任何一项。
+授权不是“按程序名放行”。只有下面两个程序能被写入白名单，而且命令行必须落在写死的参数形态里。不在列表上的程序（shell、解释器、`mksh`、`git`、`grep`、`cat`、`python3.11`、网络客户端、`security`、脚本文件，以及任何没写在这里的名字）一律不发请求，任务按普通失败处理。匹配时只取 basename 并转小写，**不**去掉版本后缀：`python3.11` 不是 `python`，也不是允许列表里的任何一项。
 
 | 程序 | 可以授权的形态 | 一律拒绝 |
 | --- | --- | --- |
 | `rg` | 普通搜索。`--` 后面的内容当作模式，不当作选项 | `--pre`、`--pre-glob`（以及 `--pre=`、`--pre-glob=`）：它们会再执行一个程序 |
 | `sed` | 看得见的脚本，且其中没有执行命令；`w`/`W` 和 `-i` 的目标文件必须落在任务 worktree 内（按真实路径，穿过符号链接） | `e` 命令、`s///e`、`-f`/`--file`（脚本不在命令行里，无法检查）、写到 worktree 之外、解析不了的脚本 |
-| `git` | 只读子命令 `status`、`log`、`diff`、`show`、`ls-files`、`rev-parse`、`blame`，以及少量不改配置、不换目录的全局选项（例如 `--no-pager`） | 任何其他子命令（别名也算）、`-c`、`--config`、`--upload-pack`、`--exec`、`-C`、`--git-dir`、`--work-tree`、`--ext-diff`。`log -c` 这种合并 diff 同样拒绝 |
+
+**`git` 现在不授权。** `status`、`log`、`diff`、`show`、`ls-files`、`rev-parse`、`blame` 这些只读子命令仍会按仓库配置执行外部程序：`diff.external`、`textconv`、`core.fsmonitor`，以及 `-p` / `pager.*` 强制打开的 `core.pager`。worktree 里的 `.git` 可写，模型可以把它改指向另一个 gitdir。`git diff --output=` 也能把输出写到 worktree 之外。沙箱挡得住写出 worktree，挡不住这些钩子在沙箱里拉起解释器（网络默认开启）。以后若要加回 `git`，必须单独做，并且只能走写死的绝对路径，强制带上 `-c core.pager=cat --no-pager --no-ext-diff --no-textconv`、`-c core.fsmonitor=false`、`GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL=/dev/null`，并且不读仓库配置。本次不实现这条路径。
+
+批准前，执行器还看 CLI 输出里的**整段命令文本**（检测器捕获的原文，不是裁到 300 字符之后的那一截）。文本里若有 shell 连接符（`;`、`&`、`|`、反引号、`$`、`(`、`)`、`>`、`<`、换行），或者原文长过单行字段、会被裁掉，就直接拒绝、不发请求。`rg x && python3`、`sed 's/a/b/'; sh` 属于前一种。参数策略本身（`--pre`、`s///e`）在 shim 里对**每一次执行的完整 argv** 再查一遍，不拿裁短后的 CLI 文本当依据。
 
 这些限制由 shim 在**每一次执行**时检查，不靠 CLI 白名单的文本。写进白名单的只有 shim 的绝对路径。shim 是执行器生成的一小段标准库 Python（不用 `eval`），解释器是 `/usr/bin/python3` 的绝对路径；它放在任务 worktree 之外、worker 可写目录之外，沙箱里以只读挂载。真实程序的路径在授权时解析并写死。拒绝时 shim 把 JSON 写到 `~/.local/share/baton-runner/spool/<worker>/`（沙箱里这块是可写的），执行器读到后用自己的令牌调用 `record_permission(event=shim_refused)`。`shim_refused` 可以重复报告，不改变授权是 `granted` 还是 `revoked`。调用时的工作目录必须在这条授权的 worktree 之内。
 

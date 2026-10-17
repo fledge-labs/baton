@@ -1011,19 +1011,22 @@ UNPARSED_TOOL = "(unparsed)"
 # Only these programs can ever be written into a CLI allowlist, and only under the argument policy next to each name.
 # Everything else (shells, interpreters, mksh, network clients, package managers, a versioned python3.11, a script) is
 # never granted: there is no deny-list to forget an entry on.
-GRANTABLE_TOOLS = frozenset({"rg", "sed", "git"})
-# Text embedded in the CLI rule so the entry states the same limits the runner enforced. A template that cannot carry
-# both this text ({args}) and the worktree ({directory}) cannot be granted through.
+# git is not here. status/log/diff/show/ls-files/rev-parse/blame still run diff.external, textconv, core.fsmonitor and
+# core.pager from repository config (including a pager forced by -p), and the worktree's .git is writable so it can be
+# pointed at another gitdir. `git diff --output=` can also write outside the worktree. The sandbox stops a write that
+# leaves the worktree; it does not stop a program those hooks start inside it, and the network is on by default.
+# A later change could allow git only by invoking it with the real binary's absolute path plus forced
+# `-c core.pager=cat --no-pager --no-ext-diff --no-textconv -c core.fsmonitor=false`, `GIT_CONFIG_NOSYSTEM=1`,
+# `GIT_CONFIG_GLOBAL=/dev/null`, and no repository config. That is not this change.
+GRANTABLE_TOOLS = frozenset({"rg", "sed"})
+# Shown in the shim's header. The CLI allowlist entry is only the shim path; this text is not a CLI rule.
 POLICY_ARGS = {
     "rg": "[! --pre ! --pre-glob]",
     "sed": "[! e-command ! s///e; w/W/-i inside worktree]",
-    "git": "[status|log|diff|show|ls-files|rev-parse|blame ! -c ! --config ! --upload-pack ! --exec ! -C ! alias]",
 }
-GIT_READONLY = frozenset({"status", "log", "diff", "show", "ls-files", "rev-parse", "blame"})
-GIT_SAFE_GLOBAL = frozenset({
-    "-p", "--paginate", "-P", "--no-pager", "--no-replace-objects",
-    "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs",
-})
+# A command line from a shell-shaped CLI. These characters start another program, a redirect, or a substitution.
+# The check is on the raw text, before shlex, because `sed 's/a/b/'; sh` does not contain a forbidden sed option.
+SHELL_CONTROL_RE = re.compile(r"[;&|`$()><\n]")
 
 
 def tool_basename(tool):
@@ -1282,44 +1285,28 @@ def _sed_problem(argv, worktree):
     return None
 
 
-def _git_forbidden(arg, _subcommand):
-    """Dangerous git arguments. Every -c is refused, including combined-diff: the rule written into the CLI says ! -c,
-    and `git -c name=value` runs through config. -C is refused the same way (it is also how git changes directory)."""
-    if arg.startswith(("-c", "-C", "--upload-pack", "--exec", "--config", "--git-dir", "--work-tree", "--ext-diff",
-                       "--textconv", "--extcmd")):
-        return True
-    if "alias." in arg:
-        return True
-    return False
+_GRANT_POLICIES = {"rg": _rg_problem, "sed": _sed_problem}
 
 
-def _git_problem(argv, worktree):
-    index = 1
-    while index < len(argv):
-        arg = argv[index]
-        if arg == "--" or not arg.startswith("-"):
-            break
-        if arg not in GIT_SAFE_GLOBAL:
-            return "git option %s can run a command, change directory or set config, and is never granted" % arg
-        index += 1
-    if index >= len(argv) or argv[index].startswith("-"):
-        return "git was given no read-only subcommand and is never granted"
-    subcommand = argv[index]
-    if subcommand not in GIT_READONLY:
-        return "git %s is not one of the read-only subcommands this runner can grant (an alias would be, too)" % subcommand
-    for arg in argv[index + 1:]:
-        if _git_forbidden(arg, subcommand):
-            return "git option %s can run a command, change directory or set config, and is never granted" % arg
+def _command_text_problem(command):
+    """Why this CLI command text cannot be granted, before any parse.
+
+    Shell control characters are refused on the raw text: shlex would drop `&&` or keep `;` inside a sed script and
+    the option check would then pass. A command longer than the single-line field is refused outright. The argument
+    policy itself runs on the full argv inside the shim at execution, never on a clipped copy of this text.
+    """
+    if SHELL_CONTROL_RE.search(command):
+        return "the command line contains a shell control operator and is never granted"
+    if len(command) > FIELD_CHARS or len(re.sub(r"\s+", " ", command).strip()) > FIELD_CHARS:
+        return "the command line was truncated, so it is never granted"
     return None
-
-
-_GRANT_POLICIES = {"rg": _rg_problem, "sed": _sed_problem, "git": _git_problem}
 
 
 def argv_problem(tool, argv, worktree):
     """None when this argv is within the tool's fixed policy and every path it writes stays in worktree.
 
-    The generated shim calls this on every execution. `argv[0]` is the program name, not a path.
+    The generated shim calls this on every execution with the process argv, the full list, not the command text
+    clipped out of the CLI's output. `argv[0]` is the program name, not a path.
     """
     name = tool_basename(tool)
     if name not in _GRANT_POLICIES:
@@ -1332,12 +1319,18 @@ def argv_problem(tool, argv, worktree):
 
 
 def argument_problem(tool, command, worktree):
-    """None when this exact command line is within the tool's fixed policy and every path it writes stays in worktree."""
+    """None when this exact command line is within the tool's fixed policy and every path it writes stays in worktree.
+
+    `command` must be the detector's full capture. A clipped copy can hide `--pre` or a shell operator past the cut.
+    """
     name = tool_basename(tool)
     if name not in _GRANT_POLICIES:
         return "%s is not on the allow-list and is never granted" % (name or tool)
     if not isinstance(command, str) or not command.strip():
         return "%s was refused without a command line, so its arguments cannot be checked" % name
+    problem = _command_text_problem(command)
+    if problem:
+        return problem
     argv = _split_command(command)
     if not argv:
         return "the command line could not be parsed, so it is never granted"
@@ -1414,7 +1407,7 @@ def resolve_real_binary(name):
 
 
 _SHIM_FUNCTIONS = (tool_basename, _inside_worktree, _rg_problem, _sed_regex_end, _sed_address, _sed_line_path,
-                   _sed_script_problem, _sed_problem, _git_forbidden, _git_problem, argv_problem)
+                   _sed_script_problem, _sed_problem, argv_problem)
 
 # Appended to every generated shim. Standard library only; no eval; the real program is exec'd by the baked absolute path.
 SHIM_MAIN = """
@@ -1508,11 +1501,10 @@ def shim_script(tool, real, spool, grants):
         "REAL = %r" % real,
         "SPOOL = %r" % spool,
         "GRANTS = %r" % (rows,),
-        "GIT_READONLY = frozenset(%r)" % (tuple(sorted(GIT_READONLY)),),
-        "GIT_SAFE_GLOBAL = frozenset(%r)" % (tuple(sorted(GIT_SAFE_GLOBAL)),),
     ]
     parts.extend(inspect.getsource(function).rstrip() for function in _SHIM_FUNCTIONS)
-    parts.append('_GRANT_POLICIES = {"rg": _rg_problem, "sed": _sed_problem, "git": _git_problem}')
+    parts.append("_GRANT_POLICIES = {%s}" % ", ".join("%r: %s" % (name, _GRANT_POLICIES[name].__name__)
+                                                       for name in sorted(_GRANT_POLICIES)))
     parts.append(SHIM_MAIN.strip("\n"))
     return "\n".join(parts) + "\n"
 
@@ -1587,6 +1579,7 @@ class Denial:
     cli: str
     tool: str = None
     command: str = None
+    command_full: str = None
     directory: str = None
     reason: str = None
     kind: str = "command"
@@ -1663,7 +1656,10 @@ def detect_denial(cli_name, text, secrets=()):
     found = match.groupdict()
     command = found.get("command") or found.get("tool") or ""
     tool = program_name(command) if detector.kind == "command" else found.get("tool")
-    denial = Denial(cli_name, tool=tool, command=one_line(command, FIELD_CHARS, secrets) or None, kind=detector.kind,
+    # `command` is the one-line field sent to Baton. `command_full` is the raw capture the grant check must use:
+    # clipping first would hide a `--pre`, an `s///e` or a shell operator past FIELD_CHARS.
+    denial = Denial(cli_name, tool=tool, command=one_line(command, FIELD_CHARS, secrets) or None,
+                    command_full=command or None, kind=detector.kind,
                     directory=one_line(found["directory"], 4000, secrets) if found.get("directory") else None,
                     reason=one_line(found.get("reason") or detector.reason or GENERIC_REASON, FIELD_CHARS, secrets),
                     detector=detector.name)
@@ -2494,8 +2490,10 @@ class WorkerRunner:
             return None
         if denial.kind != "command":
             return "the CLI wants %s permission, which is outside the command allowlist and is never granted here" % plain(denial.tool)
-        return refusal_grant_problem(self.worker.permissions, self.principal, denial.tool, denial.command, plan.worktree,
-                                     self.keeper.ledger.active())
+        # The clipped `command` field is only for the request text. The policy sees the raw capture.
+        return refusal_grant_problem(self.worker.permissions, self.principal, denial.tool,
+                                     denial.command_full if denial.command_full is not None else denial.command,
+                                     plan.worktree, self.keeper.ledger.active())
 
     def post_request(self, task_id, epoch, denial, worktree):
         permissions = self.worker.permissions
@@ -2584,7 +2582,8 @@ class WorkerRunner:
                 if denial.tool is None:
                     raise RunnerError("permission approved, but the refused tool could not be identified; add it to the "
                                       "CLI's allowlist by hand")
-                record = self.keeper.grant(decided, denial.tool, plan.worktree, denial.command)
+                record = self.keeper.grant(decided, denial.tool, plan.worktree,
+                                           denial.command_full if denial.command_full is not None else denial.command)
                 if decided["status"] == "allow_once":
                     once.append(record["id"])
                 self.baton.write("renew", {"task_id": task_id, "epoch": epoch, "lease_seconds": lease})

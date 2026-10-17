@@ -1347,6 +1347,12 @@ class SpaceStore:
         row.pop("idempotency_key")
         row.pop("role_sla_notified_at")
         reason, blocker, blocked_at = (row.pop(key) for key in ("blocked_reason", "blocked_by", "blocked_at"))
+        if reason == "waiting_input":
+            # Derived expiry of the permission request clears the marker in this same transaction, including a task
+            # read and a handoff's returned view. The advisory lock keeps this from racing a new request.
+            self._permission_views(conn, task_id)
+            fresh = conn.execute("SELECT blocked_reason,blocked_by,blocked_at FROM baton.tasks WHERE id=%s", (task_id,)).fetchone()
+            reason, blocker, blocked_at = fresh["blocked_reason"], fresh["blocked_by"], fresh["blocked_at"]
         row["blocked"] = {"reason_code": reason, "by": blocker, "at": blocked_at} if reason else None
         if not include_prompt and row["execution_mode"] != "manual":
             row.pop("prompt")
@@ -2115,7 +2121,12 @@ class SpaceStore:
     @staticmethod
     def _expire_requests(conn, task_id, views):
         """A pending request is only live while the claim it was made under is: it expires when the epoch moves on, the
-        holder's lease is gone, or its own time-to-live passes. Derived, so nothing has to run to free the task."""
+        holder's lease is gone, or its own time-to-live passes. Derived, so nothing has to run to free the task.
+
+        The same moment clears `waiting_input` when no request is still pending. Cancel of an already-expired request
+        stays `stale_claim` (there is nothing left to withdraw); the marker does not wait for that cancel, the next
+        claim, or a newer request.
+        """
         pending = [view for view in views.values() if view["status"] == "pending"]
         if not pending:
             return
@@ -2123,10 +2134,16 @@ class SpaceStore:
         claim = conn.execute("SELECT holder,epoch FROM baton.x_claim WHERE task_id=%s AND lease_expires_at>clock_timestamp()",
                              (task_id,)).fetchone()
         now = conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
+        expired_by = []
         for view in pending:
             if (task["state"] != "claimed" or task["epoch"] != view["epoch"] or claim is None
                     or (claim["holder"], claim["epoch"]) != (view["worker"], view["epoch"]) or view["expires_at"] <= now):
                 view["status"] = "expired"
+                expired_by.append(view["worker"])
+        if not expired_by or any(view["status"] == "pending" for view in views.values()):
+            return
+        conn.execute("""UPDATE baton.tasks SET blocked_reason=NULL,blocked_by=NULL,blocked_at=NULL
+            WHERE id=%s AND blocked_reason='waiting_input' AND blocked_by=ANY(%s)""", (task_id, expired_by))
 
     def _permission_request(self, conn, task_id, request_id):
         view = self._permission_views(conn, task_id).get(_uuid(request_id, "request_id"))

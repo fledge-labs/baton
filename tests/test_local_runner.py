@@ -1600,13 +1600,14 @@ def test_a_command_the_parser_cannot_name_falls_back_to_the_excerpt():
     "curl", "wget", "ssh", "bash", "python3", "sudo", "security", "env", "xargs", "nc", "python3.11", "python3.12", "Python3.11",
     "perl5.36", "ruby3.2", "node20", "nodejs18", "php8.2", "busybox", "awk", "gawk", "mawk", "find", "make", "npm", "npx",
     "pip3", "cargo", "go", "tar", "vim", "timeout", "nohup", "run.sh", "build.py", "/usr/bin/python3.9", "/bin/BASH",
-    "mksh", "ksh", "grep", "cat", "ls", "jq", "head", "diff", "sort", "x264", "ripgrep"])
+    "mksh", "ksh", "grep", "cat", "ls", "jq", "head", "diff", "sort", "x264", "ripgrep",
+    "git", "/usr/bin/git", "GIT"])
 def test_anything_off_the_allow_list_is_never_grantable(tool):
     assert lr.is_ungrantable(tool)
 
 
-@pytest.mark.parametrize("tool", ["rg", "sed", "git", "/usr/bin/rg", "/usr/bin/git", "RG"])
-def test_only_rg_sed_and_git_are_grantable_programs(tool):
+@pytest.mark.parametrize("tool", ["rg", "sed", "/usr/bin/rg", "RG"])
+def test_only_rg_and_sed_are_grantable_programs(tool):
     assert not lr.is_ungrantable(tool)
 
 
@@ -1622,10 +1623,10 @@ def test_only_rg_sed_and_git_are_grantable_programs(tool):
     ("sed -n 's/a/b/p' file", None),
     ("sed -e 's/a/bee/g'", None),
     ("sed '# the letter e is a comment'", None),
-    ("sed '1,$d'", None),
+    ("sed '1,$d'", "shell"),
     ("sed -e 's/a/b/e'", "s///e"),
     ("sed 'e'", "e command"),
-    ("sed 's/a/b/;e'", "e command"),
+    ("sed 's/a/b/;e'", "shell"),
     ("sed '1e'", "e command"),
     ("sed -f /tmp/script", "-f"),
     ("sed -i 's/a/b/'", "worktree"),
@@ -1635,25 +1636,11 @@ def test_only_rg_sed_and_git_are_grantable_programs(tool):
     ("sed 'w /work/wt/out'", None),
     ("sed 's/a/b/w /etc/x'", "worktree"),
     ("sed 's/a/b/w /work/wt/out'", None),
-    ("git status", None),
-    ("git status --porcelain", None),
-    ("git log --oneline", None),
-    ("git log -c --oneline", "never granted"),
     ("sed 'w ../outside'", "worktree"),
-    ("git diff --stat", None),
-    ("git show HEAD", None),
-    ("git ls-files", None),
-    ("git rev-parse HEAD", None),
-    ("git blame README", None),
-    ("git -c core.pager=less status", "never granted"),
-    ("git -C /tmp status", "never granted"),
-    ("git --upload-pack=evil status", "never granted"),
-    ("git --exec-path=/tmp status", "never granted"),
-    ("git status -c core.pager=sh", "never granted"),
-    ("git diff -C", "never granted"),
-    ("git diff --ext-diff", "never granted"),
-    ("git push", "read-only"),
-    ("git my-alias", "read-only"),
+    ("git status", "allow-list"),
+    ("git diff --stat", "allow-list"),
+    ("git diff --output=/tmp/out", "allow-list"),
+    ("git -c core.pager=less status", "allow-list"),
     ("mksh -c id", "allow-list"),
     ("grep -n TODO", "allow-list"),
     ("python3.11 -c pass", "allow-list"),
@@ -1671,6 +1658,31 @@ def test_grantable_tools_keep_a_fixed_argument_policy(command, fragment):
         assert got is None, got
     else:
         assert got and fragment in got, got
+
+
+@pytest.mark.parametrize("command", [
+    "rg x && python3", "rg x || python3", "rg x | sh", "sed 's/a/b/'; sh", "rg `id`", "rg $(id)",
+    "rg foo > /tmp/out", "rg foo < /etc/passwd", "rg a\nb",
+])
+def test_shell_control_operators_are_refused_before_shlex(command):
+    tool = "sed" if command.startswith("sed") else "rg"
+    got = lr.argument_problem(tool, command, "/work/wt")
+    assert got and "shell" in got, got
+
+
+def test_a_truncated_command_is_refused_and_the_shim_still_sees_the_full_argv():
+    hidden = "rg -n " + ("a" * 400) + " --pre=sh"
+    clipped = lr.one_line(hidden, lr.FIELD_CHARS)
+    assert "--pre" not in clipped and lr.argument_problem("rg", clipped, "/work/wt") is None
+    assert "truncated" in lr.argument_problem("rg", hidden, "/work/wt")
+    output = 'Permission denied: run_command "%s" is not in permissions.allow (cwd: /work/wt)\n' % hidden
+    denial = lr.detect_denial("agy", output)
+    assert denial.tool == "rg" and denial.command_full == hidden and "--pre" not in denial.command
+    permissions = lr.PermissionConfig("agy", "/x", ["boss"])
+    assert "truncated" in lr.refusal_grant_problem(permissions, "w1", denial.tool, denial.command_full, "/work/wt", [])
+    compound = lr.detect_denial("agy", 'Permission denied: run_command "rg x && python3" is not in permissions.allow\n')
+    assert "shell" in lr.refusal_grant_problem(permissions, "w1", compound.tool, compound.command_full, "/work/wt", [])
+    assert "--pre" in lr.argv_problem("rg", ["rg", "a" * 5000, "--pre=sh"], "/work/wt")
 
 
 def test_sed_cannot_write_through_a_symlink_that_leaves_the_worktree(tmp_path):
@@ -1929,10 +1941,10 @@ def test_a_grant_that_cannot_be_audited_is_withdrawn_again(tmp_path, monkeypatch
 def test_reconcile_withdraws_leftover_allow_once_grants_and_keeps_allow_always(tmp_path, monkeypatch):
     settings, keeper, recorder = keeper_for(tmp_path, monkeypatch)
     once = keeper.grant(request_view("r1", "allow_once"), "rg", "/work/w1")
-    always = keeper.grant(request_view("r2", "allow_always", "t2"), "git", "/work/w1", command="git status")
+    always = keeper.grant(request_view("r2", "allow_always", "t2"), "sed", "/work/w1", command="sed -n 's/a/b/p'")
     keeper.reconcile()
     allow = json.loads(settings.read_text())["permissions"]["allow"]
-    assert allow == [agy_rule("git")] and [item["id"] for item in keeper.ledger.active()] == [always["id"]]
+    assert allow == [agy_rule("sed")] and [item["id"] for item in keeper.ledger.active()] == [always["id"]]
     assert once["id"] not in [item["id"] for item in keeper.ledger.active()]
 
 
@@ -2205,7 +2217,10 @@ def test_a_tool_that_would_widen_the_sandbox_is_never_requested(lab, bridge, spa
 @pytest.mark.parametrize("message,fragment", [
     ('Permission denied: run_command "rg --pre cat TODO" is not in permissions.allow (cwd: /etc)', "--pre"),
     ('Permission denied: run_command "sed -e \'s/a/b/e\'" is not in permissions.allow (cwd: {cwd})', "s///e"),
-    ('Permission denied: run_command "git -c core.pager=sh status" is not in permissions.allow (cwd: {cwd})', "never granted"),
+    ('Permission denied: run_command "git -c core.pager=sh status" is not in permissions.allow (cwd: {cwd})', "allow-list"),
+    ('Permission denied: run_command "rg x && python3" is not in permissions.allow (cwd: {cwd})', "shell"),
+    ('Permission denied: run_command "sed \'s/a/b/\'; sh" is not in permissions.allow (cwd: {cwd})', "shell"),
+    ('Permission denied: run_command "%s" is not in permissions.allow (cwd: {cwd})' % ("rg -n " + "a" * 400 + " --pre=sh"), "truncated"),
     ('Permission denied: run_command "mksh -c id" is not in permissions.allow (cwd: {cwd})', "allow-list"),
 ])
 def test_commands_outside_the_argument_policy_are_never_requested(lab, bridge, space, agy, message, fragment):
@@ -2362,13 +2377,16 @@ def test_a_pending_request_expires_with_its_epoch_so_the_task_can_ask_again(brid
     moved = Api(bridge, "worker").write("handoff", task_id=task_id, epoch=claimed["epoch"], target_principal=worker2)
     assert moved["epoch"] == claimed["epoch"] + 1
     assert [item["status"] for item in permissions_of(space, task_id)] == ["expired"]
+    assert moved["blocked"] is None and task_view(space, task_id)["blocked"] is None
     assert api_error(lambda: space.owner.write("decide_permission", task_id=task_id, request_id=first["request_id"],
                                                option="allow_always")) == ("stale_claim", 409)
     second = ask(bridge, "worker2", task_id, moved["epoch"])
     assert second["status"] == "pending" and second["request_id"] != first["request_id"]
     assert [item["status"] for item in permissions_of(space, task_id)] == ["expired", "pending"]
+    assert task_view(space, task_id)["blocked"]["reason_code"] == "waiting_input"
     assert api_error(lambda: space.owner.write("cancel_permission", task_id=task_id,
                                                request_id=first["request_id"])) == ("stale_claim", 409)
+    assert task_view(space, task_id)["blocked"]["reason_code"] == "waiting_input", "cancelling the expired request does not clear the new one"
 
 
 def test_a_pending_request_expires_after_its_ttl_and_when_the_lease_is_gone(bridge, space):
@@ -2378,13 +2396,18 @@ def test_a_pending_request_expires_after_its_ttl_and_when_the_lease_is_gone(brid
     assert api_error(lambda: ask(bridge, "worker", task_id, claimed["epoch"], ttl_seconds=0))[1] == 422
     time.sleep(1.3)
     assert permissions_of(space, task_id)[0]["status"] == "expired"
+    assert task_view(space, task_id)["blocked"] is None
     assert api_error(lambda: space.owner.write("decide_permission", task_id=task_id, request_id=short["request_id"],
                                                option="allow_once")) == ("stale_claim", 409)
+    assert api_error(lambda: space.owner.write("cancel_permission", task_id=task_id,
+                                               request_id=short["request_id"])) == ("stale_claim", 409)
+    assert task_view(space, task_id)["blocked"] is None
     again = ask(bridge, "worker", task_id, claimed["epoch"])
     assert again["status"] == "pending"
     Api(bridge, "worker").write("renew", task_id=task_id, epoch=claimed["epoch"], lease_seconds=1)
     time.sleep(1.3)
     assert permissions_of(space, task_id)[-1]["status"] == "expired", "no live lease, no live request"
+    assert task_view(space, task_id)["blocked"] is None
 
 
 def test_a_request_can_be_cancelled_by_its_worker_or_the_root_and_nobody_else(bridge, space):
@@ -2426,10 +2449,9 @@ def test_a_forged_versioned_interpreter_denial_is_never_requested(lab, bridge, s
     assert permissions_of(space, task_id) == [] and agy.allow() == agy.initial["permissions"]["allow"]
 
 
-def test_a_very_long_command_and_directory_still_produce_a_request_not_a_422(lab, bridge, space, agy):
-    command = "rg -n " + "a" * 3000
+def test_a_very_long_directory_in_cli_output_still_produces_a_request_not_a_422(lab, bridge, space, agy):
     nested = "/".join(["d" * 100] * 6)
-    message = 'Permission denied: run_command "%s" is not in permissions.allow (cwd: {cwd}/%s)' % (command, nested)
+    message = 'Permission denied: run_command "rg -n TODO" is not in permissions.allow (cwd: {cwd}/%s)' % nested
     task_id = assign(space, bridge, "worker")
     lab.start([agy_worker(lab, bridge, agy, message=message)], max_failures_per_task=1)
     request = pending_request(space, task_id)
@@ -2564,7 +2586,7 @@ def test_one_pending_grant_that_cannot_be_settled_does_not_stop_the_others(tmp_p
     settings, keeper, _ = keeper_for(tmp_path, monkeypatch)
     work = "/work/w1"
     once = keeper.grant(request_view("r-once", "allow_once", "t-once"), "rg", work)
-    always = keeper.grant(request_view("r-always", "allow_always", "t-always"), "git", work, command="git status")
+    always = keeper.grant(request_view("r-always", "allow_always", "t-always"), "sed", work, command="sed -n 's/a/b/p'")
     sed_rule = agy_rule("sed", work)
     lr.edit_rule(settings, lr.CLI_PROFILES["agy"], sed_rule, True)
     grants = keeper.ledger.load()
@@ -2580,7 +2602,7 @@ def test_one_pending_grant_that_cannot_be_settled_does_not_stop_the_others(tmp_p
     keeper.reconcile()
     allow = json.loads(settings.read_text())["permissions"]["allow"]
     assert sed_rule not in allow and agy_rule("rg", work) not in allow
-    assert agy_rule("git", work) in allow
+    assert agy_rule("sed", work) in allow
     loaded = keeper.ledger.load()
     assert loaded["bad"]["status"] == "pending" and loaded["good"]["status"] == "revoked"
     assert [item["id"] for item in keeper.ledger.active()] == [always["id"]]
