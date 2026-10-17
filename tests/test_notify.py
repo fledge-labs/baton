@@ -536,3 +536,43 @@ def test_delivery_internals_are_service_only_and_timeouts_are_enforced(team, rec
     receiver.delay = 0
     assert webhooks.post(receiver.url(), b"{}", {"Content-Type": "application/json"}, timeout=5) == ("delivered", 200)
     assert webhooks.sign(b"k", b"body") == "sha256=" + hmac.new(b"k", b"body", hashlib.sha256).hexdigest()
+
+
+def test_definite_worker_failure_notifies_the_owner_in_the_same_transaction(team, modules, pg_store, receiver):
+    call, identities, space, page = team
+    server = modules[1]
+    _, secret = subscribe(call, "owner", receiver.url())
+    task = call("owner", "submit_task", operation_id=op(), idempotency_key="notify-failure", prompt=PROMPT, page_id=page["id"])
+    assert task["execution_mode"] == "codex" and notes(call, "owner")["notifications"] == []
+    claim = pg_store.claim_next(server.SERVICE, op(), lease_seconds=300)
+    pg_store.mark_dispatched(server.SERVICE, op(), claim["id"], claim["epoch"])
+    assert notes(call, "owner")["notifications"] == []
+
+    failing = op()
+    a2a_id = str(uuid.uuid4())
+    original = pg_store._task_view
+    pg_store._task_view = lambda *args, **kwargs: (_ for _ in ()).throw(StoreError("storage_unavailable"))
+    try:
+        with pytest.raises(StoreError):
+            pg_store.fail_auto(server.SERVICE, failing, claim["id"], claim["epoch"], "CODEX_TIMEOUT", a2a_id)
+    finally:
+        pg_store._task_view = original
+    assert notes(call, "owner")["notifications"] == [], "a rolled-back failure leaves no outbox row"
+
+    pg_store.fail_auto(server.SERVICE, failing, claim["id"], claim["epoch"], "CODEX_TIMEOUT", a2a_id)
+    pg_store.fail_auto(server.SERVICE, failing, claim["id"], claim["epoch"], "CODEX_TIMEOUT", a2a_id)
+    result = notes(call, "owner")
+    assert events(result) == ["task.failed"], "exactly one row, even after an idempotent replay"
+    failure = result["notifications"][0]
+    assert set(failure) == PAYLOAD_KEYS and failure["object_type"] == "task"
+    assert failure["object_id"] == task["task_id"] == failure["thread_id"] and failure["recipient"] == identities["owner"]["agent"]
+    for label in ("reviewer", "worker", "replacement", "stranger"):
+        assert notes(call, label)["notifications"] == []
+    assert any(item["subject"].startswith("[failed]") for item in call("owner", "fetch_inbox")["messages"])
+    assert PROMPT not in json.dumps(result)
+
+    assert deliver(modules) == 1
+    request = receiver.requests[0]
+    assert request["headers"]["X-Baton-Event"] == "task.failed" and json.loads(request["body"])["id"] == failure["id"]
+    assert hmac.compare_digest(request["headers"]["X-Baton-Signature"], webhooks.sign(secret, request["body"]))
+    assert PROMPT.encode() not in request["body"]
