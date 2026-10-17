@@ -9,14 +9,18 @@ Run it on the machine that runs Docker, from the directory your Compose files ar
 
 Steps, each with a hard timeout (the recovery path too):
   1. preflight: read the migration SQL (a missing file is an error) and run a textual early warning over it;
-     services that the Compose files no longer declare (orphans) must be acknowledged with --allow-remove-orphans;
+     when a build will run, refuse unless every tracked path the build context would include is readable by
+     other users (files need o+r, directories o+rx), before any docker command. Paths excluded by
+     .dockerignore, including deploy/.env, may stay private. --no-build skips this check. Services that the
+     Compose files no longer declare (orphans) must be acknowledged with --allow-remove-orphans;
   2. record the image of every container of the project, running or not, and tag each local image per service as
      `baton-deploy-rollback:<service>-<id>` so it cannot be garbage-collected;
   3. if a database volume exists, make sure the database container is up (even when every application container
      is stopped or gone), then (a) precheck the migration: apply it to a throwaway copy of the live schema and diff
      the catalogs; any breaking change, or any step that fails, aborts (fail closed); and (b) back up the database
      with pg_dump (custom format, mode 0600) into --backup-dir; a failed dump aborts;
-  4. build (optionally with --build-network host);
+  4. build (optionally with --build-network host). The image itself also runs `chmod -R a+rX /app` after COPY,
+     so a 0600 checkout cannot leave migrate (uid 999) unable to read the schema;
   5. `docker compose up -d --wait --force-recreate --remove-orphans` (this also runs the migration);
   6. smoke-test the public entry point: GET /board is 200, an unauthenticated POST /mcp is 401, and one real MCP
      initialize + tools/list + fetch_inbox succeeds with the smoke token.
@@ -34,7 +38,8 @@ files. Removed orphans are not recreated. If every container was removed there i
 The smoke token is read from a file, sent only as a bearer header and never printed.
 
 Exit codes: 0 deployed; 1 failed, with the previous deployment running (restored by the rollback, or untouched
-because preflight, backup or build failed); 2 usage or configuration error; 3 failed and the previous deployment is
+because preflight, backup or build failed); 2 usage or configuration error (including a checkout other users
+cannot read); 3 failed and the previous deployment is
 not verified to be running (rollback failed or incomplete, or there was nothing to restore).
 Python 3.9+ standard library only.
 """
@@ -45,6 +50,7 @@ import re
 import secrets
 import signal
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -872,6 +878,189 @@ def current_image_ids(docker, refs):
     return ids
 
 
+def source_root():
+    """Checkout whose tracked files the image build and the bind mounts ship. Tests replace this."""
+    return Path(__file__).resolve().parents[1]
+
+
+def _clean_ignore_pattern(line):
+    """One .dockerignore line, as Docker's patternmatcher reads it: strip, drop comments, honor `!`, drop a leading slash."""
+    line = line.strip().lstrip('\ufeff')
+    if not line or line.startswith('#'):
+        return None
+    negate = line.startswith('!')
+    body = line[1:].strip() if negate else line
+    body = body.lstrip('/')
+    parts = []
+    for part in body.split('/'):
+        if part in ('', '.'):
+            continue
+        if part == '..':
+            if parts:
+                parts.pop()
+            continue
+        parts.append(part)
+    cleaned = '/'.join(parts)
+    if not cleaned or cleaned == '.':
+        return None
+    return negate, cleaned
+
+
+def _dockerignore_regex(pattern):
+    """Compile one pattern the way moby/patternmatcher does: `**` crosses directories, `*` and `?` do not."""
+    parts = ['^']
+    index, length = 0, len(pattern)
+    while index < length:
+        char = pattern[index]
+        if char == '*':
+            if index + 1 < length and pattern[index + 1] == '*':
+                index += 2
+                if index < length and pattern[index] == '/':
+                    index += 1
+                parts.append('.*' if index >= length else '(?:.*/)?')
+            else:
+                parts.append('[^/]*')
+                index += 1
+        elif char == '?':
+            parts.append('[^/]')
+            index += 1
+        elif char == '\\':
+            index += 1
+            parts.append(re.escape(pattern[index]) if index < length else re.escape('\\'))
+            if index < length:
+                index += 1
+        elif char == '[':
+            end = pattern.find(']', index + 1)
+            if end == -1:
+                parts.append(re.escape(char))
+                index += 1
+            else:
+                parts.append(pattern[index:end + 1])
+                index = end + 1
+        else:
+            parts.append(re.escape(char))
+            index += 1
+    parts.append('$')
+    try:
+        return re.compile(''.join(parts))
+    except re.error:
+        raise UsageError('cannot interpret .dockerignore pattern %r; refusing to build' % pattern) from None
+
+
+class DockerIgnore:
+    """Whether a context-relative path is excluded, including because a parent directory is.
+
+    The last matching pattern wins, so a later `!` can put a file back. This follows
+    MatchesOrParentMatches: a file under an excluded directory is excluded too.
+    """
+
+    def __init__(self, text):
+        self.patterns = []
+        for raw in text.splitlines():
+            cleaned = _clean_ignore_pattern(raw)
+            if cleaned:
+                negate, pattern = cleaned
+                self.patterns.append((negate, _dockerignore_regex(pattern)))
+
+    def ignored(self, relative):
+        relative = relative.strip('/')
+        if not relative or relative == '.':
+            return False
+        parts = relative.split('/')
+        parents = ['/'.join(parts[:i]) for i in range(1, len(parts))]
+        matched = False
+        for negate, regex in self.patterns:
+            if negate != matched:
+                continue
+            if regex.fullmatch(relative) or any(regex.fullmatch(parent) for parent in parents):
+                matched = not negate
+        return matched
+
+
+def dockerignore_for(root):
+    """The ignore file Docker would use for `deploy/Dockerfile` with the repository as the context.
+
+    A `deploy/Dockerfile.dockerignore` next to the Dockerfile replaces `.dockerignore` entirely.
+    """
+    root = Path(root)
+    specific = root / 'deploy' / 'Dockerfile.dockerignore'
+    path = specific if specific.is_file() else root / '.dockerignore'
+    if not path.exists():
+        return DockerIgnore('')
+    try:
+        return DockerIgnore(path.read_text(encoding='utf-8'))
+    except OSError:
+        raise UsageError('cannot read %s; refusing to build' % path) from None
+
+
+def tracked_paths(root):
+    """Paths git will ship from this checkout. Untracked files are not part of the check."""
+    try:
+        result = subprocess.run(['git', '-C', str(root), '-c', 'safe.directory=*', 'ls-files', '-z'],
+                                capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        raise UsageError('cannot list tracked files; refusing to build') from None
+    if result.returncode != 0:
+        raise UsageError('cannot list tracked files; refusing to build') from None
+    return [item.decode('utf-8', 'surrogateescape') for item in result.stdout.split(b'\0') if item]
+
+
+def _mode(path):
+    """(mode bits, is_directory) of path, following symlinks. None when the path cannot be stat'ed."""
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return stat.S_IMODE(info.st_mode), stat.S_ISDIR(info.st_mode)
+
+
+def _others_can_read(mode, directory):
+    needed = 0o005 if directory else 0o004
+    return mode & needed == needed
+
+
+def unreadable_build_paths(root):
+    """Tracked paths the build context would include that other users cannot read.
+
+    Files need o+r. Directories on the way to such a file need o+rx, because COPY and the bind mounts
+    keep that mode and migrate (uid 999) and edge (uid 101) are not the owner. A missing worktree file
+    is not copied, so it is skipped. A path that exists but cannot be stat'ed is refused.
+    """
+    root = Path(root)
+    matcher = dockerignore_for(root)
+    offending, seen_dirs = [], set()
+    for relative in tracked_paths(root):
+        posix = Path(relative).as_posix()
+        if matcher.ignored(posix):
+            continue
+        location = root / relative
+        if not location.exists() and not location.is_symlink():
+            continue
+        found = _mode(location)
+        if found is None or not _others_can_read(found[0], found[1]):
+            offending.append(posix)
+        parent = Path(posix).parent
+        while parent != Path('.'):
+            key = parent.as_posix()
+            parent = parent.parent
+            if key in seen_dirs or matcher.ignored(key):
+                continue
+            seen_dirs.add(key)
+            found = _mode(root / key)
+            if found is None or not found[1] or not _others_can_read(found[0], True):
+                offending.append(key)
+    return sorted(set(offending))
+
+
+def build_permission_error(paths):
+    listing = '\n'.join('  ' + path for path in paths)
+    return ('refusing to build: these tracked paths are not readable by other users '
+            '(files need o+r, directories o+rx). COPY and the bind mounts keep that mode, so migrate '
+            '(uid 999) cannot read them:\n%s\n'
+            'chmod a+rX each path. Files excluded by .dockerignore are not copied and may stay private, '
+            'including deploy/.env, token files, keys and secrets/.' % listing)
+
+
 def manual_recovery(previous, backup, holds):
     steps = ['docker tag %s %s   # %s' % (hold['tag'], hold['image'], hold['service']) for hold in holds if hold['ok']]
     steps.append('docker compose <your -f and -p options> up -d --wait --force-recreate')
@@ -946,6 +1135,11 @@ def deploy(config, runner, http=None, log=None, clock=time.monotonic, sleep=time
         return stop('aborted', 'the migration SQL is not backward compatible (%s); nothing was changed; a rollback '
                     'could not restore the previous image. Split it into an expand release and a later contract '
                     'release, or pass --allow-incompatible-migration' % '; '.join(migration['unsafe']))
+
+    if config.build:
+        offending = unreadable_build_paths(source_root())
+        if offending:
+            raise UsageError(build_permission_error(offending))
 
     model = compose_model(docker, config)
     project = report['project'] = model['project']

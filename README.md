@@ -95,12 +95,12 @@ docker compose run --rm --no-deps \
 
 在 Docker 主机上用 [`scripts/deploy.py`](scripts/deploy.py)（仅 Python 3 标准库）重建并替换运行中的实例，而不是手工 `up`。每一步都有硬超时，超时按失败处理并进入回滚。顺序是：
 
-1. 预检：读取待部署的迁移 SQL（默认 `bridge/space_schema.sql`，用 `--schema-file` 指向要构建的镜像实际执行的那份；找不到或为空就报错退出，不会当作通过）并做一次文本快速检查；Compose 文件不再声明的服务（孤立服务）必须用 `--allow-remove-orphans` 确认。任一不满足就在改动任何东西之前中止。
+1. 预检：读取待部署的迁移 SQL（默认 `bridge/space_schema.sql`，用 `--schema-file` 指向要构建的镜像实际执行的那份；找不到或为空就报错退出，不会当作通过）并做一次文本快速检查。若这次会构建，还检查工作区：每个会送进构建上下文的已跟踪路径必须对其它用户可读（文件含 o+r，目录含 o+rx），否则拒绝并逐条列出，不运行任何 docker 命令。`.dockerignore` 排除的文件不会进镜像，可以保持私有，包括 `deploy/.env`、令牌、密钥和 `secrets/`；若存在 `deploy/Dockerfile.dockerignore`，则只用它。镜像在全部 `COPY` 之后执行 `chmod -R a+rX /app`（只加读权限；执行位只加在目录和本来就可执行的文件上，不加写），因此即使检出时 umask 把源文件收成 0600，`migrate`（uid 999）也能读到 `bridge/space_schema.sql`。Compose 文件不再声明的服务（孤立服务）必须用 `--allow-remove-orphans` 确认。任一不满足就在改动任何东西之前中止。
 2. 记录项目里**所有**容器（含已退出、已崩溃的）的镜像 ID，并**按服务**给每个本地镜像加 `baton-deploy-rollback:<服务>-<id>` 保留标签，防止被垃圾回收（共用同一镜像引用的服务各自保留自己的镜像，崩溃的 bridge 原来的旧镜像也不会丢）。
 3. 数据库保护：只要项目的数据卷（`postgres-data`）存在，就确保数据库可连接——应用容器全部停止甚至已被删除时，用 `compose up -d --no-deps --no-recreate --wait database` 直接启动数据库容器（不重建已有容器）；启动不了就中止。然后做两件事：
    - **迁移预检**：在数据库容器里建一个临时数据库 `baton_precheck_<随机>`，用 `pg_dump --schema-only` 克隆当前 schema，应用待部署的迁移，再对比应用前后的 `pg_catalog`（表、列、类型、默认值、NOT NULL、约束、唯一索引、触发器、函数、类型），随后删掉临时数据库。删除或改动列/表/类型/约束/函数、给已有列加 `NOT NULL`、加无默认值的 `NOT NULL` 列、对已有列新增约束或唯一索引或对已有表新增触发器等，都视为破坏性；预检任何一步失败或结果读不出来也按破坏性处理（fail closed），中止部署。`--allow-incompatible-migration` 可以越过（结果仍写入报告）。
    - **备份**：用 `pg_dump`（custom 格式）把数据库直接从数据库容器转储到 `--backup-dir`（目录 0700、文件 0600，密码只在数据库容器内读取，不出现在命令行）。备份失败、超时或文件头无效则中止。没有数据卷（首次部署）时两者都跳过。
-4. 构建，然后 `docker compose … up -d --wait --force-recreate --remove-orphans`（此时迁移已执行并提交）。
+4. 构建（可用 `--build-network host`），然后 `docker compose … up -d --wait --force-recreate --remove-orphans`（此时迁移已执行并提交）。
 5. 对入口做冒烟：`GET /board` 为 200、不带凭据的 `POST /mcp` 为 401，以及用冒烟令牌完成一次真实的 MCP `initialize`、`tools/list`、`fetch_inbox`。
 
 `up` 或冒烟失败（含超时）时，脚本把之前的镜像重新打回原标签，再次 `up`，逐个服务核对是否都回到了之前的镜像 ID，并复测冒烟；只有核对和冒烟都通过才报告 `rolled_back`。重打标签或回滚 `up` 失败不会提前返回：其余镜像照常恢复，仍会执行 `up`，`up` 失败再做一次尽力恢复（`up -d --wait --wait-timeout … --remove-orphans`，同样带硬超时），最后在报告里给出逐服务的手工恢复命令并保留保留标签。标准输出是 JSON 报告，进度写到标准错误。
@@ -120,10 +120,10 @@ python3 ../scripts/deploy.py -f compose.yaml -p baton \
 
 - 项目名与 `-f` 文件按你平时给 `docker compose` 的写法；TLS 实例加 `-f compose.tls.yaml`，并用 `--base-url https://<host>:<端口>`（私有 CA 用 `--ca-file`）。默认入口是 `http://127.0.0.1:8080`；明文 http 只允许回环地址，避免把令牌发往远端。
 - 超时：`--wait-timeout`（默认 300 秒，传给 `up --wait-timeout`，脚本在其后 120 秒强杀 `up` 的整个进程组）、`--build-timeout`（1800）、`--backup-timeout`（900）、`--precheck-timeout`（迁移预检的每一步，300）、`--command-timeout`（其余 docker 命令，120）；冒烟由 `--smoke-timeout` 和 `--request-timeout` 限定。回滚的 `up` 和尽力恢复的 `up` 同样有超时；强杀之后的等待也有上限，逃出进程组仍占着管道的子进程不会让部署一直卡住。
-- `docker compose build` 没有网络参数；构建需要宿主网络时加 `--build-network host`，脚本会为带 `build` 的服务临时生成一个只含 `build.network` 的 Compose 覆盖文件，仅用于构建。`--no-build` 跳过构建。
+- `docker compose build` 没有网络参数；构建需要宿主网络时加 `--build-network host`，脚本会为带 `build` 的服务临时生成一个只含 `build.network` 的 Compose 覆盖文件，仅用于构建。`--no-build` 跳过构建，也跳过工作区可读性检查。
 - 孤立服务：`up --remove-orphans` 会删除 `-f` 文件集合之外的服务容器，回滚不会重建它们（只恢复镜像）。脚本在预检时列出这些服务（报告里的 `orphans`），没有 `--allow-remove-orphans` 就中止；先确认没有漏传某个 `-f` 文件。这正是移除某个 Compose 服务后需要加该参数的场景。
-- `--dry-run` 只执行只读的 docker 查询，列出将要运行的命令，不备份、不构建、不重建、不发请求。`--no-backup` 只放弃备份（写入报告），不放弃迁移预检；只有 `--no-backup` 加 `--allow-incompatible-migration` 同时给出时，数据库启动不了才允许继续。
-- 退出码：0 已部署；1 失败但旧版本在运行（已回滚并核对，或预检、备份、构建阶段中止时从未被改动）；2 用法或配置错误；3 失败且旧版本没有核对通过（回滚失败或不完整，或首次部署没有可恢复的版本）。
+- `--dry-run` 只执行只读的 docker 查询，列出将要运行的命令，不备份、不构建、不重建、不发请求；工作区可读性检查仍会执行（它不需要 Docker）。`--no-backup` 只放弃备份（写入报告），不放弃迁移预检；只有 `--no-backup` 加 `--allow-incompatible-migration` 同时给出时，数据库启动不了才允许继续。
+- 退出码：0 已部署；1 失败但旧版本在运行（已回滚并核对，或预检、备份、构建阶段中止时从未被改动）；2 用法或配置错误（含工作区文件对其它用户不可读，或迁移文件缺失）；3 失败且旧版本没有核对通过（回滚失败或不完整，或首次部署没有可恢复的版本）。
 
 **回滚的边界（务必先读）。** 回滚只恢复镜像：不恢复数据库，不恢复 Compose 拓扑。冒烟时迁移已经提交，所以旧镜像必须能在新 schema 上运行，即迁移必须向后兼容（expand/contract）：一个版本里只增加可空或带默认值的列和新表，不删除、重命名、改类型，也不对已有列加 `NOT NULL`；收缩（contract）放到再下一个版本，等旧镜像不再需要回滚之后。上面的临时数据库预检对着真实 schema 校验这一点；迁移里的数据语句（`UPDATE`/`DELETE`）临时数据库是空的，看不出效果，由文本快速检查（`DROP`、`TRUNCATE`、`DELETE FROM`、`RENAME`、改类型、`SET NOT NULL`、无默认值的 `NOT NULL` 列；注释和字符串先整体去掉再匹配）兜底，这仍不是兼容性证明，也不覆盖 `deploy/migrate.py` 里的授权语句。若仍然破坏了兼容，应先停止服务，再用备份手工恢复，例如（在 `deploy/` 目录，密码在容器内读取）：
 

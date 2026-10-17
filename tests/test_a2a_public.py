@@ -870,7 +870,9 @@ def test_nginx_serves_the_cards_with_caching_and_keeps_the_rpc_stream_unbuffered
         config = (ROOT / "deploy" / filename).read_text()
         card = config[config.index("location ~ ^/\\.well-known/(agent-card|jwks)\\.json$"):]
         card = card[:card.index("}") + 1]
-        assert "proxy_pass http://gateway:3000;" in card and "add_header X-Content-Type-Options nosniff always;" in card
+        assert "set $upstream http://gateway:3000;" in card and "proxy_pass $upstream$request_uri;" in card
+        assert "proxy_pass http://" not in card and "proxy_buffering" not in card
+        assert "add_header X-Content-Type-Options nosniff always;" in card
         # Declaring add_header in the location drops the server-level no-store, so the bridge's caching headers apply.
         assert "Cache-Control" not in card and ("Strict-Transport-Security" in card) == (filename == "nginx.tls.conf")
         assert "limit_req_zone $binary_remote_addr zone=baton_public_docs:1m rate=10r/s;" in config

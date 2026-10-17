@@ -4,6 +4,7 @@
 import importlib.util
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -79,22 +80,30 @@ def test_nginx_proxy_pass_never_uses_a_static_upstream_name(nginx):
     assert not re.search(r"proxy_pass\s+https?://", text)
 
 
+PUBLIC_DOCS = ("location", ("~", r"^/\.well-known/(agent-card|jwks)\.json$"))
+
+
 def test_nginx_resolves_the_gateway_per_request_through_docker_dns(nginx):
     _, config = nginx
     resolvers = [(path, args) for path, args in directives_in(config, "resolver")]
     assert resolvers == [((("http", ()),), ["127.0.0.11", "valid=10s", "ipv6=off"])]
-    ((path, args),) = directives_in(config, "proxy_pass")
-    assert path[-1] == ("location", ("/",))
-    assert args == ["$upstream$request_uri"], "the client's request URI is forwarded unchanged"
-    assert [a for p, a in directives_in(config, "set") if p == path] == [["$upstream", "http://gateway:3000"]]
-    in_location = [name for found_path, name, _ in walk(config) if found_path == path and name in ("set", "proxy_pass")]
-    assert in_location == ["set", "proxy_pass"], "the variable is set before it is used"
+    passes = directives_in(config, "proxy_pass")
+    assert [path[-1] for path, _ in passes] == [PUBLIC_DOCS, ("location", ("/",))]
+    for path, args in passes:
+        assert args == ["$upstream$request_uri"], "the client's request URI is forwarded unchanged"
+        assert [a for p, a in directives_in(config, "set") if p == path] == [["$upstream", "http://gateway:3000"]]
+        in_location = [name for found_path, name, _ in walk(config) if found_path == path and name in ("set", "proxy_pass")]
+        assert in_location == ["set", "proxy_pass"], "the variable is set before it is used"
 
 
 def test_nginx_keeps_every_location_header_limit_and_streaming_setting(nginx):
     _, config = nginx
     locations = [args for _, name, args in walk(config) if name == "location"]
-    assert locations == [["=", "/"], ["=", "/board"], ["/"]]
+    assert locations == [["=", "/"], ["=", "/board"], ["~", r"^/\.well-known/(agent-card|jwks)\.json$"], ["/"]]
+    public = {(name, tuple(args)) for path, name, args in walk(config) if path and path[-1] == PUBLIC_DOCS}
+    assert ("limit_req", ("zone=baton_public_docs", "burst=20", "nodelay")) in public
+    assert ("limit_req_status", ("429",)) in public
+    assert ("proxy_buffering", ("off",)) not in public, "the card and key set are not the streaming route"
     in_gateway = {(name, tuple(args)) for path, name, args in walk(config) if path and path[-1] == ("location", ("/",))}
     for expected in [
         ("proxy_http_version", ("1.1",)),
@@ -877,6 +886,127 @@ def test_a_missing_or_empty_migration_file_is_an_error_never_a_pass(files, tmp_p
     (tmp_path / "empty.sql").write_text("  \n")
     code, report, _ = run(files, docker, FakeGateway(docker), "--schema-file", str(tmp_path / "empty.sql"), *extra)
     assert code == 2 and "empty" in report["error"] and not docker.calls
+
+
+def git_env():
+    env = dict(os.environ)
+    env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env.pop("GIT_DIR", None)
+    env.pop("GIT_WORK_TREE", None)
+    return env
+
+
+def checkout(tmp_path, files, directories=None, dockerignore=None, specific_ignore=None):
+    """A tiny git checkout. Modes are applied after git add, because that is what Docker COPY reads."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    for relative, _mode in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x\n")
+    (root / ".dockerignore").write_text((ROOT / ".dockerignore").read_text() if dockerignore is None else dockerignore)
+    if specific_ignore is not None:
+        dest = root / "deploy" / "Dockerfile.dockerignore"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(specific_ignore)
+    env = git_env()
+    subprocess.run(["git", "-C", str(root), "init", "-q"], check=True, env=env, capture_output=True)
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True, env=env, capture_output=True)
+    for directory in root.rglob("*"):
+        if directory.is_dir() and ".git" not in directory.parts:
+            directory.chmod(0o755)
+    (root / ".dockerignore").chmod(0o644)
+    if specific_ignore is not None:
+        (root / "deploy" / "Dockerfile.dockerignore").chmod(0o644)
+    for relative, mode in files.items():
+        (root / relative).chmod(mode)
+    for relative, mode in (directories or {}).items():
+        (root / relative).chmod(mode)
+    return root
+
+
+def test_dockerignore_matches_parents_and_keeps_private_files_out_of_the_image():
+    matcher = deploy.DockerIgnore((ROOT / ".dockerignore").read_text(encoding="utf-8"))
+    private = ("deploy/.env", ".env", "secrets/database.json", "runtime/x", "evidence/a", "client.token",
+               "nested/client.token", "bridge/__pycache__/x.pyc", "auth.json", "deploy/auth.json", "certs/a.pem",
+               "certs/a.key", ".git/config", ".venv/lib", ".pytest_cache/v")
+    copied = ("bridge/space_schema.sql", "deploy/Dockerfile", "deploy/migrate.py", "board/index.html",
+              "scripts/deploy.py", "README.md", "deploy/nginx.conf", "sub/secrets/a")
+    for path in private:
+        assert matcher.ignored(path), path
+    for path in copied:
+        assert not matcher.ignored(path), path
+    sample = deploy.DockerIgnore("*/temp*\ntemp?\n**/*.go\n*.md\n!README.md\ndocs\n")
+    assert sample.ignored("somedir/temporary.txt") and sample.ignored("somedir/temp")
+    assert not sample.ignored("temporary.txt") and not sample.ignored("a/b/temp")
+    assert sample.ignored("x/tempa"), "*/temp* matches a temp prefix in an immediate subdirectory"
+    only_temp = deploy.DockerIgnore("temp?\n")
+    assert only_temp.ignored("tempa") and not only_temp.ignored("temp") and not only_temp.ignored("x/tempa")
+    assert sample.ignored("a.go") and sample.ignored("pkg/a.go")
+    assert sample.ignored("NOTES.md") and not sample.ignored("guide/NOTES.md") and not sample.ignored("README.md")
+    assert sample.ignored("docs/file.txt") and sample.ignored("docs/sub/file.txt")
+
+
+def test_unreadable_tracked_files_and_directories_are_listed_and_private_ones_are_not(tmp_path):
+    root = checkout(tmp_path, {
+        "bridge/space_schema.sql": 0o600,
+        "deploy/nginx.conf": 0o640,
+        "board/index.html": 0o644,
+        "scripts/deploy.py": 0o604,
+        "deploy/.env": 0o600,
+        "secrets/key": 0o600,
+        "client.token": 0o600,
+    }, directories={"bridge": 0o700, "board": 0o755, "deploy": 0o755, "scripts": 0o750, "secrets": 0o700})
+    extra = root / "bridge" / "untracked.sql"
+    extra.write_text("x\n")
+    extra.chmod(0o600)
+    assert deploy.unreadable_build_paths(root) == ["bridge", "bridge/space_schema.sql", "deploy/nginx.conf", "scripts"]
+    gone = root / "board" / "index.html"
+    gone.unlink()
+    assert "board/index.html" not in deploy.unreadable_build_paths(root)
+
+
+def test_a_dockerfile_specific_ignore_replaces_the_repository_one(tmp_path):
+    root = checkout(tmp_path, {"note.token": 0o600, "bridge/space_schema.sql": 0o644},
+                    directories={"bridge": 0o755}, dockerignore="**/*.token\n**/.env\n", specific_ignore="# copy everything\n")
+    assert deploy.unreadable_build_paths(root) == ["note.token"]
+
+
+def test_an_unreadable_checkout_refuses_the_build_before_any_docker_command(files, tmp_path, monkeypatch):
+    root = checkout(tmp_path, {"bridge/space_schema.sql": 0o600, "deploy/.env": 0o600, "README.md": 0o644},
+                    directories={"bridge": 0o755})
+    monkeypatch.setattr(deploy, "source_root", lambda: root)
+    docker = FakeDocker()
+    code, report, _ = run(files, docker, FakeGateway(docker), "--allow-incompatible-migration")
+    assert code == 2 and report["status"] == "error" and not docker.calls
+    assert "\n  bridge/space_schema.sql\n" in report["error"] and "\n  deploy/.env\n" not in report["error"]
+    assert "o+r" in report["error"] and "chmod a+rX" in report["error"]
+    docker = FakeDocker()
+    code, report, _ = run(files, docker, None, "--dry-run")
+    assert code == 2 and "\n  bridge/space_schema.sql\n" in report["error"] and not docker.calls
+
+
+def test_no_build_skips_the_readability_check(files, tmp_path, monkeypatch):
+    root = checkout(tmp_path, {"bridge/space_schema.sql": 0o600})
+    monkeypatch.setattr(deploy, "source_root", lambda: root)
+    docker = FakeDocker()
+    code, report, _ = run(files, docker, FakeGateway(docker), "--no-build")
+    assert code == 0 and report["status"] == "deployed"
+    assert not [c for c in docker.calls if c[-1:] == ["build"]]
+
+
+def test_this_checkout_is_readable_by_other_users():
+    assert deploy.unreadable_build_paths(deploy.source_root()) == []
+
+
+def test_dockerfile_makes_copied_files_readable_without_adding_write():
+    lines = (ROOT / "deploy/Dockerfile").read_text(encoding="utf-8").splitlines()
+    copies = [index for index, line in enumerate(lines) if line.startswith("COPY ")]
+    chmod = [index for index, line in enumerate(lines) if "chmod -R a+rX /app" in line]
+    user = [index for index, line in enumerate(lines) if line.startswith("USER ")]
+    assert copies and chmod and user and max(copies) < chmod[0] < user[0]
+    assert "a+rw" not in lines[chmod[0]] and "777" not in lines[chmod[0]] and "666" not in lines[chmod[0]]
 
 
 def test_the_migration_is_applied_to_a_throwaway_database_never_to_the_live_one_and_it_is_dropped(files):
