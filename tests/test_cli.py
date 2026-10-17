@@ -749,3 +749,153 @@ def test_failing_gate_and_idempotent_retry_with_the_same_operation_id(cli, bridg
     failed = run_json(cli, bridge, "owner", "gate", "--task", task["task_id"], "--epoch", str(epoch),
                       "--decision", "fail")
     assert failed["state"] != "done"
+
+
+# --- UTF-8 output, subcommand registration, --summary, --scope none ---------------------------
+
+CHINESE = "\u5ba1\u9605\u6587\u6863\uff1a\u4f60\u597d\u4e16\u754c"
+SUMMARY_LINE = re.compile(r"task ([0-9a-f-]{36}) state=([a-z_]+) epoch=(\d+)\n")
+
+
+def submit_manual(cli, bridge, page, prompt, *extra, assignee="worker", key=None):
+    return run_json(cli, bridge, "owner", "submit", "--key", key or "cli-" + uuid.uuid4().hex, "--prompt", prompt,
+                    "--page", page["id"], "--assignee", bridge.identities[assignee]["agent"], *extra)
+
+
+def test_json_output_keeps_chinese_text_unescaped_and_valid_utf8(cli, bridge, workspace, tmp_path):
+    _, page = workspace
+    result = run_as(cli, bridge, "owner", "submit", "--key", "utf8-" + uuid.uuid4().hex, "--prompt", CHINESE,
+                    "--page", page["id"], "--assignee", bridge.identities["worker"]["agent"], "--scope", "none")
+    assert result.rc == 0, result.err
+    assert CHINESE in result.out and "\\u" not in result.out
+    assert result.json()["prompt"] == CHINESE
+
+    # The bytes are UTF-8 whatever the locale says.
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(cli.home), "LANG": "C", "LC_ALL": "C"}
+    process = subprocess.run([sys.executable, str(CLI), "--url", bridge.https, "--ca-file", str(bridge.pki["ca"]),
+                              "--token-file", str(bridge.tokens["worker"]), "inbox"],
+                             capture_output=True, env=env, timeout=90)
+    assert process.returncode == 0, process.stderr
+    assert json.loads(process.stdout.decode("utf-8", errors="strict")) is not None
+    task_id = json.loads(result.out)["task_id"]
+    process = subprocess.run([sys.executable, str(CLI), "--url", bridge.https, "--ca-file", str(bridge.pki["ca"]),
+                              "--token-file", str(bridge.tokens["worker"]), "task", task_id],
+                             capture_output=True, env=env, timeout=90)
+    assert process.returncode == 0, process.stderr
+    assert CHINESE.encode("utf-8") in process.stdout and b"\\u" not in process.stdout
+    assert json.loads(process.stdout.decode("utf-8"))["prompt"] == CHINESE
+
+
+def test_dump_json_is_unescaped_utf8_with_an_ascii_fallback_for_lone_surrogates():
+    module = load_cli_module()
+    value = {"text": CHINESE, "emoji": "\U0001f600", "n": [1, 2]}
+    for options in ({"indent": 2}, {"separators": (",", ":")}):
+        text = module.dump_json(value, **options)
+        assert CHINESE in text and "\U0001f600" in text and "\\u" not in text
+        assert json.loads(text) == value
+        text.encode("utf-8")
+    lone = module.dump_json({"bad": json.loads('"\\ud800"')}, separators=(",", ":"))
+    lone.encode("utf-8")
+    assert lone == '{"bad":"\\ud800"}'
+
+
+def test_help_lists_watch_and_every_subcommand(cli):
+    module = load_cli_module()
+    parser = module.build_parser()
+    registered = next(action for action in parser._actions if getattr(action, "choices", None)).choices
+    assert {"watch", "wait", "claim", "renew", "result", "gate", "submit"} <= set(registered)
+    top = cli.run("--help")
+    assert top.rc == 0 and re.search(r"^\s+watch\s+\S", top.out, re.M)
+    sub = cli.run("watch", "--help")
+    assert sub.rc == 0 and "--state" in sub.out and "--agent" in sub.out
+
+
+def test_summary_line_goes_to_stderr_while_stdout_stays_pure_json(cli, bridge, workspace):
+    _, page = workspace
+    task = submit_manual(cli, bridge, page, "Summarize", "--scope", "none")
+    task_id = task["task_id"]
+    quiet = run_as(cli, bridge, "owner", "task", task_id)
+    assert quiet.err == ""
+
+    claim = run_as(cli, bridge, "worker", "claim", "--task", task_id)
+    assert claim.rc == 0
+    assert claim.err == "task %s state=claimed epoch=%d\n" % (task_id, claim.json()["epoch"])
+    assert claim.json()["task_id"] == task_id and claim.out.lstrip().startswith("{")
+    epoch = claim.json()["epoch"]
+
+    renewed = run_as(cli, bridge, "worker", "renew", "--task", task_id, "--epoch", str(epoch))
+    assert renewed.rc == 0 and renewed.err == "task %s state=claimed epoch=%d\n" % (task_id, epoch)
+    json.loads(renewed.out)
+
+    submitted = run_as(cli, bridge, "worker", "result", "--task", task_id, "--epoch", str(epoch), "--result", "ok")
+    assert submitted.rc == 0 and submitted.err == "task %s state=awaiting_gate epoch=%d\n" % (task_id, epoch)
+    json.loads(submitted.out)
+
+    decided = run_as(cli, bridge, "owner", "gate", "--task", task_id, "--epoch", str(epoch), "--decision", "pass")
+    assert decided.rc == 0 and decided.err == "task %s state=done epoch=%d\n" % (task_id, epoch)
+    assert decided.json()["state"] == "done"
+
+
+def test_summary_can_be_turned_off_or_on_per_command(cli, bridge, workspace):
+    _, page = workspace
+    task = submit_manual(cli, bridge, page, "Toggle", "--scope", "none")
+    task_id = task["task_id"]
+    silent = run_as(cli, bridge, "worker", "claim", "--task", task_id, "--no-summary")
+    assert silent.rc == 0 and silent.err == "" and silent.json()["state"] == "claimed"
+    epoch = silent.json()["epoch"]
+    assert run_as(cli, bridge, "worker", "renew", "--task", task_id, "--epoch", str(epoch), "--summary").err.startswith("task ")
+    explicit = run_as(cli, bridge, "worker", "task", task_id, "--summary")
+    assert explicit.err == "task %s state=claimed epoch=%d\n" % (task_id, epoch)
+    no_summary_on_submit = run_as(cli, bridge, "owner", "submit", "--key", "k-" + uuid.uuid4().hex, "--prompt", "x",
+                                  "--page", page["id"], "--assignee", bridge.identities["reviewer"]["agent"],
+                                  "--scope", "none")
+    assert no_summary_on_submit.err == ""
+    for args in (["claim", "--task", task_id], ["gate", "--task", task_id, "--epoch", "1", "--decision", "pass"]):
+        assert "--summary" in cli.run(*args, "--help").out
+
+
+def test_summary_is_not_printed_when_the_call_fails_or_has_no_task(cli, bridge, workspace):
+    _, page = workspace
+    task = submit_manual(cli, bridge, page, "Fail", "--scope", "none")
+    failed = run_as(cli, bridge, "reviewer", "claim", "--task", task["task_id"])
+    assert failed.rc == 1 and failed.out == ""
+    assert "task " not in failed.err.replace("operation_id", "")
+    listed = run_as(cli, bridge, "owner", "call", "list_spaces", "--summary")
+    assert listed.rc == 0 and listed.err == ""
+
+
+def test_summary_only_echoes_well_formed_fields(capsys):
+    module = load_cli_module()
+    module.print_summary({"task_id": TASK_A, "state": "claimed", "epoch": 4})
+    module.print_summary({"task_id": TASK_A, "state": "claimed"})
+    module.print_summary({"task_id": "x\x1b[31m", "state": "claimed", "epoch": 1})
+    module.print_summary({"task_id": TASK_A, "state": "bad state\n", "epoch": 1})
+    module.print_summary([TASK_A])
+    module.print_summary({"task_id": TASK_A, "state": "done", "epoch": True})
+    assert capsys.readouterr().err == ("task %s state=claimed epoch=4\n" % TASK_A + "task %s state=claimed\n" % TASK_A
+                                       + "task %s state=done\n" % TASK_A)
+
+
+def test_scope_none_is_accepted_alone_and_refused_with_other_scopes(cli, bridge, workspace):
+    _, page = workspace
+    run_as(cli, bridge, "owner", "submit", "--key", "none-shape", "--prompt", "p", "--scope", "none",
+           "--assignee", bridge.identities["worker"]["agent"], "--page", page["id"], "--operation-id", OP)
+    assert last_request(bridge)[1]["scopes"] == [{"kind": "none"}]
+    requests_before = len(bridge.requests)
+    for args in (["--scope", "none", "--scope", "path=src"], ["--scope", "path=src", "--scope", "none"],
+                 ["--scope", "none=x"], ["--scope", "NONE"]):
+        result = run_as(cli, bridge, "owner", "submit", "--key", "k", "--prompt", "p", *args)
+        assert result.rc == 2 and result.out == ""
+    assert len(bridge.requests) == requests_before
+
+
+def test_two_footprintless_tasks_can_be_claimed_at_once_through_the_cli(cli, bridge, workspace):
+    _, page = workspace
+    worker = bridge.identities["worker"]["agent"]
+    first = run_json(cli, bridge, "owner", "submit", "--key", "np-" + uuid.uuid4().hex, "--prompt", "Review one",
+                     "--page", page["id"], "--assignee", worker)
+    second = run_json(cli, bridge, "owner", "submit", "--key", "np-" + uuid.uuid4().hex, "--prompt", "Review two",
+                      "--page", page["id"], "--assignee", worker)
+    assert first["scopes"] == second["scopes"] == [{"kind": "none"}]
+    assert run_json(cli, bridge, "worker", "claim", "--task", first["task_id"])["state"] == "claimed"
+    assert run_json(cli, bridge, "worker", "claim", "--task", second["task_id"])["state"] == "claimed"
