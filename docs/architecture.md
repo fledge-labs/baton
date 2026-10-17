@@ -6,6 +6,8 @@
 
 nginx 提供静态看板与反向代理；agentgateway 校验 bearer、只放行 client 角色，转发 MCP 与 HTTP 请求并记录请求元数据。应用使用官方 MCP Python SDK。Baton 是通信与协作层，不执行任务：执行属于通过 MCP、HTTP 或适配器（`adapters/`）连接的外部 agent。空间产品语义及未验证范围见 [规格](spec/space.md)；`baton.space.v1` HTTP/JSON、表结构和全部 `x_` 协作协议属于 Baton，不是官方 Space API。
 
+人机交互通道（聊天平台中的卡片与按钮，飞书优先；设计，尚未实现）见 [通道设计](design/channels.md)。
+
 ## 服务与权限
 
 普通 Compose 启动只有 `initialize` 构建应用镜像。该离线管理进程创建命名卷中的秘密文件；`database` 随后启动固定版本 PostgreSQL，`migrate` 复用应用镜像执行单事务 schema 初始化及授权。bridge 必须等待迁移成功；业务进程不会在收到请求时执行 DDL。ops 下的 `admin` 可单独构建，用于新 clone 初始化和凭据管理。
