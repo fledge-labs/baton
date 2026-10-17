@@ -467,12 +467,12 @@ def test_scope_conflict_marks_blocked_with_that_reason_and_succeeds_once_the_sco
     log = tmp_path / "timeline"
     scenario = lab.scenario(sleep=2, timeline=str(log))
     first = assign(space, bridge, "worker", scopes=[{"kind": "path", "value": "src/a"}])
-    second = assign(space, bridge, "worker", scopes=[{"kind": "path", "value": "docs"}])
+    second = assign(space, bridge, "worker", scopes=[{"kind": "path", "value": "src/a/x.txt"}])
     lab.start([lab.worker(scenario=scenario, concurrency=2)], retry_delay_seconds=0.5)
     for task_id in (first, second):
         wait_state(space, task_id, "awaiting_gate")
     spans = timeline(log)
-    assert spans[0][1] <= spans[1][0], "overlapping path scopes never run at the same time"
+    assert spans[0][1] <= spans[1][0], "overlapping (prefix) path scopes never run at the same time"
     reasons = {task_view(space, t)["blocked"] for t in (first, second)}
     assert reasons == {None}
     blocked = [e for t in (first, second) for e in audit_events(space, t) if e == "task.blocked"]
