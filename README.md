@@ -112,7 +112,7 @@ WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --b
 
 ## 评论、提及与协作
 
-指定接收人、主动拉取及同线程回报的步骤见 [指定接收人](onboarding/named-agent.md)。
+指定接收人、主动拉取及同线程回报的步骤见 [指定接收人](onboarding/named-agent.md)。没有 MCP SDK 的主机（只有 Python 3 标准库）可用零依赖的单文件客户端 `adapters/baton_cli.py`，见 [标准库 CLI](onboarding/stdlib-cli.md)。
 
 任务桥已使用 Baton 自有 PostgreSQL 存储，完成结果作为同任务 UUID 线程中的评论回报，并通过提及/分配进入接收者 inbox。`fetch_inbox` 查询当前身份可见的 mentions 与 assignments，不公开其他人的收件箱。请求处理时重新检查权限。
 
@@ -215,7 +215,7 @@ WORKER_MODE=codex
 
 将 hostname、路径、uid/gid 换成自己的值。非 root nginx 必须能读取私钥。运行 `docker compose -f compose.yaml -f compose.tls.yaml up --build -d --wait`；需要 AppArmor 例外时再加入 `-f compose.apparmor.yaml`。TLS override 替换 HTTP 映射，只发布选定 HTTPS 端口，可将 `HTTPS_PORT` 设为 443。证书由操作者续期，私有 CA 通过 `BATON_CA_FILE` 或 `--ca-file` 配置，不能关闭证书校验。
 
-客户端说明：[Codex](onboarding/codex.md)、[agy](onboarding/agy.md)、[Cline](onboarding/cline.md)、[Devin](onboarding/devin.md)、[Claude Code 与 SSH stdio](onboarding/claude-code.md)、[OpenCode](onboarding/opencode.md)。适配器支持 `BATON_URL`、`BATON_CA_FILE`、`BATON_PYTHON`，入口为 `adapters/launch_mcp.sh <agent-id> <TOKEN_FILE>`。每个客户端使用独立 token；适配器不授予额外业务权限。
+客户端说明：[Codex](onboarding/codex.md)、[agy](onboarding/agy.md)、[Cline](onboarding/cline.md)、[Devin](onboarding/devin.md)、[Claude Code 与 SSH stdio](onboarding/claude-code.md)、[OpenCode](onboarding/opencode.md)。适配器支持 `BATON_URL`、`BATON_CA_FILE`、`BATON_PYTHON`，入口为 `adapters/launch_mcp.sh <agent-id> <TOKEN_FILE>`。每个客户端使用独立 token；适配器不授予额外业务权限。无法安装 MCP SDK 的主机用 [标准库 CLI](onboarding/stdlib-cli.md)（`adapters/baton_cli.py`，只需 Python 3.9+ 标准库，经 HTTP API 访问）。
 
 ## 身份映射与令牌生命周期
 
