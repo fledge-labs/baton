@@ -164,7 +164,7 @@ SCOPES_EXPECTED = ("array of at most 100 scope objects: {kind: path|module|migra
 
 
 def normalize_scopes(scopes):
-    """Keep declarations for display; v1 cannot prove physical path independence."""
+    """Normalize declarations: repo-relative `/` paths keep their case; module and migration identifiers are case-folded."""
     if scopes is None or scopes == []:
         return [{"kind": "path", "value": ""}]
     if not isinstance(scopes, list) or len(scopes) > 100:
@@ -188,10 +188,10 @@ def normalize_scopes(scopes):
             raise StoreError("invalid", "scopes", SCOPES_EXPECTED)
         if value.startswith("/") or not re.fullmatch(r"[A-Za-z0-9_./-]*", value) or ".." in value.split("/"):
             raise StoreError("invalid", "scopes", SCOPES_EXPECTED)
-        value = value.casefold()
         if kind == "path":
             value = "/".join(part for part in value.split("/") if part not in {"", "."})
         else:
+            value = value.casefold()
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", value):
                 raise StoreError("invalid", "scopes", SCOPES_EXPECTED)
             if "/" in value or value in {".", ".."}:
@@ -219,7 +219,45 @@ def _stored_scopes(requested, normalized, manual):
     return normalized
 
 
+SCOPE_CASE_INSENSITIVE_ENV = "BATON_SCOPE_CASE_INSENSITIVE"
+
+
+def _path_parts(value, fold):
+    value = value.casefold() if fold else value
+    return tuple(part for part in value.split("/") if part not in {"", "."})
+
+
+def paths_overlap(left, right, case_insensitive=False):
+    """True when one normalized path equals the other or is a directory prefix of it on a `/` boundary.
+
+    The empty path is the repository root and overlaps every path. Symlinks, hard links and other aliases are not
+    resolved: two declarations that reach the same files through different paths do not overlap.
+    """
+    a, b = _path_parts(left, case_insensitive), _path_parts(right, case_insensitive)
+    shorter = min(len(a), len(b))
+    return a[:shorter] == b[:shorter]
+
+
+def scope_case_insensitive():
+    return os.environ.get(SCOPE_CASE_INSENSITIVE_ENV, "").strip() == "1"
+
+
+def _request_scopes(normalized):
+    """Scopes as hashed into request digests: path case is folded, as it was before paths kept their case.
+
+    This keeps the digest of an already-persisted request stable across the upgrade, so a retry of an old
+    operation or idempotency key still replays instead of reporting operation_conflict.
+    """
+    folded = []
+    for item in normalized:
+        item = {**item, "value": item["value"].casefold()} if item["kind"] == "path" else item
+        if item not in folded:
+            folded.append(item)
+    return sorted(folded, key=lambda item: (item["kind"], item.get("value", "")))
+
+
 def scopes_overlap(left, right):
+    fold = scope_case_insensitive()
     for a in left:
         if a["kind"] == "none":
             continue
@@ -227,12 +265,13 @@ def scopes_overlap(left, right):
             if b["kind"] == "none":
                 continue
             if "module" in {a["kind"], b["kind"]}:
-                return True  # No administrator module map exists in v1.
+                return True  # No administrator module map exists: a module covers the whole repository.
             if a["kind"] != b["kind"]:
                 continue
-            # No trusted repository/alias catalogue exists. Two different path
-            # strings might name the same file, so every path reserves the root.
-            if a["kind"] == "path" or a["value"] == b["value"]:
+            if a["kind"] == "path":
+                if paths_overlap(a["value"], b["value"], fold):
+                    return True
+            elif a["value"] == b["value"]:
                 return True
     return False
 
@@ -404,7 +443,8 @@ def _policy_matches(kind, value, scopes):
         if scope["kind"] != kind:
             continue
         if kind == "path":
-            if scope["value"] in {"", value} or scope["value"].startswith(value + "/"):
+            declared = scope["value"].casefold()
+            if declared in {"", value.casefold()} or declared.startswith(value.casefold() + "/"):
                 return True
         elif scope["value"] == value:
             return True
@@ -1423,7 +1463,7 @@ class SpaceStore:
             raise StoreError("invalid", 'assignee_principal', 'principal different from the requester')
         priority, escalate_to, fallback_assignee, response_args = _response_request(priority, escalate_to, fallback_assignee, actor.principal, assignee)
         approvals_required = _approvals_request(approvals_required, assignee is not None)
-        args = {"idempotency_key": idempotency_key, "prompt": prompt, "page_id": page_id, "scopes": normalized,
+        args = {"idempotency_key": idempotency_key, "prompt": prompt, "page_id": page_id, "scopes": _request_scopes(normalized),
                 "assignee": asdict(assignee) if assignee else None}
         # Preserve v1 hashes for already-persisted submissions without dependencies.
         if dependencies:
@@ -1478,7 +1518,7 @@ class SpaceStore:
             raise StoreError("invalid")
         priority, escalate_to, fallback_assignee, response_args = _response_request(priority, escalate_to, fallback_assignee, actor.principal, assignee)
         approvals_required = _approvals_request(approvals_required, True)
-        args = {"page_id": page_id, "prompt": prompt, "scopes": normalized, "reviewers": reviewers,
+        args = {"page_id": page_id, "prompt": prompt, "scopes": _request_scopes(normalized), "reviewers": reviewers,
                 "base_commit": base_commit, "context": context, "evidence": evidence, "assignee": asdict(assignee) if assignee else None}
         if dependencies:
             args["depends_on"] = dependencies
@@ -2329,7 +2369,7 @@ class SpaceStore:
     def _policy_key(space_id, scope_kind, scope_value):
         space_id = _uuid(space_id, "space_id")
         scope = normalize_scopes([{"kind": scope_kind, "value": scope_value}])[0]
-        return space_id, scope["kind"], scope["value"]
+        return space_id, scope["kind"], scope["value"].casefold()
 
     def _policy_audit(self, conn, event, operator, space_id, kind, **metadata):
         self._audit(conn, Actor(operator, "baton-operator", "human"), uuid.uuid4(), event, space_id=space_id, requested_by=operator,

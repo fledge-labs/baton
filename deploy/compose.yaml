@@ -88,6 +88,7 @@ services:
       GATEWAY_INTERNAL: http://gateway:3000
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
       BATON_RESPONSE_MINUTES: ${BATON_RESPONSE_MINUTES:-}
+      BATON_SCOPE_CASE_INSENSITIVE: ${BATON_SCOPE_CASE_INSENSITIVE:-}
     volumes: [config:/config:ro, database-app-secrets:/run/secrets:ro, bridge-secrets:/run/secrets/bridge:ro, bridge-data:/data]
     tmpfs: ["/tmp:size=32m,mode=1777"]
     networks: [private, database]
