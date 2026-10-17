@@ -18,8 +18,10 @@ Steps, each with a hard timeout (the recovery path too):
   3. record the image of every container of the project, running or not, and tag each local image per service as
      `baton-deploy-rollback:<service>-<id>` so it cannot be garbage-collected. Then diff the migration against the
      schema recorded on the running image label or in the deploy state (if neither is known, the whole file is
-     treated as added and the report says so). Crude tokens on added lines abort unless
-     `--allow-incompatible-migration` is set. That flag does not override the catalog diff;
+     treated as added and the report says so). If any added or removed line contains a quote or comment
+     delimiter ($, ', ", /*, */, --), that diff shortcut is disabled and the whole new file is scanned raw;
+     the report names the mode and why. Crude single-word tokens abort unless `--allow-incompatible-migration`
+     is set. That flag does not override the catalog diff;
   4. if a database volume exists, make sure the database container is up (even when every application container
      is stopped or gone), then (a) precheck the migration in a separate Postgres container (same image, --network none,
      its own superuser, tmpfs data) loaded from a schema-only dump and a roles-only dump with no passwords; the
@@ -98,19 +100,22 @@ PRIVATE_OUTPUT_ERROR = 'cannot create a private output file'
 LOCK_DIR = Path(tempfile.gettempdir()) / 'baton-deploy-locks'
 BACKUP_CREATE_ATTEMPTS = 3
 
-# One scanner, on the raw added lines. Nothing is stripped: comments, strings, dollar quotes and
-# quoted identifiers all count. Case-insensitive word boundaries. This does not parse SQL.
-# ``--allow-incompatible-migration`` overrides TOKEN_PATTERNS. ``--allow-breaking-catalog`` overrides
-# STATEMENT_PATTERNS, the NOT NULL add, psql meta-commands, and the catalog diff.
+# One scanner, on raw text. Nothing is stripped: comments, strings, dollar quotes and quoted identifiers all
+# count. Case-insensitive word boundaries. This does not parse SQL. Tokens are single words so a comment
+# cannot split a phrase. ``--allow-incompatible-migration`` overrides TOKEN_PATTERNS.
+# ``--allow-breaking-catalog`` overrides STATEMENT_PATTERNS, the NOT NULL add, psql meta-commands, and the
+# catalog diff.
 IDENT = r'[\w".$]+'
 ON_CONFLICT_DO_NOTHING = re.compile(r'\bon\s+conflict\s+do\s+nothing\b', re.IGNORECASE)
+# A changed line carrying any of these can move a string or comment boundary, so unchanged lines that the
+# diff blanks may now be executable SQL. Fail closed and scan the whole new file.
+QUOTE_OR_COMMENT = re.compile(r"""\$|'|"|/\*|\*/|--""")
 TOKEN_PATTERNS = (
-    ('alter system', re.compile(r'\balter\s+system\b', re.IGNORECASE)),
-    ('alter database', re.compile(r'\balter\s+database\b', re.IGNORECASE)),
-    ('create extension', re.compile(r'\bcreate\s+extension\b', re.IGNORECASE)),
-    ('start transaction', re.compile(r'\bstart\s+transaction\b', re.IGNORECASE)),
-    ('prepare transaction', re.compile(r'\bprepare\s+transaction\b', re.IGNORECASE)),
-    ('copy program', re.compile(r'\bcopy\b[^;]*\bprogram\b', re.IGNORECASE)),
+    ('extension', re.compile(r'\bextension\b', re.IGNORECASE)),
+    ('program', re.compile(r'\bprogram\b', re.IGNORECASE)),
+    ('system', re.compile(r'\bsystem\b', re.IGNORECASE)),
+    ('database', re.compile(r'\bdatabase\b', re.IGNORECASE)),
+    ('transaction', re.compile(r'\btransaction\b', re.IGNORECASE)),
     ('set_config', re.compile(r'\bset_config\b', re.IGNORECASE)),
     ('session_authorization', re.compile(r'\bsession_authorization\b', re.IGNORECASE)),
     ('authorization', re.compile(r'\bauthorization\b', re.IGNORECASE)),
@@ -127,6 +132,7 @@ TOKEN_PATTERNS = (
     ('delete', re.compile(r'\bdelete\b', re.IGNORECASE)),
     ('truncate', re.compile(r'\btruncate\b', re.IGNORECASE)),
     ('merge', re.compile(r'\bmerge\b', re.IGNORECASE)),
+    ('prepare', re.compile(r'\bprepare\b', re.IGNORECASE)),
 )
 STATEMENT_PATTERNS = (
     ('DROP', re.compile(
@@ -745,12 +751,9 @@ def psql_meta_command(sql):
 def added_scan_text(sql, baseline):
     """Text of the new migration with lines that already deployed blanked out.
 
-    ``baseline is None`` means the deployed revision is unknown, so the whole file is scanned. Otherwise
     ``difflib`` compares the raw lines. Equal lines become empty so a later match keeps the new file's line
     number, and unchanged schema text is never re-flagged. Inserted and replaced lines are kept raw.
     """
-    if baseline is None:
-        return sql
     old_lines, new_lines = baseline.splitlines(), sql.splitlines()
     kept = []
     for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False).get_opcodes():
@@ -759,6 +762,48 @@ def added_scan_text(sql, baseline):
         elif tag in ('insert', 'replace'):
             kept.extend(new_lines[j1:j2])
     return '\n'.join(kept)
+
+
+def changed_line_has_delimiter(sql, baseline):
+    """True when an added or removed line contains ``$``, a quote, or a comment delimiter.
+
+    Blanking the unchanged lines is wrong once a delimiter moves: SQL that used to sit inside a string or a
+    comment can become executable while its line is still equal in the diff. Deleted lines count, because
+    removing the closing tag is exactly that move.
+    """
+    old_lines, new_lines = baseline.splitlines(), sql.splitlines()
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False).get_opcodes():
+        if tag == 'equal':
+            continue
+        changed = []
+        if tag in ('delete', 'replace'):
+            changed.extend(old_lines[i1:i2])
+        if tag in ('insert', 'replace'):
+            changed.extend(new_lines[j1:j2])
+        if any(QUOTE_OR_COMMENT.search(line) for line in changed):
+            return True
+    return False
+
+
+def scan_target(sql, baseline):
+    """``(text, mode, reason)``. ``whole-file`` scans ``sql`` raw; ``added-lines`` blanks equal lines.
+
+    ``baseline is None`` (the deployed revision was not supplied) always scans the whole file. A known
+    baseline scans only added lines unless any added or removed line contains a quote or comment delimiter,
+    in which case the shortcut is disabled. The reason names the mode.
+    """
+    if baseline is None:
+        return sql, 'whole-file', (
+            'whole-file: no deployed revision was supplied, so the diff shortcut was disabled '
+            'and the whole new schema file was scanned raw')
+    if changed_line_has_delimiter(sql, baseline):
+        return sql, 'whole-file', (
+            'whole-file: an added or removed line contains a quote or comment delimiter '
+            "($, ', \", /*, */ or --), so the diff shortcut was disabled "
+            'and the whole new schema file was scanned raw')
+    return added_scan_text(sql, baseline), 'added-lines', (
+        'added-lines: no added or removed line contains a quote or comment delimiter '
+        "($, ', \", /*, */ or --), so only added lines were scanned")
 
 
 def do_nothing_spans(sql):
@@ -797,26 +842,30 @@ def not_null_without_default(sql):
 
 
 def migration_findings(sql, baseline=None):
-    """One raw scan of the lines added since ``baseline``.
+    """One raw scan of the migration text that ``scan_target`` selects.
 
-    ``baseline is None`` scans the whole file (the deployed revision is unknown). A baseline equal to ``sql``
-    adds nothing, so an unchanged schema is not re-flagged. Comments and strings are not removed.
-    ``END`` is not a token. ``ON CONFLICT DO NOTHING`` is the only DO that is ignored. ``update``, ``delete``,
-    ``truncate`` and ``merge`` are ordinary words, so a trigger clause or foreign-key action that contains
-    them is flagged too.
+    ``baseline is None``, or any added or removed line that contains a quote or comment delimiter, scans the
+    whole new file and says so (``scan`` is ``whole-file``). Otherwise only added lines are scanned
+    (``scan`` is ``added-lines``). A baseline equal to ``sql`` adds nothing, so an unchanged schema is not
+    re-flagged. Comments and strings are not removed. ``END`` is not a token. ``ON CONFLICT DO NOTHING`` is
+    the only DO that is ignored. Every token is one word (``extension``, ``program``, ``system``,
+    ``database``, ``transaction``, ``prepare``, and the data-rewrite words), so a comment cannot split it.
+    ``update``, ``delete``, ``truncate`` and ``merge`` are ordinary words, so a trigger clause or foreign-key
+    action that contains them is flagged too.
     """
-    added = added_scan_text(sql, baseline)
-    exempt = do_nothing_spans(added)
-    tokens = pattern_hits(added, TOKEN_PATTERNS, exempt)
-    statements = pattern_hits(added, STATEMENT_PATTERNS, ())
-    statements.extend(not_null_without_default(added))
-    if psql_meta_command(added):
+    scanned, mode, reason = scan_target(sql, baseline)
+    exempt = do_nothing_spans(scanned)
+    tokens = pattern_hits(scanned, TOKEN_PATTERNS, exempt)
+    statements = pattern_hits(scanned, STATEMENT_PATTERNS, ())
+    statements.extend(not_null_without_default(scanned))
+    if psql_meta_command(scanned):
         statements.append('contains a psql meta-command')
-    return {'tokens': tokens, 'statements': statements, 'unsafe': statements + tokens}
+    return {'tokens': tokens, 'statements': statements, 'unsafe': statements + tokens,
+            'scan': mode, 'scan_reason': reason}
 
 
 def unsafe_migration_statements(sql, baseline=None):
-    """Findings that make the added part of a migration incompatible. See ``migration_findings``."""
+    """Findings that make the scanned part of a migration incompatible. See ``migration_findings``."""
     return migration_findings(sql, baseline)['unsafe']
 
 
@@ -937,12 +986,15 @@ def deployed_schema(docker, previous, project):
 
 
 def classify_migration(sql, config, baseline, baseline_kind, baseline_note):
-    """Report of token findings (added lines only) and catalog-shaped statements on those same lines."""
+    """Report of token findings and catalog-shaped statements, plus which scan mode was used and why."""
     findings = migration_findings(sql, None if baseline_kind == 'unknown' else baseline)
+    scan_reason = findings['scan_reason']
     report = {'checked': True, 'file': str(config.schema_file), 'baseline': baseline_kind,
+              'scan': findings['scan'], 'scan_reason': scan_reason,
               'tokens': findings['tokens'], 'statements': findings['statements'], 'unsafe': findings['unsafe']}
     if baseline_note:
         report['baseline_note'] = baseline_note
+        report['scan_reason'] = 'whole-file: %s' % baseline_note
     return report
 
 
@@ -1973,7 +2025,13 @@ def deploy(config, runner, http=None, log=None, clock=time.monotonic, sleep=time
             blocks.append('catalog-shaped statements (%s); pass --allow-breaking-catalog after reading them'
                           % '; '.join(migration['statements']))
         if blocks:
-            note = (' ' + baseline_note) if baseline_note else ''
+            extras = []
+            scan_reason = migration.get('scan_reason')
+            if scan_reason:
+                extras.append(scan_reason)
+            if baseline_note and baseline_note not in (scan_reason or ''):
+                extras.append(baseline_note)
+            note = (' ' + ' '.join(extras)) if extras else ''
             return stop('aborted', 'the migration SQL is not backward compatible%s: %s; nothing was changed. '
                         'Split it into an expand release and a later contract release' % (note, '; '.join(blocks)))
 

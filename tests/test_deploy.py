@@ -939,10 +939,14 @@ def test_backup_dir_is_required_unless_no_backup_is_given(files, capsys):
     "SET SESSION AUTHORIZATION baton_bootstrap;", "ALTER SYSTEM SET log_statement = 'all';",
     "ALTER DATABASE baton SET log_statement = 'all';", "CREATE ROLE extra LOGIN;", "ALTER ROLE baton_app NOLOGIN;",
     "DROP ROLE extra;", "COPY baton.t TO PROGRAM 'id';", "COPY baton.t FROM PROGRAM 'id';",
-    "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;", "DO $$ BEGIN NULL; END $$;",
+    "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;",
+    "CREATE /*x*/ EXTENSION pg_stat_statements;",
+    "ALTER /**/ SYSTEM SET log_statement = 'all';",
+    "COPY baton.t TO /**/ PROGRAM 'id';",
+    "DO $$ BEGIN NULL; END $$;",
     "DO LANGUAGE plpgsql $$ BEGIN NULL; END $$;", "DO 'BEGIN NULL; END';",
     "do language plpgsql $$ BEGIN NULL; END $$;",
-    "COMMIT;", "COMMIT WORK;", "START TRANSACTION;",
+    "COMMIT;", "COMMIT WORK;", "START TRANSACTION;", "BEGIN TRANSACTION;",
     "ROLLBACK;", "ROLLBACK TO SAVEPOINT s;", "ABORT;",
     "SAVEPOINT s;", "RELEASE SAVEPOINT s;", "RELEASE s;", "PREPARE TRANSACTION 'x';",
     'SET "role" = \'x\';', 'RESET "role";', 'SET "session_authorization" = \'x\';',
@@ -975,7 +979,6 @@ def test_migration_lint_flags_contract_statements_a_previous_image_cannot_surviv
     "ALTER TABLE baton.t DROP CONSTRAINT IF EXISTS old_key;",
     "COPY baton.t TO stdout;",
     "BEGIN;",
-    "BEGIN TRANSACTION;",
     "SET statement_timeout = '1s';",
     "SET session_replication_role = 'replica';",
     "END;",
@@ -1000,7 +1003,7 @@ def test_a_string_comment_marker_does_not_hide_a_later_commit():
     hidden = "SELECT '/*';\nCOMMIT;\nRESET ROLE;\nSELECT set_config('role', 'x', true);\nCOPY t TO PROGRAM 'id';\nALTER SYSTEM SET a = 1;\n*/\n"
     found = deploy.unsafe_migration_statements(hidden)
     for expected in ("commit on line 2", "reset on line 3", "role on line 3", "set_config on line 4",
-                     "copy program on line 5", "alter system on line 6"):
+                     "program on line 5", "system on line 6"):
         assert expected in found, (expected, found)
 
 
@@ -1020,17 +1023,18 @@ def test_crude_tokens_on_added_lines_name_the_line_and_leave_the_deployed_text_a
          "  PERFORM set_config('session_authorization', 'x', true);\nEND;\n$$\n", "session_authorization on line 4"),
         ("CREATE FUNCTION baton.f() RETURNS void LANGUAGE sql AS $$\nRESET ROLE;\nSELECT 1;\n$$\n", "reset on line 3"),
         ("RESET ALL;\n", "reset on line 2"),
-        ("ALTER SYSTEM SET log_statement = 'all';\n", "alter system on line 2"),
-        ("ALTER DATABASE baton SET log_statement = 'all';\n", "alter database on line 2"),
-        ("COPY baton.t TO PROGRAM 'id';\n", "copy program on line 2"),
-        ("CREATE EXTENSION pg_stat_statements;\n", "create extension on line 2"),
+        ("ALTER SYSTEM SET log_statement = 'all';\n", "system on line 2"),
+        ("ALTER DATABASE baton SET log_statement = 'all';\n", "database on line 2"),
+        ("COPY baton.t TO PROGRAM 'id';\n", "program on line 2"),
+        ("CREATE EXTENSION pg_stat_statements;\n", "extension on line 2"),
         ("COMMIT;\n", "commit on line 2"),
         ("ROLLBACK;\n", "rollback on line 2"),
         ("ABORT;\n", "abort on line 2"),
         ("SAVEPOINT s;\n", "savepoint on line 2"),
         ("RELEASE SAVEPOINT s;\n", "release on line 2"),
-        ("START TRANSACTION;\n", "start transaction on line 2"),
-        ("PREPARE TRANSACTION 'x';\n", "prepare transaction on line 2"),
+        ("START TRANSACTION;\n", "transaction on line 2"),
+        ("BEGIN TRANSACTION;\n", "transaction on line 2"),
+        ("PREPARE TRANSACTION 'x';\n", "prepare on line 2"),
         ("DO $$ BEGIN NULL; END $$;\n", "do on line 2"),
         ("DO LANGUAGE plpgsql $$ BEGIN NULL; END $$;\n", "do on line 2"),
         ("DO 'BEGIN NULL; END';\n", "do on line 2"),
@@ -1063,6 +1067,36 @@ def test_dollar_quote_and_do_prefixes_do_not_hide_a_rewrite():
         assert "%s on line 2" % word in found, (word, found)
 
 
+def test_a_moved_dollar_quote_scans_the_whole_file():
+    """Removing the closing tag leaves COMMIT unchanged in the diff, and that line is now executable."""
+    baseline = "SELECT $q$\nCOMMIT;\n$q$;\n"
+    shifted = "SELECT $q$\nCOMMIT;\n"
+    findings = deploy.migration_findings(shifted, baseline)
+    assert findings["scan"] == "whole-file"
+    assert "delimiter" in findings["scan_reason"] and "whole-file" in findings["scan_reason"]
+    assert "commit on line 2" in findings["tokens"]
+    untouched = baseline + "ALTER TABLE baton.note ADD COLUMN note text NULL;\n"
+    quiet = deploy.migration_findings(untouched, baseline)
+    assert quiet["scan"] == "added-lines" and quiet["unsafe"] == []
+    commented = baseline + "-- a note\n"
+    forced = deploy.migration_findings(commented, baseline)
+    assert forced["scan"] == "whole-file" and "commit on line 2" in forced["tokens"]
+
+
+def test_a_comment_cannot_split_extension_system_or_program():
+    base = "CREATE TABLE baton.note (id int);\n"
+    samples = (
+        ("CREATE /*x*/ EXTENSION pg_stat_statements;\n", "extension on line 2"),
+        ("ALTER /**/ SYSTEM SET log_statement = 'all';\n", "system on line 2"),
+        ("COPY baton.t TO /**/ PROGRAM 'id';\n", "program on line 2"),
+    )
+    for statement, expected in samples:
+        findings = deploy.migration_findings(base + statement, baseline=base)
+        assert findings["scan"] == "whole-file", findings["scan_reason"]
+        assert "delimiter" in findings["scan_reason"]
+        assert expected in findings["tokens"], (expected, findings["tokens"])
+
+
 def test_do_nothing_and_case_end_in_added_lines_pass():
     base = "CREATE TABLE baton.note (id int);\n"
     sql = (base + "INSERT INTO baton.note(id) VALUES (1) ON CONFLICT DO NOTHING;\n"
@@ -1090,6 +1124,7 @@ def test_reapplying_the_shipped_schema_needs_no_override_once_the_revision_is_kn
     code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP))
     assert code == 0 and report["status"] == "deployed"
     assert report["migration"]["baseline"] == "deploy-state"
+    assert report["migration"]["scan"] == "added-lines"
     assert report["migration"]["tokens"] == [] and report["migration"]["statements"] == []
     assert "baseline_note" not in report["migration"]
     docker = FakeDocker()
@@ -1097,6 +1132,7 @@ def test_reapplying_the_shipped_schema_needs_no_override_once_the_revision_is_kn
     state.unlink()
     code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP))
     assert code == 0 and report["migration"]["baseline"] == "image-label"
+    assert report["migration"]["scan"] == "added-lines"
     assert report["migration"]["tokens"] == [] and report["migration"]["statements"] == []
 
 
@@ -1127,6 +1163,25 @@ def test_an_unknown_deployed_revision_scans_the_whole_file_and_says_so(files, mo
     assert code == 0 and report["status"] == "deployed"
 
 
+def test_moving_a_dollar_quote_aborts_in_whole_file_mode(files, tmp_path, monkeypatch):
+    baseline = "SELECT $q$\nCOMMIT;\n$q$;\n"
+    schema = tmp_path / "shifted.sql"
+    schema.write_text("SELECT $q$\nCOMMIT;\n")
+    monkeypatch.setattr(deploy, "SCHEMA_FILE", schema)
+    state = deploy.deploy_state_path("demo")
+    state.parent.mkdir(parents=True, mode=0o700)
+    state.write_text(baseline)
+    docker = FakeDocker()
+    code, report, _ = run(files, docker, FakeGateway(docker))
+    assert code == 1 and report["migration"]["baseline"] == "deploy-state"
+    assert report["migration"]["scan"] == "whole-file"
+    assert "baseline_note" not in report["migration"]
+    assert "delimiter" in report["migration"]["scan_reason"]
+    assert "commit on line 2" in report["migration"]["tokens"]
+    assert "whole-file" in report["rollback"]["reason"] and "commit on line 2" in report["rollback"]["reason"]
+    assert not docker.ups() and not dump_calls(docker)
+
+
 def test_a_commit_hidden_behind_a_string_comment_marker_on_an_added_line_aborts(files, tmp_path, monkeypatch):
     base = "CREATE TABLE IF NOT EXISTS baton.note (id int);\n"
     schema = tmp_path / "added.sql"
@@ -1155,8 +1210,10 @@ def test_disagreeing_schema_labels_are_unknown_and_the_report_says_so(files):
 
 def test_the_shipped_schema_reapplied_unchanged_has_no_findings():
     schema = (ROOT / "bridge/space_schema.sql").read_text(encoding="utf-8")
-    assert deploy.unsafe_migration_statements(schema, baseline=schema) == []
+    same = deploy.migration_findings(schema, schema)
+    assert same["scan"] == "added-lines" and same["unsafe"] == []
     unknown = deploy.migration_findings(schema, None)
+    assert unknown["scan"] == "whole-file"
     assert any(item.startswith("role on line ") for item in unknown["tokens"])
     assert any(item.startswith("do on line ") for item in unknown["tokens"])
     assert any(item.startswith("update on line ") for item in unknown["tokens"])
