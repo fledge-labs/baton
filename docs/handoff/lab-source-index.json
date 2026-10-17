@@ -1,0 +1,151 @@
+{
+  "license": "Apache-2.0",
+  "source_commit": "7101874379b539e53bb1e6439e34481fae06b118",
+  "files": [
+    {
+      "path": "Dockerfile",
+      "sha256": "d854ba94d250d600de9ffa7c222a23ef942976782ce165c867111918db574f4b",
+      "mode": "100644"
+    },
+    {
+      "path": "Dockerfile.mail",
+      "sha256": "e71738f2e586a94cad7f5f2aec8d929b560258c933aa84ab83bb46122e5cd5d4",
+      "mode": "100644"
+    },
+    {
+      "path": "board.html",
+      "sha256": "ba08d0e0ef9de84998c15ecc22e6d85b1b475f4e41574eea83d21ecfc699c1b6",
+      "mode": "100644"
+    },
+    {
+      "path": "compose.yaml",
+      "sha256": "e242f468953066e91d4b30783f81525ce84c9248b05575f7db1b9ba1c80caabb",
+      "mode": "100644"
+    },
+    {
+      "path": "lab/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "mode": "100644"
+    },
+    {
+      "path": "lab/bridge.py",
+      "sha256": "5991019818256dfc6aeba9616421d3b1de316810590fdbf78e98533a33da8196",
+      "mode": "100644"
+    },
+    {
+      "path": "lab/codex_agent.py",
+      "sha256": "ca6f33e3bf0644eee6a8e2e412922bd650b6675c4f4a13bde314c0bd5625aec8",
+      "mode": "100644"
+    },
+    {
+      "path": "lab/common.py",
+      "sha256": "d9afe7aae750af9e853a4f566719342a1b7f8809aa43941d02d98cf13a338712",
+      "mode": "100644"
+    },
+    {
+      "path": "lab/failures.py",
+      "sha256": "162139a1f4857027310baaf4e5a677cb319299b89640953c45b6499e2ceba0f1",
+      "mode": "100644"
+    },
+    {
+      "path": "lab/mail_entry.py",
+      "sha256": "5f4af49285fc23339298d2528236f19bc71206a3bd71bccbfa73aedb61cd4018",
+      "mode": "100644"
+    },
+    {
+      "path": "lab/mail_identity.py",
+      "sha256": "53bce5642d735d39fe3b9d277dfd98501bbec43cb394d96befaa472324c240d3",
+      "mode": "100644"
+    },
+    {
+      "path": "lab/provision_mail.py",
+      "sha256": "ee16df83bd95902896c04ddec662befe5d09ebd04f90f8d744df46a64cbe1d20",
+      "mode": "100644"
+    },
+    {
+      "path": "lab/worker_health.py",
+      "sha256": "3df40653b1cb2b21da7a7c5f37f16a6c34538ee215aadff0504b8295ccaf42bf",
+      "mode": "100644"
+    },
+    {
+      "path": "mail-constraints.txt",
+      "sha256": "c11ae88002b67b6da7307eb2bd7142e9c1cb1be1d80a7e2777aad4f455864558",
+      "mode": "100644"
+    },
+    {
+      "path": "requirements.in",
+      "sha256": "a68425c364c75a2e8bc5fd47daa6aff9a8b02e1d08c9fcd3f6bfb70f71735d65",
+      "mode": "100644"
+    },
+    {
+      "path": "requirements.txt",
+      "sha256": "7cf01999d181ac497de46ec83d0b3436bac8663740e3740be3d8fdebc9e55026",
+      "mode": "100644"
+    },
+    {
+      "path": "scripts/tokens.py",
+      "sha256": "829b9b1d2444ffe3f4232086cd72037ebcfdfc8551dc2d57b3587c70477997ab",
+      "mode": "100644"
+    },
+    {
+      "path": "security/codex-apparmor",
+      "sha256": "923716ddd880618584261021b491743013b348e6c45490dfefd7cdcdba5a1092",
+      "mode": "100644"
+    },
+    {
+      "path": "security/codex-seccomp.json",
+      "sha256": "818f1fa170392b2014fb1caee5f1d9169370a682607a188984524242ae55228f",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/test_boundaries.py",
+      "sha256": "a229997b253464db79f42b0ff0d28d0035379c33b086fe3201ba8c07f67277cd",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/test_client_mail_provision.py",
+      "sha256": "32c4f7a1136cdcd0f4d89ec80b3f2de7bc2b59e6ceec4fcfc276c1781c0da509",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/test_worker_failures.py",
+      "sha256": "83d5df0f53797561fdb957a57782fd9ce76490e45b8ae1c92262cd2f9e9fcb71",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/test_worker_health.py",
+      "sha256": "e6c16c73d973406583c1a40b9b222de871b05d2b21daada9b42383bc736a358b",
+      "mode": "100644"
+    },
+    {
+      "path": "security/SOURCE.txt",
+      "sha256": "251a37a94ff99c1250005a9b3236c56b09c7c288bdfb2d70793864c8e7715220",
+      "mode": "100644"
+    }
+  ],
+  "purpose": "Frozen first-party lab recovery source; separate from Baton application implementation.",
+  "source_progress_commits": [
+    "45c044fc9729b6d79b8ed8e82140517b269ebfb2",
+    "85e2ae430eefade175eb20913a8af2b4769ccb61",
+    "b8e3c329492eb8a3bb660790518be0dbbc4299c3",
+    "453bf1e9aa0404e9d408145eabe4f1e79f60170a",
+    "bfd27bf306e49c1ec8493e5408e92317f54df49f",
+    "dfce8add60791f57af77d2e6fc984287a5041dbd",
+    "7101874379b539e53bb1e6439e34481fae06b118"
+  ],
+  "omitted": [
+    "Runtime receipts/databases/registries and credential values/digests",
+    "Private ingress configuration and operator README",
+    "Historical diffs that retain superseded non-example identity literals"
+  ],
+  "sanitization": [
+    "Private endpoint defaults replaced with a documentation hostname.",
+    "Dependency generator comments containing operator filesystem paths removed.",
+    "No third-party source vendored."
+  ],
+  "dco": "Private lab placeholder signoffs are not verified real-signer DCO; upstream review remains required.",
+  "provenance": "The archived security policy source notes and modification boundary are preserved in security/SOURCE.txt; imported dependency implementations are not vendored.",
+  "archive": "lab-source-7101874.txt",
+  "archive_sha256": "8a14a4233225f120edf064d7f2bb8561a9b9e14d99050d5dccba7ed78fc8acfe",
+  "archive_format": "Readable UTF-8 source with length-delimited JSON headers; restore helper verifies every file and mode."
+}

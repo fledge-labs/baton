@@ -1,0 +1,4340 @@
+=== BATON_SOURCE_FILE === {"path": "Dockerfile", "mode": "100644", "size": 842}
+FROM node:22-bookworm-slim AS codex
+RUN npm install -g @openai/codex@0.154.0
+FROM python:3.12-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git && rm -rf /var/lib/apt/lists/*
+COPY --from=codex /usr/local/bin/node /usr/local/bin/node
+COPY --from=codex /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s /usr/local/lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt && useradd -m -u 10001 agent
+WORKDIR /app
+COPY lab /app/lab
+RUN mkdir -p /data /work /home/agent/.codex && chown -R agent:agent /data /work /home/agent
+USER 10001:10001
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 HOME=/home/agent CODEX_HOME=/home/agent/.codex
+CMD ["python", "-m", "lab.bridge"]
+
+=== BATON_SOURCE_FILE === {"path": "Dockerfile.mail", "mode": "100644", "size": 823}
+FROM python:3.12-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
+ARG MAIL_COMMIT=fd9c518458daa1ac7cf74500aa37ed7bd72b8dd0
+COPY mail-constraints.txt /app/mail-constraints.txt
+RUN pip install --no-cache-dir -c /app/mail-constraints.txt "git+https://github.com/Dicklesworthstone/mcp_agent_mail.git@${MAIL_COMMIT}" && useradd -m -u 10001 agent
+WORKDIR /app
+COPY lab/mail_entry.py /app/mail_entry.py
+RUN mkdir -p /data && chown agent:agent /data
+USER 10001:10001
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 HTTP_HOST=0.0.0.0 HTTP_PORT=8765 STORAGE_ROOT=/data/mailbox DATABASE_URL=sqlite+aiosqlite:////data/mail.sqlite3 HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=false TOOLS_LOG_ENABLED=false LOG_LEVEL=WARNING
+CMD ["python", "/app/mail_entry.py"]
+
+=== BATON_SOURCE_FILE === {"path": "board.html", "mode": "100644", "size": 3690}
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent Lab · 任务与消息</title>
+<style>body{font:16px system-ui;max-width:1080px;margin:40px auto;padding:0 24px;background:#101521;color:#e6edf5}h1{font-size:28px}small{color:#a5b4c8}section{background:#1c2535;border:1px solid #344157;border-radius:12px;padding:24px;margin:20px 0}input,textarea,button{font:inherit;border-radius:6px;padding:10px;background:#101521;color:#e6edf5;border:1px solid #567}input,textarea{box-sizing:border-box;width:100%;margin:8px 0}button{background:#8bd6bf;color:#10221e;cursor:pointer;margin:6px 8px 6px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px ui-monospace}#status{color:#8bd6bf}.task{border-top:1px solid #344157;padding:16px 0}</style>
+<h1>Agent Lab</h1><small>硅谷测试环境 · MCP → A2A → Codex · Agent Mail 消息</small>
+<section><label>Agent 令牌<input id="token" type="password" autocomplete="off" placeholder="粘贴分配给当前 agent 的令牌"></label><button id="connect">连接 / 刷新</button><button id="clear">清除令牌</button><p id="status">令牌仅保存在当前页面内存，刷新页面即清除。</p></section>
+<section><h2>提交测试任务</h2><label>幂等键<input id="key" placeholder="例如 hello-codex-001"></label><label>任务<textarea id="prompt" rows="4" placeholder="仅提交测试任务，不要输入密钥或生产数据。"></textarea></label><button id="submit">经 MCP 提交</button></section>
+<section><h2>任务</h2><div id="tasks">尚未连接</div></section><section><h2>Agent Mail 收件箱</h2><div id="mail">尚未连接</div></section>
+<script>
+const $=id=>document.getElementById(id);
+function headers(){return {'Authorization':'Bearer '+$('token').value.trim(),'Content-Type':'application/json','Accept':'application/json, text/event-stream'}}
+function showError(e){$('status').textContent=e.message}
+async function refresh(){const r=await fetch('/board/data',{headers:headers(),cache:'no-store'});if(!r.ok)throw Error('请求失败：HTTP '+r.status);const d=await r.json();$('status').textContent='已连接：'+d.agent;$('tasks').replaceChildren();for(const t of d.tasks){const el=document.createElement('div');el.className='task';const title=document.createElement('strong');title.textContent=t.status+' · '+t.id;const p=document.createElement('pre');p.textContent=t.result||t.error||'等待执行';el.append(title,p);$('tasks').append(el)}$('mail').replaceChildren();const messages=Array.isArray(d.mail)?d.mail:(d.mail.result||[]);for(const m of messages){const el=document.createElement('div');el.className='task';const title=document.createElement('strong');title.textContent=m.subject;const meta=document.createElement('p');meta.textContent=(m.from||'Codex')+' · '+m.created_ts;const body=document.createElement('pre');body.textContent=m.body_md||'';el.append(title,meta,body);$('mail').append(el)}}
+$('connect').onclick=()=>refresh().catch(showError);
+$('clear').onclick=()=>{$('token').value='';$('tasks').textContent='已清除';$('mail').textContent='已清除';$('status').textContent='令牌已清除'};
+$('submit').onclick=async()=>{try{const r=await fetch('/mcp',{method:'POST',headers:headers(),body:JSON.stringify({jsonrpc:'2.0',id:crypto.randomUUID(),method:'tools/call',params:{name:'submit_task',arguments:{idempotency_key:$('key').value,prompt:$('prompt').value}}})});if(!r.ok)throw Error('提交失败：HTTP '+r.status);const d=await r.json();if(d.error||d.result?.isError)throw Error('提交被拒绝，请检查幂等键和任务内容');await refresh()}catch(e){showError(e)}};
+</script></html>
+
+=== BATON_SOURCE_FILE === {"path": "compose.yaml", "mode": "100644", "size": 2611}
+name: agentgateway-lab
+x-service: &service
+  restart: unless-stopped
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  logging:
+    driver: json-file
+    options: {max-size: 10m, max-file: "5"}
+services:
+  gateway:
+    <<: *service
+    image: ghcr.io/agentgateway/agentgateway:v1.6.0@sha256:9d3e6044ddcdc0878b1787f77bd401252b95e22684203fb5e874c4c42d2ed90c
+    command: [-f, /config/gateway.json]
+    ports: ["127.0.0.1:18090:3000"]
+    volumes: ["${LAB_RUNTIME:?set LAB_RUNTIME}/config:/config:ro"]
+    networks: [lab, egress]
+    mem_limit: 160m
+    cpus: 0.50
+  bridge:
+    <<: *service
+    image: agentgateway-lab-app:local
+    build: .
+    command: [python, -m, lab.bridge]
+    environment:
+      LAB_STATE: /data
+      LAB_CONFIG: /config
+      MAIL_URL: http://mail:8765/mcp/
+      GATEWAY_INTERNAL: http://gateway:3000
+      PUBLIC_URL: https://mcp.example.invalid
+    volumes:
+      - ${LAB_RUNTIME}/config:/config:ro
+      - ${LAB_RUNTIME}/secrets/bridge:/run/secrets:ro
+      - ${LAB_RUNTIME}/data/bridge:/data
+    tmpfs: ["/tmp:size=32m,mode=1777"]
+    networks: [lab]
+    mem_limit: 220m
+    cpus: 0.50
+  codex:
+    <<: *service
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./security/codex-seccomp.json
+      - apparmor=agentgateway-lab-codex
+    image: agentgateway-lab-app:local
+    command: [python, -m, lab.codex_agent]
+    environment:
+      LAB_STATE: /data
+      LAB_CONFIG: /config
+      PUBLIC_URL: https://mcp.example.invalid
+      CODEX_MODEL: gpt-6-astra
+    volumes:
+      - ${LAB_RUNTIME}/config:/config:ro
+      - ${LAB_RUNTIME}/data/codex:/data
+      - ${LAB_RUNTIME}/secrets/codex-home:/home/agent/.codex
+    tmpfs: ["/tmp:size=64m,mode=1777", "/work:size=64m,uid=10001,gid=10001,mode=0700"]
+    networks: [lab, egress]
+    mem_limit: 640m
+    cpus: 0.75
+    # Codex session startup uses many short-lived runtime threads. Keep a finite
+    # ceiling with headroom; the worker health monitor checks actual usage.
+    pids_limit: 256
+    healthcheck:
+      test: ["CMD", "python", "-m", "lab.worker_health", "check"]
+      interval: 30s
+      timeout: 5s
+      start_period: 90s
+      retries: 3
+  mail:
+    <<: *service
+    image: agentgateway-lab-mail:local
+    build:
+      context: .
+      dockerfile: Dockerfile.mail
+    environment:
+      HTTP_RBAC_DEFAULT_ROLE: writer
+    volumes:
+      - ${LAB_RUNTIME}/secrets/mail:/run/secrets:ro
+      - ${LAB_RUNTIME}/data/mail:/data
+    tmpfs: ["/tmp:size=32m,mode=1777"]
+    networks: [lab]
+    mem_limit: 300m
+    cpus: 0.50
+networks:
+  lab: {internal: true}
+  egress: {}
+
+=== BATON_SOURCE_FILE === {"path": "lab/__init__.py", "mode": "100644", "size": 0}
+
+=== BATON_SOURCE_FILE === {"path": "lab/bridge.py", "mode": "100644", "size": 11498}
+import asyncio
+import contextlib
+import hashlib
+import html
+import json
+import os
+import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import httpx
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.transport_security import TransportSecuritySettings
+
+from lab.common import AuthMiddleware, audit, database, safe_id
+from lab.mail_identity import PROJECT, init_mail_db, mail_agent, mail_call
+from lab.failures import Failure, FailureError, failure_from_a2a
+from lab.worker_health import sanitize_health_snapshot
+
+GATEWAY = os.environ.get('GATEWAY_INTERNAL', 'http://gateway:3000')
+mcp = FastMCP('Agentgateway Lab Tasks and Agent Mail', stateless_http=True, json_response=True,
+              transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=True,
+                  allowed_hosts=['bridge','bridge:9000','mcp.example.invalid','127.0.0.1:9000','localhost:9000'],
+                  allowed_origins=['https://mcp.example.invalid']))
+
+def init_db():
+    with database('tasks.sqlite3') as db:
+        db.execute('CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, owner TEXT NOT NULL, idem TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL, result TEXT, a2a_id TEXT, error TEXT, UNIQUE(owner,idem))')
+        db.execute("UPDATE tasks SET status='interrupted', error='Restart after dispatch; requires manual reconciliation, never automatic re-execution' WHERE status='working'")
+    init_mail_db()
+
+def owner(ctx):
+    return ctx.request_context.request.state.identity['agent']
+
+def lookup(task_id, agent):
+    with database('tasks.sqlite3') as db:
+        row = db.execute('SELECT * FROM tasks WHERE id=? AND owner=?',(task_id,agent)).fetchone()
+    if not row:
+        raise ValueError('Task not found')
+    return dict(row)
+
+async def mail_event(task, phase, body):
+    client=await mail_agent(task['owner']);worker=await mail_agent('codex-worker')
+    sender,recipient=(client,worker) if phase=='submitted' else (worker,client)
+    await mail_call('macro_contact_handshake',{'project_key':PROJECT,'requester':sender['name'],'target':recipient['name'],'auto_accept':True,'requester_registration_token':sender['token'],'target_registration_token':recipient['token']})
+    result=await mail_call('send_message',{'project_key':PROJECT,'sender_name':sender['name'],'sender_token':sender['token'],'to':[recipient['name']],'subject':f'[{phase}] {task["id"]}','body_md':body,'thread_id':task['id']})
+    if result.get('count') != 1 or not result.get('verified_sender'):
+        raise RuntimeError('Mail delivery not confirmed')
+    # Never log the tool result/body. Persist only the shared thread identifier.
+    message_ids=[d.get('payload',{}).get('id') for d in result.get('deliveries',[])]
+    event = 'mail.failure_reported' if phase == 'failed' else 'mail.' + phase
+    audit(event,task_id=task['id'],agent=task['owner'],mail_message_ids=message_ids)
+    return result
+
+@mcp.tool()
+async def submit_task(idempotency_key: str, prompt: str, ctx: Context) -> dict:
+    """Queue a test-only task for the A2A Codex agent. Reusing a key never executes twice."""
+    safe_id(idempotency_key)
+    if not prompt.strip() or len(prompt)>16000:raise ValueError('Prompt must contain 1..16000 characters')
+    agent=owner(ctx)
+    task_id=str(uuid.uuid5(uuid.NAMESPACE_URL,PROJECT+'/'+agent+'/'+idempotency_key))
+    with database('tasks.sqlite3') as db:
+        prior=db.execute('SELECT * FROM tasks WHERE owner=? AND idem=?',(agent,idempotency_key)).fetchone()
+        if prior:
+            if prior['prompt']!=prompt:raise ValueError('Idempotency key already used for different input')
+            audit('task.replay',task_id=task_id,agent=agent,request_id=ctx.request_context.request.headers.get('x-request-id'))
+            return {'task_id':task_id,'status':prior['status'],'replay':True}
+        db.execute('INSERT INTO tasks(id,owner,idem,prompt,status) VALUES (?,?,?,?,?)',(task_id,agent,idempotency_key,prompt,'queued'))
+    audit('task.submitted',task_id=task_id,agent=agent,request_id=ctx.request_context.request.headers.get('x-request-id'),input_sha256=hashlib.sha256(prompt.encode()).hexdigest())
+    return {'task_id':task_id,'status':'queued','replay':False}
+
+@mcp.tool()
+async def get_task(task_id: str, ctx: Context) -> dict:
+    """Get your task status/result and its A2A task identifier."""
+    row=lookup(task_id,owner(ctx));row.pop('prompt');return row
+
+@mcp.tool()
+async def list_tasks(ctx: Context) -> list[dict]:
+    """List your most recent test tasks."""
+    with database('tasks.sqlite3') as db:
+        return [dict(x) for x in db.execute('SELECT id,status,a2a_id,error FROM tasks WHERE owner=? ORDER BY rowid DESC LIMIT 50',(owner(ctx),))]
+
+@mcp.tool()
+async def fetch_inbox(ctx: Context) -> dict:
+    """Read your real MCP Agent Mail inbox (identity is bound to your bearer token)."""
+    who=await mail_agent(owner(ctx))
+    result=await mail_call('fetch_inbox',{'project_key':PROJECT,'agent_name':who['name'],'registration_token':who['token'],'include_bodies':True,'limit':30})
+    return {'agent_name':who['name'],'messages':result}
+
+async def dispatch(task):
+    task_id=task['id']
+    try:
+        await mail_event(task,'submitted',task['prompt'])
+    except Exception:
+        raise FailureError(Failure('MAIL_SUBMISSION_FAILED')) from None
+    audit('task.dispatched',task_id=task_id,agent=task['owner'])
+    payload={'jsonrpc':'2.0','id':task_id,'method':'message/send','params':{'message':{'kind':'message','role':'user','messageId':task_id,'parts':[{'kind':'text','text':json.dumps({'task_id':task_id,'owner':task['owner'],'prompt':task['prompt']})}]},'configuration':{'blocking':True}}}
+    try:
+        token=Path('/run/secrets/dispatcher.token').read_text().strip()
+        async with httpx.AsyncClient(timeout=350) as http:
+            response=await http.post(GATEWAY+'/a2a/codex',json=payload,headers={'Authorization':'Bearer '+token,'X-Request-ID':task_id,'A2A-Version':'0.3'})
+            response.raise_for_status()
+    except Exception:
+        raise FailureError(Failure('A2A_TRANSPORT_FAILED')) from None
+    try:
+        result=response.json()
+        if not isinstance(result, dict) or 'error' in result:
+            raise ValueError('invalid response')
+        result = result['result']
+        # Our pinned worker SDK issues UUID task IDs. Do not persist arbitrary
+        # peer-controlled strings as diagnostic identifiers.
+        a2a_id = str(uuid.UUID(result['id']))
+    except Exception:
+        raise FailureError(Failure('A2A_PROTOCOL_ERROR')) from None
+    with database('tasks.sqlite3') as db:
+        db.execute('UPDATE tasks SET a2a_id=? WHERE id=?', (a2a_id, task_id))
+    status = result.get('status')
+    if not isinstance(status, dict):
+        raise FailureError(Failure('A2A_PROTOCOL_ERROR'))
+    state = status.get('state')
+    if state == 'failed':
+        raise FailureError(failure_from_a2a(status))
+    if state != 'completed':
+        raise FailureError(Failure('A2A_TASK_INCOMPLETE'))
+    try:
+        texts=[p.get('text','') for artifact in result.get('artifacts',[]) for p in artifact.get('parts',[]) if p.get('kind')=='text']
+        if not all(isinstance(text, str) for text in texts):
+            raise ValueError('invalid result')
+    except Exception:
+        raise FailureError(Failure('A2A_PROTOCOL_ERROR')) from None
+    output='\n'.join(texts)
+    if not output.strip():raise FailureError(Failure('A2A_RESULT_MISSING'))
+    with database('tasks.sqlite3') as db:
+        db.execute("UPDATE tasks SET status='completed',result=?,a2a_id=? WHERE id=?",(output,a2a_id,task_id))
+    audit('task.completed',task_id=task_id,agent=task['owner'],a2a_task_id=a2a_id,output_sha256=hashlib.sha256(output.encode()).hexdigest())
+    try:
+        await mail_event(task,'completed',output)
+    except Exception:
+        failure = Failure('MAIL_REPORT_FAILED')
+        with database('tasks.sqlite3') as db:db.execute('UPDATE tasks SET error=? WHERE id=?',(failure.display(),task_id))
+        audit('mail.report_failed', task_id=task_id, a2a_task_id=a2a_id,
+              error_code=failure.code, stage=failure.stage)
+
+
+async def fail_task(task, failure):
+    # Commit the original failure before attempting a best-effort mail report.
+    with database('tasks.sqlite3') as db:
+        db.execute("UPDATE tasks SET status='failed',error=? WHERE id=?", (failure.display(), task['id']))
+        row = db.execute('SELECT a2a_id FROM tasks WHERE id=?', (task['id'],)).fetchone()
+    a2a_id = row['a2a_id']
+    audit('task.failed', task_id=task['id'], agent=task['owner'], a2a_task_id=a2a_id,
+          error_code=failure.code, stage=failure.stage)
+    try:
+        await mail_event(task, 'failed', failure.report())
+    except Exception:
+        report_failure = Failure('MAIL_REPORT_FAILED')
+        audit('mail.report_failed', task_id=task['id'], a2a_task_id=a2a_id,
+              error_code=report_failure.code, stage=report_failure.stage,
+              original_error_code=failure.code)
+
+async def worker_loop():
+    while True:
+        with database('tasks.sqlite3') as db:
+            row=db.execute("SELECT * FROM tasks WHERE status='queued' ORDER BY rowid LIMIT 1").fetchone()
+            if row:db.execute("UPDATE tasks SET status='working' WHERE id=? AND status='queued'",(row['id'],))
+        if row:
+            task=dict(row)
+            try:await dispatch(task)
+            except Exception as e:
+                failure = e.failure if isinstance(e, FailureError) else Failure('BRIDGE_INTERNAL_ERROR')
+                await fail_task(task, failure)
+        await asyncio.sleep(1)
+
+@asynccontextmanager
+async def lifespan(app):
+    init_db()
+    async with mcp.session_manager.run():
+        worker=asyncio.create_task(worker_loop())
+        yield
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):await worker
+
+app=FastAPI(lifespan=lifespan)
+@app.get('/healthz')
+async def health():
+    try:
+        token = Path('/run/secrets/dispatcher.token').read_text().strip()
+        async with httpx.AsyncClient(timeout=5) as http:
+            response = await http.get('http://codex:9001/healthz', headers={'Authorization': 'Bearer ' + token})
+            if response.status_code not in (200, 503):
+                raise ValueError('Worker health unavailable')
+            worker = sanitize_health_snapshot(response.json())
+    except Exception:
+        worker = sanitize_health_snapshot(None)
+    result = {'status': worker['status'], 'code': worker['code'], 'environment': 'isolated-lab', 'worker': worker}
+    return JSONResponse(result, status_code=200 if worker['status'] == 'healthy' else 503)
+
+@app.get('/board/data')
+async def board_data(request: Request):
+    agent=request.state.identity['agent']
+    with database('tasks.sqlite3') as db:
+        tasks=[dict(x) for x in db.execute('SELECT id,status,result,a2a_id,error FROM tasks WHERE owner=? ORDER BY rowid DESC LIMIT 50',(agent,))]
+    who=await mail_agent(agent)
+    inbox=await mail_call('fetch_inbox',{'project_key':PROJECT,'agent_name':who['name'],'registration_token':who['token'],'include_bodies':True,'limit':30})
+    return {'agent':agent,'tasks':tasks,'mail':inbox}
+
+app.mount('/',mcp.streamable_http_app())
+app=AuthMiddleware(app,role='client')
+
+if __name__=='__main__':uvicorn.run(app,host='0.0.0.0',port=9000,access_log=False,log_level='warning')
+
+=== BATON_SOURCE_FILE === {"path": "lab/codex_agent.py", "mode": "100644", "size": 10867}
+import asyncio
+import contextlib
+import hashlib
+import json
+import os
+import signal
+import tempfile
+from pathlib import Path
+
+import uvicorn
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from sqlalchemy.ext.asyncio import create_async_engine
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.routes import add_a2a_routes_to_fastapi, create_agent_card_routes, create_jsonrpc_routes
+from a2a.server.tasks import TaskUpdater
+from a2a.server.tasks.database_task_store import DatabaseTaskStore
+from a2a.types import AgentCapabilities, AgentCard, AgentInterface, AgentSkill, Message, Part, Role, Task, TaskState, TaskStatus
+from google.protobuf.json_format import ParseDict
+from google.protobuf.struct_pb2 import Value
+from lab.common import AuthMiddleware, STATE, audit, database
+from lab.failures import Failure, FailureError, WORKER_CODES, classify_codex_exit, worker_exception_failure
+from lab.worker_health import WorkerHealth, init_health_db, sanitize_health_snapshot
+
+def init_db():
+    with database('executions.sqlite3') as db:
+        db.execute('CREATE TABLE IF NOT EXISTS executions (id TEXT PRIMARY KEY, digest TEXT NOT NULL, status TEXT NOT NULL, result TEXT, a2a_id TEXT)')
+        if 'error_code' not in [row[1] for row in db.execute('PRAGMA table_info(executions)')]:
+            db.execute('ALTER TABLE executions ADD COLUMN error_code TEXT')
+        db.execute("UPDATE executions SET status='interrupted' WHERE status='running'")
+    init_health_db(recover=True)
+
+def redact_output(text):
+    # Raw Codex output is never logged. Remove known auth values before storing artifacts.
+    p=Path(os.environ.get('CODEX_HOME','/home/agent/.codex'))/'auth.json'
+    if p.exists():
+        def values(obj):
+            if isinstance(obj,dict):
+                for v in obj.values():yield from values(v)
+            elif isinstance(obj,list):
+                for v in obj:yield from values(v)
+            elif isinstance(obj,str) and len(obj)>=20:yield obj
+        for value in values(json.loads(p.read_text())):text=text.replace(value,'[REDACTED]')
+    return text[:32000]
+
+def failure_message(failure, task_id, context_id):
+    return Message(message_id=task_id + ':failure', task_id=task_id, context_id=context_id,
+                   role=Role.ROLE_AGENT, parts=[
+                       Part(data=ParseDict({'lab_failure': failure.payload()}, Value())),
+                       Part(text=failure.display()),
+                   ])
+
+
+class CodexExecutor(AgentExecutor):
+    def __init__(self):self.processes={};self.lock=asyncio.Lock()
+
+    async def run_cli(self, prompt, *, process_key, timeout=300, audit_task_id=None, health_probe=False):
+        """Business tasks and health canaries use this exact command and sandbox.
+
+        The caller must hold self.lock, including while credentials may refresh.
+        """
+        if not self.lock.locked():
+            raise RuntimeError('Executor lock is required')
+        try:
+            with tempfile.TemporaryDirectory(prefix='task-', dir='/work') as wd:
+                final = Path(wd) / 'result.txt'
+                permissions='permissions.lab={extends=":read-only",filesystem={"/data"="deny","/config"="deny","/home/agent/.codex"="deny",'+json.dumps(wd)+'="write"},network={enabled=false}}'
+                cmd=['codex','exec','--json','--ignore-user-config','--skip-git-repo-check','--ephemeral','-c','default_permissions="lab"','-c','approval_policy="never"','-c',permissions,'-c','web_search="disabled"','--model',os.environ.get('CODEX_MODEL','gpt-6-astra'),'--color','never','--output-last-message',str(final),'-']
+                env={k:v for k,v in os.environ.items() if k in ('PATH','HOME','CODEX_HOME','SSL_CERT_FILE','SSL_CERT_DIR')}
+                isolated_prompt='You are an isolated test-only coding agent. Work only on the supplied test task. Do not inspect credentials, services, or any production system. Never reveal secrets.\n\n'+prompt
+                proc=await asyncio.create_subprocess_exec(*cmd,cwd=wd,env=env,stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE,start_new_session=True)
+                self.processes[process_key] = proc
+                try:
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(isolated_prompt.encode()), timeout=timeout)
+                except BaseException:
+                    with contextlib.suppress(ProcessLookupError):os.killpg(proc.pid,signal.SIGKILL)
+                    await proc.wait()
+                    raise
+                has_output = final.exists() and final.stat().st_size > 0
+                if proc.returncode or not has_output:
+                    failure = classify_codex_exit(stderr, stdout=stdout, returncode=proc.returncode, has_output=has_output)
+                    fields = {'probe_id': process_key} if health_probe else {'task_id': audit_task_id or process_key}
+                    audit('worker.canary_exit_error' if health_probe else 'codex.exit_error', **fields, exit_code=proc.returncode,
+                          category='authentication' if failure.stage == 'authentication' else 'execution',
+                          error_code=failure.code, stage=failure.stage)
+                    raise FailureError(failure)
+                output = redact_output(final.read_text())
+                if not output.strip():
+                    raise FailureError(Failure('CODEX_OUTPUT_MISSING'))
+                return output
+        finally:
+            self.processes.pop(process_key, None)
+
+    async def execute(self, context: RequestContext, event_queue: EventQueue):
+        data=json.loads(context.get_user_input());task_id=data['task_id']
+        if len(data['prompt'])>16000:raise ValueError('Prompt too long')
+        digest=hashlib.sha256(data['prompt'].encode()).hexdigest()
+        await event_queue.enqueue_event(Task(id=context.task_id,context_id=context.context_id,status=TaskStatus(state=TaskState.TASK_STATE_SUBMITTED),history=[context.message]))
+        updater=TaskUpdater(event_queue,context.task_id,context.context_id)
+        async with self.lock:
+            with database('executions.sqlite3') as db:
+                existing=db.execute('SELECT * FROM executions WHERE id=?',(task_id,)).fetchone()
+                if existing:
+                    if existing['digest'] != digest or existing['status'] != 'completed':
+                        code = ('CODEX_IDEMPOTENCY_CONFLICT' if existing['digest'] != digest else
+                                existing['error_code'] if existing['error_code'] in WORKER_CODES else
+                                'CODEX_PRIOR_EXECUTION_UNRESOLVED')
+                        failure = Failure(code)
+                        audit('codex.replay', task_id=task_id, a2a_task_id=context.task_id,
+                              error_code=failure.code, stage=failure.stage)
+                        await updater.failed(failure_message(failure, context.task_id, context.context_id))
+                        return
+                    output=existing['result']
+                    audit('codex.replay',task_id=task_id,a2a_task_id=context.task_id)
+                    await updater.add_artifact([Part(text=output)],name='codex-result',last_chunk=True)
+                    await updater.complete();return
+                db.execute('INSERT INTO executions(id,digest,status,result,a2a_id) VALUES (?,?,?,?,?)',(task_id,digest,'running',None,context.task_id))
+            audit('codex.claimed',task_id=task_id,agent='codex-worker',a2a_task_id=context.task_id)
+            await updater.start_work()
+            try:
+                output = await self.run_cli(data['prompt'], process_key=context.task_id, audit_task_id=task_id)
+                with database('executions.sqlite3') as db:db.execute("UPDATE executions SET status='completed',result=? WHERE id=?",(output,task_id))
+                await updater.add_artifact([Part(text=output)],name='codex-result',last_chunk=True)
+                await updater.complete()
+                audit('codex.completed',task_id=task_id,agent='codex-worker',a2a_task_id=context.task_id,output_sha256=hashlib.sha256(output.encode()).hexdigest())
+            except Exception as e:
+                failure = worker_exception_failure(e)
+                with database('executions.sqlite3') as db:
+                    db.execute("UPDATE executions SET status='failed',error_code=? WHERE id=?", (failure.code, task_id))
+                audit('codex.failed', task_id=task_id, a2a_task_id=context.task_id,
+                      error_code=failure.code, stage=failure.stage)
+                await updater.failed(failure_message(failure, context.task_id, context.context_id))
+
+    async def cancel(self,context: RequestContext,event_queue: EventQueue):
+        proc=self.processes.get(context.task_id)
+        if proc:
+            with contextlib.suppress(ProcessLookupError):os.killpg(proc.pid,signal.SIGTERM)
+        await TaskUpdater(event_queue,context.task_id,context.context_id).cancel()
+
+def create_app():
+    init_db()
+    executor = CodexExecutor()
+    health = WorkerHealth(executor)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        health.start()
+        try:
+            yield
+        finally:
+            await health.stop()
+    card=AgentCard(name='Codex Lab Agent',description='Isolated Codex CLI over the official A2A Python SDK',version='1.0.0',capabilities=AgentCapabilities(streaming=False,push_notifications=False),default_input_modes=['text/plain'],default_output_modes=['text/plain'],skills=[AgentSkill(id='test-coding',name='Test coding',description='Run an isolated coding task',tags=['test','codex'])],supported_interfaces=[AgentInterface(protocol_binding='JSONRPC',protocol_version='0.3',url=os.environ.get('PUBLIC_URL','https://mcp.example.invalid')+'/a2a/codex')])
+    store=DatabaseTaskStore(create_async_engine('sqlite+aiosqlite:///'+str(STATE/'a2a.sqlite3')))
+    handler=DefaultRequestHandler(agent_executor=executor,task_store=store,agent_card=card)
+    app=FastAPI(lifespan=lifespan)
+    app.state.worker_health = health
+
+    @app.get('/healthz')
+    async def worker_health():
+        try:
+            result = health.snapshot()
+        except Exception:
+            result = sanitize_health_snapshot(None)
+        return JSONResponse(result, status_code=200 if result['status'] == 'healthy' else 503)
+    add_a2a_routes_to_fastapi(app,agent_card_routes=create_agent_card_routes(agent_card=card),jsonrpc_routes=create_jsonrpc_routes(request_handler=handler,rpc_url='/a2a/codex',enable_v0_3_compat=True))
+    return AuthMiddleware(app,role='dispatcher')
+
+if __name__=='__main__':uvicorn.run(create_app(),host='0.0.0.0',port=9001,access_log=False,log_level='warning')
+
+=== BATON_SOURCE_FILE === {"path": "lab/common.py", "mode": "100644", "size": 2261}
+import hashlib
+import json
+import os
+import re
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+STATE = Path(os.environ.get('LAB_STATE', '/data'))
+CONFIG = Path(os.environ.get('LAB_CONFIG', '/config'))
+
+def audit(event, **fields):
+    # Only explicit identifiers/statuses; never headers, prompts, tokens or replies.
+    record = {'time': datetime.now(timezone.utc).isoformat(), 'event': event, **fields}
+    line = json.dumps(record, ensure_ascii=False)
+    STATE.mkdir(parents=True, exist_ok=True)
+    with (STATE / 'audit.jsonl').open('a') as f:
+        f.write(line + '\n')
+        f.flush()
+        os.fsync(f.fileno())
+    print(line, flush=True)
+
+def identity(authorization):
+    if not authorization.startswith('Bearer '):
+        return None
+    digest = hashlib.sha256(authorization[7:].encode()).hexdigest()
+    data = json.loads((CONFIG / 'identities.json').read_text())
+    return next((v for v in data.values() if v['hash'] == digest and v['active']), None)
+
+class AuthMiddleware:
+    def __init__(self, app, role=None):
+        self.app, self.role = app, role
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http':
+            return await self.app(scope, receive, send)
+        headers = dict(scope.get('headers', []))
+        who = identity(headers.get(b'authorization', b'').decode())
+        code = 401 if not who else 403 if self.role and who['role'] != self.role else None
+        if code:
+            audit('auth.denied', status=code, agent=who['agent'] if who else 'unknown')
+            await send({'type':'http.response.start', 'status':code, 'headers':[(b'content-type',b'application/json')]})
+            await send({'type':'http.response.body','body':b'{"error":"unauthorized"}'})
+            return
+        scope.setdefault('state', {})['identity'] = who
+        await self.app(scope, receive, send)
+
+def database(name):
+    STATE.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(STATE / name, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode=WAL')
+    return conn
+
+def safe_id(value):
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,95}', value):
+        raise ValueError('Invalid identifier')
+    return value
+
+=== BATON_SOURCE_FILE === {"path": "lab/failures.py", "mode": "100644", "size": 11401}
+"""Closed diagnostic vocabulary: raw subprocess/transport errors never cross it."""
+from dataclasses import dataclass
+import errno
+import json
+import re
+
+
+CATALOG = {
+    'CODEX_AUTH_UNAUTHORIZED': ('authentication', '模型服务拒绝了 worker 认证；请核对或更新认证副本。'),
+    'CODEX_AUTH_REFRESH_FAILED': ('authentication', 'worker 认证刷新失败；需要重新认证。'),
+    'CODEX_MODEL_FORBIDDEN': ('model_access', 'worker 账号无法使用配置的模型；请核对模型权限。'),
+    'CODEX_CAPACITY_LIMITED': ('capacity', '模型服务的额度、速率或容量限制阻止了本次执行。'),
+    'MODEL_CAPACITY': ('capacity', '所选模型当前容量不足；请等待恢复或选择可用模型。'),
+    'CODEX_SANDBOX_FAILED': ('sandbox', 'worker 无法启动或使用任务沙箱；请核对沙箱权限。'),
+    'CODEX_CONFIG_INVALID': ('configuration', 'worker 命令或配置不可用；请核对部署配置。'),
+    'WORKER_RESOURCE_EXHAUSTED': ('session_start', 'worker 创建线程或进程失败；请核对 PID、线程及系统资源限制。'),
+    'WORKER_FD_EXHAUSTED': ('session_start', 'worker 文件描述符耗尽；请核对打开文件数与限制。'),
+    'WORKER_MEMORY_EXHAUSTED': ('session_start', 'worker 内存分配失败；请核对可用内存与容器限制。'),
+    'CODEX_TIMEOUT': ('execution', 'worker 执行超过时间限制，子进程已停止。'),
+    'CODEX_OUTPUT_MISSING': ('execution', 'worker 未产生可用的最终结果。'),
+    'CODEX_EXECUTION_FAILED': ('execution', 'worker 执行失败，现有诊断无法匹配已知错误；未保留原始错误正文。'),
+    'CODEX_IDEMPOTENCY_CONFLICT': ('replay', '同一任务标识对应不同输入，已拒绝重新执行。'),
+    'CODEX_PRIOR_EXECUTION_UNRESOLVED': ('replay', '已有执行未成功或被中断；必须人工核对，禁止自动重跑。'),
+    'A2A_TRANSPORT_FAILED': ('dispatch', '任务桥无法完成到 worker 的请求；请核对内部服务状态。'),
+    'A2A_PROTOCOL_ERROR': ('dispatch', 'worker 返回的 A2A 响应不符合预期协议。'),
+    'A2A_FAILED_UNCLASSIFIED': ('execution', 'worker 报告失败，但未提供可接受的安全诊断。'),
+    'A2A_TASK_INCOMPLETE': ('execution', 'worker 未返回已完成或已失败的最终状态；需要人工核对。'),
+    'A2A_RESULT_MISSING': ('execution', 'worker 报告完成，但没有可用的结果。'),
+    'MAIL_SUBMISSION_FAILED': ('mail_submission', '任务提交邮件未确认送达，未启动新的 worker 请求。'),
+    'MAIL_REPORT_FAILED': ('mail_report', '任务结果已保留，但邮件报告未确认送达；需要人工核对。'),
+    'BRIDGE_INTERNAL_ERROR': ('dispatch', '任务桥处理失败；未保留未经分类的异常正文。'),
+    'WORKER_HEALTHY': ('health_check', '资源采样与最近一次真实执行检查均通过。'),
+    'WORKER_HEALTH_UNKNOWN': ('health_check', 'worker 健康状态尚未验证。'),
+    'WORKER_HEALTH_UNAVAILABLE': ('health_check', '无法获得有效的 worker 健康检查结果。'),
+    'WORKER_RESOURCE_STALE': ('health_check', 'worker 资源采样已过期。'),
+    'WORKER_PID_PRESSURE': ('session_start', 'worker PID/线程使用量已接近限制。'),
+    'WORKER_MEMORY_PRESSURE': ('session_start', 'worker 内存使用量已接近限制。'),
+    'WORKER_CANARY_BUSY': ('health_check', 'worker 正在执行其它工作，本轮尚未执行健康探针。'),
+    'WORKER_CANARY_RUNNING': ('health_check', 'worker 健康探针正在执行，结果尚未确定。'),
+    'WORKER_CANARY_STALE': ('health_check', 'worker 上次真实执行检查已过期。'),
+    'WORKER_CANARY_REQUIRED': ('health_check', '资源告警后尚未通过新的真实执行检查。'),
+    'WORKER_CANARY_INTERRUPTED': ('health_check', '上次健康探针被中断；同一探针标识不会重跑。'),
+    'WORKER_CANARY_INVALID_RESULT': ('health_check', '健康探针未返回规定结果，不能确认执行能力。'),
+}
+WORKER_CODES = frozenset(code for code in CATALOG if code.startswith('CODEX_')) | {
+    'MODEL_CAPACITY', 'WORKER_RESOURCE_EXHAUSTED', 'WORKER_FD_EXHAUSTED', 'WORKER_MEMORY_EXHAUSTED',
+}
+
+
+@dataclass(frozen=True)
+class Failure:
+    code: str
+
+    def __post_init__(self):
+        if not isinstance(self.code, str) or self.code not in CATALOG:
+            raise ValueError('Unknown failure code')
+
+    @property
+    def stage(self):
+        return CATALOG[self.code][0]
+
+    def display(self):
+        return self.code + ': ' + CATALOG[self.code][1]
+
+    def payload(self):
+        return {'version': 1, 'code': self.code, 'stage': self.stage}
+
+    def report(self):
+        return '任务失败。\n阶段：' + self.stage + '\n' + self.display()
+
+
+class FailureError(RuntimeError):
+    def __init__(self, failure):
+        if not isinstance(failure, Failure):
+            raise TypeError('Expected safe failure')
+        self.failure = failure
+        super().__init__(failure.display())
+
+
+def _diagnostic_text(stdout, stderr):
+    messages = []
+    # --json separates CLI error events from prompts, model text and tool output.
+    # Never classify arbitrary content from any other event type.
+    for line in stdout[-262144:].splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        detail = event if event.get('type') == 'error' else (
+            event.get('error') if event.get('type') == 'turn.failed' else None)
+        if isinstance(detail, dict) and isinstance(detail.get('message'), str):
+            messages.append(detail['message'][:16384])
+    stderr_text = stderr[-65536:].decode('utf-8', errors='replace')
+    if re.search(r'(?m)^user\s*$', stderr_text):
+        # A human transcript is not an authenticated CLI diagnostic source.
+        # --json should never render one; retain only typed JSON errors.
+        return '\n'.join(messages).lower()
+    panic_lines = 0
+    for line in stderr_text.splitlines():
+        lowered = line.lower()
+        # A normal bundled-bubblewrap fallback is not a sandbox failure.
+        if re.search(r'\bwarn(?:ing)?\b|falling back|fallback', lowered):
+            continue
+        own_error = re.match(r'\s*(?:error:|fatal:|failed to (?:create|initialize) session:|'
+                             r'thread [\'"].{0,160} panicked at)', lowered)
+        tracing_error = re.search(r'\berror\b\s+(?:codex[_:]|reqwest[_:]|tokio[_:])', lowered)
+        if own_error or tracing_error or panic_lines:
+            messages.append(line[:16384])
+        if 'panicked at' in lowered and own_error:
+            panic_lines = 2
+        elif panic_lines:
+            panic_lines -= 1
+    return '\n'.join(messages).lower()
+
+
+def classify_codex_exit(stderr, *, stdout=b'', returncode, has_output):
+    # Classification is a bounded heuristic, never an excuse to retain raw text.
+    text = _diagnostic_text(stdout, stderr)
+    if re.search(r'too many open files|\bemfile\b|\benfile\b|os error 24\b', text):
+        return Failure('WORKER_FD_EXHAUSTED')
+    if re.search(r'cannot allocate memory|out of memory|\benomem\b|os error 12\b', text):
+        return Failure('WORKER_MEMORY_EXHAUSTED')
+    if (re.search(r'resource temporarily unavailable|\beagain\b|os error 11\b', text)
+            and re.search(r'(?:spawn|create|start|fork).{0,60}(?:thread|process|session)|'
+                          r'(?:thread|process|session).{0,60}(?:spawn|create|start)|'
+                          r'failed to (?:load agents\.md|initialize session)', text)):
+        return Failure('WORKER_RESOURCE_EXHAUSTED')
+    if re.search(r'refresh[_ -]?token.{0,100}(?:used|expired|invalid|revoked|failed)|'
+                 r'(?:failed|unable) to refresh|token_refresh_failed', text):
+        return Failure('CODEX_AUTH_REFRESH_FAILED')
+    if re.search(r'\b401\b|\bunauthorized\b|invalid_api_key', text):
+        return Failure('CODEX_AUTH_UNAUTHORIZED')
+    if re.search(r'model_not_found|unsupported_model|model_access_denied|'
+                 r'model.{0,100}(?:not supported|not found|not available|do not have access)|'
+                 r'(?:no access|not have access).{0,60}model|\b403\b.{0,30}forbidden', text):
+        return Failure('CODEX_MODEL_FORBIDDEN')
+    if re.search(r'(?:selected )?model is at capacity|model.{0,40}capacity exceeded', text):
+        return Failure('MODEL_CAPACITY')
+    if re.search(r'\b429\b|too many requests|rate[_ -]?limit|insufficient_quota|'
+                 r'usage limit|quota exceeded|overloaded|capacity limit|resource_exhausted', text):
+        return Failure('CODEX_CAPACITY_LIMITED')
+    if re.search(r'(?:bwrap|bubblewrap|sandbox|landlock|seccomp).{0,100}(?:failed|error|denied|cannot)|'
+                 r'(?:failed|error|denied|cannot).{0,100}(?:bwrap|bubblewrap|sandbox|landlock|seccomp)', text):
+        return Failure('CODEX_SANDBOX_FAILED')
+    if re.search(r'error parsing (?:configuration|config)|invalid (?:configuration|config|toml)|'
+                 r'failed to (?:load|read).{0,40}config|unknown (?:permissions profile|flag|option)|'
+                 r'unexpected argument', text):
+        return Failure('CODEX_CONFIG_INVALID')
+    if returncode == 0 and not has_output:
+        return Failure('CODEX_OUTPUT_MISSING')
+    return Failure('CODEX_EXECUTION_FAILED')
+
+
+def worker_exception_failure(error):
+    if isinstance(error, FailureError):
+        return error.failure
+    if isinstance(error, TimeoutError):
+        return Failure('CODEX_TIMEOUT')
+    if isinstance(error, OSError):
+        if error.errno == errno.EAGAIN:
+            return Failure('WORKER_RESOURCE_EXHAUSTED')
+        if error.errno in (errno.EMFILE, errno.ENFILE):
+            return Failure('WORKER_FD_EXHAUSTED')
+        if error.errno == errno.ENOMEM:
+            return Failure('WORKER_MEMORY_EXHAUSTED')
+        if error.errno in (errno.EPERM, errno.EACCES):
+            return Failure('CODEX_SANDBOX_FAILED')
+        if error.errno == errno.ENOENT:
+            return Failure('CODEX_CONFIG_INVALID')
+    return Failure('CODEX_EXECUTION_FAILED')
+
+
+def failure_from_a2a(status):
+    """Accept only our versioned data part; descriptions/text are never trusted."""
+    fallback = Failure('A2A_FAILED_UNCLASSIFIED')
+    message = status.get('message') if isinstance(status, dict) else None
+    parts = message.get('parts') if isinstance(message, dict) else None
+    if not isinstance(parts, list):
+        return fallback
+    accepted = []
+    for part in parts:
+        if not isinstance(part, dict) or part.get('kind') != 'data':
+            continue
+        data = part.get('data')
+        if not isinstance(data, dict) or 'lab_failure' not in data:
+            continue
+        payload = data['lab_failure']
+        if (set(data) != {'lab_failure'} or not isinstance(payload, dict)
+                or set(payload) != {'version', 'code', 'stage'}
+                or type(payload['version']) not in (int, float) or payload['version'] != 1
+                or not isinstance(payload['code'], str) or payload['code'] not in WORKER_CODES):
+            return fallback
+        failure = Failure(payload['code'])
+        if payload['stage'] != failure.stage:
+            return fallback
+        accepted.append(failure)
+    return accepted[0] if len(accepted) == 1 else fallback
+
+=== BATON_SOURCE_FILE === {"path": "lab/mail_entry.py", "mode": "100644", "size": 272}
+import os
+from pathlib import Path
+
+os.environ['HTTP_BEARER_TOKEN'] = Path('/run/secrets/mail.token').read_text().strip()
+from mcp_agent_mail.http import create_app
+import uvicorn
+uvicorn.run(create_app(), host='0.0.0.0', port=8765, access_log=False, log_level='warning')
+
+=== BATON_SOURCE_FILE === {"path": "lab/mail_identity.py", "mode": "100644", "size": 5110}
+"""The single authority for stable gateway ID -> generated Mail identity mapping."""
+import asyncio
+from contextlib import asynccontextmanager, closing
+import fcntl
+import json
+import os
+from pathlib import Path
+
+import httpx
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+
+from lab import common
+
+
+PROJECT = '/agentgateway-lab'
+MAIL_URL = os.environ.get('MAIL_URL', 'http://mail:8765/mcp/')
+
+
+class MailProvisionError(RuntimeError):
+    """Fixed, non-secret failure classification suitable for the admin CLI."""
+
+
+def init_mail_db():
+    """Initialize only identity storage; never reconcile or modify tasks."""
+    with closing(common.database('tasks.sqlite3')) as db, db:
+        db.execute('BEGIN IMMEDIATE')
+        db.execute('CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, name TEXT NOT NULL)')
+        if 'token' not in [row[1] for row in db.execute('PRAGMA table_info(agents)')]:
+            db.execute('ALTER TABLE agents ADD COLUMN token TEXT')
+        db.execute('CREATE TABLE IF NOT EXISTS mail_registration_pending (id TEXT PRIMARY KEY)')
+
+
+@asynccontextmanager
+async def identity_lock():
+    """A shared-volume flock serializes bridge requests and separate CLI processes."""
+    common.STATE.mkdir(parents=True, exist_ok=True)
+    fd = os.open(common.STATE / '.mail-identity.lock', os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        # Do not block the bridge event loop while another process owns the lock.
+        async with asyncio.timeout(90):
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    await asyncio.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
+async def mail_call(name, args):
+    token = Path('/run/secrets/mail.token').read_text().strip()
+    async with httpx.AsyncClient(headers={'Authorization': 'Bearer ' + token}, timeout=30) as http:
+        async with streamable_http_client(MAIL_URL, http_client=http) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool(name, args)
+                if result.isError:
+                    raise MailProvisionError('mail_tool_failed')
+                if result.structuredContent is not None:
+                    return result.structuredContent
+                texts = [item.text for item in result.content if item.type == 'text']
+                return json.loads('\n'.join(texts))
+
+
+async def mail_agent(agent):
+    common.safe_id(agent)
+    async with identity_lock():
+        init_mail_db()
+        with closing(common.database('tasks.sqlite3')) as db:
+            row = db.execute('SELECT name,token FROM agents WHERE id=?', (agent,)).fetchone()
+            if row and row['token'] and row['name'] and row['name'] != agent:
+                return dict(row)
+            if row and row['name'] != agent:
+                # A generated name without its token may already exist remotely.
+                # Losing local credentials is not permission to create another.
+                raise MailProvisionError('registration_requires_reconciliation')
+            if db.execute('SELECT id FROM mail_registration_pending WHERE id=?', (agent,)).fetchone():
+                raise MailProvisionError('registration_requires_reconciliation')
+        try:
+            await mail_call('ensure_project', {'human_key': PROJECT})
+            # register_agent generates a new name and has no stable-key replay.
+            # Persist intent first: an uncertain outcome must never register twice.
+            with closing(common.database('tasks.sqlite3')) as db, db:
+                db.execute('INSERT INTO mail_registration_pending(id) VALUES (?)', (agent,))
+            result = await mail_call('register_agent', {
+                'project_key': PROJECT, 'program': agent,
+                'model': 'codex' if agent == 'codex-worker' else 'mcp-client',
+                'task_description': 'Isolated agentgateway lab',
+            })
+            record = {'name': result['name'], 'token': result['registration_token']}
+            if (not all(isinstance(value, str) and value.strip() for value in record.values())
+                    or record['name'] == agent):
+                raise MailProvisionError('invalid_registration_response')
+            # This upstream revision rejects explicit IDs as recipients. Preserve
+            # its generated name and registration token behind our stable ID.
+            with closing(common.database('tasks.sqlite3')) as db, db:
+                db.execute('INSERT OR REPLACE INTO agents(id,name,token) VALUES (?,?,?)',
+                           (agent, record['name'], record['token']))
+                db.execute('DELETE FROM mail_registration_pending WHERE id=?', (agent,))
+            return record
+        except Exception:
+            # Never expose exception text: transport/tool errors may contain secrets.
+            raise MailProvisionError('registration_failed') from None
+
+=== BATON_SOURCE_FILE === {"path": "lab/provision_mail.py", "mode": "100644", "size": 1720}
+"""Compose-only mailbox provisioning entry point; outputs a non-secret receipt."""
+import argparse
+import asyncio
+from contextlib import redirect_stderr, redirect_stdout
+import json
+import logging
+import os
+import re
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--agent', required=True)
+    parser.add_argument('--proof', required=True)
+    args = parser.parse_args(argv)
+    if not re.fullmatch(r'[a-z][a-z0-9-]{0,40}', args.agent):
+        parser.error('invalid agent name')
+    if not re.fullmatch(r'[a-f0-9]{32}', args.proof):
+        parser.error('invalid runtime proof')
+    expected = {'agent': args.agent, 'proof': args.proof}
+    previous_logging = logging.root.manager.disable
+    try:
+        # Third-party diagnostics and exception payloads never reach this CLI's
+        # stdout/stderr. The host accepts only the exact receipt below.
+        logging.disable(logging.CRITICAL)
+        with open(os.devnull, 'w') as sink, redirect_stdout(sink), redirect_stderr(sink):
+            from lab import common
+            from lab.mail_identity import mail_agent
+            marker = '.mail-provision-' + args.proof
+            for directory in [common.CONFIG, common.STATE]:
+                if json.loads((directory / marker).read_text()) != expected:
+                    raise ValueError('runtime_mismatch')
+            asyncio.run(mail_agent(args.agent))
+    except Exception:
+        parser.exit(1, 'Mailbox provisioning failed; inspect protected state and reconcile before retrying.\n')
+    finally:
+        logging.disable(previous_logging)
+    print(json.dumps({'status': 'ready', **expected}))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+
+=== BATON_SOURCE_FILE === {"path": "lab/worker_health.py", "mode": "100644", "size": 19548}
+"""Active resource and execution checks, sharing the business executor lock."""
+import asyncio
+import argparse
+from contextlib import closing
+import json
+import math
+import os
+from pathlib import Path
+import re
+import time
+import uuid
+
+from lab.common import audit, database
+from lab import common
+from lab.failures import CATALOG, Failure, FailureError, worker_exception_failure
+
+
+CANARY_PROMPT = 'Reply with exactly LAB_CANARY_OK. Do not use tools.'
+HEALTH_STATES = {'healthy', 'degraded', 'error', 'unknown', 'busy', 'checking'}
+
+
+def init_health_db(*, recover=False):
+    with closing(database('executions.sqlite3')) as db, db:
+        db.execute('CREATE TABLE IF NOT EXISTS health_probes (id TEXT PRIMARY KEY, status TEXT NOT NULL, code TEXT, started REAL NOT NULL, finished REAL)')
+        db.execute('CREATE TABLE IF NOT EXISTS health_flags (key TEXT PRIMARY KEY, value INTEGER NOT NULL)')
+        if recover:
+            db.execute("UPDATE health_probes SET status='interrupted',code='WORKER_CANARY_INTERRUPTED',finished=? WHERE status='running'", (time.time(),))
+
+
+def setting(name, default):
+    try:
+        value = float(os.environ.get(name, default))
+        return value if math.isfinite(value) and value >= 1 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def component(status, code, **values):
+    return {'status': status, 'code': code, **values}
+
+
+def combine(resources, canary):
+    # A skipped check must never hide a known authentication failure.
+    ordered = [canary, resources]
+    chosen = next((item for item in ordered if item['status'] == 'error'), None)
+    if chosen is None:
+        chosen = next((item for item in ordered if item['status'] == 'degraded'), None)
+    if chosen is None:
+        chosen = next((item for item in ordered if item['status'] == 'unknown'), None)
+    if chosen is None:
+        chosen = next((item for item in ordered if item['status'] in ('busy', 'checking')), None)
+    if chosen is None:
+        chosen = component('healthy', 'WORKER_HEALTHY')
+    status = 'unknown' if chosen['status'] == 'checking' else chosen['status']
+    return {'version': 1, 'status': status, 'code': chosen['code'],
+            'resources': resources, 'canary': canary}
+
+
+def sanitize_health_snapshot(value):
+    """Bridge reconstructs fixed fields; a peer's descriptions are never copied."""
+    def safe_part(name):
+        original = value.get(name) if isinstance(value, dict) else None
+        unknown = component('unknown', 'WORKER_HEALTH_UNAVAILABLE', fresh=False, tested=False)
+        if not isinstance(original, dict):
+            return unknown
+        status, code = original.get('status'), original.get('code')
+        if not isinstance(status, str) or status not in HEALTH_STATES or not isinstance(code, str) or code not in CATALOG:
+            return unknown
+        fresh = original.get('fresh') is True
+        tested = original.get('tested') is True
+        if status == 'healthy' and (code != 'WORKER_HEALTHY' or not fresh or (name == 'canary' and not tested)):
+            return unknown
+        if code == 'WORKER_HEALTHY' and status != 'healthy':
+            return unknown
+        result = component(status, code, fresh=fresh, tested=tested)
+        check_status = original.get('check_status')
+        if check_status in ('busy', 'checking', 'finished', 'not_checked'):
+            result['check_status'] = check_status
+        age = original.get('age_seconds')
+        if type(age) in (int, float) and math.isfinite(age) and age >= 0:
+            result['age_seconds'] = age
+        return result
+    return combine(safe_part('resources'), safe_part('canary'))
+
+
+class WorkerHealth:
+    def __init__(self, executor, *, cgroup_root=Path('/sys/fs/cgroup'), proc_root=Path('/proc'),
+                 clock=time.time, resource_interval=None, canary_interval=None, canary_timeout=None):
+        self.executor = executor
+        self.cgroup_root, self.proc_root, self.clock = Path(cgroup_root), Path(proc_root), clock
+        self.resource_interval = resource_interval if resource_interval is not None else setting('LAB_RESOURCE_SAMPLE_SECONDS', 30)
+        self.canary_interval = canary_interval if canary_interval is not None else setting('LAB_CANARY_INTERVAL_SECONDS', 900)
+        # 30 seconds of canary lock hold + 300 seconds business execution stays
+        # below the bridge's existing 350-second request budget.
+        self.canary_timeout = min(30, canary_timeout if canary_timeout is not None else setting('LAB_CANARY_TIMEOUT_SECONDS', 30))
+        if not all(math.isfinite(value) and value > 0 for value in (self.resource_interval, self.canary_interval, self.canary_timeout)):
+            raise ValueError('Health intervals must be positive')
+        self._resources = None
+        self._event_counts = None
+        self._canary_override = None
+        self._transitions = {}
+        self._tasks = []
+        init_health_db()
+
+    def _record_change(self, source, state):
+        signature = (state['status'], state['code'], state.get('check_status'))
+        previous = self._transitions.get(source)
+        if previous == signature:
+            return
+        self._transitions[source] = signature
+        level = 'error' if state['status'] == 'error' else 'warning' if state['status'] != 'healthy' else 'info'
+        audit('worker.health_changed', source=source, status=state['status'], error_code=state['code'],
+              stage=CATALOG[state['code']][0], level=level)
+        if state['status'] == 'error' and CATALOG[state['code']][0] == 'authentication':
+            audit('worker.auth_failed', error_code=state['code'], stage='authentication', level='error')
+        if source == 'canary' and previous and previous[0] != 'healthy' and state['status'] == 'healthy':
+            audit('worker.health_recovered', source=source, error_code=state['code'], level='info')
+
+    def _require_new_canary(self):
+        with closing(database('executions.sqlite3')) as db, db:
+            seq = db.execute('SELECT COALESCE(MAX(rowid),0) FROM health_probes').fetchone()[0]
+            db.execute("INSERT INTO health_flags(key,value) VALUES ('canary_after',?) ON CONFLICT(key) DO UPDATE SET value=MAX(value,excluded.value)", (seq,))
+
+    def sample_resources(self):
+        def number(name):
+            value = (self.cgroup_root / name).read_text().strip()
+            if not re.fullmatch(r'[0-9]+', value):
+                raise ValueError('Invalid resource counter')
+            return int(value)
+
+        def limit(name):
+            return None if (self.cgroup_root / name).read_text().strip() == 'max' else number(name)
+
+        def event(name, key):
+            for line in (self.cgroup_root / name).read_text().splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[0] == key and parts[1].isdigit():
+                    return int(parts[1])
+            raise ValueError('Missing resource counter')
+
+        def memory_statistics():
+            values = {}
+            for line in (self.cgroup_root / 'memory.stat').read_text().splitlines():
+                parts = line.split()
+                if len(parts) != 2 or not re.fullmatch(r'[0-9]+', parts[1]) or parts[0] in values:
+                    raise ValueError('Invalid memory statistic')
+                values[parts[0]] = int(parts[1])
+            if not {'inactive_file', 'anon'} <= values.keys():
+                raise ValueError('Missing memory statistic')
+            return values['inactive_file'], values['anon']
+
+        try:
+            pids, pids_max = number('pids.current'), limit('pids.max')
+            memory, memory_max = number('memory.current'), limit('memory.max')
+            inactive_file, anon = memory_statistics()
+            # Retain charged anon, shmem and kernel memory while discounting
+            # inactive file cache. Cross-file sampling can briefly exceed current.
+            working_set = max(0, memory - inactive_file)
+            counts = (event('pids.events', 'max'), event('memory.events', 'oom'), event('memory.events', 'oom_kill'),
+                      event('memory.events', 'high'), event('memory.events', 'max'))
+            thread_match = re.search(r'(?m)^Threads:\s*([0-9]+)$', (self.proc_root / 'self/status').read_text())
+            if thread_match is None:
+                raise ValueError('Missing thread counter')
+            threads = int(thread_match[1])
+            fds = sum(1 for _ in (self.proc_root / 'self/fd').iterdir())
+            previous, self._event_counts = self._event_counts, counts
+            status, code = 'healthy', 'WORKER_HEALTHY'
+            if previous and (counts[1] > previous[1] or counts[2] > previous[2]):
+                status, code = 'error', 'WORKER_MEMORY_EXHAUSTED'
+            elif previous and counts[0] > previous[0]:
+                status, code = 'error', 'WORKER_RESOURCE_EXHAUSTED'
+            elif pids_max is not None and pids >= pids_max * 0.8:
+                status, code = 'degraded', 'WORKER_PID_PRESSURE'
+            elif memory_max is not None and working_set * 100 >= memory_max * 85:
+                status, code = 'degraded', 'WORKER_MEMORY_PRESSURE'
+            elif previous and (counts[3] > previous[3] or counts[4] > previous[4]):
+                status, code = 'degraded', 'WORKER_MEMORY_PRESSURE'
+            self._resources = component(status, code, sampled=self.clock(), fresh=True,
+                pids={'current': pids, 'limit': pids_max, 'denied_total': counts[0]},
+                memory={'current': memory, 'working_set': working_set, 'anon': anon,
+                        'limit': memory_max, 'oom_total': counts[1], 'oom_kill_total': counts[2],
+                        'high_total': counts[3], 'max_total': counts[4]},
+                process={'threads': threads, 'open_fds': fds})
+            if status in ('degraded', 'error'):
+                self._require_new_canary()
+        except Exception:
+            self._resources = component('unknown', 'WORKER_HEALTH_UNAVAILABLE', sampled=self.clock(), fresh=False)
+        self._record_change('resources', self._resource_snapshot())
+        self._record_change('canary', self._canary_snapshot())
+        self._publish_snapshot()
+        return self._resource_snapshot()
+
+    def _resource_snapshot(self):
+        if self._resources is None:
+            return component('unknown', 'WORKER_HEALTH_UNKNOWN', fresh=False)
+        result = {key: value for key, value in self._resources.items() if key != 'sampled'}
+        age = self.clock() - self._resources['sampled']
+        result['age_seconds'] = max(0, age) if math.isfinite(age) else None
+        if not math.isfinite(age) or age < 0 or age > self.resource_interval * 2:
+            result.update(status='unknown', code='WORKER_RESOURCE_STALE', fresh=False)
+        return result
+
+    def _probe_snapshot(self, row):
+        if row is None:
+            return component('unknown', 'WORKER_HEALTH_UNKNOWN', fresh=False, tested=False, check_status='not_checked')
+        finished = row['finished']
+        age = self.clock() - finished if finished is not None else None
+        valid_age = age is not None and math.isfinite(age) and age >= 0
+        common = {'tested': row['status'] in ('completed', 'failed'), 'fresh': valid_age and age <= self.canary_interval,
+                  'probe_id': row['id'], 'age_seconds': age, 'check_status': 'finished'}
+        code = row['code'] if row['code'] in CATALOG else 'WORKER_HEALTH_UNAVAILABLE'
+        if row['status'] == 'failed':
+            return component('error', code, **common)
+        if row['status'] == 'interrupted':
+            return component('unknown', 'WORKER_CANARY_INTERRUPTED', **common)
+        if row['status'] != 'completed':
+            return component('unknown', 'WORKER_CANARY_RUNNING', **{**common, 'check_status': 'checking'})
+        if code != 'WORKER_HEALTHY':
+            return component('unknown', 'WORKER_HEALTH_UNAVAILABLE', **common)
+        if not common['fresh']:
+            return component('unknown', 'WORKER_CANARY_STALE', **common)
+        with closing(database('executions.sqlite3')) as db:
+            required = db.execute("SELECT value FROM health_flags WHERE key='canary_after'").fetchone()
+        if required and row['seq'] <= required['value']:
+            return component('unknown', 'WORKER_CANARY_REQUIRED', **common)
+        return component('healthy', 'WORKER_HEALTHY', **common)
+
+    def _canary_snapshot(self):
+        with closing(database('executions.sqlite3')) as db:
+            row = db.execute('SELECT rowid AS seq,* FROM health_probes ORDER BY rowid DESC LIMIT 1').fetchone()
+            prior = (db.execute("SELECT rowid AS seq,* FROM health_probes WHERE status IN ('completed','failed') ORDER BY rowid DESC LIMIT 1").fetchone()
+                     if row and row['status'] in ('running', 'interrupted') else None)
+        result = self._probe_snapshot(row)
+        if prior and prior['status'] == 'failed':
+            result = {**self._probe_snapshot(prior), 'check_status': 'checking' if row['status'] == 'running' else 'not_checked', 'tested': False}
+        if self._canary_override:
+            if result['status'] == 'error':
+                return {**result, 'check_status': self._canary_override['status'], 'tested': False}
+            return dict(self._canary_override)
+        return result
+
+    def snapshot(self):
+        return combine(self._resource_snapshot(), self._canary_snapshot())
+
+    def _publish_snapshot(self):
+        state = self.snapshot()
+        now = self.clock()
+        remaining = self.resource_interval * 2
+        if state['status'] == 'healthy':
+            remaining = min(remaining - state['resources']['age_seconds'],
+                            self.canary_interval - state['canary']['age_seconds'])
+        payload = {'version': 1, 'written_at': now, 'valid_until': now + max(0, remaining), 'state': state}
+        path = common.STATE / 'worker-health.json'
+        temporary = path.with_suffix('.new')
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, 'w') as output:
+                os.fchmod(output.fileno(), 0o600)
+                json.dump(payload, output, ensure_ascii=False)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    async def run_canary(self, probe_id=None):
+        probe_id = str(uuid.UUID(probe_id)) if probe_id else str(uuid.uuid4())
+        started = False
+        try:
+            await asyncio.wait_for(self.executor.lock.acquire(), timeout=0.05)
+        except TimeoutError:
+            self._canary_override = component('busy', 'WORKER_CANARY_BUSY', fresh=False, tested=False, check_status='busy')
+            self._record_change('canary', self._canary_snapshot())
+            self._publish_snapshot()
+            return self._canary_snapshot()
+        try:
+            with closing(database('executions.sqlite3')) as db, db:
+                db.execute('BEGIN IMMEDIATE')
+                existing = db.execute('SELECT rowid AS seq,* FROM health_probes WHERE id=?', (probe_id,)).fetchone()
+                if existing:
+                    return self._probe_snapshot(existing)
+                db.execute("INSERT INTO health_probes(id,status,started) VALUES (?,'running',?)", (probe_id, self.clock()))
+            started = True
+            self._canary_override = component('checking', 'WORKER_CANARY_RUNNING', fresh=False, tested=False, check_status='checking')
+            self._record_change('canary', self._canary_snapshot())
+            self._publish_snapshot()
+            try:
+                output = await self.executor.run_cli(CANARY_PROMPT, process_key=probe_id, timeout=self.canary_timeout, health_probe=True)
+                if output.strip() != 'LAB_CANARY_OK':
+                    raise FailureError(Failure('WORKER_CANARY_INVALID_RESULT'))
+                status, code = 'completed', 'WORKER_HEALTHY'
+            except asyncio.CancelledError:
+                with closing(database('executions.sqlite3')) as db, db:
+                    db.execute("UPDATE health_probes SET status='interrupted',code='WORKER_CANARY_INTERRUPTED',finished=? WHERE id=?", (self.clock(), probe_id))
+                raise
+            except Exception as error:
+                status, code = 'failed', worker_exception_failure(error).code
+            with closing(database('executions.sqlite3')) as db, db:
+                db.execute('UPDATE health_probes SET status=?,code=?,finished=? WHERE id=?', (status, code, self.clock(), probe_id))
+            self._canary_override = None
+            result = self._canary_snapshot()
+            self._record_change('canary', result)
+            self._publish_snapshot()
+            return result
+        finally:
+            if started:
+                self._canary_override = None
+            self.executor.lock.release()
+
+    async def _resource_loop(self):
+        while True:
+            try:
+                self.sample_resources()
+            except Exception:
+                self._resources = component('unknown', 'WORKER_HEALTH_UNAVAILABLE', sampled=self.clock(), fresh=False)
+                self._record_change('resources', self._resource_snapshot())
+            await asyncio.sleep(self.resource_interval)
+
+    async def _canary_loop(self):
+        while True:
+            try:
+                result = await self.run_canary()
+            except Exception:
+                self._canary_override = component('unknown', 'WORKER_HEALTH_UNAVAILABLE', fresh=False, tested=False)
+                result = self._canary_snapshot()
+                self._record_change('canary', result)
+            delay = min(self.resource_interval, self.canary_interval) if result.get('check_status') == 'busy' else self.canary_interval
+            await asyncio.sleep(delay)
+
+    def start(self):
+        if not self._tasks:
+            self._tasks = [asyncio.create_task(self._resource_loop()), asyncio.create_task(self._canary_loop())]
+
+    async def stop(self):
+        for task in self._tasks:
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks = []
+
+
+def check_snapshot(*, path=None, now=None):
+    """Credential-free container healthcheck; stale files can never pass."""
+    fallback = component('unknown', 'WORKER_HEALTH_UNAVAILABLE')
+    path = path or common.STATE / 'worker-health.json'
+    now = time.time() if now is None else now
+    try:
+        if path.stat().st_size > 65536:
+            return fallback
+        value = json.loads(path.read_text())
+        if not isinstance(value, dict) or value.get('version') != 1:
+            return fallback
+        written, valid = value.get('written_at'), value.get('valid_until')
+        if not all(type(item) in (int, float) and math.isfinite(item) for item in (written, valid, now)):
+            return fallback
+        if not written <= now <= valid:
+            return component('unknown', 'WORKER_RESOURCE_STALE')
+        state = sanitize_health_snapshot(value.get('state'))
+        return {'status': state['status'], 'code': state['code']}
+    except Exception:
+        return fallback
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('action', choices=['check'])
+    parser.parse_args(argv)
+    state = check_snapshot()
+    print(json.dumps(state))
+    return 0 if state['status'] == 'healthy' else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+
+=== BATON_SOURCE_FILE === {"path": "mail-constraints.txt", "mode": "100644", "size": 2823}
+# From upstream mcp_agent_mail fd9c518458daa1ac7cf74500aa37ed7bd72b8dd0 uv.lock.
+aiohappyeyeballs==2.6.1
+aiohttp==3.13.3
+aiolimiter==1.2.1
+aiosignal==1.4.0
+aiosqlite==0.22.1
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anyio==4.12.1
+asttokens==3.0.1
+asyncpg==0.31.0
+attrs==25.4.0
+authlib==1.5.2
+beartype==0.22.9
+bleach==6.3.0
+cachetools==6.2.4
+certifi==2026.1.4
+cffi==2.0.0
+charset-normalizer==3.4.4
+click==8.3.1
+colorama==0.4.6
+coverage==7.13.1
+cryptography==46.0.3
+cyclopts==4.5.0
+decorator==5.2.1
+diskcache==5.6.3
+distro==1.9.0
+dnspython==2.8.0
+docstring-parser==0.17.0
+docutils==0.22.4
+email-validator==2.3.0
+exceptiongroup==1.3.1
+executing==2.2.1
+fastapi==0.128.0
+fastmcp==2.13.0.2
+fastuuid==0.14.0
+filelock==3.20.3
+frozenlist==1.8.0
+fsspec==2026.1.0
+gitdb==4.0.12
+gitpython==3.1.46
+greenlet==3.3.0
+grpcio==1.76.0
+h11==0.16.0
+h2==4.3.0
+hf-xet==1.2.0
+hiredis==3.3.0
+hpack==4.1.0
+httpcore==1.0.9
+httptools==0.7.1
+httpx-sse==0.4.3
+httpx==0.28.1
+huggingface-hub==1.3.2
+hyperframe==6.1.0
+idna==3.11
+importlib-metadata==8.7.1
+iniconfig==2.3.0
+ipython-pygments-lexers==1.1.1
+ipython==9.9.0
+jaraco-classes==3.4.0
+jaraco-context==6.1.0
+jaraco-functools==4.4.0
+jedi==0.19.2
+jeepney==0.9.0
+jinja2==3.1.6
+jiter==0.12.0
+jsonschema-path==0.3.4
+jsonschema-specifications==2025.9.1
+jsonschema==4.26.0
+keyring==25.7.0
+librt==0.7.8
+litellm==1.81.0
+markdown-it-py==4.0.0
+markdown2==2.5.4
+markupsafe==3.0.3
+matplotlib-inline==0.2.1
+mcp==1.25.0
+mdurl==0.1.2
+more-itertools==10.8.0
+multidict==6.7.0
+mypy-extensions==1.1.0
+mypy==1.19.1
+openai==2.15.0
+openapi-pydantic==0.5.1
+orjson==3.11.5
+packaging==25.0
+parso==0.8.5
+pathable==0.4.4
+pathspec==1.0.3
+pathvalidate==3.3.1
+pexpect==4.9.0
+pillow==12.1.0
+platformdirs==4.5.1
+pluggy==1.6.0
+prompt-toolkit==3.0.52
+propcache==0.4.1
+psutil==7.2.1
+ptyprocess==0.7.0
+pure-eval==0.2.3
+py-key-value-aio==0.2.8
+py-key-value-shared==0.2.8
+pycparser==2.23
+pydantic-core==2.41.5
+pydantic-settings==2.12.0
+pydantic==2.12.5
+pygments==2.19.2
+pyjwt==2.10.1
+pynacl==1.6.2
+pyperclip==1.11.0
+pytest-asyncio==1.3.0
+pytest-cov==7.0.0
+pytest-timeout==2.4.0
+pytest==9.0.2
+python-decouple==3.8
+python-dotenv==1.2.1
+python-multipart==0.0.21
+pywin32-ctypes==0.2.3
+pywin32==311
+pyyaml==6.0.3
+redis==7.1.0
+referencing==0.36.2
+regex==2026.1.15
+requests==2.32.5
+rich-rst==1.3.2
+rich==14.2.0
+rpds-py==0.30.0
+ruff==0.14.13
+secretstorage==3.5.0
+shellingham==1.5.4
+smmap==5.0.2
+sniffio==1.3.1
+sqlalchemy==2.0.45
+sqlmodel==0.0.31
+sse-starlette==3.2.0
+stack-data==0.6.3
+starlette==0.50.0
+structlog==25.5.0
+tenacity==9.1.2
+tiktoken==0.12.0
+tinycss2==1.5.1
+tokenizers==0.22.2
+tqdm==4.67.1
+traitlets==5.14.3
+typer-slim==0.21.1
+typer==0.21.1
+typing-extensions==4.15.0
+typing-inspection==0.4.2
+urllib3==2.6.3
+uvicorn==0.40.0
+uvloop==0.22.1
+watchfiles==1.1.1
+wcwidth==0.2.14
+webencodings==0.5.1
+websockets==16.0
+yarl==1.22.0
+zipp==3.23.0
+
+=== BATON_SOURCE_FILE === {"path": "requirements.in", "mode": "100644", "size": 73}
+a2a-sdk[fastapi,sqlite]==1.2.2
+mcp==1.30.0
+uvicorn==0.54.0
+PyYAML==6.0.3
+
+=== BATON_SOURCE_FILE === {"path": "requirements.txt", "mode": "100644", "size": 1021}
+# SPDX-License-Identifier: Apache-2.0
+a2a-sdk==1.2.2
+aiologic==0.17.1
+aiosqlite==0.22.1
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+attrs==26.1.0
+certifi==2026.7.22
+cffi==2.1.1
+charset-normalizer==3.5.2
+click==8.5.0
+cryptography==50.0.2
+culsans==0.11.0
+fastapi==0.143.2
+google-api-core==2.42.0
+google-auth==2.62.0
+googleapis-common-protos==1.75.5
+greenlet==3.5.6
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+httpx-sse==0.4.3
+idna==3.20
+json-rpc==1.15.0
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+mcp==1.30.0
+opentelemetry-api==1.45.1
+packaging==26.3
+proto-plus==1.29.0
+protobuf==7.36.2
+pyasn1==0.6.4
+pyasn1-modules==0.4.2
+pycparser==3.11
+pydantic==2.14.1
+pydantic-core==2.50.1
+pydantic-settings==2.16.0
+pyjwt==2.15.1
+python-dotenv==1.2.4
+python-multipart==0.0.32
+pyyaml==6.0.3
+referencing==0.37.0
+requests==2.34.2
+rpds-py==2026.9.1
+sniffio==1.3.1
+sqlalchemy==2.1.4
+sse-starlette==3.5.0
+starlette==1.8.0
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+urllib3==2.8.0
+uvicorn==0.54.0
+wrapt==2.5.1
+
+=== BATON_SOURCE_FILE === {"path": "scripts/tokens.py", "mode": "100644", "size": 8099}
+#!/usr/bin/env python3
+"""Issue/revoke lab identities. Raw secrets go only to mode-0600 files."""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import secrets
+import subprocess
+import tempfile
+from pathlib import Path
+
+def write(path, data, mode=0o600):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    previous = path.stat() if path.exists() else None
+    fd, temporary = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
+    tmp = Path(temporary)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            os.fchmod(f.fileno(), mode)
+            if previous is not None and os.geteuid() == 0:
+                os.fchown(f.fileno(), previous.st_uid, previous.st_gid)
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def provision_client(root, agent):
+    """The host needs only stdlib; SDK and Mail secrets stay inside the bridge."""
+    repo = Path(__file__).resolve().parents[1]
+    proof = secrets.token_hex(16)  # A mount challenge, never an authentication token.
+    expected = {'agent': agent, 'proof': proof}
+    markers = [root / directory / ('.mail-provision-' + proof)
+               for directory in ['config', 'data/bridge']]
+    try:
+        for marker in markers:
+            write(marker, json.dumps(expected), 0o644)
+        # Existing bridge containers must see BOTH host directories. A Compose
+        # project with a different LAB_RUNTIME cannot attest this fresh challenge.
+        command = ['docker', 'compose', '--project-directory', str(repo),
+                   '--file', str(repo / 'compose.yaml'), 'exec', '-T', 'bridge',
+                   'python', '-m', 'lab.provision_mail', '--agent', agent, '--proof', proof]
+        result = subprocess.run(command, env={**os.environ, 'LAB_RUNTIME': str(root)},
+                                capture_output=True, text=True, timeout=120)
+        if result.returncode != 0 or json.loads(result.stdout) != {'status': 'ready', **expected}:
+            raise RuntimeError('mail_provisioning_unconfirmed')
+    finally:
+        for marker in markers:
+            marker.unlink(missing_ok=True)
+
+
+def publish_identity(root, identities, agent, role, token):
+    """Keep the delivery file private until both gateway identity files commit."""
+    registry = root / 'config/identities.json'
+    config = root / 'config/gateway.json'
+    dest = root / ('secrets/bridge/dispatcher.token' if role == 'dispatcher'
+                   else f'secrets/clients/{agent}.token')
+    pending = dest.with_name('.' + dest.name + '.pending')
+    previous = {path: path.read_text() if path.exists() else None for path in [registry, config]}
+    try:
+        write(pending, token + '\n')
+        write(registry, json.dumps(identities, indent=2) + '\n', 0o644)
+        write(config, json.dumps(gateway(identities), indent=2) + '\n', 0o644)
+        os.chmod(root / 'config', 0o755)
+        # Preserve the owner's access when replacing a prior delivery file.
+        if dest.exists() and os.geteuid() == 0:
+            previous_dest = dest.stat()
+            os.chown(pending, previous_dest.st_uid, previous_dest.st_gid)
+        os.replace(pending, dest)
+    except Exception:
+        # No new delivery file was published. Restore any partially updated
+        # config without changing unrelated identities or an old delivery file.
+        for path, content in previous.items():
+            try:
+                if content is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    write(path, content, 0o644)
+            except OSError:
+                pass  # The failure remains nonzero; no new token is delivered.
+        raise
+    finally:
+        pending.unlink(missing_ok=True)
+    return dest
+
+def gateway(identities):
+    keys = [{'keyHash':'sha256:'+v['hash'], 'metadata':{'agent':v['agent'],'role':v['role']}} for v in identities.values() if v['active']]
+    auth = {'apiKey':{'keys':keys,'mode':'strict','location':{'header':{'name':'authorization','prefix':'Bearer '}}},
+            'transformations':{'request':{'set':{'authorization':'"Bearer " + apiKey.key.unredacted()'}}}}
+    return {
+        'config':{'logging':{'format':'json'}},
+        'frontendPolicies':{'accessLog':{'add':{'agent':'apiKey.agent','request_id':'request.headers["x-request-id"]'},'remove':['http.path','http.query']}},
+        'binds':[{'port':3000,'listeners':[{'protocol':'HTTP','routes':[
+            {'name':'codex-a2a','matches':[{'path':{'pathPrefix':'/a2a/'}},{'path':{'exact':'/.well-known/agent-card.json'}}], 'policies':{**auth,'authorization':{'rules':["apiKey.role == 'dispatcher'"]},'a2a':{},'timeout':{'requestTimeout':'360s'}},'backends':[{'host':'codex:9001'}]},
+            {'name':'mcp-tasks-and-mail','matches':[{'path':{'pathPrefix':'/mcp'}},{'path':{'pathPrefix':'/board'}},{'path':{'exact':'/healthz'}}], 'policies':{**auth,'authorization':{'rules':["apiKey.role == 'client'"]}},'backends':[{'host':'bridge:9000'}]}
+        ]}]}]
+    }
+
+def main():
+    p=argparse.ArgumentParser()
+    p.add_argument('--runtime',type=Path,required=True)
+    p.add_argument('action',choices=['init','issue','revoke','list'])
+    p.add_argument('agent',nargs='?')
+    p.add_argument('--role',choices=['client','dispatcher'],default='client')
+    a=p.parse_args();root=a.runtime.resolve();root.mkdir(mode=0o700,parents=True,exist_ok=True)
+    if a.agent and not re.fullmatch(r'[a-z][a-z0-9-]{0,40}',a.agent):p.error('invalid agent name')
+    with (root/'.tokens.lock').open('w') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        registry=root/'config/identities.json'
+        ids=json.loads(registry.read_text()) if registry.exists() else {}
+        if a.action=='list':
+            print(json.dumps([{k:v[k] for k in ('agent','role','active')} for v in ids.values()]));return
+        if a.action=='init':
+            for d in ['config','secrets/clients','secrets/bridge','secrets/mail','secrets/codex-home','data/bridge','data/codex','data/mail']:
+                (root/d).mkdir(mode=0o700,parents=True,exist_ok=True)
+            f=root/'secrets/mail/mail.token'
+            if not f.exists():write(f,secrets.token_urlsafe(48)+'\n')
+            write(root/'secrets/bridge/mail.token',f.read_text())
+        elif a.action=='issue':
+            if not a.agent:p.error('agent required')
+            existing = ids.get(a.agent)
+            active = existing is not None and existing['active']
+            if active and (existing['role'] != a.role or a.role == 'dispatcher'):
+                p.error('active identity already exists; revoke before replacing')
+            if a.role == 'client':
+                try:
+                    provision_client(root, a.agent)
+                except Exception:
+                    p.exit(1, 'Client mail provisioning failed; no new token issued and identity unchanged.\n')
+            if active:
+                print('Client mailbox confirmed; existing gateway identity and token unchanged')
+                return
+            token=secrets.token_urlsafe(48)
+            ids[a.agent]={'agent':a.agent,'role':a.role,'hash':hashlib.sha256(token.encode()).hexdigest(),'active':True}
+            try:
+                dest=publish_identity(root,ids,a.agent,a.role,token)
+            except Exception:
+                p.exit(1, 'Identity publication failed; no new token delivered. Inspect protected runtime state.\n')
+            print('Token written to '+str(dest)+'; value not displayed')
+            print('Registry and gateway config updated; secrets not printed')
+            return
+        elif a.action=='revoke':
+            if a.agent not in ids:p.error('unknown agent')
+            ids[a.agent]['active']=False
+        write(registry,json.dumps(ids,indent=2)+'\n',0o644)
+        write(root/'config/gateway.json',json.dumps(gateway(ids),indent=2)+'\n',0o644)
+        os.chmod(root/'config',0o755)
+        print('Registry and gateway config updated; secrets not printed')
+
+if __name__=='__main__':main()
+
+=== BATON_SOURCE_FILE === {"path": "security/codex-apparmor", "mode": "100644", "size": 2454}
+# SPDX-License-Identifier: Apache-2.0
+# Adapted from Moby profiles; see SOURCE.txt
+#include <tunables/global>
+profile agentgateway-lab-codex flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+  network,
+  # Disallow obsolete socket families removed from the Linux kernel.
+  # AF_DECnet has no AppArmor family name, so it cannot be denied here.
+  deny network ax25,
+  deny network ipx,
+  deny network appletalk,
+  deny network netrom,
+  deny network rose,
+  deny network econet,
+  deny network atmsvc,
+  deny network irda,
+  deny network wanpipe,
+  deny network isdn,
+  deny network caif,
+  # Disallow AF_ALG (Linux kernel crypto API); see https://copy.fail/
+  deny network alg,
+  # Disallow AF_VSOCK to prevent host/guest communication.
+  deny network vsock,
+  capability,
+  file,
+  umount,
+  # Host (privileged) processes may send signals to container processes.
+  signal (receive) peer=unconfined,
+  # runc may send signals to container processes (for "docker stop").
+  signal (receive) peer=runc,
+  # crun may send signals to container processes (for "docker stop" when used with crun OCI runtime).
+  signal (receive) peer=crun,
+  # dockerd may send signals to container processes (for "docker kill").
+  signal (receive) peer=unconfined,
+  # Container processes may send signals amongst themselves.
+  signal (send,receive) peer=agentgateway-lab-codex,
+
+  deny @{PROC}/* w,   # deny write for all files directly in /proc (not in a subdir)
+  # deny write to files not in /proc/<number>/** or /proc/sys/**
+  deny @{PROC}/{[^1-9/],[^1-9/][^0-9/],[^1-9s/][^0-9y/][^0-9s/],[^1-9/][^0-9/][^0-9/][^0-9/]*}/** w,
+  deny @{PROC}/sys/[^k]** w,  # deny /proc/sys except /proc/sys/k* (effectively /proc/sys/kernel)
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,  # deny everything except shm* in /proc/sys/kernel/
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+
+  # Required by nested unprivileged bubblewrap; outer capabilities stay dropped.
+  mount,
+  pivot_root,
+
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/devices/virtual/powercap/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+  # allow processes within the container to trace each other,
+  # provided all other LSM and yama setting allow it.
+  ptrace (trace,tracedby,read,readby) peer=agentgateway-lab-codex,
+}
+
+=== BATON_SOURCE_FILE === {"path": "security/codex-seccomp.json", "mode": "100644", "size": 22464}
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "defaultErrnoRet": 1,
+  "archMap": [
+    {
+      "architecture": "SCMP_ARCH_X86_64",
+      "subArchitectures": [
+        "SCMP_ARCH_X86",
+        "SCMP_ARCH_X32"
+      ]
+    },
+    {
+      "architecture": "SCMP_ARCH_AARCH64",
+      "subArchitectures": [
+        "SCMP_ARCH_ARM"
+      ]
+    },
+    {
+      "architecture": "SCMP_ARCH_MIPS64",
+      "subArchitectures": [
+        "SCMP_ARCH_MIPS",
+        "SCMP_ARCH_MIPS64N32"
+      ]
+    },
+    {
+      "architecture": "SCMP_ARCH_MIPS64N32",
+      "subArchitectures": [
+        "SCMP_ARCH_MIPS",
+        "SCMP_ARCH_MIPS64"
+      ]
+    },
+    {
+      "architecture": "SCMP_ARCH_MIPSEL64",
+      "subArchitectures": [
+        "SCMP_ARCH_MIPSEL",
+        "SCMP_ARCH_MIPSEL64N32"
+      ]
+    },
+    {
+      "architecture": "SCMP_ARCH_MIPSEL64N32",
+      "subArchitectures": [
+        "SCMP_ARCH_MIPSEL",
+        "SCMP_ARCH_MIPSEL64"
+      ]
+    },
+    {
+      "architecture": "SCMP_ARCH_S390X",
+      "subArchitectures": [
+        "SCMP_ARCH_S390"
+      ]
+    },
+    {
+      "architecture": "SCMP_ARCH_RISCV64",
+      "subArchitectures": null
+    },
+    {
+      "architecture": "SCMP_ARCH_LOONGARCH64",
+      "subArchitectures": null
+    }
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "accept",
+        "accept4",
+        "access",
+        "adjtimex",
+        "alarm",
+        "bind",
+        "brk",
+        "cachestat",
+        "capget",
+        "capset",
+        "chdir",
+        "chmod",
+        "chown",
+        "chown32",
+        "clock_adjtime",
+        "clock_adjtime64",
+        "clock_getres",
+        "clock_getres_time64",
+        "clock_gettime",
+        "clock_gettime64",
+        "clock_nanosleep",
+        "clock_nanosleep_time64",
+        "close",
+        "close_range",
+        "connect",
+        "copy_file_range",
+        "creat",
+        "dup",
+        "dup2",
+        "dup3",
+        "epoll_create",
+        "epoll_create1",
+        "epoll_ctl",
+        "epoll_ctl_old",
+        "epoll_pwait",
+        "epoll_pwait2",
+        "epoll_wait",
+        "epoll_wait_old",
+        "eventfd",
+        "eventfd2",
+        "execve",
+        "execveat",
+        "exit",
+        "exit_group",
+        "faccessat",
+        "faccessat2",
+        "fadvise64",
+        "fadvise64_64",
+        "fallocate",
+        "fanotify_mark",
+        "fchdir",
+        "fchmod",
+        "fchmodat",
+        "fchmodat2",
+        "fchown",
+        "fchown32",
+        "fchownat",
+        "fcntl",
+        "fcntl64",
+        "fdatasync",
+        "fgetxattr",
+        "flistxattr",
+        "flock",
+        "fork",
+        "fremovexattr",
+        "fsetxattr",
+        "fstat",
+        "fstat64",
+        "fstatat64",
+        "fstatfs",
+        "fstatfs64",
+        "fsync",
+        "ftruncate",
+        "ftruncate64",
+        "futex",
+        "futex_requeue",
+        "futex_time64",
+        "futex_wait",
+        "futex_waitv",
+        "futex_wake",
+        "futimesat",
+        "getcpu",
+        "getcwd",
+        "getdents",
+        "getdents64",
+        "getegid",
+        "getegid32",
+        "geteuid",
+        "geteuid32",
+        "getgid",
+        "getgid32",
+        "getgroups",
+        "getgroups32",
+        "getitimer",
+        "getpeername",
+        "getpgid",
+        "getpgrp",
+        "getpid",
+        "getppid",
+        "getpriority",
+        "getrandom",
+        "getresgid",
+        "getresgid32",
+        "getresuid",
+        "getresuid32",
+        "getrlimit",
+        "get_robust_list",
+        "getrusage",
+        "getsid",
+        "getsockname",
+        "getsockopt",
+        "get_thread_area",
+        "gettid",
+        "gettimeofday",
+        "getuid",
+        "getuid32",
+        "getxattr",
+        "getxattrat",
+        "inotify_add_watch",
+        "inotify_init",
+        "inotify_init1",
+        "inotify_rm_watch",
+        "io_cancel",
+        "ioctl",
+        "io_destroy",
+        "io_getevents",
+        "io_pgetevents",
+        "io_pgetevents_time64",
+        "ioprio_get",
+        "ioprio_set",
+        "io_setup",
+        "io_submit",
+        "ipc",
+        "kill",
+        "landlock_add_rule",
+        "landlock_create_ruleset",
+        "landlock_restrict_self",
+        "lchown",
+        "lchown32",
+        "lgetxattr",
+        "link",
+        "linkat",
+        "listen",
+        "listmount",
+        "listxattr",
+        "listxattrat",
+        "llistxattr",
+        "_llseek",
+        "lremovexattr",
+        "lseek",
+        "lsetxattr",
+        "lstat",
+        "lstat64",
+        "madvise",
+        "map_shadow_stack",
+        "membarrier",
+        "memfd_create",
+        "memfd_secret",
+        "mincore",
+        "mkdir",
+        "mkdirat",
+        "mknod",
+        "mknodat",
+        "mlock",
+        "mlock2",
+        "mlockall",
+        "mmap",
+        "mmap2",
+        "mprotect",
+        "mq_getsetattr",
+        "mq_notify",
+        "mq_open",
+        "mq_timedreceive",
+        "mq_timedreceive_time64",
+        "mq_timedsend",
+        "mq_timedsend_time64",
+        "mq_unlink",
+        "mremap",
+        "mseal",
+        "msgctl",
+        "msgget",
+        "msgrcv",
+        "msgsnd",
+        "msync",
+        "munlock",
+        "munlockall",
+        "munmap",
+        "name_to_handle_at",
+        "nanosleep",
+        "newfstatat",
+        "_newselect",
+        "open",
+        "openat",
+        "openat2",
+        "pause",
+        "pidfd_open",
+        "pidfd_send_signal",
+        "pipe",
+        "pipe2",
+        "pkey_alloc",
+        "pkey_free",
+        "pkey_mprotect",
+        "poll",
+        "ppoll",
+        "ppoll_time64",
+        "prctl",
+        "pread64",
+        "preadv",
+        "preadv2",
+        "prlimit64",
+        "process_mrelease",
+        "pselect6",
+        "pselect6_time64",
+        "pwrite64",
+        "pwritev",
+        "pwritev2",
+        "read",
+        "readahead",
+        "readlink",
+        "readlinkat",
+        "readv",
+        "recv",
+        "recvfrom",
+        "recvmmsg",
+        "recvmmsg_time64",
+        "recvmsg",
+        "remap_file_pages",
+        "removexattr",
+        "removexattrat",
+        "rename",
+        "renameat",
+        "renameat2",
+        "restart_syscall",
+        "riscv_hwprobe",
+        "rmdir",
+        "rseq",
+        "rt_sigaction",
+        "rt_sigpending",
+        "rt_sigprocmask",
+        "rt_sigqueueinfo",
+        "rt_sigreturn",
+        "rt_sigsuspend",
+        "rt_sigtimedwait",
+        "rt_sigtimedwait_time64",
+        "rt_tgsigqueueinfo",
+        "sched_getaffinity",
+        "sched_getattr",
+        "sched_getparam",
+        "sched_get_priority_max",
+        "sched_get_priority_min",
+        "sched_getscheduler",
+        "sched_rr_get_interval",
+        "sched_rr_get_interval_time64",
+        "sched_setaffinity",
+        "sched_setattr",
+        "sched_setparam",
+        "sched_setscheduler",
+        "sched_yield",
+        "seccomp",
+        "select",
+        "semctl",
+        "semget",
+        "semop",
+        "semtimedop",
+        "semtimedop_time64",
+        "send",
+        "sendfile",
+        "sendfile64",
+        "sendmmsg",
+        "sendmsg",
+        "sendto",
+        "setfsgid",
+        "setfsgid32",
+        "setfsuid",
+        "setfsuid32",
+        "setgid",
+        "setgid32",
+        "setgroups",
+        "setgroups32",
+        "setitimer",
+        "setpgid",
+        "setpriority",
+        "setregid",
+        "setregid32",
+        "setresgid",
+        "setresgid32",
+        "setresuid",
+        "setresuid32",
+        "setreuid",
+        "setreuid32",
+        "setrlimit",
+        "set_robust_list",
+        "setsid",
+        "setsockopt",
+        "set_thread_area",
+        "set_tid_address",
+        "setuid",
+        "setuid32",
+        "setxattr",
+        "setxattrat",
+        "shmat",
+        "shmctl",
+        "shmdt",
+        "shmget",
+        "shutdown",
+        "sigaltstack",
+        "signalfd",
+        "signalfd4",
+        "sigprocmask",
+        "sigreturn",
+        "socketcall",
+        "socketpair",
+        "splice",
+        "stat",
+        "stat64",
+        "statfs",
+        "statfs64",
+        "statmount",
+        "statx",
+        "symlink",
+        "symlinkat",
+        "sync",
+        "sync_file_range",
+        "syncfs",
+        "sysinfo",
+        "tee",
+        "tgkill",
+        "time",
+        "timer_create",
+        "timer_delete",
+        "timer_getoverrun",
+        "timer_gettime",
+        "timer_gettime64",
+        "timer_settime",
+        "timer_settime64",
+        "timerfd_create",
+        "timerfd_gettime",
+        "timerfd_gettime64",
+        "timerfd_settime",
+        "timerfd_settime64",
+        "times",
+        "tkill",
+        "truncate",
+        "truncate64",
+        "ugetrlimit",
+        "umask",
+        "uname",
+        "unlink",
+        "unlinkat",
+        "uretprobe",
+        "utime",
+        "utimensat",
+        "utimensat_time64",
+        "utimes",
+        "vfork",
+        "vmsplice",
+        "wait4",
+        "waitid",
+        "waitpid",
+        "write",
+        "writev"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "names": [
+        "process_vm_readv",
+        "process_vm_writev",
+        "ptrace"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "minKernel": "4.8"
+      }
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 3,
+          "op": "SCMP_CMP_LT"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 7,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 8,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 9,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 10,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 13,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 14,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 15,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 16,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 17,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 18,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 21,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 22,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 24,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 26,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 27,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 28,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 29,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 30,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 31,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 32,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 33,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 35,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 36,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 39,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 41,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 42,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 43,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 44,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 45,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "personality"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 0,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "personality"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 8,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "personality"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 131072,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "personality"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 131080,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "personality"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 4294967295,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "sync_file_range2",
+        "swapcontext"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "arches": [
+          "ppc64le"
+        ]
+      }
+    },
+    {
+      "names": [
+        "arm_fadvise64_64",
+        "arm_sync_file_range",
+        "sync_file_range2",
+        "breakpoint",
+        "cacheflush",
+        "set_tls"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "arches": [
+          "arm",
+          "arm64"
+        ]
+      }
+    },
+    {
+      "names": [
+        "arch_prctl"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "arches": [
+          "amd64",
+          "x32"
+        ]
+      }
+    },
+    {
+      "names": [
+        "modify_ldt"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "arches": [
+          "amd64",
+          "x32",
+          "x86"
+        ]
+      }
+    },
+    {
+      "names": [
+        "s390_pci_mmio_read",
+        "s390_pci_mmio_write",
+        "s390_runtime_instr"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "arches": [
+          "s390",
+          "s390x"
+        ]
+      }
+    },
+    {
+      "names": [
+        "riscv_flush_icache"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "arches": [
+          "riscv64"
+        ]
+      }
+    },
+    {
+      "names": [
+        "open_by_handle_at"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "caps": [
+          "CAP_DAC_READ_SEARCH"
+        ]
+      }
+    },
+    {
+      "names": [
+        "bpf",
+        "clone",
+        "clone3",
+        "fanotify_init",
+        "fsconfig",
+        "fsmount",
+        "fsopen",
+        "fspick",
+        "lookup_dcookie",
+        "lsm_get_self_attr",
+        "lsm_list_modules",
+        "lsm_set_self_attr",
+        "mount",
+        "mount_setattr",
+        "move_mount",
+        "open_tree",
+        "perf_event_open",
+        "quotactl",
+        "quotactl_fd",
+        "setdomainname",
+        "sethostname",
+        "setns",
+        "syslog",
+        "umount",
+        "umount2",
+        "unshare"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "caps": [
+          "CAP_SYS_ADMIN"
+        ]
+      }
+    },
+    {
+      "names": [
+        "clone"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 2114060288,
+          "op": "SCMP_CMP_MASKED_EQ"
+        }
+      ],
+      "excludes": {
+        "caps": [
+          "CAP_SYS_ADMIN"
+        ],
+        "arches": [
+          "s390",
+          "s390x"
+        ]
+      }
+    },
+    {
+      "names": [
+        "clone"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 1,
+          "value": 2114060288,
+          "op": "SCMP_CMP_MASKED_EQ"
+        }
+      ],
+      "comment": "s390 parameter ordering for clone is different",
+      "includes": {
+        "arches": [
+          "s390",
+          "s390x"
+        ]
+      },
+      "excludes": {
+        "caps": [
+          "CAP_SYS_ADMIN"
+        ]
+      }
+    },
+    {
+      "names": [
+        "clone3"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 38,
+      "excludes": {
+        "caps": [
+          "CAP_SYS_ADMIN"
+        ]
+      }
+    },
+    {
+      "names": [
+        "reboot"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "caps": [
+          "CAP_SYS_BOOT"
+        ]
+      }
+    },
+    {
+      "names": [
+        "chroot"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "caps": [
+          "CAP_SYS_CHROOT"
+        ]
+      }
+    },
+    {
+      "names": [
+        "delete_module",
+        "init_module",
+        "finit_module"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "caps": [
+          "CAP_SYS_MODULE"
+        ]
+      }
+    },
+    {
+      "names": [
+        "acct"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "caps": [
+          "CAP_SYS_PACCT"
+        ]
+      }
+    },
+    {
+      "names": [
+        "kcmp",
+        "pidfd_getfd",
+        "process_madvise",
+        "process_vm_readv",
+        "process_vm_writev",
+        "ptrace"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "caps": [
+          "CAP_SYS_PTRACE"
+        ]
+      }
+    },
+    {
+      "names": [
+        "iopl",
+        "ioperm"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "caps": [
+          "CAP_SYS_RAWIO"
+        ]
+      }
+    },
+    {
+      "names": [
+        "settimeofday",
+        "stime",
+        "clock_settime",
+        "clock_settime64"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "caps": [
+          "CAP_SYS_TIME"
+        ]
+      }
+    },
+    {
+      "names": [
+        "vhangup"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "caps": [
+          "CAP_SYS_TTY_CONFIG"
+        ]
+      }
+    },
+    {
+      "names": [
+        "get_mempolicy",
+        "mbind",
+        "set_mempolicy",
+        "set_mempolicy_home_node"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "caps": [
+          "CAP_SYS_NICE"
+        ]
+      }
+    },
+    {
+      "names": [
+        "syslog"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "caps": [
+          "CAP_SYSLOG"
+        ]
+      }
+    },
+    {
+      "names": [
+        "bpf"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "caps": [
+          "CAP_BPF"
+        ]
+      }
+    },
+    {
+      "names": [
+        "perf_event_open"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "caps": [
+          "CAP_PERFMON"
+        ]
+      }
+    },
+    {
+      "names": [
+        "clone",
+        "unshare",
+        "mount",
+        "umount2",
+        "pivot_root",
+        "setns"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}
+
+=== BATON_SOURCE_FILE === {"path": "tests/test_boundaries.py", "mode": "100644", "size": 3828}
+import importlib
+import json
+import hashlib
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+@pytest.fixture
+def modules(tmp_path,monkeypatch):
+    monkeypatch.setenv('LAB_STATE',str(tmp_path/'data'))
+    monkeypatch.setenv('LAB_CONFIG',str(tmp_path/'config'))
+    from lab import common,bridge
+    importlib.reload(common);importlib.reload(bridge)
+    bridge.init_db()
+    return common,bridge
+
+def ctx(agent):return SimpleNamespace(request_context=SimpleNamespace(request=SimpleNamespace(state=SimpleNamespace(identity={'agent':agent}),headers={'x-request-id':'test-request-id'})))
+
+@pytest.mark.asyncio
+async def test_idempotency_and_owner_isolation(modules):
+    _,b=modules
+    first=await b.submit_task('stable-key','test prompt',ctx('alice'))
+    replay=await b.submit_task('stable-key','test prompt',ctx('alice'))
+    assert first['task_id']==replay['task_id'] and replay['replay']
+    with pytest.raises(ValueError,match='different input'):await b.submit_task('stable-key','changed',ctx('alice'))
+    with pytest.raises(ValueError,match='not found'):await b.get_task(first['task_id'],ctx('bob'))
+    second=await b.submit_task('stable-key','test prompt',ctx('bob'))
+    assert second['task_id']!=first['task_id']
+
+@pytest.mark.asyncio
+async def test_restart_never_reexecutes_ambiguous_task(modules):
+    c,b=modules
+    task=await b.submit_task('stable-key','test',ctx('alice'))
+    with c.database('tasks.sqlite3') as db:db.execute("UPDATE tasks SET status='working' WHERE id=?",(task['task_id'],))
+    b.init_db()
+    assert b.lookup(task['task_id'],'alice')['status']=='interrupted'
+
+def test_issue_revoke_and_no_secret_in_config(modules,tmp_path,monkeypatch,capsys):
+    c,_=modules
+    from scripts import tokens
+    root=tmp_path/'runtime'
+    # Explicit offline dependency replacement; production has no skip-mail flag.
+    monkeypatch.setattr(tokens,'provision_client',lambda root,agent: None)
+    def run(*args):
+        monkeypatch.setattr(sys,'argv',['tokens.py','--runtime',str(root),*args])
+        tokens.main()
+        return capsys.readouterr().out
+    run('init');output=run('issue','alice')
+    token=(root/'secrets/clients/alice.token').read_text().strip()
+    assert token not in output
+    assert token not in (root/'config/gateway.json').read_text()
+    c.CONFIG=root/'config'
+    assert c.identity('Bearer '+token)['agent']=='alice'
+    assert c.identity('Bearer bad') is None
+    run('revoke','alice')
+    assert c.identity('Bearer '+token) is None
+
+@pytest.mark.asyncio
+async def test_audit_does_not_contain_prompt(modules):
+    c,b=modules
+    marker='DO-NOT-LOG-THIS-SENSITIVE-PROMPT'
+    await b.submit_task('secret-test',marker,ctx('alice'))
+    log=(c.STATE/'audit.jsonl').read_text()
+    assert marker not in log
+    assert hashlib.sha256(marker.encode()).hexdigest() in log
+
+def test_real_mcp_http_host_origin_and_auth(modules,monkeypatch):
+    c,b=modules
+    from starlette.testclient import TestClient
+    monkeypatch.setattr(c,'identity',lambda auth: {'agent':'alice','role':'client'} if auth=='Bearer test' else None)
+    with TestClient(b.app) as client:
+        request={'jsonrpc':'2.0','id':1,'method':'initialize','params':{'protocolVersion':'2025-11-25','capabilities':{},'clientInfo':{'name':'boundary-test','version':'1'}}}
+        for host in ['bridge','bridge:9000','mcp.example.invalid']:
+            r=client.post('/mcp',json=request,headers={'Host':host,'Origin':'https://mcp.example.invalid','Authorization':'Bearer test','Accept':'application/json, text/event-stream'})
+            assert r.status_code==200,r.text
+        r=client.post('/mcp',json=request,headers={'Host':'evil.invalid','Authorization':'Bearer test','Accept':'application/json, text/event-stream'})
+        assert r.status_code==421
+        assert client.get('/healthz').status_code==401
+
+=== BATON_SOURCE_FILE === {"path": "tests/test_client_mail_provision.py", "mode": "100644", "size": 18058}
+"""Offline provisioning contract: every external dependency is explicitly replaced."""
+import asyncio
+import hashlib
+import importlib
+import io
+import json
+import os
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+import subprocess
+import sqlite3
+import sys
+
+import pytest
+
+
+REPO = Path(__file__).parents[1]
+
+
+@pytest.fixture
+def tokens():
+    from scripts import tokens
+    return importlib.reload(tokens)
+
+
+def invoke(tokens, monkeypatch, root, *args):
+    monkeypatch.setattr(sys, 'argv', ['tokens.py', '--runtime', str(root), *args])
+    return tokens.main()
+
+
+def registry(root):
+    path = root / 'config/identities.json'
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def test_client_is_provisioned_before_activation(tokens, monkeypatch, tmp_path, capsys):
+    calls = []
+
+    def provision(root, agent):
+        assert agent not in registry(root)
+        assert not (root / 'secrets/clients/alice.token').exists()
+        calls.append(agent)
+
+    monkeypatch.setattr(tokens, 'provision_client', provision, raising=False)
+    invoke(tokens, monkeypatch, tmp_path, 'issue', 'alice')
+    assert calls == ['alice']
+    token = (tmp_path / 'secrets/clients/alice.token').read_text().strip()
+    assert registry(tmp_path)['alice']['hash'] == hashlib.sha256(token.encode()).hexdigest()
+    assert registry(tmp_path)['alice']['active']
+    assert token not in capsys.readouterr().out
+    assert token not in (tmp_path / 'config/gateway.json').read_text()
+
+
+def test_registration_failure_cannot_activate_or_publish(tokens, monkeypatch, tmp_path, capsys):
+    invoke(tokens, monkeypatch, tmp_path, 'issue', 'worker', '--role', 'dispatcher')
+    before = {p: p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+
+    def fail(root, agent):
+        raise RuntimeError('TEST-SECRET-MUST-NOT-LEAK')
+
+    monkeypatch.setattr(tokens, 'provision_client', fail, raising=False)
+    with pytest.raises(SystemExit) as exc:
+        invoke(tokens, monkeypatch, tmp_path, 'issue', 'alice')
+    assert exc.value.code != 0
+    assert 'alice' not in registry(tmp_path)
+    assert not (tmp_path / 'secrets/clients/alice.token').exists()
+    assert all(p.read_bytes() == content for p, content in before.items())
+    output = capsys.readouterr()
+    assert 'TEST-SECRET-MUST-NOT-LEAK' not in output.out + output.err
+
+
+def test_active_replay_repairs_mail_without_rotating(tokens, monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(tokens, 'provision_client', lambda root, agent: calls.append(agent), raising=False)
+    invoke(tokens, monkeypatch, tmp_path, 'issue', 'alice')
+    path = tmp_path / 'secrets/clients/alice.token'
+    original = path.read_bytes()
+    original_ids = registry(tmp_path)
+    path.unlink()  # Delivery copies may already have been removed by an administrator.
+    invoke(tokens, monkeypatch, tmp_path, 'issue', 'alice')
+    assert calls == ['alice', 'alice']
+    assert registry(tmp_path) == original_ids
+    assert not path.exists()
+    assert original_ids['alice']['hash'] == hashlib.sha256(original.strip()).hexdigest()
+
+
+@pytest.mark.parametrize('failure', ['registry', 'gateway', 'delivery'])
+def test_publication_failure_preserves_other_identities(tokens, monkeypatch, tmp_path, failure):
+    monkeypatch.setattr(tokens, 'provision_client', lambda *_: None)
+    invoke(tokens, monkeypatch, tmp_path, 'issue', 'existing')
+    before = {p: p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    original_write, original_replace = tokens.write, os.replace
+    failed = False
+
+    def write(path, data, mode=0o600):
+        nonlocal failed
+        target = 'identities.json' if failure == 'registry' else 'gateway.json'
+        if failure != 'delivery' and path.name == target and not failed:
+            failed = True
+            raise OSError('TEST-WRITE-SECRET')
+        return original_write(path, data, mode)
+
+    def replace(source, dest):
+        nonlocal failed
+        if failure == 'delivery' and Path(dest).name == 'alice.token':
+            failed = True
+            raise OSError('TEST-WRITE-SECRET')
+        return original_replace(source, dest)
+
+    monkeypatch.setattr(tokens, 'write', write)
+    monkeypatch.setattr(os, 'replace', replace)
+    with pytest.raises(SystemExit) as exc:
+        invoke(tokens, monkeypatch, tmp_path, 'issue', 'alice')
+    assert exc.value.code != 0 and failed
+    assert all(p.read_bytes() == value for p, value in before.items())
+    assert not (tmp_path / 'secrets/clients/alice.token').exists()
+    assert not list(tmp_path.rglob('*.pending'))
+
+
+def test_failed_reissue_keeps_revoked_token_revoked(tokens, monkeypatch, tmp_path):
+    monkeypatch.setattr(tokens, 'provision_client', lambda *_: None)
+    invoke(tokens, monkeypatch, tmp_path, 'issue', 'alice')
+    invoke(tokens, monkeypatch, tmp_path, 'revoke', 'alice')
+    before = {p: p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+
+    def fail(*_):
+        raise RuntimeError('TEST-REGISTRATION-SECRET')
+
+    monkeypatch.setattr(tokens, 'provision_client', fail)
+    with pytest.raises(SystemExit):
+        invoke(tokens, monkeypatch, tmp_path, 'issue', 'alice')
+    assert all(p.read_bytes() == value for p, value in before.items())
+    assert registry(tmp_path)['alice']['active'] is False
+
+
+def test_existing_role_change_is_rejected(tokens, monkeypatch, tmp_path):
+    monkeypatch.setattr(tokens, 'provision_client', lambda *_: None, raising=False)
+    invoke(tokens, monkeypatch, tmp_path, 'issue', 'alice')
+    original = registry(tmp_path)
+    with pytest.raises(SystemExit):
+        invoke(tokens, monkeypatch, tmp_path, 'issue', 'alice', '--role', 'dispatcher')
+    assert registry(tmp_path) == original
+    assert not (tmp_path / 'secrets/bridge/dispatcher.token').exists()
+
+
+def test_dispatcher_does_not_need_client_mail(tokens, monkeypatch, tmp_path):
+    def unexpected(*_):
+        pytest.fail('dispatcher must not provision a client mailbox')
+
+    monkeypatch.setattr(tokens, 'provision_client', unexpected, raising=False)
+    invoke(tokens, monkeypatch, tmp_path, 'issue', 'worker', '--role', 'dispatcher')
+    assert registry(tmp_path)['worker']['active']
+    assert (tmp_path / 'secrets/bridge/dispatcher.token').is_file()
+    with pytest.raises(SystemExit):
+        invoke(tokens, monkeypatch, tmp_path, 'issue', 'worker', '--role', 'dispatcher')
+
+
+@pytest.fixture
+def mail(tmp_path, monkeypatch):
+    from lab import common
+    monkeypatch.setattr(common, 'STATE', tmp_path / 'state')
+    monkeypatch.setattr(common, 'CONFIG', tmp_path / 'config')
+    module = importlib.import_module('lab.mail_identity')
+    return common, importlib.reload(module)
+
+
+def fake_mail(calls):
+    async def call(name, args):
+        calls.append((name, args))
+        if name == 'register_agent':
+            return {'name': 'AmberMeadow', 'registration_token': 'TEST-REGISTRATION-SECRET'}
+        return {}
+    return call
+
+
+@pytest.mark.asyncio
+async def test_shared_registration_persists_once_and_preserves_working(mail, monkeypatch):
+    common, module = mail
+    from lab import bridge
+    importlib.reload(bridge)
+    bridge.init_db()
+    with common.database('tasks.sqlite3') as db:
+        db.execute("INSERT INTO tasks(id,owner,idem,prompt,status) VALUES ('task','alice','stable','test','working')")
+    calls = []
+    monkeypatch.setattr(module, 'mail_call', fake_mail(calls))
+    assert bridge.mail_agent is module.mail_agent
+    first, second = await asyncio.gather(module.mail_agent('alice'), bridge.mail_agent('alice'))
+    assert first == second == {'name': 'AmberMeadow', 'token': 'TEST-REGISTRATION-SECRET'}
+    assert [name for name, _ in calls] == ['ensure_project', 'register_agent']
+    with common.database('tasks.sqlite3') as db:
+        assert db.execute("SELECT status FROM tasks WHERE id='task'").fetchone()[0] == 'working'
+        assert dict(db.execute("SELECT name,token FROM agents WHERE id='alice'").fetchone()) == first
+
+
+@pytest.mark.asyncio
+async def test_uncertain_registration_is_not_repeated(mail, monkeypatch):
+    common, module = mail
+    calls = []
+
+    async def fail(name, args):
+        calls.append(name)
+        if name == 'register_agent':
+            raise RuntimeError('TEST-REGISTRATION-SECRET')
+        return {}
+
+    monkeypatch.setattr(module, 'mail_call', fail)
+    for _ in range(2):
+        with pytest.raises(module.MailProvisionError):
+            await module.mail_agent('alice')
+    assert calls.count('register_agent') == 1
+    with common.database('tasks.sqlite3') as db:
+        assert db.execute("SELECT * FROM agents WHERE id='alice'").fetchone() is None
+
+
+@pytest.mark.asyncio
+async def test_mapping_write_failure_keeps_durable_intent(mail, monkeypatch):
+    common, module = mail
+    original_database = common.database
+    calls = []
+    monkeypatch.setattr(module, 'mail_call', fake_mail(calls))
+
+    def blocked_database(name):
+        db = original_database(name)
+        db.set_authorizer(lambda action, table, *_:
+                          sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_INSERT and table == 'agents'
+                          else sqlite3.SQLITE_OK)
+        return db
+
+    monkeypatch.setattr(common, 'database', blocked_database)
+    with pytest.raises(module.MailProvisionError):
+        await module.mail_agent('alice')
+    monkeypatch.setattr(common, 'database', original_database)
+    with pytest.raises(module.MailProvisionError, match='reconciliation'):
+        await module.mail_agent('alice')
+    assert [name for name, _ in calls].count('register_agent') == 1
+    with common.database('tasks.sqlite3') as db:
+        assert db.execute("SELECT * FROM agents WHERE id='alice'").fetchone() is None
+        assert db.execute("SELECT id FROM mail_registration_pending WHERE id='alice'").fetchone()
+
+
+@pytest.mark.asyncio
+async def test_generated_name_without_token_requires_reconciliation(mail, monkeypatch):
+    common, module = mail
+    module.init_mail_db()
+    with common.database('tasks.sqlite3') as db:
+        db.execute("INSERT INTO agents(id,name,token) VALUES ('alice','AmberMeadow',NULL)")
+    calls = []
+    monkeypatch.setattr(module, 'mail_call', fake_mail(calls))
+    with pytest.raises(module.MailProvisionError, match='reconciliation'):
+        await module.mail_agent('alice')
+    assert not calls
+
+
+def test_cross_process_registration_is_serialized(tmp_path):
+    # Child processes replace only the remote MCP call, leaving the real lock/DB intact.
+    code = '''
+import asyncio, json, os
+from pathlib import Path
+from lab import mail_identity
+async def fake(name, args):
+    if name == 'register_agent':
+        with (Path(os.environ['LAB_STATE']) / 'registrations.txt').open('a') as output:
+            output.write('registered\\n')
+        await asyncio.sleep(0.15)
+        return {'name': 'AmberMeadow', 'registration_token': 'TEST-SECRET'}
+    return {}
+mail_identity.mail_call = fake
+record = asyncio.run(mail_identity.mail_agent('alice'))
+print(json.dumps({'name': record['name']}))
+'''
+    env = {**os.environ, 'LAB_STATE': str(tmp_path), 'PYTHONPATH': str(REPO)}
+    children = [subprocess.Popen([sys.executable, '-c', code], env=env, cwd=REPO,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                for _ in range(4)]
+    results = [child.communicate(timeout=20) for child in children]
+    assert all(child.returncode == 0 for child in children), results
+    assert (tmp_path / 'registrations.txt').read_text().splitlines() == ['registered']
+    assert all(json.loads(stdout) == {'name': 'AmberMeadow'} for stdout, _ in results)
+
+
+def test_concurrent_issue_publishes_only_one_token(tmp_path):
+    code = '''
+import time
+from scripts import tokens
+def provision(root, agent):
+    time.sleep(0.05)
+tokens.provision_client = provision
+tokens.main()
+'''
+    children = [subprocess.Popen([sys.executable, '-c', code, '--runtime', str(tmp_path), 'issue', 'alice'],
+                                cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                for _ in range(4)]
+    results = [child.communicate(timeout=20) for child in children]
+    assert all(child.returncode == 0 for child in children), results
+    assert sum('Token written to' in out for out, _ in results) == 1
+    assert sum('existing gateway identity and token unchanged' in out for out, _ in results) == 3
+    token = (tmp_path / 'secrets/clients/alice.token').read_text().strip()
+    assert registry(tmp_path)['alice']['hash'] == hashlib.sha256(token.encode()).hexdigest()
+
+
+def test_compose_entry_rejects_wrong_runtime_and_never_prints_secrets(mail, monkeypatch, capsys):
+    common, module = mail
+    entry = importlib.import_module('lab.provision_mail')
+    calls = []
+    monkeypatch.setattr(module, 'mail_call', fake_mail(calls))
+    proof = 'a' * 32
+    with pytest.raises(SystemExit) as exc:
+        entry.main(['--agent', 'alice', '--proof', proof])
+    assert exc.value.code != 0 and not calls
+    for directory in [common.STATE, common.CONFIG]:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / ('.mail-provision-' + proof)).write_text(json.dumps({'agent': 'alice', 'proof': proof}))
+    assert entry.main(['--agent', 'alice', '--proof', proof]) == 0
+    output = capsys.readouterr()
+    assert 'TEST-REGISTRATION-SECRET' not in output.out + output.err
+    assert json.loads(output.out) == {'status': 'ready', 'agent': 'alice', 'proof': proof}
+
+
+def test_host_uses_fixed_compose_command_and_checks_receipt(tokens, monkeypatch, tmp_path):
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        assert command[:2] == ['docker', 'compose']
+        assert command[2:6] == ['--project-directory', str(REPO), '--file', str(REPO / 'compose.yaml')]
+        assert command[6:13] == ['exec', '-T', 'bridge', 'python', '-m', 'lab.provision_mail', '--agent']
+        assert command[13] == 'alice'
+        assert kwargs['env']['LAB_RUNTIME'] == str(tmp_path)
+        proof = command[-1]
+        assert command[-2] == '--proof'
+        for directory in [tmp_path / 'config', tmp_path / 'data/bridge']:
+            assert json.loads((directory / ('.mail-provision-' + proof)).read_text()) == {'agent': 'alice', 'proof': proof}
+        return subprocess.CompletedProcess(command, 0, json.dumps({'status': 'ready', 'agent': 'alice', 'proof': proof}), '')
+
+    monkeypatch.setattr(subprocess, 'run', run)
+    tokens.provision_client(tmp_path, 'alice')
+    assert len(calls) == 1
+    assert not list(tmp_path.rglob('.mail-provision-*'))
+
+
+def test_host_rejects_untrusted_output(tokens, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(subprocess, 'run', lambda command, **kwargs:
+                        subprocess.CompletedProcess(command, 0, 'TEST-MAIL-BEARER', 'TEST-REGISTRATION-SECRET'))
+    with pytest.raises(SystemExit):
+        invoke(tokens, monkeypatch, tmp_path, 'issue', 'alice')
+    assert 'alice' not in registry(tmp_path)
+    assert not (tmp_path / 'secrets/clients/alice.token').exists()
+    output = capsys.readouterr()
+    assert 'TEST-MAIL-BEARER' not in output.out + output.err
+    assert 'TEST-REGISTRATION-SECRET' not in output.out + output.err
+
+
+def test_entry_suppresses_dependency_diagnostics(mail, monkeypatch, capsys):
+    common, module = mail
+    entry = importlib.import_module('lab.provision_mail')
+    proof = 'b' * 32
+    for directory in [common.STATE, common.CONFIG]:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / ('.mail-provision-' + proof)).write_text(json.dumps({'agent': 'alice', 'proof': proof}))
+
+    async def fail(name, args):
+        import logging
+        print('TEST-MAIL-BEARER')
+        print('TEST-REGISTRATION-SECRET', file=sys.stderr)
+        logging.error('TEST-LOG-SECRET')
+        raise RuntimeError('TEST-EXCEPTION-SECRET')
+
+    monkeypatch.setattr(module, 'mail_call', fail)
+    with pytest.raises(SystemExit):
+        entry.main(['--agent', 'alice', '--proof', proof])
+    output = capsys.readouterr()
+    assert 'TEST-' not in output.out + output.err
+    assert 'provisioning failed' in output.err
+
+
+@pytest.mark.parametrize('registration_fails', [False, True])
+def test_issue_through_compose_entry_offline(tokens, mail, monkeypatch, tmp_path, registration_fails):
+    common, module = mail
+    entry = importlib.import_module('lab.provision_mail')
+    root = tmp_path / 'runtime'
+    monkeypatch.setattr(common, 'STATE', root / 'data/bridge')
+    monkeypatch.setattr(common, 'CONFIG', root / 'config')
+
+    async def fake_call(name, args):
+        assert 'alice' not in registry(root)
+        assert not (root / 'secrets/clients/alice.token').exists()
+        if name == 'register_agent':
+            if registration_fails:
+                raise RuntimeError('TEST-REGISTRATION-SECRET')
+            return {'name': 'AmberMeadow', 'registration_token': 'TEST-REGISTRATION-SECRET'}
+        return {}
+
+    def compose_transport(command, **kwargs):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                code = entry.main(command[12:])
+            except SystemExit as exc:
+                code = exc.code
+        return subprocess.CompletedProcess(command, code, out.getvalue(), err.getvalue())
+
+    monkeypatch.setattr(module, 'mail_call', fake_call)
+    monkeypatch.setattr(subprocess, 'run', compose_transport)
+    if registration_fails:
+        with pytest.raises(SystemExit) as exc:
+            invoke(tokens, monkeypatch, root, 'issue', 'alice')
+        assert exc.value.code != 0
+        assert 'alice' not in registry(root)
+        assert not (root / 'secrets/clients/alice.token').exists()
+    else:
+        invoke(tokens, monkeypatch, root, 'issue', 'alice')
+        assert registry(root)['alice']['active']
+        with common.database('tasks.sqlite3') as db:
+            assert db.execute("SELECT name FROM agents WHERE id='alice'").fetchone()[0] == 'AmberMeadow'
+        assert (root / 'secrets/clients/alice.token').stat().st_mode & 0o777 == 0o600
+
+=== BATON_SOURCE_FILE === {"path": "tests/test_worker_failures.py", "mode": "100644", "size": 14415}
+"""Offline worker/bridge failure contracts; no real process, network, or credentials."""
+import asyncio
+import importlib
+import json
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace
+
+import pytest
+from a2a.compat.v0_3.conversions import to_compat_task_status
+from a2a.types import Message, Role, TaskState, TaskStatusUpdateEvent
+
+
+A2A_ID = '12345678-1234-4234-8234-123456789abc'
+CONTEXT_ID = '87654321-4321-4321-8321-cba987654321'
+SECRET = 'SYNTHETIC-PRIVATE-PROMPT-AND-CREDENTIAL'
+
+
+@pytest.fixture
+def modules(tmp_path, monkeypatch):
+    monkeypatch.setenv('LAB_STATE', str(tmp_path / 'state'))
+    monkeypatch.setenv('LAB_CONFIG', str(tmp_path / 'config'))
+    monkeypatch.setenv('CODEX_HOME', str(tmp_path / 'fake-codex-home'))
+    from lab import common, bridge, codex_agent
+    importlib.reload(common)
+    importlib.reload(bridge)
+    importlib.reload(codex_agent)
+    bridge.init_db()
+    codex_agent.init_db()
+    return common, bridge, codex_agent
+
+
+@pytest.mark.parametrize(('stderr', 'code'), [
+    (b'HTTP 401 Unauthorized', 'CODEX_AUTH_UNAUTHORIZED'),
+    (b'Your refresh token has already been used. Please log in again.', 'CODEX_AUTH_REFRESH_FAILED'),
+    (b'refresh_token_expired', 'CODEX_AUTH_REFRESH_FAILED'),
+    (b'The model is not supported when using this account', 'CODEX_MODEL_FORBIDDEN'),
+    (b'model_not_found', 'CODEX_MODEL_FORBIDDEN'),
+    (b'HTTP 403 Forbidden', 'CODEX_MODEL_FORBIDDEN'),
+    (b'HTTP 429 Too Many Requests', 'CODEX_CAPACITY_LIMITED'),
+    (b'insufficient_quota', 'CODEX_CAPACITY_LIMITED'),
+    (b'provider is overloaded', 'CODEX_CAPACITY_LIMITED'),
+    (b'ERROR: Selected model is at capacity. Please try a different model.', 'MODEL_CAPACITY'),
+    (b'bwrap: Creating new namespace failed: Operation not permitted', 'CODEX_SANDBOX_FAILED'),
+    (b'error parsing configuration: invalid TOML', 'CODEX_CONFIG_INVALID'),
+    (b'unknown permissions profile lab', 'CODEX_CONFIG_INVALID'),
+    (b'Failed to create session: failed to load AGENTS.md: Resource temporarily unavailable (os error 11)\nreqwest-internal-sync-runtime: OS can\'t spawn worker thread: EAGAIN', 'WORKER_RESOURCE_EXHAUSTED'),
+    (b'failed to open session file: Too many open files (os error 24)', 'WORKER_FD_EXHAUSTED'),
+    (b'failed to initialize session: Cannot allocate memory (os error 12)', 'WORKER_MEMORY_EXHAUSTED'),
+    (b'network read: Resource temporarily unavailable (os error 11)', 'CODEX_EXECUTION_FAILED'),
+    (b'opaque failure with ' + SECRET.encode(), 'CODEX_EXECUTION_FAILED'),
+])
+def test_exit_classification_is_an_allowlist(stderr, code):
+    from lab.failures import classify_codex_exit
+    stdout = json.dumps({'type': 'error', 'message': stderr.decode() + '\n' + SECRET}).encode()
+    failure = classify_codex_exit(b'', stdout=stdout, returncode=1, has_output=False)
+    assert failure.code == code
+    assert SECRET not in failure.display()
+    assert SECRET not in json.dumps(failure.payload())
+
+
+def test_user_tool_text_and_bubblewrap_fallback_do_not_classify_errors():
+    from lab.failures import classify_codex_exit
+    stdout = b'\n'.join(json.dumps(event).encode() for event in [
+        {'type': 'item.completed', 'item': {'text': '401 Unauthorized refresh_token_expired Selected model is at capacity'}},
+        {'type': 'tool.output', 'message': 'bwrap sandbox failed; ' + SECRET},
+        {'type': 'user', 'message': 'ERROR: 401 Unauthorized'},
+    ])
+    stderr = (b'user\nERROR: 401 Unauthorized\nERROR: Selected model is at capacity\n'
+              b'WARNING: bundled bubblewrap unavailable, falling back to system bwrap\n'
+              b'ERROR: unrecognized execution failure\n')
+    assert classify_codex_exit(stderr, stdout=stdout, returncode=1, has_output=False).code == 'CODEX_EXECUTION_FAILED'
+
+
+def test_typed_turn_failure_is_classified_but_not_echoed():
+    from lab.failures import classify_codex_exit
+    stdout = json.dumps({'type': 'turn.failed', 'error': {'message':
+                        'Selected model is at capacity. ' + SECRET}}).encode()
+    failure = classify_codex_exit(b'', stdout=stdout, returncode=1, has_output=False)
+    assert failure.code == 'MODEL_CAPACITY'
+    assert SECRET not in failure.display()
+
+
+def test_native_session_panic_remains_diagnosable():
+    from lab.failures import classify_codex_exit
+    stderr = (b"thread 'reqwest-internal-sync-runtime' panicked at library/thread/mod.rs:1:\n"
+              b"OS can't spawn worker thread: Resource temporarily unavailable (os error 11)\n")
+    assert classify_codex_exit(stderr, returncode=1, has_output=False).code == 'WORKER_RESOURCE_EXHAUSTED'
+
+
+class Queue:
+    def __init__(self):
+        self.events = []
+
+    async def enqueue_event(self, event):
+        self.events.append(event)
+
+
+def context(prompt=SECRET, task_id=A2A_ID):
+    data = {'task_id': 'stable-task', 'owner': 'alice', 'prompt': prompt}
+    return SimpleNamespace(task_id=task_id, context_id=CONTEXT_ID,
+                           message=Message(message_id='request', role=Role.ROLE_USER),
+                           get_user_input=lambda: json.dumps(data))
+
+
+def terminal_status(queue):
+    statuses = [item.status for item in queue.events if isinstance(item, TaskStatusUpdateEvent)]
+    assert statuses[-1].state == TaskState.TASK_STATE_FAILED
+    return to_compat_task_status(statuses[-1]).model_dump(mode='json', by_alias=True, exclude_none=True)
+
+
+def wire_failure(status):
+    parts = status.get('message', {}).get('parts', [])
+    values = [part['data']['lab_failure'] for part in parts
+              if part.get('kind') == 'data' and 'lab_failure' in part.get('data', {})]
+    assert len(values) == 1
+    return values[0]
+
+
+def test_failure_envelope_survives_real_sdk_v03_conversion(modules):
+    from a2a.types import TaskStatus
+    from lab.failures import Failure, failure_from_a2a
+    _, _, worker = modules
+    original = Failure('WORKER_RESOURCE_EXHAUSTED')
+    status = TaskStatus(state=TaskState.TASK_STATE_FAILED,
+                        message=worker.failure_message(original, A2A_ID, CONTEXT_ID))
+    wire = to_compat_task_status(status).model_dump(mode='json', by_alias=True, exclude_none=True)
+    assert failure_from_a2a(wire) == original
+
+
+def fake_process(monkeypatch, worker, tmp_path, stderr, returncode=1, result=None, timeout=False):
+    calls = []
+    real_directory = tempfile.TemporaryDirectory
+    monkeypatch.setattr(worker.tempfile, 'TemporaryDirectory',
+                        lambda **kwargs: real_directory(prefix='test-worker-', dir=tmp_path))
+    monkeypatch.setattr(worker, 'redact_output', lambda text: text)
+    monkeypatch.setattr(worker.os, 'killpg', lambda *_: None)
+
+    class Process:
+        pid = 999999
+
+        async def communicate(self, prompt):
+            if timeout:
+                raise asyncio.TimeoutError()
+            stdout = json.dumps({'type': 'error', 'message': stderr.decode()}).encode() if stderr else b''
+            return stdout, stderr
+
+        async def wait(self):
+            return returncode
+
+    async def start(*command, **kwargs):
+        calls.append(command)
+        if result is not None:
+            Path(command[command.index('--output-last-message') + 1]).write_text(result)
+        process = Process()
+        process.returncode = returncode
+        return process
+
+    monkeypatch.setattr(worker.asyncio, 'create_subprocess_exec', start)
+    return calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('stderr', 'code'), [
+    (b'401 Unauthorized ' + SECRET.encode(), 'CODEX_AUTH_UNAUTHORIZED'),
+    (b'opaque ' + SECRET.encode(), 'CODEX_EXECUTION_FAILED'),
+])
+async def test_worker_persists_safe_failure_and_replay_never_reruns(modules, monkeypatch, tmp_path, capsys, stderr, code):
+    common, _, worker = modules
+    calls = fake_process(monkeypatch, worker, tmp_path, stderr)
+    executor = worker.CodexExecutor()
+    first, replay = Queue(), Queue()
+    await executor.execute(context(), first)
+    await executor.execute(context(task_id='22345678-1234-4234-8234-123456789abc'), replay)
+    assert len(calls) == 1
+    for queue in [first, replay]:
+        status = terminal_status(queue)
+        assert wire_failure(status)['code'] == code
+        assert SECRET not in json.dumps(status)
+    with common.database('executions.sqlite3') as db:
+        row = dict(db.execute("SELECT * FROM executions WHERE id='stable-task'").fetchone())
+    assert row['status'] == 'failed' and row.get('error_code') == code
+    assert row['result'] is None
+    assert SECRET not in (common.STATE / 'audit.jsonl').read_text()
+    assert SECRET not in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('timeout', 'code'), [(True, 'CODEX_TIMEOUT'), (False, 'CODEX_OUTPUT_MISSING')])
+async def test_timeout_and_empty_success_are_safe_failures(modules, monkeypatch, tmp_path, timeout, code):
+    _, _, worker = modules
+    fake_process(monkeypatch, worker, tmp_path, b'', returncode=0, timeout=timeout)
+    queue = Queue()
+    await worker.CodexExecutor().execute(context(), queue)
+    assert wire_failure(terminal_status(queue))['code'] == code
+
+
+@pytest.mark.asyncio
+async def test_conflicting_replay_does_not_replace_original_failure(modules, monkeypatch, tmp_path):
+    common, _, worker = modules
+    calls = fake_process(monkeypatch, worker, tmp_path, b'401 Unauthorized')
+    executor = worker.CodexExecutor()
+    await executor.execute(context(), Queue())
+    conflict = Queue()
+    await executor.execute(context(prompt='changed input'), conflict)
+    assert len(calls) == 1
+    assert wire_failure(terminal_status(conflict))['code'] == 'CODEX_IDEMPOTENCY_CONFLICT'
+    with common.database('executions.sqlite3') as db:
+        assert dict(db.execute("SELECT * FROM executions WHERE id='stable-task'").fetchone()).get('error_code') == 'CODEX_AUTH_UNAUTHORIZED'
+
+
+def client_context():
+    return SimpleNamespace(request_context=SimpleNamespace(request=SimpleNamespace(
+        state=SimpleNamespace(identity={'agent': 'alice'}), headers={})))
+
+
+def fake_dispatcher(monkeypatch, bridge, reply, reports, report_fails=False):
+    class FakeSecretPath:
+        def __init__(self, path):
+            assert path == '/run/secrets/dispatcher.token'
+
+        def read_text(self):
+            return 'SYNTHETIC-DISPATCHER-TOKEN'
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return reply
+
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            pass
+
+        async def post(self, *_args, **_kwargs):
+            return Response()
+
+    async def mail_event(task, phase, body):
+        reports.append((task['id'], phase, body))
+        if phase == 'failed' and report_fails:
+            raise RuntimeError(SECRET)
+
+    monkeypatch.setattr(bridge, 'Path', FakeSecretPath)
+    monkeypatch.setattr(bridge.httpx, 'AsyncClient', Client)
+    monkeypatch.setattr(bridge, 'mail_event', mail_event)
+
+
+async def one_cycle(monkeypatch, bridge):
+    class Finished(Exception):
+        pass
+
+    async def stop(_delay):
+        raise Finished()
+
+    with monkeypatch.context() as local:
+        local.setattr(bridge.asyncio, 'sleep', stop)
+        with pytest.raises(Finished):
+            await bridge.worker_loop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('report_fails', [False, True])
+async def test_bridge_preserves_failed_a2a_id_and_original_error(modules, monkeypatch, report_fails):
+    common, bridge, _ = modules
+    reply = {'result': {'id': A2A_ID, 'status': {'state': 'failed', 'message': {'parts': [
+        {'kind': 'data', 'data': {'lab_failure': {
+            'version': 1, 'code': 'CODEX_AUTH_UNAUTHORIZED', 'stage': 'authentication'}}},
+        {'kind': 'text', 'text': SECRET},
+    ]}}}}
+    reports = []
+    fake_dispatcher(monkeypatch, bridge, reply, reports, report_fails=report_fails)
+    task = await bridge.submit_task('stable-key', SECRET, client_context())
+    await one_cycle(monkeypatch, bridge)
+    row = bridge.lookup(task['task_id'], 'alice')
+    assert row['status'] == 'failed' and row['a2a_id'] == A2A_ID
+    assert row['error'].startswith('CODEX_AUTH_UNAUTHORIZED: ')
+    assert SECRET not in row['error']
+    failure_reports = [report for report in reports if report[1] == 'failed']
+    assert len(failure_reports) == 1
+    assert failure_reports[0][0] == task['task_id']
+    assert 'CODEX_AUTH_UNAUTHORIZED' in failure_reports[0][2]
+    assert SECRET not in failure_reports[0][2]
+    log = (common.STATE / 'audit.jsonl').read_text()
+    assert SECRET not in log
+    if report_fails:
+        events = [json.loads(line) for line in log.splitlines()]
+        failed_report = next(event for event in events if event['event'] == 'mail.report_failed')
+        assert failed_report['original_error_code'] == 'CODEX_AUTH_UNAUTHORIZED'
+    replay = await bridge.submit_task('stable-key', SECRET, client_context())
+    assert replay['replay'] and replay['status'] == 'failed'
+    await one_cycle(monkeypatch, bridge)
+    assert len(reports) == 2  # submitted + attempted failed report, never re-dispatched.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('payload', [
+    {'version': 1, 'code': SECRET, 'stage': 'authentication'},
+    {'version': 1, 'code': 'CODEX_AUTH_UNAUTHORIZED', 'stage': SECRET},
+    {'version': 1, 'code': 'CODEX_AUTH_UNAUTHORIZED', 'stage': 'authentication', 'message': SECRET},
+    {'version': 1, 'code': ['CODEX_AUTH_UNAUTHORIZED'], 'stage': 'authentication'},
+])
+async def test_untrusted_a2a_diagnostic_is_replaced_with_fixed_fallback(modules, monkeypatch, payload):
+    common, bridge, _ = modules
+    reply = {'result': {'id': A2A_ID, 'status': {'state': 'failed', 'message': {'parts': [
+        {'kind': 'data', 'data': {'lab_failure': payload}}, {'kind': 'text', 'text': SECRET},
+    ]}}}}
+    reports = []
+    fake_dispatcher(monkeypatch, bridge, reply, reports)
+    task = await bridge.submit_task('untrusted', SECRET, client_context())
+    await one_cycle(monkeypatch, bridge)
+    row = bridge.lookup(task['task_id'], 'alice')
+    assert row['a2a_id'] == A2A_ID
+    assert row['error'].startswith('A2A_FAILED_UNCLASSIFIED: ')
+    assert SECRET not in row['error']
+    assert SECRET not in (common.STATE / 'audit.jsonl').read_text()
+    assert SECRET not in [body for _, phase, body in reports if phase == 'failed'][0]
+
+=== BATON_SOURCE_FILE === {"path": "tests/test_worker_health.py", "mode": "100644", "size": 23330}
+"""Active health checks use fake cgroups and fake CLI execution only."""
+import asyncio
+import importlib
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from test_worker_failures import modules, fake_process
+
+
+PROBE_1 = '11111111-1111-4111-8111-111111111111'
+PROBE_2 = '22222222-2222-4222-8222-222222222222'
+PROBE_3 = '33333333-3333-4333-8333-333333333333'
+SECRET = 'SYNTHETIC-HEALTH-SECRET'
+
+
+@pytest.fixture
+def health_setup(modules, tmp_path):
+    common, bridge, worker = modules
+    health_module = importlib.import_module('lab.worker_health')
+    cgroup, proc = tmp_path / 'cgroup', tmp_path / 'proc'
+    cgroup.mkdir()
+    for name, value in {'pids.current': '4', 'pids.max': '128', 'pids.events': 'max 49\n',
+                        'memory.current': '100', 'memory.max': '1000',
+                        'memory.stat': 'anon 80\ninactive_file 0\n',
+                        'memory.events': 'high 0\nmax 0\noom 0\noom_kill 0\n'}.items():
+        (cgroup / name).write_text(value)
+    (proc / 'self/fd').mkdir(parents=True)
+    (proc / 'self/status').write_text('Name:\ttest\nThreads:\t4\n')
+    now = [1000.0]
+    executor = worker.CodexExecutor()
+    health = health_module.WorkerHealth(executor, cgroup_root=cgroup, proc_root=proc,
+                                       clock=lambda: now[0], resource_interval=30,
+                                       canary_interval=900, canary_timeout=30)
+    return SimpleNamespace(common=common, bridge=bridge, worker=worker, module=health_module,
+                           health=health, executor=executor, cgroup=cgroup, now=now)
+
+
+def fake_cli(monkeypatch, setup, outcome='LAB_CANARY_OK'):
+    calls = []
+
+    async def run(prompt, *, process_key, timeout, **kwargs):
+        assert setup.executor.lock.locked()
+        assert prompt == setup.module.CANARY_PROMPT
+        assert timeout <= 30
+        with setup.common.database('executions.sqlite3') as db:
+            row = db.execute('SELECT status FROM health_probes WHERE id=?', (process_key,)).fetchone()
+            assert row and row['status'] == 'running'  # Durable intent precedes effect.
+        calls.append(process_key)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(setup.executor, 'run_cli', run)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_unknown_stale_and_missing_samples_never_report_healthy(health_setup, monkeypatch):
+    setup = health_setup
+    fake_cli(monkeypatch, setup)
+    assert setup.health.snapshot()['status'] == 'unknown'
+    setup.health.sample_resources()
+    assert setup.health.snapshot()['status'] == 'unknown'
+    await setup.health.run_canary(PROBE_1)
+    assert setup.health.snapshot()['status'] == 'healthy'
+    setup.now[0] += 61
+    assert setup.health.snapshot()['resources']['status'] == 'unknown'
+    setup.health.sample_resources()
+    setup.now[0] += 901
+    setup.health.sample_resources()
+    assert setup.health.snapshot()['canary']['code'] == 'WORKER_CANARY_STALE'
+    assert setup.health.snapshot()['status'] != 'healthy'
+    (setup.cgroup / 'pids.current').unlink()
+    setup.health.sample_resources()
+    assert setup.health.snapshot()['resources']['status'] == 'unknown'
+
+
+@pytest.mark.asyncio
+async def test_auth_failure_is_active_alert_and_only_success_recovers(health_setup, monkeypatch, capsys):
+    from lab.failures import Failure, FailureError
+    setup = health_setup
+    setup.health.sample_resources()
+    calls = fake_cli(monkeypatch, setup, FailureError(Failure('CODEX_AUTH_REFRESH_FAILED')))
+    await setup.health.run_canary(PROBE_1)
+    assert calls == [PROBE_1]
+    assert setup.health.snapshot()['status'] == 'error'
+    async with setup.executor.lock:
+        await setup.health.run_canary(PROBE_2)
+    busy = setup.health.snapshot()
+    assert busy['canary']['check_status'] == 'busy'
+    assert busy['status'] == 'error'  # Skipping must not hide known auth failure.
+    assert calls == [PROBE_1]
+    events = [json.loads(line) for line in (setup.common.STATE / 'audit.jsonl').read_text().splitlines()]
+    assert any(event['event'] == 'worker.auth_failed' and event['level'] == 'error' for event in events)
+    fake_cli(monkeypatch, setup, SECRET)
+    await setup.health.run_canary(PROBE_2)
+    assert setup.health.snapshot()['canary']['code'] == 'WORKER_CANARY_INVALID_RESULT'
+    fake_cli(monkeypatch, setup)
+    await setup.health.run_canary(PROBE_3)
+    assert setup.health.snapshot()['status'] == 'healthy'
+    assert SECRET not in capsys.readouterr().out
+    assert SECRET not in (setup.common.STATE / 'audit.jsonl').read_text()
+
+
+@pytest.mark.asyncio
+async def test_resource_events_require_fresh_execution_before_green(health_setup, monkeypatch):
+    setup = health_setup
+    fake_cli(monkeypatch, setup)
+    setup.health.sample_resources()
+    await setup.health.run_canary(PROBE_1)
+    assert setup.health.snapshot()['status'] == 'healthy'  # Old cumulative events are not a new failure.
+    prior_recoveries = (setup.common.STATE / 'audit.jsonl').read_text().count('worker.health_recovered')
+    (setup.cgroup / 'pids.events').write_text('max 50\n')
+    setup.health.sample_resources()
+    assert setup.health.snapshot()['resources']['code'] == 'WORKER_RESOURCE_EXHAUSTED'
+    setup.health.sample_resources()
+    assert setup.health.snapshot()['status'] != 'healthy'
+    assert setup.health.snapshot()['canary']['code'] == 'WORKER_CANARY_REQUIRED'
+    assert (setup.common.STATE / 'audit.jsonl').read_text().count('worker.health_recovered') == prior_recoveries
+    await setup.health.run_canary(PROBE_2)
+    assert setup.health.snapshot()['status'] == 'healthy'
+
+
+@pytest.mark.asyncio
+async def test_canary_probe_id_replay_and_interrupted_probe_never_rerun(health_setup, monkeypatch):
+    setup = health_setup
+    calls = fake_cli(monkeypatch, setup)
+    await setup.health.run_canary(PROBE_1)
+    await setup.health.run_canary(PROBE_1)
+    assert calls == [PROBE_1]
+    with setup.common.database('executions.sqlite3') as db:
+        db.execute('INSERT INTO health_probes(id,status,started) VALUES (?,?,?)', (PROBE_2, 'running', setup.now[0]))
+    setup.module.init_health_db(recover=True)
+    await setup.health.run_canary(PROBE_2)
+    assert calls == [PROBE_1]
+    assert setup.health.snapshot()['canary']['code'] == 'WORKER_CANARY_INTERRUPTED'
+    assert setup.health.snapshot()['status'] != 'healthy'
+
+
+@pytest.mark.asyncio
+async def test_inflight_recheck_does_not_hide_known_auth_failure(health_setup, monkeypatch):
+    from lab.failures import Failure, FailureError
+    setup = health_setup
+    setup.health.sample_resources()
+    fake_cli(monkeypatch, setup, FailureError(Failure('CODEX_AUTH_UNAUTHORIZED')))
+    await setup.health.run_canary(PROBE_1)
+    started, finish = asyncio.Event(), asyncio.Event()
+
+    async def pending(*args, **kwargs):
+        started.set()
+        await finish.wait()
+        return 'LAB_CANARY_OK'
+
+    monkeypatch.setattr(setup.executor, 'run_cli', pending)
+    task = asyncio.create_task(setup.health.run_canary(PROBE_2))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    try:
+        current = setup.health.snapshot()
+        assert current['status'] == 'error' and current['code'] == 'CODEX_AUTH_UNAUTHORIZED'
+        assert current['canary']['check_status'] == 'checking'
+    finally:
+        finish.set()
+        await task
+    assert setup.health.snapshot()['status'] == 'healthy'
+
+
+@pytest.mark.asyncio
+async def test_cancelled_probe_is_durable_interrupted_and_unlocks(health_setup, monkeypatch):
+    setup = health_setup
+    started = asyncio.Event()
+
+    async def pending(*args, **kwargs):
+        started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(setup.executor, 'run_cli', pending)
+    task = asyncio.create_task(setup.health.run_canary(PROBE_1))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    with setup.common.database('executions.sqlite3') as db:
+        assert db.execute("SELECT COUNT(*) FROM health_probes WHERE status='running'").fetchone()[0] == 1
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not setup.executor.lock.locked()
+    with setup.common.database('executions.sqlite3') as db:
+        assert db.execute('SELECT status FROM health_probes WHERE id=?', (PROBE_1,)).fetchone()[0] == 'interrupted'
+
+
+@pytest.mark.asyncio
+async def test_busy_check_does_not_create_probe_or_touch_business_tasks(health_setup, monkeypatch):
+    setup = health_setup
+    calls = fake_cli(monkeypatch, setup)
+    with setup.common.database('tasks.sqlite3') as db:
+        db.execute("INSERT INTO tasks(id,owner,idem,prompt,status) VALUES ('working','alice','key','private','working')")
+    async with setup.executor.lock:
+        await setup.health.run_canary(PROBE_1)
+    assert setup.health.snapshot()['canary']['status'] == 'busy'
+    assert calls == []
+    with setup.common.database('executions.sqlite3') as db:
+        assert db.execute('SELECT COUNT(*) FROM health_probes').fetchone()[0] == 0
+    with setup.common.database('tasks.sqlite3') as db:
+        assert db.execute("SELECT status FROM tasks WHERE id='working'").fetchone()[0] == 'working'
+    await setup.health.run_canary(PROBE_1)
+    assert calls == [PROBE_1]
+
+
+@pytest.mark.asyncio
+async def test_replaying_old_success_does_not_clear_an_untested_busy_check(health_setup, monkeypatch):
+    setup = health_setup
+    calls = fake_cli(monkeypatch, setup)
+    setup.health.sample_resources()
+    await setup.health.run_canary(PROBE_1)
+    async with setup.executor.lock:
+        await setup.health.run_canary(PROBE_2)
+    await setup.health.run_canary(PROBE_1)
+    assert calls == [PROBE_1]
+    assert setup.health.snapshot()['status'] == 'busy'
+
+
+@pytest.mark.asyncio
+async def test_background_loops_check_idle_worker_without_business_requests(health_setup, monkeypatch):
+    setup = health_setup
+    calls = fake_cli(monkeypatch, setup)
+    setup.health.resource_interval = 0.01
+    setup.health.canary_interval = 0.02
+    setup.health.start()
+    try:
+        for _ in range(50):
+            if len(calls) >= 2:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await setup.health.stop()
+    assert len(calls) >= 2
+    assert len(set(calls)) == len(calls)
+    assert setup.health.snapshot()['status'] == 'healthy'
+    with setup.common.database('tasks.sqlite3') as db:
+        assert db.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_clock_rollback_cannot_make_previous_success_green(health_setup, monkeypatch):
+    setup = health_setup
+    fake_cli(monkeypatch, setup)
+    setup.health.sample_resources()
+    await setup.health.run_canary(PROBE_1)
+    setup.now[0] -= 1
+    assert setup.health.snapshot()['status'] == 'unknown'
+
+
+@pytest.mark.asyncio
+async def test_canary_uses_real_shared_command_and_sandbox(health_setup, monkeypatch, tmp_path):
+    setup = health_setup
+    calls = fake_process(monkeypatch, setup.worker, tmp_path, b'', returncode=0, result='LAB_CANARY_OK')
+    await setup.health.run_canary(PROBE_1)
+    assert len(calls) == 1
+    command = calls[0]
+    assert command[:2] == ('codex', 'exec')
+    assert 'default_permissions="lab"' in command
+    assert 'approval_policy="never"' in command
+    assert any('network={enabled=false}' in part for part in command)
+    assert setup.health.snapshot()['canary']['status'] == 'healthy'
+
+
+def test_resource_pressure_is_proactive_without_business_task(health_setup):
+    setup = health_setup
+    (setup.cgroup / 'pids.current').write_text('110')
+    setup.health.sample_resources()
+    assert setup.health.snapshot()['resources']['code'] == 'WORKER_PID_PRESSURE'
+    (setup.cgroup / 'pids.current').write_text('4')
+    (setup.cgroup / 'memory.current').write_text('900')
+    setup.health.sample_resources()
+    assert setup.health.snapshot()['resources']['code'] == 'WORKER_MEMORY_PRESSURE'
+
+
+def test_memory_limit_events_without_oom_are_pressure_not_exhaustion(health_setup):
+    setup = health_setup
+    setup.health.sample_resources()
+    (setup.cgroup / 'memory.events').write_text('high 0\nmax 1\noom 0\noom_kill 0\n')
+    setup.health.sample_resources()
+    state = setup.health.snapshot()['resources']
+    assert state['status'] == 'degraded' and state['code'] == 'WORKER_MEMORY_PRESSURE'
+    assert state['memory']['oom_total'] == 0 and state['memory']['max_total'] == 1
+
+
+@pytest.mark.asyncio
+async def test_high_cache_low_working_set_preserves_valid_canary(health_setup, monkeypatch):
+    setup = health_setup
+    calls = fake_cli(monkeypatch, setup)
+    setup.health.sample_resources()
+    await setup.health.run_canary(PROBE_1)
+    assert setup.health.snapshot()['status'] == 'healthy'
+    (setup.cgroup / 'memory.current').write_text('950')
+    (setup.cgroup / 'memory.stat').write_text('anon 80\nfile 850\ninactive_file 850\nshmem 10\nkernel 10\n')
+    setup.health.sample_resources()
+    state = setup.health.snapshot()
+    assert state['status'] == 'healthy'
+    assert state['resources']['code'] == 'WORKER_HEALTHY'
+    assert state['resources']['memory'] == {
+        'current': 950, 'working_set': 100, 'anon': 80, 'limit': 1000,
+        'oom_total': 0, 'oom_kill_total': 0, 'high_total': 0, 'max_total': 0,
+    }
+    assert state['canary']['probe_id'] == PROBE_1 and calls == [PROBE_1]
+    with setup.common.database('executions.sqlite3') as db:
+        assert db.execute("SELECT value FROM health_flags WHERE key='canary_after'").fetchone() is None
+    published = json.loads((setup.common.STATE / 'worker-health.json').read_text())
+    assert published['state']['resources']['memory'] == state['resources']['memory']
+    assert setup.module.check_snapshot(now=setup.now[0])['status'] == 'healthy'
+
+
+@pytest.mark.parametrize(('inactive_file', 'working_set', 'status'), [
+    (101, 849, 'healthy'), (100, 850, 'degraded'), (99, 851, 'degraded'),
+])
+def test_working_set_pressure_threshold_includes_equality(health_setup, inactive_file, working_set, status):
+    setup = health_setup
+    (setup.cgroup / 'memory.current').write_text('950')
+    # Low anon must not conceal other charged working-set memory.
+    (setup.cgroup / 'memory.stat').write_text(f'anon 100\ninactive_file {inactive_file}\n')
+    state = setup.health.sample_resources()
+    assert state['status'] == status
+    assert state['memory']['working_set'] == working_set
+    assert state['memory']['anon'] == 100
+    assert state['code'] == ('WORKER_HEALTHY' if status == 'healthy' else 'WORKER_MEMORY_PRESSURE')
+
+
+def test_inactive_file_above_current_clamps_working_set_to_zero(health_setup):
+    setup = health_setup
+    (setup.cgroup / 'memory.stat').write_text('anon 80\ninactive_file 150\n')
+    state = setup.health.sample_resources()
+    assert state['status'] == 'healthy'
+    assert state['memory']['current'] == 100
+    assert state['memory']['working_set'] == 0 and state['memory']['anon'] == 80
+
+
+@pytest.mark.parametrize(('event', 'status', 'code'), [
+    ('max', 'degraded', 'WORKER_MEMORY_PRESSURE'),
+    ('high', 'degraded', 'WORKER_MEMORY_PRESSURE'),
+    ('oom', 'error', 'WORKER_MEMORY_EXHAUSTED'),
+    ('oom_kill', 'error', 'WORKER_MEMORY_EXHAUSTED'),
+])
+def test_memory_event_deltas_still_alert_with_low_working_set(health_setup, event, status, code):
+    setup = health_setup
+    (setup.cgroup / 'memory.current').write_text('950')
+    (setup.cgroup / 'memory.stat').write_text('anon 30\ninactive_file 900\n')
+    assert setup.health.sample_resources()['status'] == 'healthy'
+    counts = {'high': 0, 'max': 0, 'oom': 0, 'oom_kill': 0}
+    counts[event] = 1
+    (setup.cgroup / 'memory.events').write_text(''.join(f'{name} {value}\n' for name, value in counts.items()))
+    state = setup.health.sample_resources()
+    assert state['status'] == status and state['code'] == code
+    assert state['memory']['working_set'] == 50
+    assert state['memory'][event + '_total'] == 1
+    with setup.common.database('executions.sqlite3') as db:
+        assert db.execute("SELECT value FROM health_flags WHERE key='canary_after'").fetchone() is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('invalid_stat', [
+    b'', b'anon 80\n', b'inactive_file 0\n',
+    b'anon -1\ninactive_file 0\n', b'anon 80\ninactive_file -1\n',
+    b'anon 80\ninactive_file 0.5\n', b'anon 80 extra\ninactive_file 0\n',
+    b'anon 80\ninactive_file 0\ninactive_file 1\n',
+    b'anon 80\ninactive_file 0\nfile SYNTHETIC-HEALTH-SECRET\n', b'\xff',
+], ids=['empty', 'missing_inactive', 'missing_anon', 'negative_anon', 'negative_inactive',
+        'fractional_inactive', 'extra_column', 'duplicate_key', 'malformed_other_counter', 'invalid_encoding'])
+async def test_malformed_memory_stat_fails_closed_without_error_text(health_setup, monkeypatch, capsys, invalid_stat):
+    setup = health_setup
+    fake_cli(monkeypatch, setup)
+    setup.health.sample_resources()
+    await setup.health.run_canary(PROBE_1)
+    assert setup.health.snapshot()['status'] == 'healthy'
+    (setup.cgroup / 'memory.stat').write_bytes(invalid_stat)
+    setup.health.sample_resources()
+    state = setup.health.snapshot()
+    assert state['status'] == 'unknown'
+    assert state['resources']['code'] == 'WORKER_HEALTH_UNAVAILABLE'
+    assert state['resources']['fresh'] is False
+    assert setup.module.check_snapshot(now=setup.now[0])['status'] == 'unknown'
+    captured = capsys.readouterr()
+    assert SECRET not in captured.out + captured.err
+    assert SECRET not in (setup.common.STATE / 'audit.jsonl').read_text()
+    assert SECRET not in (setup.common.STATE / 'worker-health.json').read_text()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['missing_file', 'read_error'])
+async def test_memory_stat_read_failure_does_not_reuse_old_healthy_sample(health_setup, monkeypatch, capsys, failure):
+    setup = health_setup
+    fake_cli(monkeypatch, setup)
+    setup.health.sample_resources()
+    await setup.health.run_canary(PROBE_1)
+    assert setup.health.snapshot()['status'] == 'healthy'
+    path = setup.cgroup / 'memory.stat'
+    if failure == 'missing_file':
+        path.unlink()
+    else:
+        original = Path.read_text
+
+        def fail_stat(self, *args, **kwargs):
+            if self == path:
+                raise PermissionError(SECRET)
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'read_text', fail_stat)
+    state = setup.health.sample_resources()
+    assert state['status'] == 'unknown' and state['fresh'] is False
+    assert setup.health.snapshot()['status'] == 'unknown'
+    assert setup.module.check_snapshot(now=setup.now[0])['status'] == 'unknown'
+    captured = capsys.readouterr()
+    assert SECRET not in captured.out + captured.err
+    assert SECRET not in (setup.common.STATE / 'audit.jsonl').read_text()
+    assert SECRET not in (setup.common.STATE / 'worker-health.json').read_text()
+
+
+def test_health_proxy_reconstructs_only_safe_fields(health_setup):
+    setup = health_setup
+    forged = {'status': 'healthy', 'code': 'WORKER_HEALTHY', 'message': SECRET,
+              'resources': {'status': 'healthy', 'code': 'WORKER_HEALTHY', 'fresh': True},
+              'canary': {'status': 'error', 'code': 'CODEX_AUTH_UNAUTHORIZED', 'fresh': True,
+                         'tested': True, 'message': SECRET, 'stderr': SECRET}}
+    safe = setup.module.sanitize_health_snapshot(forged)
+    assert safe['status'] == 'error' and safe['code'] == 'CODEX_AUTH_UNAUTHORIZED'
+    assert SECRET not in json.dumps(safe)
+    forged['canary'] = {'status': 'healthy', 'code': 'WORKER_HEALTHY', 'fresh': False}
+    assert setup.module.sanitize_health_snapshot(forged)['status'] != 'healthy'
+
+
+@pytest.mark.asyncio
+async def test_bridge_health_retains_safe_auth_error_on_worker_503(health_setup, monkeypatch):
+    setup = health_setup
+    body = {'resources': {'status': 'healthy', 'code': 'WORKER_HEALTHY', 'fresh': True},
+            'canary': {'status': 'error', 'code': 'CODEX_AUTH_UNAUTHORIZED', 'fresh': True,
+                       'tested': True, 'stderr': SECRET}, 'message': SECRET}
+
+    class Client:
+        def __init__(self, **_):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            pass
+
+        async def get(self, *_args, **kwargs):
+            assert kwargs['headers']['Authorization'] == 'Bearer SYNTHETIC-DISPATCHER'
+            return SimpleNamespace(status_code=503, json=lambda: body)
+
+    monkeypatch.setattr(setup.bridge, 'Path', lambda _: SimpleNamespace(read_text=lambda: 'SYNTHETIC-DISPATCHER'))
+    monkeypatch.setattr(setup.bridge.httpx, 'AsyncClient', Client)
+    response = await setup.bridge.health()
+    output = json.loads(response.body)
+    assert response.status_code == 503
+    assert output['status'] == 'error' and output['code'] == 'CODEX_AUTH_UNAUTHORIZED'
+    assert SECRET not in response.body.decode()
+    assert 'SYNTHETIC-DISPATCHER' not in response.body.decode()
+
+
+def test_intervals_are_configurable_and_canary_timeout_is_capped(health_setup, monkeypatch):
+    setup = health_setup
+    monkeypatch.setenv('LAB_RESOURCE_SAMPLE_SECONDS', '5')
+    monkeypatch.setenv('LAB_CANARY_INTERVAL_SECONDS', '20')
+    monkeypatch.setenv('LAB_CANARY_TIMEOUT_SECONDS', '999')
+    health = setup.module.WorkerHealth(setup.executor)
+    assert (health.resource_interval, health.canary_interval, health.canary_timeout) == (5, 20, 30)
+
+
+@pytest.mark.asyncio
+async def test_container_check_reads_only_safe_snapshot_and_rejects_stale(health_setup, monkeypatch, capsys):
+    setup = health_setup
+    fake_cli(monkeypatch, setup)
+    setup.health.sample_resources()
+    await setup.health.run_canary(PROBE_1)
+    monkeypatch.setattr(setup.module, 'time', SimpleNamespace(time=lambda: setup.now[0]))
+    capsys.readouterr()
+    assert setup.module.main(['check']) == 0
+    assert json.loads(capsys.readouterr().out)['status'] == 'healthy'
+    setup.now[0] += 61
+    assert setup.module.main(['check']) == 1
+    assert json.loads(capsys.readouterr().out)['status'] == 'unknown'
+    path = setup.common.STATE / 'worker-health.json'
+    path.write_text(SECRET)
+    assert setup.module.main(['check']) == 1
+    assert SECRET not in capsys.readouterr().out
+
+
+def test_worker_http_health_is_authenticated_and_starts_background_checks(health_setup, monkeypatch):
+    from starlette.testclient import TestClient
+    setup = health_setup
+    calls = fake_cli(monkeypatch, setup)
+    monkeypatch.setattr(setup.worker, 'CodexExecutor', lambda: setup.executor)
+    monkeypatch.setattr(setup.worker, 'WorkerHealth', lambda executor: setup.health)
+    monkeypatch.setattr(setup.common, 'identity', lambda auth:
+                        {'agent': 'health-check', 'role': 'dispatcher'} if auth == 'Bearer SYNTHETIC' else None)
+    with TestClient(setup.worker.create_app()) as client:
+        assert client.get('/healthz').status_code == 401
+        response = client.get('/healthz', headers={'Authorization': 'Bearer SYNTHETIC'})
+        for _ in range(20):
+            if response.status_code == 200:
+                break
+            response = client.get('/healthz', headers={'Authorization': 'Bearer SYNTHETIC'})
+        assert response.status_code == 200
+        assert response.json()['status'] == 'healthy'
+    assert len(calls) >= 1 and not setup.health._tasks
+
+=== BATON_SOURCE_FILE === {"path": "security/SOURCE.txt", "mode": "100644", "size": 217}
+Moby seccomp base: https://github.com/moby/profiles/blob/4b8214fc4971e06172938a1f1554ccff6647ee80/seccomp/default.json
+Added allow: clone, unshare, mount, umount2, pivot_root, setns. All other default rules retained.
+
+=== BATON_SOURCE_END ===
