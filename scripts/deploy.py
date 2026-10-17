@@ -18,9 +18,11 @@ Steps, each with a hard timeout (the recovery path too):
   3. record the image of every container of the project, running or not, and tag each local image per service as
      `baton-deploy-rollback:<service>-<id>` so it cannot be garbage-collected;
   4. if a database volume exists, make sure the database container is up (even when every application container
-     is stopped or gone), then (a) precheck the migration: apply it to a throwaway copy of the live schema and diff
-     the catalogs, including privileges and row level security; any breaking change, or any step that fails, aborts
-     (fail closed); and (b) back up the database with pg_dump (custom format) into --backup-dir. The dump file is
+     is stopped or gone), then (a) precheck the migration in a separate Postgres container (same image, --network none,
+     its own superuser, tmpfs data) loaded from a schema-only dump and a roles-only dump with no passwords; the
+     migration runs there the way migrate.py runs it, and the catalog diff includes roles, memberships, privileges,
+     row level security and index shape; any breaking change, or any step that fails, aborts (fail closed); and
+     (b) back up the database with pg_dump (custom format) into --backup-dir, still before the real migration. The dump file is
      created with O_EXCL|O_NOFOLLOW and fchmod 0600 under an unpredictable name; an existing file or symbolic link
      is left untouched and the backup fails. A failed dump aborts;
   5. build (optionally with --build-network host). The image itself also runs `chmod -R a+rX /app` after COPY,
@@ -96,6 +98,9 @@ INCOMPATIBLE_SQL = (
      r'\bDROP\b(?!\s+(?:CONSTRAINT|TRIGGER|INDEX|POLICY|DEFAULT|RULE|STATISTICS)\b)'),
     ('truncates a table', r'(?:^|;)\s*TRUNCATE\b'),
     ('deletes rows', r'\bDELETE\s+FROM\b'),
+    # Data rewrites are invisible to a schema-only catalog. Trigger clauses (BEFORE UPDATE OR/OF) are not statements.
+    ('rewrites rows', r'\bUPDATE\s+(?:ONLY\s+)?(?!OR\b|OF\b)(?:[\w."]+\.)?[\w."]+'),
+    ('merges rows', r'\bMERGE\s+INTO\b'),
     ('renames an object', r'\bRENAME\b'),
     ('changes a column type', r'\bALTER\s+(?:COLUMN\s+)?' + IDENT + r'\s+(?:SET\s+DATA\s+)?TYPE\b'),
     ('makes an existing column NOT NULL', r'\bSET\s+NOT\s+NULL\b'),
@@ -109,14 +114,12 @@ ADD_CLAUSE = re.compile(r'\bADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?'
                         r'(?!CONSTRAINT\b|PRIMARY\b|UNIQUE\b|CHECK\b|FOREIGN\b|LIKE\b|EXCLUDE\b)([^;]*?)'
                         r'(?=,\s*(?:ADD|ALTER|DROP)\b|;|$)', re.IGNORECASE | re.DOTALL)
 NOISE = re.compile(r"--[^\n]*|/\*.*?\*/|'(?:[^']|'')*'", re.DOTALL)
-PRECHECK_PREFIX = 'baton_precheck_'
-PSQL = ('PGPASSWORD="$(cat /run/secrets/database-admin/postgres.password)" '
-        'exec psql -X -q -v ON_ERROR_STOP=1 -U baton_bootstrap -d %s')
-PSQL_ROWS = PSQL + ' -At'
-CLONE_SCRIPT = ('PGPASSWORD="$(cat /run/secrets/database-admin/postgres.password)"; export PGPASSWORD; '
-                'pg_dump -U baton_bootstrap -d baton --schema-only --file=/tmp/%(name)s.sql && '
-                'psql -X -q -v ON_ERROR_STOP=1 -U baton_bootstrap -d %(name)s -f /tmp/%(name)s.sql; '
-                'status=$?; rm -f /tmp/%(name)s.sql; exit $status')
+PRECHECK_PREFIX = 'baton-precheck-'
+MAX_SMOKE_BODY = 1024 * 1024
+ROLES_DUMP = ('PGPASSWORD="$(cat /run/secrets/database-admin/postgres.password)" '
+              'exec pg_dumpall -U baton_bootstrap --roles-only --no-role-passwords')
+SCHEMA_DUMP = ('PGPASSWORD="$(cat /run/secrets/database-admin/postgres.password)" '
+               'exec pg_dump -U baton_bootstrap -d baton --schema-only')
 SYSTEM_SCHEMAS = "n.nspname !~ '^(pg_|information_schema$)'"
 CATALOG_SQL = """SELECT json_build_object(
  'columns', (SELECT coalesce(json_agg(json_build_object('t', n.nspname||'.'||c.relname, 'c', a.attname,
@@ -135,6 +138,7 @@ CATALOG_SQL = """SELECT json_build_object(
    FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE %(system)s),
  'indexes', (SELECT coalesce(json_agg(json_build_object('t', n.nspname||'.'||c.relname, 'name', ic.relname,
      'def', pg_get_indexdef(i.indexrelid), 'unique', i.indisunique,
+     'pred', pg_get_expr(i.indpred, i.indrelid),
      'cols', (SELECT coalesce(json_agg(a.attname), '[]'::json) FROM pg_attribute a
               WHERE a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)))), '[]'::json)
    FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid JOIN pg_class c ON c.oid = i.indrelid
@@ -171,12 +175,21 @@ CATALOG_SQL = """SELECT json_build_object(
      'acl', coalesce(p.proacl::text, ''))), '[]'::json)
    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.prokind IN ('f','p') AND %(system)s),
  'database_privileges', (SELECT coalesce(json_agg(json_build_object('acl', coalesce(d.datacl::text, ''))), '[]'::json)
-   FROM pg_database d WHERE d.datname = current_database())
+   FROM pg_database d WHERE d.datname = current_database()),
+ 'roles', (SELECT coalesce(json_agg(json_build_object('name', r.rolname, 'super', r.rolsuper,
+     'inherit', r.rolinherit, 'createrole', r.rolcreaterole, 'createdb', r.rolcreatedb, 'login', r.rolcanlogin,
+     'replication', r.rolreplication, 'bypassrls', r.rolbypassrls, 'connlimit', r.rolconnlimit,
+     'password', md5(r.rolpassword)) ORDER BY r.rolname), '[]'::json)
+   FROM pg_roles r WHERE r.rolname !~ '^pg_'),
+ 'memberships', (SELECT coalesce(json_agg(json_build_object('role', r.rolname, 'member', m.rolname,
+     'admin', a.admin_option, 'inherit', a.inherit_option, 'set', a.set_option)
+     ORDER BY r.rolname, m.rolname), '[]'::json)
+   FROM pg_auth_members a JOIN pg_roles r ON r.oid = a.roleid JOIN pg_roles m ON m.oid = a.member)
 );
 """ % {'system': SYSTEM_SCHEMAS}
 SNAPSHOT_KEYS = ('columns', 'relations', 'constraints', 'indexes', 'triggers', 'functions', 'types',
                  'policies', 'row_security', 'privileges', 'column_privileges', 'schema_privileges',
-                 'function_privileges', 'database_privileges')
+                 'function_privileges', 'database_privileges', 'roles', 'memberships')
 
 
 class UsageError(Exception):
@@ -443,13 +456,16 @@ class HttpClient:
                 timer.start()
             connection.request(method, path, body=body, headers=headers or {})
             remote = connection.getresponse()
-            chunks = []
+            chunks, size = [], 0
             while True:
                 if self.deadline is not None and self.clock() >= self.deadline:
                     raise SmokeError('timed out')
                 block = remote.read(65536)
                 if not block:
                     break
+                size += len(block)
+                if size > MAX_SMOKE_BODY:
+                    raise SmokeError('response too large')
                 chunks.append(block)
             payload = b''.join(chunks)
             header_map = dict((key.lower(), value) for key, value in remote.getheaders())
@@ -778,12 +794,19 @@ def schema_breaking_changes(before, after):
         before_items, after_items = keyed(before, section, key), keyed(after, section, key)
         for name, item in sorted(before_items.items()):
             now = after_items.get(name)
-            # A non-unique index is not a constraint, so dropping or rebuilding it is compatible. Replacing it
-            # with a unique index of the same name is not: the name is already in before_items, so the "new
-            # index" loop below would skip it, and the old image's writes can start failing.
-            if section == 'indexes' and not item['unique']:
-                if now is not None and now['unique']:
+            # Any change to an index that already exists is incompatible, including a non-unique index rebuilt
+            # under the same name with different uniqueness, columns or predicate. Dropping a non-unique index
+            # and not putting it back does not make old writes fail, so that one case stays compatible.
+            if section == 'indexes':
+                if now is None:
+                    if item['unique']:
+                        changes.append('drops index %s on %s' % (name[1], name[0]))
+                    continue
+                if now['unique'] and not item['unique']:
                     changes.append('replaces non-unique index %s on %s with a unique index' % (name[1], name[0]))
+                elif (now['unique'] != item['unique'] or now.get('cols') != item.get('cols')
+                      or now.get('pred') != item.get('pred') or now.get('def') != item.get('def')):
+                    changes.append('changes index %s on %s' % (name[1], name[0]))
                 continue
             if now is None:
                 changes.append('drops %s %s on %s' % (label, name[1], name[0]))
@@ -810,6 +833,36 @@ def schema_breaking_changes(before, after):
         elif new_types[name]['def'] != item['def']:
             changes.append('changes type %s' % name)
     changes.extend(privilege_and_rls_changes(before, after, keyed))
+    changes.extend(role_changes(before, after))
+    return changes
+
+
+def role_changes(before, after):
+    """Role and membership changes are cluster-wide and a database drop does not undo them.
+
+    The precheck applies them only inside the throwaway cluster, then refuses the deploy when this diff is not
+    empty. The message names the role and never includes a password or its hash.
+    """
+    changes = []
+    old = {item['name']: item for item in before['roles']}
+    new = {item['name']: item for item in after['roles']}
+    for name, item in sorted(old.items()):
+        now = new.get(name)
+        if now is None:
+            changes.append('drops role %s' % name)
+        elif now != item:
+            changes.append('changes role %s' % name)
+    old_members = {(item['role'], item['member']): item for item in before['memberships']}
+    new_members = {(item['role'], item['member']): item for item in after['memberships']}
+    for key, item in sorted(old_members.items()):
+        now = new_members.get(key)
+        if now is None:
+            changes.append('drops membership of %s in %s' % (key[1], key[0]))
+        elif now != item:
+            changes.append('changes membership of %s in %s' % (key[1], key[0]))
+    for key in sorted(set(new_members) - set(old_members)):
+        if key[0] in old or key[1] in old:
+            changes.append('adds membership of %s in %s' % (key[1], key[0]))
     return changes
 
 
@@ -908,64 +961,90 @@ def database_exec(config, script):
     return config.compose_base() + ['exec', '-T', DATABASE_SERVICE, 'sh', '-c', script]
 
 
-def restricted_migration(sql):
-    """SQL for the throwaway psql, with meta-commands disabled before any of the migration is read.
+def migration_script(sql):
+    """The migration as ``deploy/migrate.py`` runs it: as ``baton_owner``, then back to the session user.
 
-    ``\\restrict`` (PostgreSQL 17.6+, the pinned image is 17.11) rejects every meta-command except
-    ``\\unrestrict`` with this key. The key is random, so the script cannot leave restricted mode and then
-    ``\\c`` to the real database or ``\\!`` a shell. migrate.py applies the same file through psycopg, which
-    does not interpret those commands. The wrapper stays in place even when ``--allow-incompatible-migration``
-    skips the textual warning.
+    ``\\restrict`` is sent first so psql, which ``migrate.py`` does not use, cannot run a meta-command even
+    inside the throwaway container. The random key is not in the migration, so ``\\unrestrict`` cannot match it.
     """
     key = secrets.token_hex(16)
-    return 'BEGIN;\nSET LOCAL ROLE baton_owner;\n\\restrict %s\n%s\nCOMMIT;\n' % (key, sql)
+    return 'BEGIN;\nSET LOCAL ROLE baton_owner;\n\\restrict %s\n%s\nRESET ROLE;\nCOMMIT;\n' % (key, sql)
 
 
-def precheck_migration(docker, config, sql):
-    """Apply the pending migration to a throwaway copy of the live schema and diff the catalogs.
+def precheck_migration(docker, config, sql, previous, project, clock=time.monotonic, sleep=time.sleep):
+    """Apply the pending migration in a separate Postgres container and diff the catalogs.
 
-    Fails closed: any step that fails or cannot be read counts as a breaking change. The migration is applied
-    only to the throwaway database, with psql meta-commands disabled, and that database is dropped at the end.
+    The container uses the database service's image, ``--network none``, a private superuser and a tmpfs data
+    directory. It is loaded from a schema-only dump plus ``pg_dumpall --roles-only --no-role-passwords`` of the
+    live database. Those two dumps are read-only. psql then runs only inside the throwaway container, so a
+    backslash meta-command cannot reach the real database or the host. The container is removed at the end.
+    Role changes commit there and show up in the diff; they never touch the live cluster. Fails closed.
     """
     name = PRECHECK_PREFIX + secrets.token_hex(6)
-    report = {'database': name, 'ok': False, 'changes': [], 'error': None}
+    report = {'database': name, 'network': 'none', 'ok': False, 'changes': [], 'error': None}
     timeout = config.precheck_timeout
+    started = False
 
-    def step(label, script, stdin_text=None):
-        result = docker.run(database_exec(config, script), mutating=True, timeout=timeout, stdin_text=stdin_text)
+    def step(label, argv, stdin_text=None):
+        result = docker.run(argv, mutating=True, timeout=timeout, stdin_text=stdin_text)
         if config.dry_run:
             return ''
         if result.returncode != 0:
             raise UsageError('%s %s' % (label, 'timed out' if result.timed_out else 'failed: ' + tail(result.stderr, 300)))
         return result.stdout
 
+    def psql(database, statement, rows=False):
+        command = ['docker', 'exec', '-i', name, 'psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-U', 'precheck']
+        if rows:
+            command.append('-At')
+        command += ['-d', database]
+        return command, statement
+
     try:
-        step('creating the throwaway database', PSQL % 'postgres', 'CREATE DATABASE "%s";\n' % name)
-        created = True
-    except UsageError as exc:
-        report['error'], created = str(exc), False
-    try:
-        if created:
-            step('cloning the live schema', CLONE_SCRIPT % {'name': name})
-            step('preparing the throwaway schema', PSQL % name,
-                 'CREATE SCHEMA IF NOT EXISTS baton AUTHORIZATION baton_owner;\n'
-                 'GRANT CREATE ON DATABASE "%s" TO baton_owner;\n' % name)
-            before = step('reading the schema before the migration', PSQL_ROWS % name, CATALOG_SQL)
-            step('applying the migration', PSQL % name, restricted_migration(sql))
-            after = step('reading the schema after the migration', PSQL_ROWS % name, CATALOG_SQL)
-            if config.dry_run:
-                report.update(ok=True, planned=True)
-            else:
-                report['changes'] = schema_breaking_changes(parse_snapshot(before), parse_snapshot(after))
-                report['ok'] = not report['changes']
+        info = previous.get(DATABASE_SERVICE)
+        if not info:
+            info = project_snapshot(docker, project).get(DATABASE_SERVICE)
+        image = (info or {}).get('image')
+        if not image:
+            raise UsageError('cannot find the database service image')
+        report['image'] = image
+        roles = step('dumping roles', database_exec(config, ROLES_DUMP))
+        schema = step('dumping the live schema', database_exec(config, SCHEMA_DUMP))
+        step('starting the throwaway database', [
+            'docker', 'run', '-d', '--rm', '--name', name, '--network', 'none',
+            '--tmpfs', '/var/lib/postgresql/data:uid=999,gid=999,mode=0700',
+            '-e', 'POSTGRES_HOST_AUTH_METHOD=trust', '-e', 'POSTGRES_USER=precheck', '-e', 'POSTGRES_DB=baton',
+            image])
+        started = True
+        if not config.dry_run:
+            deadline = clock() + timeout
+            ready = False
+            while clock() < deadline:
+                probe = docker.run(['docker', 'exec', '-i', name, 'pg_isready', '-U', 'precheck', '-d', 'baton'],
+                                   mutating=True, timeout=timeout)
+                if probe.returncode == 0:
+                    ready = True
+                    break
+                sleep(0.5)
+            if not ready:
+                raise UsageError('starting the throwaway database timed out')
+        step('loading roles', *psql('postgres', roles))
+        step('loading the schema', *psql('baton', schema))
+        before = step('reading the schema before the migration', *psql('baton', CATALOG_SQL, rows=True))
+        step('applying the migration', *psql('baton', migration_script(sql)))
+        after = step('reading the schema after the migration', *psql('baton', CATALOG_SQL, rows=True))
+        if config.dry_run:
+            report.update(ok=True, planned=True)
+        else:
+            report['changes'] = schema_breaking_changes(parse_snapshot(before), parse_snapshot(after))
+            report['ok'] = not report['changes']
     except UsageError as exc:
         report['error'] = str(exc)
     finally:
-        if created:
-            dropped = docker.run(database_exec(config, PSQL % 'postgres'), mutating=True, timeout=timeout,
-                                 stdin_text='DROP DATABASE IF EXISTS "%s" WITH (FORCE);\n' % name)
-            if dropped.returncode != 0:
-                report['cleanup_error'] = 'could not drop %s: %s' % (name, tail(dropped.stderr, 300))
+        if started:
+            removed = docker.run(['docker', 'rm', '-f', name], mutating=True, timeout=timeout)
+            if removed.returncode != 0 and not config.dry_run:
+                report['cleanup_error'] = 'could not drop %s: %s' % (name, tail(removed.stderr, 300))
     return report
 
 
@@ -1673,8 +1752,9 @@ def deploy(config, runner, http=None, log=None, clock=time.monotonic, sleep=time
         if not database['ok'] or database['state'] == 'none':
             report['precheck'] = {'skipped': True, 'reason': database.get('reason') or 'database unavailable'}
         else:
-            log('prechecking the migration on a throwaway database')
-            precheck = report['precheck'] = precheck_migration(docker, config, migration_sql)
+            log('prechecking the migration in an isolated database container')
+            precheck = report['precheck'] = precheck_migration(
+                docker, config, migration_sql, previous, project, clock, sleep)
             if not precheck['ok'] and not config.allow_incompatible_migration:
                 detail = ('the precheck could not be completed (%s); treated as incompatible' % precheck['error']
                           if precheck['error'] else 'it would break the previous image: ' + '; '.join(precheck['changes']))

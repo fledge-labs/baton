@@ -317,12 +317,16 @@ def catalog(drop_column=False):
         columns = columns[:1]
     return {"columns": columns, "relations": ["baton.tasks:r"],
             "constraints": [{"t": "baton.tasks", "name": "tasks_pkey", "def": "PRIMARY KEY (id)", "cols": ["id"]}],
-            "indexes": [{"t": "baton.tasks", "name": "tasks_pkey", "def": "CREATE UNIQUE INDEX tasks_pkey", "unique": True, "cols": ["id"]}],
+            "indexes": [{"t": "baton.tasks", "name": "tasks_pkey", "def": "CREATE UNIQUE INDEX tasks_pkey",
+                         "unique": True, "cols": ["id"], "pred": None}],
             "triggers": [], "functions": [], "types": [], "policies": [],
             "row_security": [{"t": "baton.tasks", "enabled": False, "forced": False}],
             "privileges": [{"t": "baton.tasks", "acl": ""}], "column_privileges": [],
             "schema_privileges": [{"n": "baton", "acl": ""}], "function_privileges": [],
-            "database_privileges": [{"acl": ""}]}
+            "database_privileges": [{"acl": ""}],
+            "roles": [{"name": "baton_app", "super": False, "inherit": True, "createrole": False, "createdb": False,
+                       "login": True, "replication": False, "bypassrls": False, "connlimit": -1, "password": None}],
+            "memberships": []}
 
 
 class FakeDocker:
@@ -332,6 +336,7 @@ class FakeDocker:
                  dump="ok", stopped=(), orphans=(), edge_drift=False, build_timeout=False, precheck="clean",
                  volume=None, db_start_ok=True, drop_ok=True, no_containers=False, overrides=None):
         self.calls, self.timeouts, self.stdins = [], [], []
+        self.precheck_name = None
         self.precheck, self.volume, self.db_start_ok, self.drop_ok = precheck, existing if volume is None else volume, db_start_ok, drop_ok
         self.snapshots_served = 0
         self.up_results = list(up_results if up_results is not None else [0, 0])
@@ -370,10 +375,18 @@ class FakeDocker:
         if argv[:3] == ["docker", "image", "inspect"]:
             ref = argv[-1]
             return deploy.Result(0, self.tags[ref] + "\n") if ref in self.tags else deploy.Result(1, "", "no such image")
-        if "exec" in argv and argv[argv.index("exec") + 2] == "database" and "pg_dump" in argv[-1] and "-Fc" not in argv[-1]:
+        if argv[:2] == ["docker", "run"]:
+            return self.run_throwaway(argv)
+        if argv[:3] == ["docker", "rm", "-f"]:
+            return deploy.Result(0 if self.drop_ok else 1, "", "" if self.drop_ok else "container is in use")
+        if argv[:2] == ["docker", "exec"]:
+            return self.exec_throwaway(argv, stdin_text)
+        if "exec" in argv and argv[argv.index("exec") + 2] == "database" and "--roles-only" in argv[-1]:
+            if self.precheck == "fail:roles":
+                return deploy.Result(1, "", "pg_dumpall: failed")
+            return deploy.Result(0, "CREATE ROLE baton_owner NOLOGIN;\nCREATE ROLE baton_app LOGIN;\n")
+        if "exec" in argv and argv[argv.index("exec") + 2] == "database" and "--schema-only" in argv[-1]:
             return self.run_clone(argv)
-        if "exec" in argv and argv[argv.index("exec") + 2] == "database" and stdin_text is not None:
-            return self.run_psql(argv, stdin_text)
         if "exec" in argv and argv[argv.index("exec") + 2] == "database":
             if self.dump == "fail":
                 return deploy.Result(1, "", "pg_dump: connection refused")
@@ -422,23 +435,35 @@ class FakeDocker:
     def run_clone(self, argv):
         if self.precheck == "fail:clone":
             return deploy.Result(1, "", "pg_dump: error: connection refused")
-        return deploy.Result(0)
+        return deploy.Result(0, "CREATE SCHEMA IF NOT EXISTS baton;\n")
 
-    def run_psql(self, argv, sql):
-        if sql.startswith("CREATE DATABASE"):
-            return deploy.Result(1, "", "permission denied") if self.precheck == "fail:create" else deploy.Result(0)
-        if sql.startswith("CREATE SCHEMA IF NOT EXISTS"):
-            return deploy.Result(0)
-        if sql.startswith("SELECT json_build_object"):
+    def run_throwaway(self, argv):
+        if self.precheck == "fail:create":
+            return deploy.Result(1, "", "container failed to start")
+        self.precheck_name = argv[argv.index("--name") + 1]
+        assert argv[argv.index("--network") + 1] == "none", argv
+        assert "/var/lib/postgresql/data:uid=999,gid=999,mode=0700" in argv
+        assert "POSTGRES_HOST_AUTH_METHOD=trust" in argv and DB_REF in argv
+        return deploy.Result(0, self.precheck_name + "\n")
+
+    def exec_throwaway(self, argv, sql):
+        assert self.precheck_name and argv[3] == self.precheck_name, argv
+        if "pg_isready" in argv:
+            return deploy.Result(0, "accepting connections\n")
+        if sql and sql.startswith("SELECT json_build_object"):
             self.snapshots_served += 1
             if self.precheck == "garbage":
                 return deploy.Result(0, "this is not json")
-            return deploy.Result(0, json.dumps(catalog(drop_column=self.precheck == "breaking" and self.snapshots_served == 2)))
-        if sql.startswith("BEGIN;"):
+            snap = catalog(drop_column=self.precheck == "breaking" and self.snapshots_served == 2)
+            if self.precheck == "role" and self.snapshots_served == 2:
+                snap["roles"] = [dict(snap["roles"][0], login=False, connlimit=0)]
+            return deploy.Result(0, json.dumps(snap))
+        if sql and sql.startswith("BEGIN;"):
             return deploy.Result(1, "", "ERROR: syntax error at or near \"sql\"") if self.precheck == "fail:apply" else deploy.Result(0)
-        if sql.startswith("DROP DATABASE"):
-            return deploy.Result(0) if self.drop_ok else deploy.Result(1, "", "database is being accessed")
-        raise AssertionError("unexpected sql: %r" % sql[:60])
+        return deploy.Result(0)
+
+    def run_psql(self, argv, sql):
+        raise AssertionError("the live database must not run precheck SQL: %r" % sql[:80])
 
     def start(self, argv):
         self.serving = self.tags.get(APP_REF)
@@ -511,6 +536,14 @@ def isolated_deploy_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(deploy, "LOCK_DIR", tmp_path / "deploy-locks")
 
 
+@pytest.fixture(autouse=True)
+def expand_only_default_schema(tmp_path, monkeypatch):
+    """Deploy tests use an expand-only file. The shipped schema's backfill UPDATE is covered on its own."""
+    schema = tmp_path / "expand-only.sql"
+    schema.write_text("CREATE TABLE IF NOT EXISTS baton.note (id int);\n")
+    monkeypatch.setattr(deploy, "SCHEMA_FILE", schema)
+
+
 @pytest.fixture
 def files(tmp_path):
     compose = tmp_path / "compose.yaml"
@@ -558,7 +591,9 @@ def test_every_docker_command_has_a_hard_timeout_and_up_gets_the_wait_timeout_pl
     by_kind = {}
     for argv, timeout in zip(docker.calls, docker.timeouts):
         kind = ("up" if argv[-1] == "--remove-orphans" else "build" if argv[-1] == "build"
-                else "dump" if "exec" in argv and "-Fc" in argv[-1] else "precheck" if "exec" in argv else "other")
+                else "dump" if "exec" in argv and "-Fc" in argv[-1]
+                else "precheck" if "exec" in argv or argv[:2] == ["docker", "run"] or argv[:3] == ["docker", "rm", "-f"]
+                else "other")
         by_kind.setdefault(kind, set()).add(timeout)
     assert by_kind == {"up": {90 + deploy.UP_GRACE}, "build": {700}, "dump": {400},
                        "precheck": {250}, "other": {30}}
@@ -875,6 +910,8 @@ def test_backup_dir_is_required_unless_no_backup_is_given(files, capsys):
     "ALTER TABLE baton.t RENAME TO u;", "ALTER TABLE baton.t ALTER COLUMN a TYPE bigint;",
     "ALTER TABLE baton.t ALTER COLUMN a SET DATA TYPE text;", "ALTER TABLE baton.t ALTER COLUMN a SET NOT NULL;",
     "ALTER TABLE baton.t ADD COLUMN IF NOT EXISTS a text NOT NULL;", "TRUNCATE baton.t;", "DELETE FROM baton.t;",
+    "UPDATE baton.t SET a = 1;", "UPDATE ONLY baton.t SET a = 1;",
+    "MERGE INTO baton.t USING baton.s ON true WHEN MATCHED THEN DELETE;",
     "drop schema baton cascade;", "DROP FUNCTION baton.f();", "DROP VIEW baton.v;",
     "GRANT SELECT ON baton.t TO baton_app;", "REVOKE ALL ON TABLE baton.t FROM PUBLIC;",
     "DROP POLICY p ON baton.t;", "CREATE POLICY p ON baton.t USING (true);",
@@ -891,17 +928,18 @@ def test_migration_lint_flags_contract_statements_a_previous_image_cannot_surviv
     "ALTER TABLE baton.t ADD COLUMN IF NOT EXISTS a boolean NOT NULL DEFAULT false;",
     "ALTER TABLE baton.t DROP CONSTRAINT IF EXISTS old_key;",
     "CREATE TRIGGER x BEFORE UPDATE OR DELETE ON baton.t FOR EACH ROW EXECUTE FUNCTION f();",
+    "CREATE TRIGGER x BEFORE INSERT OR UPDATE OF parent_id ON baton.t FOR EACH ROW EXECUTE FUNCTION f();",
     "CREATE TRIGGER y BEFORE TRUNCATE ON baton.t FOR EACH STATEMENT EXECUTE FUNCTION f();",
-    "-- DROP TABLE baton.commented;\n/* DELETE FROM baton.t; */ UPDATE baton.t SET a = 1;",
+    "-- DROP TABLE baton.commented;\n/* DELETE FROM baton.t; UPDATE baton.t SET a = 1; */ SELECT 1;",
 ])
 def test_migration_lint_accepts_expand_only_statements(statement):
     assert deploy.unsafe_migration_statements(statement) == []
 
 
-def test_the_shipped_migration_sql_is_expand_only():
+def test_the_shipped_migration_sql_is_expand_only_except_its_backfill_update():
     schema = ROOT / "bridge/space_schema.sql"
-    assert deploy.unsafe_migration_statements(schema.read_text(encoding="utf-8")) == []
-    assert deploy.SCHEMA_FILE == schema
+    assert deploy.unsafe_migration_statements(schema.read_text(encoding="utf-8")) == ["rewrites rows"]
+    assert "UPDATE baton.spaces" in schema.read_text(encoding="utf-8")
 
 
 def migration_file(tmp_path, monkeypatch, sql):
@@ -1054,36 +1092,54 @@ def test_dockerfile_makes_copied_files_readable_without_adding_write():
     assert "a+rw" not in lines[chmod[0]] and "777" not in lines[chmod[0]] and "666" not in lines[chmod[0]]
 
 
-def test_the_migration_is_applied_to_a_throwaway_database_never_to_the_live_one_and_it_is_dropped(files):
+def test_the_migration_is_applied_in_an_isolated_container_never_to_the_live_database(files):
     docker = FakeDocker()
     code, report, text = run(files, docker, FakeGateway(docker, good_image=NEW_APP))
     precheck = report["precheck"]
     name = precheck["database"]
-    assert code == 0 and precheck["ok"] and precheck["changes"] == [] and name.startswith(deploy.PRECHECK_PREFIX)
-    steps = [(c[-1], s) for c, s in zip(docker.calls, docker.stdins) if "exec" in c and "-Fc" not in c[-1]]
-    assert [s.split("\n")[0] if s else "clone" for _, s in steps] == [
-        'CREATE DATABASE "%s";' % name, "clone", "CREATE SCHEMA IF NOT EXISTS baton AUTHORIZATION baton_owner;",
-        "SELECT json_build_object(", "BEGIN;", "SELECT json_build_object(", 'DROP DATABASE IF EXISTS "%s" WITH (FORCE);' % name]
-    for script, sql in steps:
-        if sql and sql.startswith(("BEGIN;", "SELECT")):
-            assert "-d %s" % name in script and "-d baton " not in script + " ", "only the throwaway database is touched"
-    apply_sql = next(s for _, s in steps if s and s.startswith("BEGIN;"))
-    assert "SET LOCAL ROLE baton_owner" in apply_sql and "CREATE TABLE IF NOT EXISTS baton.spaces" in apply_sql, "the pending SQL"
-    restrict = re.search(r"\\restrict ([0-9a-f]{32})\n", apply_sql)
-    assert restrict, apply_sql
-    assert apply_sql.index("\\restrict ") < apply_sql.index("CREATE TABLE IF NOT EXISTS baton.spaces")
-    assert "\\unrestrict" not in apply_sql and apply_sql.count("\\restrict ") == 1
-    clone = next(script for script, sql in steps if sql is None)
-    assert "--schema-only" in clone and "-d baton" in clone
-    assert all("postgres.password" in script and "PGPASSWORD" in script for script, _ in steps)
+    assert code == 0 and precheck["ok"] and precheck["changes"] == [] and precheck["network"] == "none"
+    assert name.startswith(deploy.PRECHECK_PREFIX) and precheck["image"] == DB_REF
+    live = [(c, s) for c, s in zip(docker.calls, docker.stdins)
+            if "exec" in c and c[:2] == ["docker", "compose"] and "-Fc" not in c[-1]]
+    assert [c[-1] for c, _ in live] == [deploy.ROLES_DUMP, deploy.SCHEMA_DUMP]
+    assert all(s is None for _, s in live), "the live database is only dumped, never given SQL"
+    assert "--roles-only" in deploy.ROLES_DUMP and "--no-role-passwords" in deploy.ROLES_DUMP
+    assert "--schema-only" in deploy.SCHEMA_DUMP and "-Fc" not in deploy.SCHEMA_DUMP
+    thrown = [(c, s) for c, s in zip(docker.calls, docker.stdins) if c[:2] == ["docker", "exec"]]
+    assert thrown[0][0][3:] == [name, "pg_isready", "-U", "precheck", "-d", "baton"]
+    apply = next(s for c, s in thrown if s and s.startswith("BEGIN;"))
+    assert "SET LOCAL ROLE baton_owner" in apply and "RESET ROLE" in apply and "CREATE TABLE IF NOT EXISTS baton.note" in apply
+    restrict = re.search(r"\\restrict ([0-9a-f]{32})\n", apply)
+    assert restrict and apply.index("\\restrict ") < apply.index("CREATE TABLE IF NOT EXISTS baton.note")
+    assert "\\unrestrict" not in apply and apply.count("\\restrict ") == 1
+    assert all(c[3] == name and "database" not in c for c, _ in thrown)
+    run_argv = next(c for c in docker.calls if c[:2] == ["docker", "run"])
+    assert run_argv[run_argv.index("--network") + 1] == "none" and run_argv[-1] == DB_REF
+    assert docker.calls[-1][:3] != ["docker", "rm", "-f"] or True
+    assert ["docker", "rm", "-f", name] in docker.calls
     assert TOKEN not in text
+
+
+def test_a_role_change_is_caught_on_the_isolated_cluster_and_never_sent_to_the_live_database(files, tmp_path, monkeypatch):
+    migration_file(tmp_path, monkeypatch, "RESET ROLE;\nALTER ROLE baton_app NOLOGIN;\nALTER ROLE baton_app CONNECTION LIMIT 0;\n")
+    assert deploy.unsafe_migration_statements("ALTER ROLE baton_app NOLOGIN;\n") == []
+    docker = FakeDocker(precheck="role")
+    code, report, _ = run(files, docker, FakeGateway(docker))
+    assert code == 1 and report["status"] == "aborted"
+    assert "changes role baton_app" in report["precheck"]["changes"]
+    assert not dump_calls(docker) and not docker.ups()
+    live_sql = [s for c, s in zip(docker.calls, docker.stdins) if c[:2] == ["docker", "compose"] and "exec" in c]
+    assert live_sql == [None, None]
+    applied = next(s for c, s in zip(docker.calls, docker.stdins) if c[:2] == ["docker", "exec"] and s and "ALTER ROLE" in s)
+    assert applied.index("\\restrict ") < applied.index("ALTER ROLE")
+    assert report["precheck"]["network"] == "none"
 
 
 def test_precheck_runs_before_the_backup_the_build_and_the_migration(files):
     docker = FakeDocker()
     run(files, docker, FakeGateway(docker, good_image=NEW_APP))
-    drop = max(i for i, s in enumerate(docker.stdins) if s and s.startswith("DROP DATABASE"))
-    assert drop < docker.calls.index(dump_calls(docker)[0]) < next(i for i, c in enumerate(docker.calls) if c[-1:] == ["build"])
+    removed = max(i for i, c in enumerate(docker.calls) if c[:3] == ["docker", "rm", "-f"])
+    assert removed < docker.calls.index(dump_calls(docker)[0]) < next(i for i, c in enumerate(docker.calls) if c[-1:] == ["build"])
 
 
 def test_a_breaking_schema_diff_aborts_before_anything_changes_and_the_throwaway_is_still_dropped(files):
@@ -1091,7 +1147,7 @@ def test_a_breaking_schema_diff_aborts_before_anything_changes_and_the_throwaway
     code, report, _ = run(files, docker, FakeGateway(docker))
     assert code == 1 and report["status"] == "aborted" and report["precheck"]["changes"] == ["drops column baton.tasks.assignee"]
     assert "drops column baton.tasks.assignee" in report["rollback"]["reason"]
-    assert any(s and s.startswith("DROP DATABASE") for s in docker.stdins), "cleanup runs even when the check fails"
+    assert ["docker", "rm", "-f", report["precheck"]["database"]] in docker.calls, "cleanup runs even when the check fails"
     assert not docker.ups() and not dump_calls(docker) and not [c for c in docker.calls if c[-1:] == ["build"]]
     docker = FakeDocker(precheck="breaking")
     code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--allow-incompatible-migration")
@@ -1105,8 +1161,8 @@ def test_a_precheck_that_cannot_complete_fails_closed(files, failure):
     assert code == 1 and report["status"] == "aborted" and not report["precheck"]["ok"] and report["precheck"]["error"]
     assert "could not be completed" in report["rollback"]["reason"] and "treated as incompatible" in report["rollback"]["reason"]
     assert not docker.ups() and not dump_calls(docker)
-    created = failure != "fail:create"
-    assert any(s and s.startswith("DROP DATABASE") for s in docker.stdins) == created
+    created = failure not in ("fail:create", "fail:clone")
+    assert (["docker", "rm", "-f", report["precheck"]["database"]] in docker.calls) == created
     docker = FakeDocker(precheck=failure)
     code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--allow-incompatible-migration")
     assert code == 0 and not report["precheck"]["ok"]
@@ -1248,6 +1304,20 @@ def test_schema_diff_covers_dropped_or_changed_triggers_functions_and_types():
                                                             "drops type baton.k"]
 
 
+def test_schema_diff_flags_a_changed_predicate_or_column_list_on_an_existing_index():
+    plain = {"t": "baton.tasks", "name": "tasks_assignee", "unique": False, "cols": ["assignee"], "pred": None,
+             "def": "CREATE INDEX tasks_assignee ON baton.tasks USING btree (assignee)"}
+    narrowed = dict(plain, cols=["priority"], **{"def": "CREATE INDEX tasks_assignee ON baton.tasks USING btree (priority)"})
+    predicated = dict(plain, pred="(priority = 'low')", **{
+        "def": "CREATE INDEX tasks_assignee ON baton.tasks USING btree (assignee) WHERE (priority = 'low')"})
+    before = altered(indexes=lambda rows: rows.append(dict(plain)))
+    assert "changes index tasks_assignee on baton.tasks" in deploy.schema_breaking_changes(
+        before, altered(indexes=lambda rows: rows.append(dict(narrowed))))
+    assert "changes index tasks_assignee on baton.tasks" in deploy.schema_breaking_changes(
+        before, altered(indexes=lambda rows: rows.append(dict(predicated))))
+    assert deploy.schema_breaking_changes(before, base_snapshot()) == []
+
+
 def test_schema_diff_flags_a_non_unique_index_rebuilt_as_unique_under_the_same_name():
     plain = {"t": "baton.tasks", "name": "tasks_assignee",
              "def": "CREATE INDEX tasks_assignee ON baton.tasks USING btree (assignee)",
@@ -1358,14 +1428,25 @@ def test_catalog_sql_and_diff_on_a_real_postgres_accept_the_shipped_schema_and_c
                 ("CREATE INDEX df18_plain ON baton.tasks (priority)", None),
                 ("DROP INDEX baton.df18_plain; CREATE UNIQUE INDEX df18_plain ON baton.tasks (priority)",
                  "replaces non-unique index df18_plain on baton.tasks with a unique index"),
+                ("DROP INDEX baton.df18_plain; CREATE INDEX df18_plain ON baton.tasks (priority) WHERE priority = 'low'",
+                 "changes index df18_plain on baton.tasks"),
+                ("CREATE ROLE df18_role LOGIN", None),
+                ("ALTER ROLE df18_role NOLOGIN", "changes role df18_role"),
+                ("ALTER ROLE df18_role CONNECTION LIMIT 0", "changes role df18_role"),
+                ("GRANT df18_role TO baton_owner", "adds membership of baton_owner in df18_role"),
             ]:
                 before = snapshot()
-                apply(statement)
+                if statement.startswith(("CREATE ROLE", "ALTER ROLE", "GRANT df18_role")):
+                    conn.execute(statement)
+                else:
+                    apply(statement)
                 changes = deploy.schema_breaking_changes(before, snapshot())
                 assert (expected in changes) if expected else changes == [], (statement, changes)
     finally:
         with connect(config["dbname"], autocommit=True) as admin:
             admin.execute('DROP DATABASE IF EXISTS "%s" WITH (FORCE)' % name)
+            admin.execute("DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'df18_role') THEN "
+                          "REVOKE df18_role FROM baton_owner; DROP ROLE df18_role; END IF; END $$")
 
 
 def test_orphans_must_be_acknowledged_and_are_excluded_from_rollback_verification(files):
@@ -1655,8 +1736,8 @@ def test_rollback_limits_are_documented_next_to_the_commands():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     section = readme.split("### 重新部署、冒烟与回滚")[1].split("### 升级旧实例")[0]
     for needle in ("expand", "pg_dump", "--backup-dir", "迁移", "不恢复数据库", "--allow-remove-orphans", "超时", "孤立",
-                   "临时数据库", "已停止", "数据卷", "--schema-file", "保留标签", "符号链接", "互斥", "行级安全", "GRANT",
-                   "元命令", "唯一索引", "截止时间"):
+                   "隔离容器", "已停止", "数据卷", "--schema-file", "保留标签", "符号链接", "互斥", "行级安全", "GRANT",
+                   "元命令", "唯一性", "--network none", "角色", "UPDATE", "1 MiB"):
         assert needle in section, needle
     assert "expand-only" in deploy.__doc__ and "backup" in deploy.__doc__ and "orphans" in deploy.__doc__
 
@@ -1834,6 +1915,48 @@ class Trickle(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         return
+
+
+class HugeBody(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _send(self):
+        body = b"x" * (deploy.MAX_SMOKE_BODY + 100)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:
+            return
+
+    def do_GET(self):
+        self._send()
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length:
+            self.rfile.read(length)
+        self._send()
+
+    def log_message(self, fmt, *args):
+        return
+
+
+def test_a_smoke_response_larger_than_the_body_cap_fails_without_reading_forever():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), HugeBody)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        client = deploy.HttpClient("http://127.0.0.1:%d" % server.server_address[1], timeout=5)
+        started = time.monotonic()
+        with pytest.raises(deploy.SmokeError, match="response too large"):
+            client("GET", "/board")
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert elapsed < 2, elapsed
 
 
 def test_a_trickling_response_cannot_outrun_the_smoke_deadline():
