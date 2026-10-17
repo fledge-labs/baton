@@ -32,6 +32,8 @@ DEFAULT_REQUEST_TIMEOUT = 30
 DEFAULT_WAIT_SECONDS = 25
 SCOPE_KINDS = ("path", "module", "migration")
 AGENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}")
+SUMMARY_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+SUMMARY_STATE_RE = re.compile(r"[a-z][a-z_]{0,31}")
 ERROR_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 
 
@@ -243,9 +245,11 @@ def uuid_csv(value):
 
 
 def scope_arg(value):
+    if value == "none":
+        return {"kind": "none"}
     kind, separator, scope = value.partition("=")
     if not separator or kind not in SCOPE_KINDS or not scope:
-        raise argparse.ArgumentTypeError("expected kind=value with kind one of " + "/".join(SCOPE_KINDS))
+        raise argparse.ArgumentTypeError("expected kind=value with kind one of " + "/".join(SCOPE_KINDS) + ", or none")
     return {"kind": kind, "value": scope}
 
 
@@ -317,8 +321,12 @@ def build_parser():
                     formatter_class=argparse.RawDescriptionHelpFormatter)
     subcommands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
 
-    def command(name, help_text, **kwargs):
+    def command(name, help_text, summary=None, **kwargs):
         sub = subcommands.add_parser(name, help=help_text, description=help_text, **kwargs)
+        if summary is not None:
+            sub.add_argument("--summary", action=argparse.BooleanOptionalAction, default=summary,
+                             help="print one 'task <id> state=<state> epoch=<n>' line to stderr "
+                                  "(default: %s)" % ("on" if summary else "off"))
         # Connection options are also accepted after the subcommand; SUPPRESS keeps
         # a value given before it (or its default) from being overwritten.
         for flag, dest in (("--url", "url"), ("--token-file", "token_file"), ("--ca-file", "ca_file"),
@@ -340,7 +348,7 @@ def build_parser():
                                                      **opt(a, limit="limit")}),
                      read_timeout=lambda a: a.timeout)
 
-    sub = command("task", "get_task: one task by id")
+    sub = command("task", "get_task: one task by id", summary=False)
     sub.add_argument("task_id", nargs="?", type=uuid_arg, metavar="TASK_ID")
     sub.add_argument("--task", dest="task_flag", type=uuid_arg)
     sub.set_defaults(build=build_task)
@@ -354,24 +362,25 @@ def build_parser():
     sub.add_argument("--limit", type=int)
     sub.set_defaults(build=lambda a: ("ready", opt(a, page_id="page", limit="limit")))
 
-    sub = command("submit", "submit_task: create a task")
+    sub = command("submit", "submit_task: create a task", summary=False)
     add_write_options(sub)
     sub.add_argument("--key", required=True, help="stable idempotency key")
     text_group(sub, "prompt", "prompt", "task instructions")
     sub.add_argument("--page", type=uuid_arg)
     sub.add_argument("--assignee", help="assignee principal (manual pull task)")
     sub.add_argument("--scope", action="append", type=scope_arg, metavar="KIND=VALUE",
-                     help="declared scope, repeatable; kind is path, module or migration")
+                     help="declared scope, repeatable; kind is path, module or migration; "
+                          "'none' declares no repository footprint and cannot be combined")
     sub.add_argument("--depends-on", action="extend", type=uuid_csv, metavar="TASK_ID[,TASK_ID]")
     sub.set_defaults(build=build_submit, write=True)
 
-    sub = command("claim", "claim: take a task lease")
+    sub = command("claim", "claim: take a task lease", summary=True)
     add_write_options(sub)
     sub.add_argument("--task", required=True, type=uuid_arg)
     sub.add_argument("--lease", type=int, metavar="SECONDS")
     sub.set_defaults(build=lambda a: ("claim", {"task_id": a.task, **opt(a, lease_seconds="lease")}), write=True)
 
-    sub = command("renew", "renew: extend a lease")
+    sub = command("renew", "renew: extend a lease", summary=True)
     add_write_options(sub)
     sub.add_argument("--task", required=True, type=uuid_arg)
     sub.add_argument("--epoch", required=True, type=int)
@@ -379,14 +388,14 @@ def build_parser():
     sub.set_defaults(build=lambda a: ("renew", {"task_id": a.task, "epoch": a.epoch,
                                                 **opt(a, lease_seconds="lease")}), write=True)
 
-    sub = command("comment", "comment: write to a page or task thread")
+    sub = command("comment", "comment: write to a page or task thread", summary=False)
     add_write_options(sub)
     sub.add_argument("--page", required=True, type=uuid_arg)
     sub.add_argument("--thread", type=uuid_arg, help="thread id (a task's thread id is its task id)")
     text_group(sub, "body", "body", "comment text")
     sub.set_defaults(build=build_comment, write=True)
 
-    sub = command("result", "submit_result: report a result for a claimed task")
+    sub = command("result", "submit_result: report a result for a claimed task", summary=True)
     add_write_options(sub)
     sub.add_argument("--task", required=True, type=uuid_arg)
     sub.add_argument("--epoch", required=True, type=int, help="epoch returned by claim")
@@ -394,7 +403,7 @@ def build_parser():
     sub.set_defaults(build=lambda a: ("submit_result", {"task_id": a.task, "epoch": a.epoch,
                                                         "result": text_value(a, "result")}), write=True)
 
-    sub = command("gate", "gate: review a submitted result")
+    sub = command("gate", "gate: review a submitted result", summary=True)
     add_write_options(sub)
     sub.add_argument("--task", required=True, type=uuid_arg)
     sub.add_argument("--epoch", required=True, type=int, help="epoch of the result under review")
@@ -408,7 +417,7 @@ def build_parser():
     sub.add_argument("--limit", type=int)
     sub.set_defaults(build=build_audit)
 
-    sub = command("call", "call any operation: call OPERATION --json '{...}'")
+    sub = command("call", "call any operation: call OPERATION --json '{...}'", summary=False)
     sub.add_argument("operation", type=operation_arg)
     group = sub.add_mutually_exclusive_group()
     group.add_argument("--json", dest="json_text", metavar="OBJECT", help="arguments as a JSON object")
@@ -440,6 +449,9 @@ def build_task(args):
 
 
 def build_submit(args):
+    scopes = args.scope or []
+    if any(scope["kind"] == "none" for scope in scopes) and any(scope["kind"] != "none" for scope in scopes):
+        raise UsageError("--scope none cannot be combined with other scopes")
     arguments = {"idempotency_key": args.key, "prompt": text_value(args, "prompt")}
     arguments.update(opt(args, page_id="page", assignee_principal="assignee", scopes="scope", depends_on="depends_on"))
     return "submit_task", arguments
@@ -474,6 +486,43 @@ def say(message):
     print("baton_cli: " + message, file=sys.stderr)
 
 
+def dump_json(value, **options):
+    """Serialize without \\uXXXX escapes while staying encodable as UTF-8."""
+    text = json.dumps(value, ensure_ascii=False, **options)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:  # a lone surrogate from a \\ud800-style escape cannot be written as UTF-8
+        text = json.dumps(value, ensure_ascii=True, **options)
+    return text
+
+
+def emit_json(value, **options):
+    data = (dump_json(value, **options) + "\n").encode("utf-8")
+    stream = getattr(sys.stdout, "buffer", None)
+    if stream is None:
+        sys.stdout.write(data.decode("utf-8"))
+        sys.stdout.flush()
+    else:
+        sys.stdout.flush()
+        stream.write(data)
+        stream.flush()
+
+
+def print_summary(result):
+    """One human-readable line on stderr; only well-formed fields are echoed."""
+    if not isinstance(result, dict):
+        return
+    task_id = result.get("task_id", result.get("id"))
+    state, epoch = result.get("state"), result.get("epoch")
+    if (not isinstance(task_id, str) or not SUMMARY_UUID_RE.fullmatch(task_id)
+            or not isinstance(state, str) or not SUMMARY_STATE_RE.fullmatch(state)):
+        return
+    line = "task " + task_id + " state=" + state
+    if type(epoch) is int:
+        line += " epoch=" + str(epoch)
+    print(line, file=sys.stderr, flush=True)
+
+
 def make_client(args):
     if not args.token_file:
         raise UsageError("missing --token-file (the token is only read from a file)")
@@ -502,7 +551,9 @@ def run_command(args):
     except (BatonError, NetworkError) as error:
         error.operation_id = arguments.get("operation_id")
         raise
-    print(json.dumps(result, indent=2))
+    emit_json(result, indent=2)
+    if getattr(args, "summary", False):
+        print_summary(result)
     return EXIT_OK
 
 
@@ -582,7 +633,7 @@ def run_watch(args):
         if not isinstance(notifications, list) or type(next_seq) is not int:
             raise BatonError("bad_response", 200)
         for notification in notifications:
-            print(json.dumps(notification, separators=(",", ":")), flush=True)
+            emit_json(notification, separators=(",", ":"))
         if next_seq > seq:
             # Persist only after the lines are out: a crash replays rather than loses.
             save_seq(path, next_seq)

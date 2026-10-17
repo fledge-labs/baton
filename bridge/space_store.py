@@ -157,10 +157,20 @@ def normalize_scopes(scopes):
         raise StoreError("invalid")
     result = []
     for scope in scopes:
-        if not isinstance(scope, dict) or set(scope) != {"kind", "value"}:
+        kind = scope.get("kind") if isinstance(scope, dict) else None
+        if not isinstance(kind, str) or kind not in {"path", "module", "migration", "none"}:
             raise StoreError("invalid")
-        kind, value = scope["kind"], scope["value"]
-        if not isinstance(kind, str) or kind not in {"path", "module", "migration"} or not isinstance(value, str) or len(value) > 240:
+        if scope["kind"] == "none":
+            if set(scope) != {"kind"}:
+                raise StoreError("invalid")
+            item = {"kind": "none"}
+            if item not in result:
+                result.append(item)
+            continue
+        if set(scope) != {"kind", "value"}:
+            raise StoreError("invalid")
+        value = scope["value"]
+        if not isinstance(value, str) or len(value) > 240:
             raise StoreError("invalid")
         if value.startswith("/") or not re.fullmatch(r"[A-Za-z0-9_./-]*", value) or ".." in value.split("/"):
             raise StoreError("invalid")
@@ -176,12 +186,31 @@ def normalize_scopes(scopes):
         item = {"kind": kind, "value": value}
         if item not in result:
             result.append(item)
-    return sorted(result, key=lambda item: (item["kind"], item["value"]))
+    if any(item["kind"] == "none" for item in result) and len(result) > 1:
+        raise StoreError("invalid")
+    return sorted(result, key=lambda item: (item["kind"], item.get("value", "")))
+
+
+def _stored_scopes(requested, normalized, manual):
+    """Scopes persisted for a task.
+
+    Omitted scopes (None) mean "no repository footprint" for manual tasks. Automatic
+    tasks execute code, so they keep the conservative root placeholder. The
+    request digest still hashes the legacy placeholder for omitted scopes, so
+    requests persisted before the "none" kind existed replay unchanged.
+    """
+    if manual and requested is None:
+        return [{"kind": "none"}]
+    return normalized
 
 
 def scopes_overlap(left, right):
     for a in left:
+        if a["kind"] == "none":
+            continue
         for b in right:
+            if b["kind"] == "none":
+                continue
             if "module" in {a["kind"], b["kind"]}:
                 return True  # No administrator module map exists in v1.
             if a["kind"] != b["kind"]:
@@ -197,6 +226,7 @@ WORK_FACE_LISTS = ("environment", "fixtures", "constraints")
 WORK_FACE_KEYS = frozenset((*WORK_FACE_LISTS, "migration", "acceptance_command"))
 TASK_KINDS = frozenset({"construction", "prep"})
 ROOT_SCOPES = [{"kind": "path", "value": ""}]
+NONE_SCOPES = [{"kind": "none"}]
 EXECUTION_FIELDS = ("dispatch_started_at", "result_epoch", "result", "result_author", "result_author_account", "a2a_id", "backend")
 
 
@@ -957,8 +987,8 @@ class SpaceStore:
         missing = []
         if not isinstance(task["base_commit"], str) or not task["base_commit"].strip():
             missing.append("base_commit")
-        # An omitted declaration is stored as the root placeholder, which is not a declared scope.
-        if not task["scopes"] or task["scopes"] == ROOT_SCOPES:
+        # Neither the root placeholder nor an explicit "none" is a declared repository scope.
+        if not task["scopes"] or task["scopes"] in (ROOT_SCOPES, NONE_SCOPES):
             missing.append("scopes")
         try:
             if task["work_face"] is None:
@@ -1212,6 +1242,7 @@ class SpaceStore:
         _identifier(idempotency_key)
         _text(prompt)
         normalized = normalize_scopes(scopes)
+        stored = _stored_scopes(scopes, normalized, manual=assignee is not None)
         dependencies = _dependency_ids(depends_on)
         face, require_work_face, task_kind = _work_face_request(work_face, require_work_face, task_kind)
         if assignee is not None and not isinstance(assignee, Actor):
@@ -1243,7 +1274,7 @@ class SpaceStore:
                     raise StoreError("operation_conflict")
                 return {**self._task_view(conn, actor, str(prior["id"])), "_business_replay": True}
             chosen = page_id or self._default_page(conn, actor, operation_id)
-            return self._new_task(conn, actor, operation_id, chosen, prompt, normalized, "manual" if assignee else "codex",
+            return self._new_task(conn, actor, operation_id, chosen, prompt, stored, "manual" if assignee else "codex",
                                   [actor.principal] if assignee else [], digest, idempotency_key=idempotency_key, assignee=assignee, depends_on=dependencies,
                                   work_face=face, require_work_face=require_work_face, task_kind=task_kind,
                                   priority=priority, escalate_to=escalate_to, fallback_assignee=fallback_assignee)
@@ -1256,6 +1287,7 @@ class SpaceStore:
                           priority="normal", escalate_to=None, fallback_assignee=None):
         _text(prompt)
         normalized = normalize_scopes(scopes)
+        stored = _stored_scopes(scopes, normalized, manual=True)
         dependencies = _dependency_ids(depends_on)
         face, require_work_face, task_kind = _work_face_request(work_face, require_work_face, task_kind)
         if not isinstance(reviewers, list) or not reviewers or len(reviewers) > 100:
@@ -1282,7 +1314,7 @@ class SpaceStore:
                 self._task_for(conn, actor, dependency)
         return self._mutate(actor, operation_id, "create_task_block", args,
                             authorize,
-                            lambda conn: self._new_task(conn, actor, operation_id, page_id, prompt, normalized, "manual", reviewers, digest,
+                            lambda conn: self._new_task(conn, actor, operation_id, page_id, prompt, stored, "manual", reviewers, digest,
                                                         base_commit=base_commit, context=context, evidence=evidence, assignee=assignee, depends_on=dependencies,
                                                         work_face=face, require_work_face=require_work_face, task_kind=task_kind,
                                                         priority=priority, escalate_to=escalate_to, fallback_assignee=fallback_assignee),

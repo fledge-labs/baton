@@ -61,7 +61,7 @@ with urlopen(request) as response:
 - `get_proposal(proposal_id: str)` — 读取。
 - `list_proposals(block_id: str)` — 读取。
 - `list_attribution(block_id: str)` — 读取。
-- `create_task_block(operation_id: str, page_id: str, prompt: str, scopes: list[dict], reviewers: list[str], base_commit: str | None = None, context: Any = None, evidence: Any = None, assignee_principal: str | None = None, depends_on: list[str] | None = None, work_face: dict | None = None, require_work_face: bool = False, task_kind: str = "construction")` — 写入。
+- `create_task_block(operation_id: str, page_id: str, prompt: str, reviewers: list[str], scopes: list[dict] | None = None, base_commit: str | None = None, context: Any = None, evidence: Any = None, assignee_principal: str | None = None, depends_on: list[str] | None = None, work_face: dict | None = None, require_work_face: bool = False, task_kind: str = "construction")` — 写入。
 - `submit_task(operation_id: str, idempotency_key: str, prompt: str, page_id: str | None = None, scopes: list[dict] | None = None, assignee_principal: str | None = None, depends_on: list[str] | None = None, work_face: dict | None = None, require_work_face: bool = False, task_kind: str = "construction")` — 写入。
 - `assign_task(operation_id: str, task_id: str, target_principal: str)` — 写入。
 - `plan(operation_id: str, graph: list[dict])` — 写入。
@@ -90,7 +90,7 @@ with urlopen(request) as response:
 
 `create_block.kind` 为 text/file/prompt/agent_instructions；手工任务必须通过 `create_task_block` 创建，不能用普通块绕过 gate。`content` 是 Baton 的 JSON 内容格式。更新和提案接受都检查 expected_revision。`proposal_review.decision` 为 accept/reject/revise；接受或修订以及 revert_block 需要 human 身份和当前 edit 权限。
 
-`scopes` 是 `[{"kind":"path","value":"src/component"}]` 形式的列表；kind 可为 path/module/migration。全部 Space 共享 global namespace。首版未建立可信仓库路径映射，因此 path/module 均保守占用仓库根；migration 使用规范化标识的精确相等检查。不能凭不同路径文本宣称可并行领取。`reviewers` 是获准审核该手工任务的 principal ID 列表；服务端还检查这些主体当前权限与独立账户边界。
+`scopes` 是 `[{"kind":"path","value":"src/component"}]` 形式的列表；kind 可为 path/module/migration/none。`{"kind":"none"}`（没有 `value`）表示任务不触碰任何仓库路径、模块或 migration：它不与任何 claim 冲突，不能与其他 scope 条目组合（否则 `422 invalid`）。省略 `scopes` 时：手工任务（`create_task_block`，以及带 `assignee_principal` 的 `submit_task`）默认存储 `[{"kind":"none"}]`；自动任务（不带 assignee 的 `submit_task`）会执行代码，仍存储保守的仓库根占位范围 `[{"kind":"path","value":""}]`。显式传 `[]` 保持旧行为，两类任务都存储仓库根占位范围。已存在的任务不会被改写；省略 `scopes` 的请求在计算幂等摘要时仍按旧的仓库根占位范围处理，因此已持久化的请求重放不受影响。`create_task_block` 的 `scopes` 现在可省略。全部 Space 共享 global namespace。首版未建立可信仓库路径映射，因此 path/module 均保守占用仓库根；migration 使用规范化标识的精确相等检查。不能凭不同路径文本宣称可并行领取。`reviewers` 是获准审核该手工任务的 principal ID 列表；服务端还检查这些主体当前权限与独立账户边界。
 
 `comment` 返回绑定 page/thread 的评论；`mention.target_type` 为 person/agent，target_id 始终是显式 principal。服务端从有效 registry 验证 person 对应 human、agent 对应 agent；connected account 不是人物收件地址。提及不会直接触发任意运行时执行；接收者在读取或行动时仍需当前权限。评论、提及和 assignments 存入 PostgreSQL；fetch_inbox 只读取发给当前主体且当前仍可访问的条目。返回的 requested_by、action_requested 以及每线程 requests 列表保留实际提及请求者，评论作者不会覆盖后来发起提及的人。
 
@@ -126,7 +126,7 @@ x_ready 让任务携带施工面清单，并可要求清单完整前不得领取
 
 `work_face` 的格式严格为 `{"environment":[str],"fixtures":[str],"constraints":[str],"migration":str|null,"acceptance_command":str}`：五个键都必须给出，不允许多余的键；三个列表各最多 20 项，每项去掉首尾空白后非空且不超过 500 字符；`acceptance_command` 去掉首尾空白后非空且不超过 2000 字符；`migration` 为 null 或非空且不超过 200 字符。违反格式返回 `422 invalid`。`create_task_block` 与 `submit_task` 可在创建时传入 `work_face`（默认 null）、`require_work_face`（默认 false）、`task_kind`（`construction` 默认，或 `prep`）；三者计入幂等请求摘要。已有任务按默认值处理，行为不变。
 
-`require_work_face=true` 的任务，只有 `base_commit` 非空、`scopes` 有声明（省略声明时的仓库根占位范围不算声明）且 `work_face` 非空并合法，清单才完整。task view 的 `work_face_missing` 列出缺失项（只会是 `base_commit`、`scopes`、`work_face`），不要求清单的任务恒为 `[]`。清单不完整时，`claim` 返回 `409 work_face_incomplete`（含重放路径），内部自动 `claim_next` 同样不会领取，`ready` 也不返回它。
+`require_work_face=true` 的任务，只有 `base_commit` 非空、`scopes` 有声明（省略声明时的仓库根占位范围和显式 `{"kind":"none"}` 都不算声明仓库范围，两者都会让 `work_face_missing` 保留 `scopes`）且 `work_face` 非空并合法，清单才完整。task view 的 `work_face_missing` 列出缺失项（只会是 `base_commit`、`scopes`、`work_face`），不要求清单的任务恒为 `[]`。清单不完整时，`claim` 返回 `409 work_face_incomplete`（含重放路径），内部自动 `claim_next` 同样不会领取，`ready` 也不返回它。
 
 准备任务复用 x_graph：让施工任务 `depends_on` 一个 `task_kind="prep"` 的任务即可。准备任务 done 并通过当前 epoch 的 gate 之前，施工任务按既有规则返回 `dependency_blocked`；之后才可能出现在 `ready` 中并被领取。
 

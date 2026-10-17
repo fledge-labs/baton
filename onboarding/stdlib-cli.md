@@ -59,7 +59,7 @@ openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/
 | `task` | `get_task` | `TASK_ID` 或 `--task` |
 | `tasks` | `list_tasks` | `--limit` |
 | `ready` | `ready` | `--page`、`--limit` |
-| `submit` | `submit_task` | `--key`，`--prompt` 或 `--prompt-file`，`--page`、`--assignee`、`--scope kind=value`（可重复，kind 为 path/module/migration）、`--depends-on`（可重复或逗号分隔） |
+| `submit` | `submit_task` | `--key`，`--prompt` 或 `--prompt-file`，`--page`、`--assignee`、`--scope kind=value`（可重复，kind 为 path/module/migration；`--scope none` 表示不触碰任何仓库路径，不能与其他 scope 组合）、`--depends-on`（可重复或逗号分隔） |
 | `claim` | `claim` | `--task`、`--lease` |
 | `renew` | `renew` | `--task`、`--epoch`、`--lease` |
 | `comment` | `comment` | `--page`、`--thread`、`--body` 或 `--body-file` |
@@ -71,6 +71,9 @@ openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/
 
 - 写操作（`submit`、`claim`、`renew`、`comment`、`result`、`gate`）自动生成 UUIDv4 `operation_id`，也可用 `--operation-id` 指定。读操作不发送 `operation_id`。`call` 不替你生成：写操作需要在 `--json` 里放 `operation_id`，或用 `--operation-id`。
 - `--prompt-file`、`--body-file`、`--result-file`、`--json-file` 传 `-` 表示读取 stdin。`--epoch` 在 `gate` 中对应 API 的 `expected_epoch`，即被审阅结果所属的 epoch。
+- stdout 始终是纯 JSON，并以 UTF-8 输出原文（`ensure_ascii=False`），中文不会被转义成 `\uXXXX`。
+- `claim`、`renew`、`result`、`gate` 默认再向 stderr 打印一行摘要，如 `task <id> state=claimed epoch=3`；用 `--no-summary` 关闭，`submit`、`task`、`comment`、`call` 可用 `--summary` 打开。stdout 不受影响。
+- 省略 scope 时，带 `--assignee` 的手工任务默认声明 `none`（不占用任何 scope，多个无文件足迹的审阅、文档任务可同时领取）；不带 `--assignee` 的自动任务仍使用保守的仓库根占位范围。
 - 写操作失败后，stderr 会多打一行 `operation_id=...`。网络中断后不知道操作是否生效时，用同一个 `--operation-id` 重试，服务端保证只产生一次效果；不要重新生成。
 
 ## 命名接收人流程：wait → claim → comment → result

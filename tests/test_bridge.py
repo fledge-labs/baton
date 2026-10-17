@@ -592,3 +592,24 @@ def test_set_work_face_is_published_through_schema_and_mcp_with_the_same_dispatc
     rejected, raw = mcp_call(client, tokens["owner"], "submit_task", {"idempotency_key": "mcp-extra", "prompt": "Extra", "unknown": 1}, 46)
     assert rejected is None and raw["content"][0]["text"].startswith("invalid")
     assert call("worker", "claim", operation_id=op(), task_id=submitted["task_id"])["state"] == "claimed"
+
+
+def test_none_scope_over_http_lets_footprintless_manual_tasks_be_claimed_together(api):
+    _, call, identities, _, _, _ = api
+    _, page = shared_page(call, identities)
+    reviewer = identities["reviewer"]["agent"]
+    first = call("owner", "create_task_block", operation_id=op(), page_id=page["id"], prompt="Review A",
+                 reviewers=[reviewer], assignee_principal=identities["worker"]["agent"])
+    second = call("owner", "submit_task", operation_id=op(), idempotency_key="none-http-" + uuid.uuid4().hex, prompt="Review B",
+                  page_id=page["id"], assignee_principal=identities["replacement"]["agent"])
+    explicit = call("owner", "create_task_block", operation_id=op(), page_id=page["id"], prompt="Review C",
+                    scopes=[{"kind": "none"}], reviewers=[reviewer])
+    for task in (first, second, explicit):
+        assert task["scopes"] == [{"kind": "none"}]
+        assert call("owner", "x_scope", task_id=task["task_id"])["scopes"] == [{"kind": "none"}]
+    assert call("worker", "claim", operation_id=op(), task_id=first["task_id"])["state"] == "claimed"
+    assert call("replacement", "claim", operation_id=op(), task_id=second["task_id"])["state"] == "claimed"
+    assert call("owner", "claim", operation_id=op(), task_id=explicit["task_id"])["state"] == "claimed"
+    for scopes in ([{"kind": "none"}, {"kind": "path", "value": "src"}], [{"kind": "none", "value": ""}]):
+        assert call("owner", "create_task_block", 422, operation_id=op(), page_id=page["id"], prompt="Bad",
+                    scopes=scopes, reviewers=[reviewer])["code"] == "invalid"
