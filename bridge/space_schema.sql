@@ -90,6 +90,9 @@ CREATE TABLE IF NOT EXISTS baton.tasks (
 );
 CREATE INDEX IF NOT EXISTS tasks_queue ON baton.tasks(execution_mode,state,created_at);
 ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS assignee text;
+ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS work_face jsonb;
+ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS require_work_face boolean NOT NULL DEFAULT false;
+ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS task_kind text NOT NULL DEFAULT 'construction' CHECK (task_kind IN ('construction','prep'));
 CREATE TABLE IF NOT EXISTS baton.task_dependencies (
     task_id uuid NOT NULL REFERENCES baton.tasks(id),
     depends_on uuid NOT NULL REFERENCES baton.tasks(id),

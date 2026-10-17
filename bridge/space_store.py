@@ -28,6 +28,7 @@ MESSAGES = {
     "stale_claim": "Claim is expired or superseded", "revision_conflict": "Revision has changed",
     "gate_required": "A valid gate decision is required", "storage_unavailable": "Space storage is unavailable",
     "dependency_blocked": "Task dependencies are not satisfied", "graph_cycle": "Task graph would contain a cycle",
+    "work_face_incomplete": "Task work face is incomplete",
 }
 
 
@@ -149,6 +150,57 @@ def scopes_overlap(left, right):
             if a["kind"] == "path" or a["value"] == b["value"]:
                 return True
     return False
+
+
+WORK_FACE_LISTS = ("environment", "fixtures", "constraints")
+WORK_FACE_KEYS = frozenset((*WORK_FACE_LISTS, "migration", "acceptance_command"))
+TASK_KINDS = frozenset({"construction", "prep"})
+ROOT_SCOPES = [{"kind": "path", "value": ""}]
+EXECUTION_FIELDS = ("dispatch_started_at", "result_epoch", "result", "result_author", "result_author_account", "a2a_id", "backend")
+
+
+def _trimmed(value, maximum):
+    if not isinstance(value, str) or "\x00" in value:
+        raise StoreError("invalid")
+    try:
+        value.encode()
+    except UnicodeEncodeError:
+        raise StoreError("invalid") from None
+    value = value.strip()
+    if not value or len(value) > maximum:
+        raise StoreError("invalid")
+    return value
+
+
+def normalize_work_face(value):
+    """Validate a work-face checklist and return its trimmed canonical form.
+
+    Baton stores the acceptance command as reviewer-facing text. It never runs it.
+    """
+    if not isinstance(value, dict) or set(value) != WORK_FACE_KEYS:
+        raise StoreError("invalid")
+    result = {}
+    for key in WORK_FACE_LISTS:
+        items = value[key]
+        if not isinstance(items, list) or len(items) > 20:
+            raise StoreError("invalid")
+        result[key] = [_trimmed(item, 500) for item in items]
+    result["migration"] = None if value["migration"] is None else _trimmed(value["migration"], 200)
+    result["acceptance_command"] = _trimmed(value["acceptance_command"], 2000)
+    return result
+
+
+def _task_kind(value):
+    if not isinstance(value, str) or value not in TASK_KINDS:
+        raise StoreError("invalid")
+    return value
+
+
+def _work_face_request(work_face, require_work_face, task_kind):
+    if type(require_work_face) is not bool:
+        raise StoreError("invalid")
+    face = None if work_face is None else normalize_work_face(work_face)
+    return face, require_work_face, _task_kind(task_kind)
 
 
 def _dependency_ids(values):
@@ -297,7 +349,7 @@ class SpaceStore:
     def _audit(conn, actor, operation_id, event, space_id=None, task_id=None, requested_by=None, **metadata):
         allowed = {"page_id", "block_id", "thread_id", "epoch", "revision", "proposal_id", "team_id", "subject_type",
                    "role", "decision", "backend", "a2a_task_id", "input_sha256", "output_sha256", "error_code",
-                   "count", "target_type", "execution_mode", "old_epoch"}
+                   "count", "target_type", "execution_mode", "old_epoch", "work_face_keys", "work_face_sha256"}
         if not set(metadata) <= allowed:
             raise StoreError("invalid")
         conn.execute("""INSERT INTO baton.x_audit(id,event,agent,actor_account,actor_kind,requested_by,performed_by,
@@ -324,7 +376,7 @@ class SpaceStore:
                 "mentions": "id comment_id target_type target_id action_requested requested_by created_at",
                 "proposals": "id block_id expected_revision proposed_content status revision",
                 "proposal_revisions": "proposal_id revision content author_principal",
-                "tasks": "id page_id block_id owner owner_account owner_kind assignee idempotency_key input_hash prompt execution_mode gate_mode reviewers scopes state epoch result_epoch result result_author result_author_account base_commit context evidence a2a_id backend dispatch_started_at error",
+                "tasks": "id page_id block_id owner owner_account owner_kind assignee idempotency_key input_hash prompt execution_mode gate_mode reviewers scopes state epoch result_epoch result result_author result_author_account base_commit context evidence a2a_id backend dispatch_started_at error work_face require_work_face task_kind",
                 "task_dependencies": "task_id depends_on created_at",
                 "x_claim": "task_id holder holder_account holder_kind epoch lease_expires_at scopes scope_repository",
                 "x_handoff": "task_id old_epoch new_epoch base_commit context evidence",
@@ -702,9 +754,33 @@ class SpaceStore:
         row["status"] = {"claimed": "working", "done": "completed"}.get(row["state"], row["state"])
         row.update(submission_mail_status="sent", mail_status="sent" if row["state"] == "done" else "not_ready", mail_error=None)
         row.update(submission_thread_status="sent", report_status="sent" if row["state"] == "done" else "not_ready")
+        row["work_face_missing"] = self._work_face_missing(row)
         authority = self._authorization_context(actor, row)
         row["depends_on"], row["has_hidden_dependencies"] = self._visible_dependencies(conn, authority, task_id)
         return row
+
+    @staticmethod
+    def _work_face_missing(task):
+        """Names of absent work-face parts; always empty unless the task requires a checklist."""
+        if not task["require_work_face"]:
+            return []
+        missing = []
+        if not isinstance(task["base_commit"], str) or not task["base_commit"].strip():
+            missing.append("base_commit")
+        # An omitted declaration is stored as the root placeholder, which is not a declared scope.
+        if not task["scopes"] or task["scopes"] == ROOT_SCOPES:
+            missing.append("scopes")
+        try:
+            if task["work_face"] is None:
+                raise StoreError("invalid")
+            normalize_work_face(task["work_face"])
+        except StoreError:
+            missing.append("work_face")
+        return missing
+
+    def _require_work_face(self, task):
+        if self._work_face_missing(task):
+            raise StoreError("work_face_incomplete")
 
     @staticmethod
     def _authorization_context(actor, task):
@@ -750,6 +826,11 @@ class SpaceStore:
         return blocked is None
 
     @staticmethod
+    def _require_unstarted(task):
+        if task["state"] != "queued" or task["epoch"] != 0 or any(task[field] is not None for field in EXECUTION_FIELDS):
+            raise StoreError("stale_claim")
+
+    @staticmethod
     def _add_dependencies(conn, task_id, dependencies):
         if task_id in dependencies:
             raise StoreError("graph_cycle")
@@ -783,9 +864,7 @@ class SpaceStore:
             tasks = {}
             for entry in entries:
                 task = self._row(conn, "tasks", entry["task_id"])
-                execution_fields = ("dispatch_started_at", "result_epoch", "result", "result_author", "result_author_account", "a2a_id", "backend")
-                if task["state"] != "queued" or task["epoch"] != 0 or any(task[field] is not None for field in execution_fields):
-                    raise StoreError("stale_claim")
+                self._require_unstarted(task)
                 tasks[entry["task_id"]] = task
             additions = {entry["task_id"]: self._add_dependencies(conn, entry["task_id"], entry["depends_on"]) for entry in entries}
             for entry in entries:
@@ -822,7 +901,7 @@ class SpaceStore:
                     if exc.code == "forbidden":
                         continue
                     raise
-                if not satisfied:
+                if not satisfied or view["work_face_missing"]:
                     continue
                 if any(scopes_overlap(task["scopes"], scopes) for scopes in live_scopes):
                     continue
@@ -831,6 +910,38 @@ class SpaceStore:
                     break
             return result
         return self._read(actor, read)
+
+    @staticmethod
+    def _holds_prep_for(conn, actor, task_id):
+        return conn.execute("""SELECT 1 FROM baton.task_dependencies e JOIN baton.tasks p ON p.id=e.depends_on
+            JOIN baton.x_claim c ON c.task_id=p.id
+            WHERE e.task_id=%s AND p.task_kind='prep' AND p.state='claimed' AND c.epoch=p.epoch
+            AND c.holder=%s AND c.holder_account=%s AND c.holder_kind=%s AND c.lease_expires_at>clock_timestamp() LIMIT 1""",
+            (task_id, actor.principal, actor.account, actor.kind)).fetchone() is not None
+
+    def set_work_face(self, actor, operation_id, task_id, work_face, base_commit=None):
+        face = normalize_work_face(work_face)
+        if base_commit is not None:
+            _text(base_commit, 200)
+        def authorize(conn):
+            task = self._task_for(conn, actor, task_id, "edit")
+            if (task["owner"] == actor.principal and task["owner_account"] == actor.account) or actor.principal in task["reviewers"]:
+                return
+            if not self._holds_prep_for(conn, actor, task_id):
+                raise StoreError("forbidden")
+        def view(conn):
+            return self._task_view(conn, actor, task_id)
+        def effect(conn):
+            task = self._row(conn, "tasks", task_id)
+            self._require_unstarted(task)
+            if base_commit is not None and task["base_commit"] is not None and task["base_commit"] != base_commit:
+                raise StoreError("operation_conflict")
+            conn.execute("UPDATE baton.tasks SET work_face=%s,base_commit=COALESCE(base_commit,%s) WHERE id=%s", (Jsonb(face), base_commit, task_id))
+            self._task_audit(conn, actor, operation_id, "task.work_face_set", task, work_face_keys=sorted(face),
+                             work_face_sha256=hashlib.sha256(_canonical(face).encode()).hexdigest())
+            return view(conn)
+        return self._mutate(actor, operation_id, "set_work_face", {"task_id": task_id, "work_face": face, "base_commit": base_commit},
+                            authorize, effect, lambda conn, old: view(conn))
 
     def _task_audit(self, conn, actor, operation_id, event, task, **metadata):
         page = self._row(conn, "pages", str(task["page_id"]))
@@ -858,7 +969,8 @@ class SpaceStore:
         return str(page_id)
 
     def _new_task(self, conn, actor, operation_id, page_id, prompt, scopes, mode, reviewers,
-                  input_hash, idempotency_key=None, base_commit=None, context=None, evidence=None, assignee=None, depends_on=None):
+                  input_hash, idempotency_key=None, base_commit=None, context=None, evidence=None, assignee=None, depends_on=None,
+                  work_face=None, require_work_face=False, task_kind="construction"):
         if assignee is not None:
             if not isinstance(assignee, Actor):
                 raise StoreError("invalid")
@@ -872,11 +984,12 @@ class SpaceStore:
         self._revision(conn, actor, operation_id, block, content)
         conn.execute("UPDATE baton.pages SET revision=revision+1 WHERE id=%s", (page_id,))
         task = conn.execute("""INSERT INTO baton.tasks(id,page_id,block_id,owner,owner_account,owner_kind,assignee,idempotency_key,input_hash,prompt,
-            execution_mode,gate_mode,reviewers,scopes,base_commit,context,evidence)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
+            execution_mode,gate_mode,reviewers,scopes,base_commit,context,evidence,work_face,require_work_face,task_kind)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
             (task_id, page_id, block_id, actor.principal, actor.account, actor.kind, assignee.principal if assignee else None,
              idempotency_key, input_hash, prompt, mode, "worker_success" if mode == "codex" else "reviewer", Jsonb(reviewers),
-             Jsonb(scopes), base_commit, Jsonb(_items(context)), Jsonb(_items(evidence)))).fetchone()
+             Jsonb(scopes), base_commit, Jsonb(_items(context)), Jsonb(_items(evidence)),
+             None if work_face is None else Jsonb(work_face), require_work_face, task_kind)).fetchone()
         dependency_count = self._add_dependencies(conn, str(task_id), depends_on or [])
         self._require_acyclic(conn, str(task_id))
         self._task_audit(conn, actor, operation_id, "task.submitted", task, input_sha256=hashlib.sha256(prompt.encode()).hexdigest(), execution_mode=mode)
@@ -887,11 +1000,25 @@ class SpaceStore:
             self._task_audit(conn, actor, operation_id, "task.assigned", task)
         return self._task_view(conn, actor, str(task_id))
 
-    def submit_task(self, actor, operation_id, idempotency_key, prompt, page_id=None, scopes=None, assignee=None, depends_on=None):
+    @staticmethod
+    def _work_face_args(work_face, require_work_face, task_kind):
+        # Defaults are omitted so digests already persisted for older requests stay valid.
+        args = {}
+        if work_face is not None:
+            args["work_face"] = work_face
+        if require_work_face:
+            args["require_work_face"] = True
+        if task_kind != "construction":
+            args["task_kind"] = task_kind
+        return args
+
+    def submit_task(self, actor, operation_id, idempotency_key, prompt, page_id=None, scopes=None, assignee=None, depends_on=None,
+                    work_face=None, require_work_face=False, task_kind="construction"):
         _identifier(idempotency_key)
         _text(prompt)
         normalized = normalize_scopes(scopes)
         dependencies = _dependency_ids(depends_on)
+        face, require_work_face, task_kind = _work_face_request(work_face, require_work_face, task_kind)
         if assignee is not None and not isinstance(assignee, Actor):
             raise StoreError("invalid")
         if assignee is not None and assignee.principal == actor.principal:
@@ -901,6 +1028,7 @@ class SpaceStore:
         # Preserve v1 hashes for already-persisted submissions without dependencies.
         if dependencies:
             args["depends_on"] = dependencies
+        args.update(self._work_face_args(face, require_work_face, task_kind))
         digest = hashlib.sha256(_canonical(args).encode()).hexdigest()
         def authorize(conn):
             self._user(actor)
@@ -919,15 +1047,18 @@ class SpaceStore:
                 return {**self._task_view(conn, actor, str(prior["id"])), "_business_replay": True}
             chosen = page_id or self._default_page(conn, actor, operation_id)
             return self._new_task(conn, actor, operation_id, chosen, prompt, normalized, "manual" if assignee else "codex",
-                                  [actor.principal] if assignee else [], digest, idempotency_key=idempotency_key, assignee=assignee, depends_on=dependencies)
+                                  [actor.principal] if assignee else [], digest, idempotency_key=idempotency_key, assignee=assignee, depends_on=dependencies,
+                                  work_face=face, require_work_face=require_work_face, task_kind=task_kind)
         def replay(conn, old):
             return self._task_view(conn, actor, old["task_id"])
         return self._mutate(actor, operation_id, "submit_task", args, authorize, effect, replay)
 
-    def create_task_block(self, actor, operation_id, page_id, prompt, scopes, reviewers, base_commit=None, context=None, evidence=None, assignee=None, depends_on=None):
+    def create_task_block(self, actor, operation_id, page_id, prompt, scopes, reviewers, base_commit=None, context=None, evidence=None, assignee=None, depends_on=None,
+                          work_face=None, require_work_face=False, task_kind="construction"):
         _text(prompt)
         normalized = normalize_scopes(scopes)
         dependencies = _dependency_ids(depends_on)
+        face, require_work_face, task_kind = _work_face_request(work_face, require_work_face, task_kind)
         if not isinstance(reviewers, list) or not reviewers or len(reviewers) > 100:
             raise StoreError("invalid")
         for reviewer in reviewers:
@@ -942,6 +1073,7 @@ class SpaceStore:
                 "base_commit": base_commit, "context": context, "evidence": evidence, "assignee": asdict(assignee) if assignee else None}
         if dependencies:
             args["depends_on"] = dependencies
+        args.update(self._work_face_args(face, require_work_face, task_kind))
         digest = hashlib.sha256(_canonical(args).encode()).hexdigest()
         def authorize(conn):
             self._require(conn, actor, "page", page_id, "edit")
@@ -950,7 +1082,8 @@ class SpaceStore:
         return self._mutate(actor, operation_id, "create_task_block", args,
                             authorize,
                             lambda conn: self._new_task(conn, actor, operation_id, page_id, prompt, normalized, "manual", reviewers, digest,
-                                                        base_commit=base_commit, context=context, evidence=evidence, assignee=assignee, depends_on=dependencies),
+                                                        base_commit=base_commit, context=context, evidence=evidence, assignee=assignee, depends_on=dependencies,
+                                                        work_face=face, require_work_face=require_work_face, task_kind=task_kind),
                             lambda conn, old: self._task_view(conn, actor, old["task_id"]))
 
     def get_task(self, actor, task_id):
@@ -1018,6 +1151,7 @@ class SpaceStore:
             raise StoreError("scope_conflict")
         if not self._dependencies_satisfied(conn, actor, str(task["id"])):
             raise StoreError("dependency_blocked")
+        self._require_work_face(task)
         for other in conn.execute("SELECT scopes FROM baton.x_claim WHERE lease_expires_at>clock_timestamp()"):
             if scopes_overlap(task["scopes"], other["scopes"]):
                 raise StoreError("scope_conflict")
@@ -1043,6 +1177,7 @@ class SpaceStore:
             self._live(conn, actor, task_id, old["epoch"])
             if not self._dependencies_satisfied(conn, actor, task_id):
                 raise StoreError("dependency_blocked")
+            self._require_work_face(self._row(conn, "tasks", task_id))
             return self._task_view(conn, actor, task_id, include_prompt=True)
         return self._mutate(actor, operation_id, "claim", {"task_id": task_id, "lease_seconds": lease_seconds}, authorize, effect, replay)
 
@@ -1058,7 +1193,7 @@ class SpaceStore:
                     if exc.code == "forbidden":
                         continue
                     raise
-                if not satisfied:
+                if not satisfied or self._work_face_missing(task):
                     continue
                 conflicts = any(scopes_overlap(task["scopes"], row["scopes"]) for row in conn.execute("SELECT scopes FROM baton.x_claim WHERE lease_expires_at>clock_timestamp()"))
                 if not conflicts:
@@ -1070,6 +1205,7 @@ class SpaceStore:
                 self._live(conn, actor, old["task_id"], old["epoch"])
                 if not self._dependencies_satisfied(conn, actor, old["task_id"]):
                     raise StoreError("dependency_blocked")
+                self._require_work_face(self._row(conn, "tasks", old["task_id"]))
                 return self._task_view(conn, actor, old["task_id"], include_prompt=True)
         return self._mutate(actor, operation_id, "claim_next", {"lease_seconds": lease_seconds}, lambda conn: self._service(actor), effect, replay)
 

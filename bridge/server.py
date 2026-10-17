@@ -44,6 +44,7 @@ ERRORS = {
     "gate_required": (409, "Required gate has not passed"),
     "dependency_blocked": (409, "Task dependencies are not complete"),
     "graph_cycle": (409, "Dependency graph contains a cycle"),
+    "work_face_incomplete": (409, "Task work face is incomplete"),
     "storage_unavailable": (503, "Storage is unavailable"),
 }
 
@@ -65,7 +66,8 @@ class SafeFastMCP(FastMCP):
             if canonical not in PUBLIC_OPERATIONS:
                 raise BridgeError("invalid")
             if name in {"submit_task", "get_task", "list_tasks", "fetch_inbox"}:
-                allowed = {"submit_task": {"idempotency_key", "prompt", "page_id", "scopes", "assignee_principal", "depends_on"}, "get_task": {"task_id"},
+                allowed = {"submit_task": {"idempotency_key", "prompt", "page_id", "scopes", "assignee_principal", "depends_on",
+                                           "work_face", "require_work_face", "task_kind"}, "get_task": {"task_id"},
                            "list_tasks": set(), "fetch_inbox": set()}[name]
                 if not isinstance(arguments, dict) or set(arguments) - allowed:
                     raise BridgeError("invalid")
@@ -126,10 +128,13 @@ PUBLIC_OPERATIONS = {
     "get_proposal": (False, {"proposal_id": (str, ...)}),
     "list_proposals": (False, {"block_id": (str, ...)}),
     "list_attribution": (False, {"block_id": (str, ...)}),
-    "create_task_block": (True, {"page_id": (str, ...), "prompt": (str, ...), "scopes": (list[dict], ...), "reviewers": (list[str], ...), "base_commit": (str | None, None), "context": (Any, None), "evidence": (Any, None), "assignee_principal": (str | None, None), "depends_on": (list[str] | None, None)}),
-    "submit_task": (True, {"idempotency_key": (str, ...), "prompt": (str, ...), "page_id": (str | None, None), "scopes": (list[dict] | None, None), "assignee_principal": (str | None, None), "depends_on": (list[str] | None, None)}),
+    "create_task_block": (True, {"page_id": (str, ...), "prompt": (str, ...), "scopes": (list[dict], ...), "reviewers": (list[str], ...), "base_commit": (str | None, None), "context": (Any, None), "evidence": (Any, None), "assignee_principal": (str | None, None), "depends_on": (list[str] | None, None),
+                          "work_face": (dict[str, Any] | None, None), "require_work_face": (bool, False), "task_kind": (str, "construction")}),
+    "submit_task": (True, {"idempotency_key": (str, ...), "prompt": (str, ...), "page_id": (str | None, None), "scopes": (list[dict] | None, None), "assignee_principal": (str | None, None), "depends_on": (list[str] | None, None),
+                    "work_face": (dict[str, Any] | None, None), "require_work_face": (bool, False), "task_kind": (str, "construction")}),
     "assign_task": (True, {"task_id": (str, ...), "target_principal": (str, ...)}),
     "plan": (True, {"graph": (list[GraphEntry], ...)}),
+    "set_work_face": (True, {"task_id": (str, ...), "work_face": (dict[str, Any], ...), "base_commit": (str | None, None)}),
     "ready": (False, {"page_id": (str | None, None), "limit": (int, 50)}),
     "get_task": (False, {"task_id": (str, ...)}),
     "list_tasks": (False, {"limit": (int, 50)}),
@@ -237,7 +242,7 @@ async def invoke(operation, payload, request):
         if not result.get("replay"):
             audit("thread.submitted", task_id=result.get("task_id", result.get("id")),
                   thread_id=result.get("thread_id"), agent=actor.principal)
-    if operation in {"get_task", "submit_task", "create_task_block", "assign_task", "claim", "renew", "handoff", "submit_result", "gate"}:
+    if operation in {"get_task", "submit_task", "create_task_block", "assign_task", "set_work_face", "claim", "renew", "handoff", "submit_result", "gate"}:
         return public_task(result)
     if operation in {"list_tasks", "ready"}:
         return [public_task(row) for row in result]
@@ -247,14 +252,16 @@ async def invoke(operation, payload, request):
 @mcp.tool()
 async def submit_task(idempotency_key: str, prompt: str, ctx: Context, page_id: str | None = None,
                       scopes: list[dict] | None = None, assignee_principal: str | None = None,
-                      depends_on: list[str] | None = None) -> dict:
+                      depends_on: list[str] | None = None, work_face: dict[str, Any] | None = None,
+                      require_work_face: bool = False, task_kind: str = "construction") -> dict:
     """Submit a task; a named assignee uses the manual claim/review path. Reuse keys on retry."""
     request = ctx.request_context.request
     actor = request_actor(request)
     operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "baton/submit_task/" + actor.principal + "/" + idempotency_key))
     return await invoke("submit_task", {"operation_id": operation_id, "idempotency_key": idempotency_key,
                         "prompt": prompt, "page_id": page_id, "scopes": scopes,
-                        "assignee_principal": assignee_principal, "depends_on": depends_on}, request)
+                        "assignee_principal": assignee_principal, "depends_on": depends_on,
+                        "work_face": work_face, "require_work_face": require_work_face, "task_kind": task_kind}, request)
 
 
 @mcp.tool()
