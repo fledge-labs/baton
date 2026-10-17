@@ -339,7 +339,7 @@ MCP 与适配器：`submit_task` 工具和 `create_task_block` 带上述三个�
 
 ## A2A v1.0 公共端点（W2-1）
 
-Baton 在 MCP 与 `/v1/space/*` 之外提供标准 A2A v1.0 接口（JSON-RPC 绑定）。它与 bridge→worker 的内部 A2A 路径（`/a2a/codex`）无关，也不改动那条路径。设计依据见 `docs/design/space-replica.md` 的 “A2A”，行为契约见 `docs/spec/space.md` 的 X26。
+Baton 在 MCP 与 `/v1/space/*` 之外提供标准 A2A v1.0 接口（JSON-RPC 绑定）。它面向外部 agent。设计依据见 `docs/design/space-replica.md` 的 “A2A”，行为契约见 `docs/spec/space.md` 的 X26。
 
 | 端点 | 认证 | 说明 |
 | --- | --- | --- |
@@ -384,17 +384,17 @@ docker compose exec bridge python -m bridge.a2a_public init-keys
 | `input_required` | `TASK_STATE_INPUT_REQUIRED` | `awaiting_gate`（等待审批），或 `queued` 且被 `mark_blocked` 标为 `waiting_input` |
 | `auth_required` | `TASK_STATE_AUTH_REQUIRED` | 暂无产生者（保留在映射里） |
 | `completed` | `TASK_STATE_COMPLETED` | `done` |
-| `failed` | `TASK_STATE_FAILED` | `failed`；`interrupted`（自动任务派发结果未知，是死端）也读作 failed |
+| `failed` | `TASK_STATE_FAILED` | `failed`；`interrupted`（任务存储里没有出口的死端）也读作 failed |
 | `canceled` | `TASK_STATE_CANCELED` | `CancelTask`（见下） |
 | `rejected` | `TASK_STATE_REJECTED` | 暂无产生者（表 `baton.x_a2a_task_state` 已能记录） |
 
-**GetTask / CancelTask / 流。** `GetTask {"id","historyLength"?}` 需要任务的 view 权限，否则 `-32001`（与不存在无法区分）。`CancelTask {"id"}` 只允许任务的提交者（owner）或其配置的 reviewer，且需页面 edit 权限；它在 `baton.x_a2a_task_state` 追加一条 `canceled`（只追加，触发器拒绝改删）、立即释放该任务 claim 的 scope 保留、并在线程里写一条 `[canceled]` 评论通知被派者。取消后所有公开接口（HTTP 与 MCP 的 `claim`、`renew`、`handoff`、`submit_result`、`gate`、`assign_task`）对该任务返回 `409 task_canceled`（看不到该任务的人仍得到 404）。已终止的任务、已取消的任务、自动（codex）任务不可取消，返回 `-32002`。`SendStreamingMessage` 先完成与 `SendMessage` 相同的创建/追加，然后以 `text/event-stream` 返回；`SubscribeToTask` 对未终止的任务重新接入同一个流。每个 SSE 事件是 `data: {"jsonrpc":"2.0","id":<请求 id>,"result":<StreamResponse>}`：先是当前 `task`，之后有新评论就推 `message`，Baton 状态变化就推 `statusUpdate`（`metadata.baton` 带精确状态）。流在终止状态、或新进入中断状态（`input_required` 等，发完最后一条更新）、或最长 300 秒后结束，每 15 秒无事件发一行 `: keepalive`；从中断状态开始的订阅会一直持续到状态变化。当前以 1 秒为间隔轮询存储（MCP/A2A 推送和 outbox 唤醒是后续工作）；失去 view 权限时推一条错误事件并结束。
+**GetTask / CancelTask / 流。** `GetTask {"id","historyLength"?}` 需要任务的 view 权限，否则 `-32001`（与不存在无法区分）。`CancelTask {"id"}` 只允许任务的提交者（owner）或其配置的 reviewer，且需页面 edit 权限；它在 `baton.x_a2a_task_state` 追加一条 `canceled`（只追加，触发器拒绝改删）、立即释放该任务 claim 的 scope 保留、并在线程里写一条 `[canceled]` 评论通知被派者。取消后所有公开接口（HTTP 与 MCP 的 `claim`、`renew`、`handoff`、`submit_result`、`gate`、`assign_task`）对该任务返回 `409 task_canceled`（看不到该任务的人仍得到 404）。已终止的任务、已取消的任务，以及没有被派给 agent 的任务不可取消，返回 `-32002`。`SendStreamingMessage` 先完成与 `SendMessage` 相同的创建/追加，然后以 `text/event-stream` 返回；`SubscribeToTask` 对未终止的任务重新接入同一个流。每个 SSE 事件是 `data: {"jsonrpc":"2.0","id":<请求 id>,"result":<StreamResponse>}`：先是当前 `task`，之后有新评论就推 `message`，Baton 状态变化就推 `statusUpdate`（`metadata.baton` 带精确状态）。流在终止状态、或新进入中断状态（`input_required` 等，发完最后一条更新）、或最长 300 秒后结束，每 15 秒无事件发一行 `: keepalive`；从中断状态开始的订阅会一直持续到状态变化。当前以 1 秒为间隔轮询存储（MCP/A2A 推送和 outbox 唤醒是后续工作）；失去 view 权限时推一条错误事件并结束。
 
 **其他方法与版本。** v0.3 方法名（`message/send`、`message/stream`、`tasks/get`、`tasks/cancel`、`tasks/resubscribe` 等）一律返回 `-32009`（`VersionNotSupportedError`），消息写明 v1.0 的替代名；`A2A-Version` 头给出且主次版本不是 `1.0` 时同样 `-32009`（头缺省按 v1.0 处理，因为方法名已能区分版本）。推送配置四个方法返回 `-32003`；`ListTasks`、`GetExtendedAgentCard` 返回 `-32004`；未知方法 `-32601`；坏 JSON `-32700`；不合法的请求（含批量数组、超过 256 KiB）`-32600`。错误体带 `google.rpc.ErrorInfo`（`domain: a2a-protocol.org`，`reason` 为稳定的大写代码），参数错误另带 `BadRequest.fieldViolations`；没有权限是 `-32000`（`PERMISSION_DENIED`），状态冲突同为 `-32000`（`reason` 为 Baton 错误码的大写形式），存储不可用 `-32603`。错误文本是固定的，不回显请求内容。
 
 **审计。** 每个任务相关的 A2A 调用都在 `baton.x_audit` 追加一行，`agent`、`actor_account`、`actor_kind` 是 bearer token 对应的真实调用者：`a2a.message_sent`（`outcome`: `task_created`、`comment_appended`、`replayed`；`input_sha256` 是正文哈希，不存正文）、`a2a.task_streamed`、`a2a.task_read`、`a2a.task_canceled`、`a2a.refused`（无工作对象或无权取消；无工作对象的没有 task_id）。元数据只含方法名、结果、`a2a_version`、`a2a_state` 和请求 id（`X-Request-ID` 为 UUID 时）。对调用者不可见的任务不留下审计行（不泄漏存在性）。这些行在 `list_audit` 里与其他任务事件一起可读。
 
-**部署路由。** agentgateway 的 `baton-space` 路由增加精确路径 `/a2a/rpc` 与 `/a2a/agents`（client 角色，与 `/v1/space/` 相同的 ACL），新增 `baton-a2a-public` 路由承接两个公开文档（apiKey `optional`，无授权规则）；它们按精确路径优先于 `codex-a2a` 的 `/a2a/` 前缀（已用 agentgateway v1.6.0 实测）。`/.well-known/agent-card.json` 原先由 `codex-a2a` 路由转给 worker（需要 dispatcher 身份），现在由 Baton 自己的卡片占用该路径；worker 的 `/a2a/codex` 路由与 dispatcher ACL 不变，bridge 到 worker 的派发不使用那张卡片。nginx 为两个公开文档单独设置 location：保留 `nosniff`（TLS 版也保留 HSTS），不再附加服务级的 `Cache-Control: no-store`，使 bridge 给出的缓存头生效；SSE 沿用已有的 `proxy_buffering off` 与 370 秒读超时。
+**部署路由。** agentgateway 的 `baton-space` 路由增加精确路径 `/a2a/rpc` 与 `/a2a/agents`（client 角色，与 `/v1/space/` 相同的 ACL），新增 `baton-a2a-public` 路由承接两个公开文档（apiKey `optional`，无授权规则）；公开路由排在路由表最前，使 `/.well-known/agent-card.json` 解析到 Baton 自己的卡片（已用 agentgateway v1.6.0 实测，测试固定了这个顺序）；`/a2a/rpc` 与 `/a2a/agents` 是精确路径。nginx 为两个公开文档单独设置 location：保留 `nosniff`（TLS 版也保留 HSTS），不再附加服务级的 `Cache-Control: no-store`，使 bridge 给出的缓存头生效；SSE 沿用已有的 `proxy_buffering off` 与 370 秒读超时。
 
 ## MCP 兼容与发现
 

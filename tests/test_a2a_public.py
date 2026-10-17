@@ -429,7 +429,7 @@ def test_state_mapping_table_is_a_bijection_onto_the_a2a_states():
     assert set(a2a_public.STORE_TO_BATON.values()) <= set(a2a_public.BATON_TO_A2A)
 
 
-def test_get_task_projects_every_baton_state_and_reverses_exactly(a2a, pg_store, modules):
+def test_get_task_projects_every_baton_state_and_reverses_exactly(a2a, pg_store):
     client, call, identities, tokens, _ = a2a
     _, page = shared_page(call, identities)
     worker = identities["worker"]["agent"]
@@ -479,13 +479,12 @@ def test_get_task_projects_every_baton_state_and_reverses_exactly(a2a, pg_store,
                      (third["id"],))
     expect(get(third["id"]), "TASK_STATE_REJECTED", "rejected")
 
-    # Automatic tasks: a definite failure and an unknown dispatch outcome both read as failed, with the store state kept.
-    for code, store in (("worker_failed", "failed"), ("dispatch_uncertain", "interrupted")):
-        auto = call("owner", "submit_task", operation_id=op(), idempotency_key="auto-" + code, prompt="Synthetic automatic task")
-        claimed = pg_store.claim_next(modules[1].SERVICE, op())
-        assert claimed["id"] == auto["task_id"]
-        pg_store.interrupt_auto(modules[1].SERVICE, op(), auto["task_id"], claimed["epoch"], code)
-        expect(get(auto["task_id"]), "TASK_STATE_FAILED", "failed", store)
+    # The task store's failed and interrupted states both read as failed, with the store state kept.
+    for store in ("failed", "interrupted"):
+        broken = new_task("broken " + store)
+        with pg_store._transaction(write=True) as conn:
+            conn.execute("UPDATE baton.tasks SET state=%s WHERE id=%s", (store, broken["id"]))
+        expect(get(broken["id"]), "TASK_STATE_FAILED", "failed", store)
 
     assert set(seen) == {"submitted", "input_required", "working", "completed", "canceled", "rejected", "failed"}
     assert a2a_public.baton_state({"state": "queued", "blocked": {"reason_code": "scope_conflict"}}) == "submitted"
@@ -693,16 +692,13 @@ def test_cancel_task_stops_the_work_and_frees_the_scope(a2a, pg_store):
             conn.execute("UPDATE baton.x_a2a_task_state SET state='rejected' WHERE task_id=%s", (first["id"],))
 
 
-def test_cancel_task_is_refused_for_finished_and_automatic_tasks(a2a, pg_store, modules):
+def test_cancel_task_is_refused_for_finished_tasks(a2a):
     client, call, identities, tokens, _ = a2a
     _, task = assigned_task(client, tokens, call, identities)
     claim = call("worker", "claim", operation_id=op(), task_id=task["id"])
     call("worker", "submit_result", operation_id=op(), task_id=task["id"], epoch=claim["epoch"], result="Synthetic result")
     call("owner", "gate", operation_id=op(), task_id=task["id"], expected_epoch=claim["epoch"], decision="pass")
     error_of(rpc(client, tokens, "owner", "CancelTask", {"id": task["id"]}), -32002)
-    auto = call("owner", "submit_task", operation_id=op(), idempotency_key="auto-cancel", prompt="Synthetic automatic task")
-    error_of(rpc(client, tokens, "owner", "CancelTask", {"id": auto["task_id"]}), -32002)
-    assert call("owner", "get_task", task_id=auto["task_id"])["state"] == "queued"
 
 
 def test_reviewer_may_cancel_and_an_awaiting_gate_task_cannot_be_gated_afterwards(a2a):
@@ -778,11 +774,8 @@ def route_paths(route):
     return {(kind, value) for match in route["matches"] for kind, value in match["path"].items()}
 
 
-def test_gateway_routes_the_public_endpoints_without_touching_the_worker_path():
+def test_gateway_routes_the_public_endpoints():
     routes = gateway_routes()
-    codex = routes["codex-a2a"]
-    assert route_paths(codex) == {("pathPrefix", "/a2a/")}
-    assert codex["backends"] == [{"host": "codex:9001"}] and codex["policies"]["authorization"]["rules"] == ["apiKey.role == 'dispatcher'"]
     space = routes["baton-space"]
     assert {("exact", "/a2a/rpc"), ("exact", "/a2a/agents")} <= route_paths(space)
     assert space["policies"]["authorization"]["rules"] == ["apiKey.role == 'client'"] and space["policies"]["apiKey"]["mode"] == "strict"
@@ -794,6 +787,9 @@ def test_gateway_routes_the_public_endpoints_without_touching_the_worker_path():
     assert "transformations" not in public["policies"]
     for name, route in routes.items():
         assert "keys" in route["policies"]["apiKey"], name
+    # The card path must resolve to Baton's own card: no route listed before the public one may match it.
+    names = list(routes)
+    assert not [name for name in names[:names.index("baton-a2a-public")] if ("exact", CARD) in route_paths(routes[name])]
 
 
 def test_nginx_serves_the_cards_with_caching_and_keeps_the_rpc_stream_unbuffered():

@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Baton's public A2A v1.0 interface: a signed Agent Card, an agent directory and a work-object-bound JSON-RPC endpoint.
 
-This module is separate from the internal bridge-to-worker A2A path (`bridge.server.dispatch` to `bridge.codex_agent`),
-which it never touches. Everything here sits in front of the existing Space store: the caller is the authenticated Baton
+The endpoint is for external agents. Everything here sits in front of the existing Space store: the caller is the authenticated Baton
 principal, permissions are the shared-page model of `SpaceStore`, and every call is appended to `baton.x_audit`.
 
 The instance signing key is created by `python -m bridge.a2a_public init-keys` inside the bridge's state volume. It is
@@ -66,7 +65,7 @@ A2A_TO_BATON = {value: key for key, value in BATON_TO_A2A.items()}
 TERMINAL = frozenset({"completed", "failed", "canceled", "rejected"})
 INTERRUPTED = frozenset({"input_required", "auth_required"})
 # Task-store state to the superset. `awaiting_gate` is an open approval request, so it is `input_required` (an Ask);
-# `interrupted` only occurs for automatic tasks whose dispatch outcome is unknown and is a dead end, hence `failed`.
+# `interrupted` is a dead end of the task store (nothing leaves it), hence `failed`.
 STORE_TO_BATON = {"queued": "submitted", "claimed": "working", "awaiting_gate": "input_required", "done": "completed",
                   "failed": "failed", "interrupted": "failed"}
 
@@ -838,7 +837,7 @@ async def get_task(ctx, params, rpc_id):
 def cancel_in_store(conn, actor, task_id):
     """Record the cancellation, release the claim's scope reservation and audit it, in one transaction."""
     row = conn.execute("SELECT state,execution_mode FROM baton.tasks WHERE id=%s", (task_id,)).fetchone()
-    # Automatic tasks are picked up by the worker queue, which this overlay cannot stop, so only assigned tasks cancel.
+    # Only tasks assigned to an agent (the manual path, which A2A creates) can be canceled.
     if not row or row["state"] in {"done", "failed", "interrupted"} or row["execution_mode"] != "manual":
         return False
     saved = conn.execute("""INSERT INTO baton.x_a2a_task_state(task_id,state,set_by,set_by_account,set_by_kind) VALUES (%s,'canceled',%s,%s,%s)
