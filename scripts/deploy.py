@@ -98,32 +98,13 @@ PRIVATE_OUTPUT_ERROR = 'cannot create a private output file'
 LOCK_DIR = Path(tempfile.gettempdir()) / 'baton-deploy-locks'
 BACKUP_CREATE_ATTEMPTS = 3
 
-# Early warning only: textual patterns for statements a previous image cannot survive. The authoritative check is
-# the throwaway-database catalog diff (precheck_migration); this just fails fast on the obvious cases.
+# One scanner, on the raw added lines. Nothing is stripped: comments, strings, dollar quotes and
+# quoted identifiers all count. Case-insensitive word boundaries. This does not parse SQL.
+# ``--allow-incompatible-migration`` overrides TOKEN_PATTERNS. ``--allow-breaking-catalog`` overrides
+# STATEMENT_PATTERNS, the NOT NULL add, psql meta-commands, and the catalog diff.
 IDENT = r'[\w".$]+'
-INCOMPATIBLE_SQL = (
-    ('contains a DROP other than constraint, trigger, index, policy, default, rule or statistics',
-     r'\bDROP\b(?!\s+(?:CONSTRAINT|TRIGGER|INDEX|POLICY|DEFAULT|RULE|STATISTICS)\b)'),
-    ('truncates a table', r'(?:^|;)\s*TRUNCATE\b'),
-    ('deletes rows', r'\bDELETE\s+FROM\b'),
-    # Data rewrites are invisible to a schema-only catalog. Trigger clauses (BEFORE UPDATE ON/OR/OF) are not
-    # statements. Foreign-key actions are removed by FK_ACTION before this runs, so ON UPDATE CASCADE / SET
-    # NULL / SET DEFAULT / RESTRICT / NO ACTION do not look like UPDATE. ON CONFLICT DO UPDATE still does.
-    ('rewrites rows', r'\bUPDATE\s+(?:ONLY\s+)?(?!OR\b|OF\b|ON\b)(?:[\w."]+\.)?[\w."]+'),
-    ('merges rows', r'\bMERGE\s+INTO\b'),
-    ('renames an object', r'\bRENAME\b'),
-    ('changes a column type', r'\bALTER\s+(?:COLUMN\s+)?' + IDENT + r'\s+(?:SET\s+DATA\s+)?TYPE\b'),
-    ('makes an existing column NOT NULL', r'\bSET\s+NOT\s+NULL\b'),
-    # A rollback re-tags images; it does not undo privileges or row level security that already committed.
-    ('changes privileges', r'\b(?:GRANT|REVOKE)\b'),
-    ('changes a row level security policy', r'\b(?:CREATE|ALTER|DROP)\s+POLICY\b'),
-    ('changes row level security',
-     r'\b(?:NO\s+FORCE|ENABLE|DISABLE|FORCE)\s+ROW\s+LEVEL\s+SECURITY\b'),
-    ('disables a trigger', r'\bDISABLE\s+TRIGGER\b'),
-)
-# Crude on purpose. Applied only to lines added since the deployed revision, on the raw text:
-# comments and strings are not removed. This does not parse SQL. END is not a token.
-CRUDE_TOKENS = (
+ON_CONFLICT_DO_NOTHING = re.compile(r'\bon\s+conflict\s+do\s+nothing\b', re.IGNORECASE)
+TOKEN_PATTERNS = (
     ('alter system', re.compile(r'\balter\s+system\b', re.IGNORECASE)),
     ('alter database', re.compile(r'\balter\s+database\b', re.IGNORECASE)),
     ('create extension', re.compile(r'\bcreate\s+extension\b', re.IGNORECASE)),
@@ -134,21 +115,35 @@ CRUDE_TOKENS = (
     ('session_authorization', re.compile(r'\bsession_authorization\b', re.IGNORECASE)),
     ('authorization', re.compile(r'\bauthorization\b', re.IGNORECASE)),
     ('role', re.compile(r'\brole\b', re.IGNORECASE)),
-    # DO only when it introduces a block (dollar quote, string, or LANGUAGE). ON CONFLICT DO NOTHING does not.
-    ('do', re.compile(r"""\bdo\b(?=\s*(?:\$|'|language\b))""", re.IGNORECASE)),
+    # Any DO, except the DO inside the exact phrase ON CONFLICT DO NOTHING.
+    ('do', re.compile(r'\bdo\b', re.IGNORECASE)),
     ('commit', re.compile(r'\bcommit\b', re.IGNORECASE)),
     ('rollback', re.compile(r'\brollback\b', re.IGNORECASE)),
     ('abort', re.compile(r'\babort\b', re.IGNORECASE)),
     ('savepoint', re.compile(r'\bsavepoint\b', re.IGNORECASE)),
     ('release', re.compile(r'\brelease\b', re.IGNORECASE)),
     ('reset', re.compile(r'\breset\b', re.IGNORECASE)),
+    ('update', re.compile(r'\bupdate\b', re.IGNORECASE)),
+    ('delete', re.compile(r'\bdelete\b', re.IGNORECASE)),
+    ('truncate', re.compile(r'\btruncate\b', re.IGNORECASE)),
+    ('merge', re.compile(r'\bmerge\b', re.IGNORECASE)),
+)
+STATEMENT_PATTERNS = (
+    ('DROP', re.compile(
+        r'\bDROP\b(?!\s+(?:CONSTRAINT|TRIGGER|INDEX|POLICY|DEFAULT|RULE|STATISTICS)\b)', re.IGNORECASE)),
+    ('rename', re.compile(r'\bRENAME\b', re.IGNORECASE)),
+    ('column type', re.compile(
+        r'\bALTER\s+(?:COLUMN\s+)?' + IDENT + r'\s+(?:SET\s+DATA\s+)?TYPE\b', re.IGNORECASE)),
+    ('SET NOT NULL', re.compile(r'\bSET\s+NOT\s+NULL\b', re.IGNORECASE)),
+    ('privileges', re.compile(r'\b(?:GRANT|REVOKE)\b', re.IGNORECASE)),
+    ('policy', re.compile(r'\b(?:CREATE|ALTER|DROP)\s+POLICY\b', re.IGNORECASE)),
+    ('row level security', re.compile(
+        r'\b(?:NO\s+FORCE|ENABLE|DISABLE|FORCE)\s+ROW\s+LEVEL\s+SECURITY\b', re.IGNORECASE)),
+    ('disable trigger', re.compile(r'\bDISABLE\s+TRIGGER\b', re.IGNORECASE)),
 )
 ADD_CLAUSE = re.compile(r'\bADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?'
                         r'(?!CONSTRAINT\b|PRIMARY\b|UNIQUE\b|CHECK\b|FOREIGN\b|LIKE\b|EXCLUDE\b)([^;]*?)'
                         r'(?=,\s*(?:ADD|ALTER|DROP)\b|;|$)', re.IGNORECASE | re.DOTALL)
-NOISE = re.compile(r"--[^\n]*|/\*.*?\*/|'(?:[^']|'')*'", re.DOTALL)
-FK_ACTION = re.compile(
-    r'\bON\s+(?:UPDATE|DELETE)\s+(?:CASCADE|RESTRICT|NO\s+ACTION|SET\s+(?:NULL|DEFAULT))\b', re.IGNORECASE)
 PRECHECK_PREFIX = 'baton-precheck-'
 MAX_SMOKE_BODY = 1024 * 1024
 ROLES_DUMP = ('PGPASSWORD="$(cat /run/secrets/database-admin/postgres.password)" '
@@ -766,48 +761,57 @@ def added_scan_text(sql, baseline):
     return '\n'.join(kept)
 
 
-def crude_fail_closed(sql):
-    """Token hits on raw text. Fail closed, and do not try to parse SQL.
+def do_nothing_spans(sql):
+    """Character spans of the word DO inside ``ON CONFLICT DO NOTHING``. Every other DO counts."""
+    spans = []
+    for match in ON_CONFLICT_DO_NOTHING.finditer(sql):
+        word = re.search(r'\bdo\b', match.group(0), re.IGNORECASE)
+        if word:
+            spans.append((match.start() + word.start(), match.start() + word.end()))
+    return spans
 
-    Nothing is stripped: a token inside a comment, a string, a dollar quote or a quoted identifier counts.
-    ``END`` is not a token, so ``CASE ... END`` and ``BEGIN ATOMIC`` do not match. The first line of each
-    token is reported. ``--allow-incompatible-migration`` is the only override for these findings.
-    """
+
+def pattern_hits(sql, patterns, exempt):
+    """First raw-text hit of each pattern, as ``name on line N``. ``exempt`` skips spans (used for DO)."""
     hits = []
-    for name, pattern in CRUDE_TOKENS:
-        match = pattern.search(sql)
+    for name, pattern in patterns:
+        match = None
+        for candidate in pattern.finditer(sql):
+            if name == 'do' and any(start <= candidate.start() < end for start, end in exempt):
+                continue
+            match = candidate
+            break
         if match:
             hits.append((sql.count('\n', 0, match.start()), name))
     hits.sort()
     return ['%s on line %d' % (name, line + 1) for line, name in hits]
 
 
-def catalog_shaped_statements(sql):
-    """Catalog-shaped warnings on comment-and-string-stripped text, plus a psql meta-command on the raw text.
-
-    These are not crude tokens. ``--allow-breaking-catalog`` is what overrides them, together with the
-    catalog diff. ``BEFORE UPDATE ON`` and ``ON UPDATE`` foreign-key actions are not rewrites.
-    """
-    text = FK_ACTION.sub(' ', NOISE.sub(' ', sql))
-    found = [label for label, pattern in INCOMPATIBLE_SQL if re.search(pattern, text, re.IGNORECASE)]
-    for clause in ADD_CLAUSE.findall(text):
+def not_null_without_default(sql):
+    """An added column that is NOT NULL and has no DEFAULT, found in the raw text."""
+    for match in ADD_CLAUSE.finditer(sql):
+        clause = match.group(0)
         if re.search(r'\bNOT\s+NULL\b', clause, re.IGNORECASE) and not re.search(r'\bDEFAULT\b', clause, re.IGNORECASE):
-            found.append('adds a NOT NULL column without a default')
-            break
-    if psql_meta_command(sql):
-        found.append('contains a psql meta-command')
-    return found
+            return ['adds a NOT NULL column without a default on line %d' % (sql.count('\n', 0, match.start()) + 1)]
+    return []
 
 
 def migration_findings(sql, baseline=None):
-    """Token and catalog-shaped findings for the lines added since ``baseline``.
+    """One raw scan of the lines added since ``baseline``.
 
     ``baseline is None`` scans the whole file (the deployed revision is unknown). A baseline equal to ``sql``
-    adds nothing, so an unchanged schema is not re-flagged.
+    adds nothing, so an unchanged schema is not re-flagged. Comments and strings are not removed.
+    ``END`` is not a token. ``ON CONFLICT DO NOTHING`` is the only DO that is ignored. ``update``, ``delete``,
+    ``truncate`` and ``merge`` are ordinary words, so a trigger clause or foreign-key action that contains
+    them is flagged too.
     """
     added = added_scan_text(sql, baseline)
-    tokens = crude_fail_closed(added)
-    statements = catalog_shaped_statements(added)
+    exempt = do_nothing_spans(added)
+    tokens = pattern_hits(added, TOKEN_PATTERNS, exempt)
+    statements = pattern_hits(added, STATEMENT_PATTERNS, ())
+    statements.extend(not_null_without_default(added))
+    if psql_meta_command(added):
+        statements.append('contains a psql meta-command')
     return {'tokens': tokens, 'statements': statements, 'unsafe': statements + tokens}
 
 

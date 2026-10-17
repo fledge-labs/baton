@@ -953,6 +953,17 @@ def test_backup_dir_is_required_unless_no_backup_is_given(files, capsys):
     "SELECT '--';\nCOMMIT;",
     "SELECT '/*';\nRESET ROLE;\nALTER SYSTEM SET a = 1;\n*/",
     "-- COMMIT\n/* START TRANSACTION; role */ SELECT 1;",
+    "SELECT $$--$$; UPDATE baton.t SET a = 1;",
+    "DO /*x*/ 'BEGIN UPDATE baton.t SET a = 1; END';",
+    "DO E'BEGIN NULL; END';",
+    "DO U&'BEGIN NULL; END';",
+    "CREATE TRIGGER x BEFORE UPDATE OR DELETE ON baton.t FOR EACH ROW EXECUTE FUNCTION f();",
+    "CREATE TRIGGER x BEFORE INSERT OR UPDATE OF parent_id ON baton.t FOR EACH ROW EXECUTE FUNCTION f();",
+    "CREATE TRIGGER x BEFORE UPDATE ON baton.t FOR EACH ROW EXECUTE FUNCTION f();",
+    "CREATE TRIGGER y BEFORE TRUNCATE ON baton.t FOR EACH STATEMENT EXECUTE FUNCTION f();",
+    "ALTER TABLE baton.child ADD COLUMN parent_id int REFERENCES baton.parent(id) "
+    "ON UPDATE CASCADE ON DELETE SET NULL;",
+    "-- DROP TABLE baton.commented;\n/* DELETE FROM baton.t; UPDATE baton.t SET a = 1; */ SELECT 1;",
 ])
 def test_migration_lint_flags_contract_statements_a_previous_image_cannot_survive(statement):
     assert deploy.unsafe_migration_statements("CREATE TABLE IF NOT EXISTS baton.t(a int);\n" + statement + "\n")
@@ -962,38 +973,25 @@ def test_migration_lint_flags_contract_statements_a_previous_image_cannot_surviv
     "ALTER TABLE baton.t ADD COLUMN IF NOT EXISTS a text;",
     "ALTER TABLE baton.t ADD COLUMN IF NOT EXISTS a boolean NOT NULL DEFAULT false;",
     "ALTER TABLE baton.t DROP CONSTRAINT IF EXISTS old_key;",
-    "CREATE TRIGGER x BEFORE UPDATE OR DELETE ON baton.t FOR EACH ROW EXECUTE FUNCTION f();",
-    "CREATE TRIGGER x BEFORE INSERT OR UPDATE OF parent_id ON baton.t FOR EACH ROW EXECUTE FUNCTION f();",
-    "CREATE TRIGGER x BEFORE UPDATE ON baton.t FOR EACH ROW EXECUTE FUNCTION f();",
-    "CREATE TRIGGER y BEFORE TRUNCATE ON baton.t FOR EACH STATEMENT EXECUTE FUNCTION f();",
     "COPY baton.t TO stdout;",
     "BEGIN;",
     "BEGIN TRANSACTION;",
-    "ALTER TABLE baton.child ADD COLUMN parent_id int REFERENCES baton.parent(id) "
-    "ON UPDATE CASCADE ON DELETE SET NULL;",
-    "ALTER TABLE baton.child ADD COLUMN parent_id int REFERENCES baton.parent(id) "
-    "ON UPDATE SET DEFAULT ON DELETE RESTRICT;",
-    "ALTER TABLE baton.child ADD COLUMN parent_id int REFERENCES baton.parent(id) "
-    "ON UPDATE RESTRICT ON DELETE NO ACTION;",
-    "ALTER TABLE baton.child ADD COLUMN parent_id int REFERENCES baton.parent(id) ON UPDATE NO ACTION;",
     "SET statement_timeout = '1s';",
     "SET session_replication_role = 'replica';",
     "END;",
     "END WORK;",
     "INSERT INTO baton.t(a) VALUES (1) ON CONFLICT DO NOTHING;",
     "SELECT CASE WHEN true THEN 1 ELSE 0 END;",
-    "DO E'BEGIN NULL; END';",
-    "DO U&'BEGIN NULL; END';",
     "CREATE FUNCTION baton.f(a int) RETURNS int LANGUAGE sql\nBEGIN ATOMIC\n  SELECT a;\nEND;",
-    "-- DROP TABLE baton.commented;\n/* DELETE FROM baton.t; UPDATE baton.t SET a = 1; */ SELECT 1;",
+    "INSERT INTO baton.t(a) SELECT a FROM baton.s;",
 ])
 def test_migration_lint_accepts_expand_only_statements(statement):
     assert deploy.unsafe_migration_statements(statement) == []
 
 
-def test_assigning_a_column_named_role_is_a_rewrite_and_names_the_token():
+def test_assigning_a_column_named_role_names_update_and_role():
     assert deploy.unsafe_migration_statements("UPDATE baton.t SET role = 'x';") == [
-        "rewrites rows", "role on line 1"]
+        "role on line 1", "update on line 1"]
 
 
 def test_a_string_comment_marker_does_not_hide_a_later_commit():
@@ -1045,6 +1043,26 @@ def test_crude_tokens_on_added_lines_name_the_line_and_leave_the_deployed_text_a
                                               baseline=already) == []
 
 
+def test_dollar_quote_and_do_prefixes_do_not_hide_a_rewrite():
+    assert "update on line 2" in deploy.unsafe_migration_statements("SELECT $$--$$;\nUPDATE baton.t SET a = 1;\n")
+    hidden = "DO /*x*/ 'BEGIN UPDATE baton.t SET a = 1; END';\n"
+    found = deploy.unsafe_migration_statements(hidden)
+    assert "do on line 1" in found and "update on line 1" in found
+    assert "do on line 1" in deploy.unsafe_migration_statements("DO E'BEGIN NULL; END';\n")
+    assert "do on line 1" in deploy.unsafe_migration_statements("DO U&'BEGIN NULL; END';\n")
+    base = "CREATE TABLE baton.note (id int);\n"
+    added = base + "INSERT INTO baton.note(id) VALUES (1) ON CONFLICT DO NOTHING;\n"
+    assert deploy.unsafe_migration_statements(added, baseline=base) == []
+    for word, statement in (
+        ("update", "UPDATE baton.t SET a = 1;\n"),
+        ("delete", "DELETE FROM baton.t;\n"),
+        ("truncate", "TRUNCATE baton.t;\n"),
+        ("merge", "MERGE INTO baton.t USING baton.s ON true WHEN MATCHED THEN DO NOTHING;\n"),
+    ):
+        found = deploy.unsafe_migration_statements(base + statement, baseline=base)
+        assert "%s on line 2" % word in found, (word, found)
+
+
 def test_do_nothing_and_case_end_in_added_lines_pass():
     base = "CREATE TABLE baton.note (id int);\n"
     sql = (base + "INSERT INTO baton.note(id) VALUES (1) ON CONFLICT DO NOTHING;\n"
@@ -1094,14 +1112,15 @@ def test_an_unknown_deployed_revision_scans_the_whole_file_and_says_so(files, mo
     assert "whole migration file was treated as added" in report["rollback"]["reason"]
     assert any(item.startswith("role on line ") for item in report["migration"]["tokens"])
     assert any(item.startswith("do on line ") for item in report["migration"]["tokens"])
-    assert "rewrites rows" in report["migration"]["statements"]
+    assert any(item.startswith("update on line ") for item in report["migration"]["tokens"])
     assert not docker.ups() and not dump_calls(docker)
+    assert any(item.startswith("privileges on line ") for item in report["migration"]["statements"])
     docker = FakeDocker()
     code, report, _ = run(files, docker, FakeGateway(docker), "--allow-incompatible-migration")
-    assert code == 1 and "rewrites rows" in report["rollback"]["reason"]
+    assert code == 1 and "privileges on line " in report["rollback"]["reason"]
     docker = FakeDocker()
     code, report, _ = run(files, docker, FakeGateway(docker), "--allow-breaking-catalog")
-    assert code == 1 and "role on line " in report["rollback"]["reason"]
+    assert code == 1 and "update on line " in report["rollback"]["reason"]
     docker = FakeDocker()
     code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP),
                           "--allow-incompatible-migration", "--allow-breaking-catalog")
@@ -1138,9 +1157,10 @@ def test_the_shipped_schema_reapplied_unchanged_has_no_findings():
     schema = (ROOT / "bridge/space_schema.sql").read_text(encoding="utf-8")
     assert deploy.unsafe_migration_statements(schema, baseline=schema) == []
     unknown = deploy.migration_findings(schema, None)
-    assert "rewrites rows" in unknown["statements"]
     assert any(item.startswith("role on line ") for item in unknown["tokens"])
     assert any(item.startswith("do on line ") for item in unknown["tokens"])
+    assert any(item.startswith("update on line ") for item in unknown["tokens"])
+    assert any(item.startswith("privileges on line ") for item in unknown["statements"])
     assert "UPDATE baton.spaces" in schema
 
 
@@ -1608,14 +1628,15 @@ def test_schema_diff_flags_policy_edits_and_fails_closed_without_privilege_secti
     assert deploy.schema_breaking_changes(base_snapshot(), after) == ["catalog snapshot is missing policies, row_security"]
 
 
-def test_comments_and_strings_do_not_count_as_privilege_changes():
-    assert deploy.unsafe_migration_statements("-- GRANT SELECT ON baton.t TO PUBLIC;\nCREATE TABLE baton.n(id int);") == []
-    assert deploy.unsafe_migration_statements("SELECT 'REVOKE ALL ON baton.t FROM PUBLIC';") == []
+def test_comments_and_strings_still_count_as_privilege_words():
+    comment = deploy.unsafe_migration_statements("-- GRANT SELECT ON baton.t TO PUBLIC;\nCREATE TABLE baton.n(id int);")
+    assert "privileges on line 1" in comment
+    quoted = deploy.unsafe_migration_statements("SELECT 'REVOKE ALL ON baton.t FROM PUBLIC';")
+    assert "privileges on line 1" in quoted
     hidden = "DO $$ BEGIN EXECUTE 'GRANT SELECT ON baton.t TO PUBLIC'; END $$;"
     found = deploy.unsafe_migration_statements(hidden)
-    assert "do on line 1" in found
+    assert "do on line 1" in found and "privileges on line 1" in found
     assert not any(item.startswith("end on line ") for item in found)
-    assert not any("privileges" in item for item in found)
 
 
 def test_schema_diff_accepts_purely_additive_changes():
