@@ -94,7 +94,7 @@ openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/
 - 写操作失败后，stderr 会多打一行 `operation_id=...`。网络中断后不知道操作是否生效时，用同一个 `--operation-id` 重试，服务端保证只产生一次效果；不要重新生成。
 - `submit --reviewer <principal>` 可重复，用来指定审批人；省略时审批人仍是请求者。任务总会创建。若某个审批人既不是该 Space 的根身份，也没有覆盖该任务的审批人委托，stderr 立即打印 `baton_cli: reviewer <principal> currently cannot approve (no delegation)`，stdout 的 JSON 带同样的 `warnings` 列表，退出码仍是 0。被指派的 `--assignee` 若同时列为 `--reviewer`，按同一条规则警告。委托后来补上之后，用同一个 `--operation-id` 重放会按当前委托重新计算，警告可以消失。
 - `claim --keepalive` 在领取成功后不退出：按租期在后台续租，直到进程退出（`SIGINT`/`SIGTERM`，退出码 0）或任务不再是 `claimed`。`--lease` 省略时按 300 秒续。遇到 `stale_claim` 时停止，并打印恢复命令（见下）。
-- 任何返回 `stale_claim` 的命令（`renew`、`result`，以及 `--keepalive` 的续租）都会在 stderr 给出下一步：租约已经没人持有时是 `baton_cli: recovery: baton_cli.py claim --task <任务 id>`；任务仍被别人有效持有时是 `baton_cli: recovery: ask the new holder <principal>`。这两行不含令牌或 URL。
+- `stale_claim` 的恢复语看的是哪条命令，不含令牌或 URL。`claim`、`renew`、`result`、`handoff`（以及 `--keepalive` 的续租）在租约已无人持有、或持有人就是调用者自己时打印 `baton_cli: recovery: baton_cli.py claim --task <任务 id>`；只有别人仍有效持有时才打印 `baton_cli: recovery: ask the new holder <principal>`，不会让你去问自己。`gate` 的 `stale_claim` 是结果 epoch 过期，任务多半仍是 `awaiting_gate`，打印 `baton_cli: recovery: re-read the task and gate the current result_epoch <n>`。`block` 在你自己仍持有有效租约时打印 `baton_cli: recovery: you still hold the lease; mark_blocked only applies when you cannot claim`；任务已经不在 `queued` 或 `claimed` 时说明当前状态，而不是建议重新领取。
 
 ## 命名接收人流程：wait → claim → comment → result
 

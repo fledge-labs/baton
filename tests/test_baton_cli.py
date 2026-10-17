@@ -153,6 +153,74 @@ def test_stale_claim_prints_reclaim_or_the_new_holder(cli, bridge, workspace):
     assert "baton_cli: recovery: ask the new holder " + reviewer in lost.err
 
 
+def test_recovery_hint_follows_the_operation_and_never_asks_the_caller(cli, bridge, workspace):
+    _, page = workspace
+    worker = bridge.identities["worker"]["agent"]
+    reviewer = bridge.identities["reviewer"]["agent"]
+    task = run_json(cli, bridge, "owner", "submit", "--key", "hint-" + uuid.uuid4().hex, "--prompt", "Gate me",
+                    "--page", page["id"], "--assignee", worker, "--scope", "none")
+    claim = run_json(cli, bridge, "worker", "claim", "--task", task["task_id"], "--no-summary")
+    own = run_as(cli, bridge, "worker", "renew", "--task", task["task_id"], "--epoch", str(claim["epoch"] + 1), "--no-summary")
+    assert own.rc == 1 and "stale_claim" in own.err
+    assert "baton_cli: recovery: baton_cli.py claim --task " + task["task_id"] in own.err
+    assert "ask the new holder" not in own.err and bridge.https not in own.err
+
+    holding = run_as(cli, bridge, "worker", "block", "--task", task["task_id"], "--reason", "other", "--no-summary")
+    assert holding.rc == 1 and "stale_claim" in holding.err
+    assert "you still hold the lease; mark_blocked only applies when you cannot claim" in holding.err
+    assert "ask the new holder" not in holding.err and "claim --task" not in holding.err
+
+    run_json(cli, bridge, "worker", "result", "--task", task["task_id"], "--epoch", str(claim["epoch"]),
+             "--result", "candidate", "--no-summary")
+    late_gate = run_as(cli, bridge, "owner", "gate", "--task", task["task_id"], "--epoch", str(claim["epoch"] + 1),
+                       "--decision", "pass", "--no-summary")
+    assert late_gate.rc == 1 and "stale_claim" in late_gate.err
+    assert "re-read the task and gate the current result_epoch " + str(claim["epoch"]) in late_gate.err
+    assert "claim --task" not in late_gate.err and "ask the new holder" not in late_gate.err
+
+    waiting = run_as(cli, bridge, "worker", "block", "--task", task["task_id"], "--reason", "other", "--no-summary")
+    assert "task is awaiting_gate; mark_blocked only applies to a queued or claimed task you do not hold" in waiting.err
+    assert "ask the new holder" not in waiting.err
+
+    other = run_json(cli, bridge, "owner", "submit", "--key", "held-" + uuid.uuid4().hex, "--prompt", "Held by reviewer",
+                     "--page", page["id"], "--assignee", worker, "--scope", "path=docs/held-" + uuid.uuid4().hex)
+    live = run_json(cli, bridge, "worker", "claim", "--task", other["task_id"], "--no-summary")
+    run_json(cli, bridge, "worker", "call", "handoff", "--operation-id", str(uuid.uuid4()), "--json",
+             json.dumps({"task_id": other["task_id"], "epoch": live["epoch"], "target_principal": reviewer}))
+    late_result = run_as(cli, bridge, "worker", "result", "--task", other["task_id"], "--epoch", str(live["epoch"]),
+                         "--result", "too late", "--no-summary")
+    assert "baton_cli: recovery: ask the new holder " + reviewer in late_result.err
+    assert "ask the new holder " + worker not in late_result.err
+    late_handoff = run_as(cli, bridge, "worker", "call", "handoff", "--operation-id", str(uuid.uuid4()), "--json",
+                          json.dumps({"task_id": other["task_id"], "epoch": live["epoch"], "target_principal": reviewer}))
+    assert late_handoff.rc == 1
+    assert "baton_cli: recovery: ask the new holder " + reviewer in late_handoff.err
+
+
+def test_claim_recovery_asks_only_a_different_holder():
+    module = load_cli_module()
+    task_id = "11111111-1111-1111-1111-111111111111"
+    me, other = "worker-one", "reviewer-one"
+
+    class Fake:
+        def __init__(self, task):
+            self.task = task
+
+        def call(self, operation, arguments, read_timeout=None):
+            if operation == "get_task":
+                return self.task
+            if operation == "fetch_inbox":
+                return {"agent_name": me, "messages": []}
+            raise AssertionError(operation)
+
+    held = {"state": "claimed", "lease_valid": True, "holder": other, "result_epoch": 4}
+    assert module.recovery_message(Fake(held), task_id, "claim") == "recovery: ask the new holder " + other
+    assert module.recovery_message(Fake(dict(held, holder=me)), task_id, "claim") == "recovery: baton_cli.py claim --task " + task_id
+    assert module.recovery_message(Fake(dict(held, holder=me)), task_id, "submit_result") == "recovery: baton_cli.py claim --task " + task_id
+    assert module.recovery_message(Fake({"state": "awaiting_gate", "lease_valid": False, "result_epoch": 4}), task_id, "handoff") == (
+        "recovery: baton_cli.py claim --task " + task_id)
+
+
 def test_keepalive_renews_until_the_process_exits(cli, bridge, workspace):
     _, page = workspace
     task = run_json(cli, bridge, "owner", "submit", "--key", "keep-" + uuid.uuid4().hex, "--prompt", "Hold the lease",

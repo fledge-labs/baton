@@ -49,9 +49,13 @@ SUBJECT_TITLE_CHARS = 60
 EVENT_LABELS = {"task.assigned": "assigned", "task.handed_off": "handed_off", "task.awaiting_gate": "awaiting_gate",
                 "gate.decided": "gate_decided", "task.failed": "failed", "task.overdue": "overdue", "task.blocked": "blocked",
                 "claim.expiring": "expiring"}
-# One claim.expiring per lease grant, once the remaining time is under this fraction of the lease and at least this many seconds.
+# One claim.expiring per lease window. The warning opens once the remainder is under this fraction of the lease and at least this many seconds.
+# A lease shorter than the minimum never warns: the 60s floor would otherwise be true for the whole lease, and every renew would notify.
 CLAIM_EXPIRING_FRACTION = 0.2
 CLAIM_EXPIRING_MIN_SECONDS = 60
+CLAIM_EXPIRING_MIN_LEASE = 120
+# _integer caps a lease at 3600s, so a warning is never further out than 20% of that. The scan's index range stops there.
+CLAIM_EXPIRING_HORIZON_SECONDS = int(3600 * CLAIM_EXPIRING_FRACTION)
 BLOCK_REASONS = ("scope_conflict", "lease_held", "dependency_blocked", "waiting_input", "other")
 WEBHOOK_LIMIT = 10
 WEBHOOK_MAX_ATTEMPTS = 8
@@ -1927,46 +1931,91 @@ class SpaceStore:
                     ORDER BY respond_by,id LIMIT %s FOR UPDATE""", (limit,)).fetchall()
                 for task in due:
                     self._escalate(conn, operation_id, task, escalated, reassigned)
-                self._notify_expiring_claims(conn)
         except _Busy:
             return {"skipped": True, "escalated": [], "reassigned": []}
+        # Audit reads for expiring leases stay outside LOCK_ID so a renew is not stuck behind this scan.
+        self._notify_expiring_claims(limit)
         return {"skipped": False, "escalated": escalated, "reassigned": reassigned}
 
-    def _notify_expiring_claims(self, conn):
-        """One claim.expiring to the holder when the live lease is inside its warning window and this grant was not renewed.
+    def _notify_expiring_claims(self, limit):
+        """One claim.expiring per lease window, for at most `limit` claims, without the global advisory lock.
 
-        Runs inside escalate_overdue's transaction, so the existing response-SLA sweep is the only timer. A grant is the
-        latest task.claimed, claim.renewed or task.handed_off audit for this epoch; one notification is written per grant.
+        One statement selects the rows. It range-scans x_claim(lease_expires_at) for leases inside the horizon,
+        soonest first, and drops any task+epoch whose current window already has a notification. A renew starts
+        that window over only when its new expiry passes the previous warning point. Leases under 120s never match.
         """
-        claims = conn.execute("""SELECT c.task_id, c.holder, c.holder_account, c.epoch, t.page_id,
-            EXTRACT(EPOCH FROM (c.lease_expires_at - clock_timestamp())) AS remaining
-            FROM baton.x_claim c JOIN baton.tasks t ON t.id=c.task_id
-            WHERE t.state='claimed' AND c.lease_expires_at>clock_timestamp()
-            ORDER BY c.lease_expires_at, c.task_id""").fetchall()
-        for claim in claims:
-            grant = conn.execute("""SELECT time, metadata FROM baton.x_audit
-                WHERE task_id=%s AND event IN ('task.claimed','claim.renewed','task.handed_off')
-                AND metadata->>'epoch'=%s ORDER BY time DESC LIMIT 1""",
-                (claim["task_id"], str(claim["epoch"]))).fetchone()
-            lease, granted_at = None, None
-            if grant is not None:
-                granted_at = grant["time"]
-                raw = grant["metadata"].get("lease_seconds") if isinstance(grant["metadata"], dict) else None
-                if type(raw) is int and raw > 0:
-                    lease = raw
-            window = CLAIM_EXPIRING_MIN_SECONDS if lease is None else max(CLAIM_EXPIRING_MIN_SECONDS, CLAIM_EXPIRING_FRACTION * lease)
-            if float(claim["remaining"]) >= window:
-                continue
-            if granted_at is not None:
-                already = conn.execute("""SELECT 1 FROM baton.x_notify WHERE event='claim.expiring' AND object_id=%s
-                    AND recipient=%s AND created_at>=%s""", (claim["task_id"], claim["holder"], granted_at)).fetchone()
-            else:
-                already = conn.execute("""SELECT 1 FROM baton.x_notify WHERE event='claim.expiring' AND object_id=%s
-                    AND recipient=%s""", (claim["task_id"], claim["holder"])).fetchone()
-            if already:
-                continue
-            self._enqueue(conn, SERVICE_ACTOR, "claim.expiring", "task", claim["task_id"], claim["page_id"],
-                          [(claim["holder"], claim["holder_account"])], claim["task_id"])
+        _integer(limit, 1, 1000)
+        try:
+            config = json.loads(self.config_path.read_text())
+            if set(config) != {"host", "port", "dbname", "user", "password"}:
+                raise StoreError("storage_unavailable")
+            with psycopg.connect(**config, connect_timeout=5, row_factory=dict_row) as conn:
+                # Single-flight only. The global LOCK_ID is intentionally not taken around the audit read.
+                if not conn.execute("SELECT pg_try_advisory_xact_lock(%s) AS ok", (ESCALATION_LOCK_ID,)).fetchone()["ok"]:
+                    return
+                rows = conn.execute("""WITH RECURSIVE bounds AS (
+                        SELECT %s::int AS min_lease, %s::int AS min_window, %s::numeric AS fraction
+                    ), candidates AS (
+                        SELECT c.task_id, c.holder, c.holder_account, c.epoch, t.page_id, c.lease_expires_at,
+                            EXTRACT(EPOCH FROM (c.lease_expires_at - clock_timestamp())) AS remaining
+                        FROM baton.x_claim c
+                        JOIN baton.tasks t ON t.id=c.task_id
+                        WHERE t.state='claimed'
+                          AND c.lease_expires_at>clock_timestamp()
+                          AND c.lease_expires_at<=clock_timestamp()+%s*interval '1 second'
+                    ), grants AS (
+                        SELECT a.task_id, (a.metadata->>'epoch')::bigint AS epoch, a.time,
+                            (a.metadata->>'lease_seconds')::int AS lease_seconds,
+                            row_number() OVER (PARTITION BY a.task_id, a.metadata->>'epoch' ORDER BY a.time, a.id) AS n
+                        FROM baton.x_audit a
+                        JOIN candidates c ON c.task_id=a.task_id AND a.metadata->>'epoch'=c.epoch::text
+                        WHERE a.event IN ('task.claimed','claim.renewed','task.handed_off')
+                          AND a.metadata->>'epoch' ~ '^[0-9]+$'
+                          AND a.metadata->>'lease_seconds' ~ '^[0-9]+$'
+                    ), walk AS (
+                        SELECT g.task_id, g.epoch, g.n, g.lease_seconds,
+                            CASE WHEN g.lease_seconds>=b.min_lease THEN g.time ELSE NULL::timestamptz END AS window_start,
+                            CASE WHEN g.lease_seconds>=b.min_lease THEN g.time+((g.lease_seconds-GREATEST(b.min_window, g.lease_seconds*b.fraction))::float8*interval '1 second')
+                                 ELSE NULL::timestamptz END AS warning_point
+                        FROM grants g CROSS JOIN bounds b WHERE g.n=1
+                        UNION ALL
+                        SELECT g.task_id, g.epoch, g.n, g.lease_seconds,
+                            CASE WHEN w.warning_point IS NULL OR g.time+g.lease_seconds*interval '1 second'>w.warning_point
+                                 THEN CASE WHEN g.lease_seconds>=b.min_lease THEN g.time ELSE NULL::timestamptz END
+                                 ELSE w.window_start END,
+                            CASE WHEN w.warning_point IS NULL OR g.time+g.lease_seconds*interval '1 second'>w.warning_point
+                                 THEN CASE WHEN g.lease_seconds>=b.min_lease
+                                           THEN g.time+((g.lease_seconds-GREATEST(b.min_window, g.lease_seconds*b.fraction))::float8*interval '1 second')
+                                           ELSE NULL::timestamptz END
+                                 ELSE w.warning_point END
+                        FROM grants g
+                        JOIN walk w ON w.task_id=g.task_id AND w.epoch=g.epoch AND g.n=w.n+1
+                        CROSS JOIN bounds b
+                    ), latest AS (
+                        SELECT DISTINCT ON (task_id, epoch) task_id, epoch, lease_seconds, window_start
+                        FROM walk ORDER BY task_id, epoch, n DESC
+                    )
+                    SELECT c.task_id, c.holder, c.holder_account, c.page_id
+                    FROM candidates c
+                    JOIN latest l ON l.task_id=c.task_id AND l.epoch=c.epoch
+                    CROSS JOIN bounds b
+                    WHERE l.lease_seconds>=b.min_lease AND l.window_start IS NOT NULL
+                      AND c.remaining<GREATEST(b.min_window, l.lease_seconds*b.fraction)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM baton.x_notify n
+                          WHERE n.event='claim.expiring' AND n.object_id=c.task_id AND n.recipient=c.holder
+                            AND n.created_at>=l.window_start)
+                    ORDER BY c.lease_expires_at, c.task_id
+                    LIMIT %s""", (
+                    CLAIM_EXPIRING_MIN_LEASE, CLAIM_EXPIRING_MIN_SECONDS, CLAIM_EXPIRING_FRACTION,
+                    CLAIM_EXPIRING_HORIZON_SECONDS, limit)).fetchall()
+                for row in rows:
+                    self._enqueue(conn, SERVICE_ACTOR, "claim.expiring", "task", row["task_id"], row["page_id"],
+                                  [(row["holder"], row["holder_account"])], row["task_id"])
+        except StoreError:
+            raise
+        except (psycopg.Error, OSError, ValueError, TypeError):
+            raise StoreError("storage_unavailable") from None
 
     def _escalate(self, conn, operation_id, task, escalated, reassigned):
         target = task["escalate_to"] or task["owner"]

@@ -734,20 +734,55 @@ def print_warnings(result):
             say(item)
 
 
-def recovery_message(client, task_id):
-    """Exact next step after stale_claim: re-claim, or ask whoever holds the live lease."""
-    task = None
+LEASE_RECOVERY = {"claim", "renew", "submit_result", "handoff"}
+
+
+def caller_principal(client):
+    """The principal this token belongs to, or None when the inbox cannot be read. Used only to avoid 'ask yourself'."""
+    try:
+        inbox = client.call("fetch_inbox", {"limit": 1})
+    except UpgradeRequired:
+        raise
+    except (BatonError, NetworkError):
+        return None
+    name = inbox.get("agent_name") if isinstance(inbox, dict) else None
+    return name if isinstance(name, str) and AGENT_RE.fullmatch(name) else None
+
+
+def read_task(client, task_id):
     try:
         task = client.call("get_task", {"task_id": task_id})
     except UpgradeRequired:
         raise
     except (BatonError, NetworkError):
-        task = None
-    holder = task.get("holder") if isinstance(task, dict) else None
-    if (isinstance(task, dict) and task.get("state") == "claimed" and task.get("lease_valid") is True
-            and isinstance(holder, str) and AGENT_RE.fullmatch(holder)):
-        return "recovery: ask the new holder " + holder
-    return "recovery: baton_cli.py claim --task " + task_id
+        return None
+    return task if isinstance(task, dict) else None
+
+
+def recovery_message(client, task_id, operation):
+    """Next step after stale_claim. The hint depends on the operation; it never tells the caller to ask themselves."""
+    task = read_task(client, task_id)
+    if operation == "gate":
+        epoch = task.get("result_epoch") if isinstance(task, dict) else None
+        if type(epoch) is int and epoch >= 1:
+            return "recovery: re-read the task and gate the current result_epoch " + str(epoch)
+        return "recovery: re-read the task and gate the current result_epoch"
+    if operation == "mark_blocked":
+        if isinstance(task, dict) and task.get("state") == "claimed" and task.get("lease_valid") is True:
+            return "recovery: you still hold the lease; mark_blocked only applies when you cannot claim"
+        state = task.get("state") if isinstance(task, dict) else None
+        if isinstance(state, str) and SUMMARY_STATE_RE.fullmatch(state):
+            return "recovery: task is " + state + "; mark_blocked only applies to a queued or claimed task you do not hold"
+        return "recovery: mark_blocked only applies to a queued or claimed task you do not hold"
+    if operation in LEASE_RECOVERY:
+        holder = task.get("holder") if isinstance(task, dict) else None
+        held_by_someone_else = (isinstance(task, dict) and task.get("state") == "claimed" and task.get("lease_valid") is True
+                                and isinstance(holder, str) and AGENT_RE.fullmatch(holder)
+                                and holder != caller_principal(client))
+        if held_by_someone_else:
+            return "recovery: ask the new holder " + holder
+        return "recovery: baton_cli.py claim --task " + task_id
+    return "recovery: re-read the task"
 
 
 def run_keepalive(args, client, claim):
@@ -774,7 +809,7 @@ def run_keepalive(args, client, claim):
             if stopper.stop:
                 return EXIT_OK
             if error.code == "stale_claim":
-                say(recovery_message(client, args.task))
+                say(recovery_message(client, args.task, "renew"))
                 return EXIT_BATON
             if not transient(error):
                 raise
@@ -812,7 +847,7 @@ def run_command(args):
         error.operation_id = arguments.get("operation_id")
         task_id = arguments.get("task_id")
         if error.code == "stale_claim" and isinstance(task_id, str) and SUMMARY_UUID_RE.fullmatch(task_id):
-            error.recovery = recovery_message(client, task_id)
+            error.recovery = recovery_message(client, task_id, operation)
         raise
     except NetworkError as error:
         error.operation_id = arguments.get("operation_id")

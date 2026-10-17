@@ -187,13 +187,13 @@ Baton 不会执行 `acceptance_command`。它只是显示给领取人和 gate �
 | `task.failed` | 旧版内置 worker 行的历史事件；当前没有任何路径产生它，保留是为了让旧订阅与旧 outbox 行继续有效 | owner | task |
 | `task.overdue` | 后台升级循环发现任务超过 `respond_by` 仍无响应（见“响应时效与超时升级”） | `escalate_to`，与其不同时还有 owner | task |
 | `task.blocked` | `mark_blocked`（见“阻塞标记”） | 任务 owner（不含操作者） | task |
-| `claim.expiring` | 既有的响应时效扫描发现一条有效租约剩余不足租期的 20%（至少 60 秒），且这次发放之后没有续租 | 当前持有人 | task |
+| `claim.expiring` | 既有的响应时效扫描发现一条有效租约剩余不足 `max(60 秒, 租期的 20%)`，租期至少 120 秒，且该 epoch 的当前租约窗口还没有这条通知 | 当前持有人 | task |
 
 操作者本人不会收到自己操作产生的通知，同一 principal 在一次事件中只收到一条。收件人在插入时必须对对象所在页面有 view 权限，否则不写行。outbox 与 webhook 默认负载只含元数据：`id`、`seq`、`event`、`object_type`、`object_id`、`thread_id`、`created_at`、`recipient`；`task.awaiting_gate` 另带 `result_epoch`（被通知的结果所属 epoch）与 `result_author`（提交结果的 principal），见下一段；outbox、审计和日志从不存放 prompt、评论正文或结果文本，接收者凭 object_id 再用 `get_task`、`list_comments` 等带权限检查的读取操作取完整内容。
 
 **`task.awaiting_gate` 的 `result_epoch`（DF-15）。** `submit_result` 写入该通知时，同时把当次结果的 epoch 和作者记在 outbox 行（`x_notify.result_epoch`、`x_notify.result_author`，只是整数和 principal 名，不含结果文本）。`wait_inbox` 返回的该事件行与 webhook 负载（无论是否 `include_preview`）都带这两个字段，审批人可以直接用 `gate(expected_epoch=result_epoch)`，不必先 `get_task`。其他事件没有这两个字段。审批人收到的是通知发出时的 epoch：任务之后被退回并重新提交，会有一条新通知带新 epoch，用旧 epoch gate 返回 `409 stale_claim`。命令行 `gate --task <id>` 省略 `--epoch` 时用任务当前的 `result_epoch`（一次 `get_task`）；`watch --summary` 的通知行显示 `result_epoch=` 与 `result_author=`。
 
-**`claim.expiring`。** bridge 不另起定时线程。已有的响应时效扫描（`escalate_overdue`，默认每 30 秒，咨询锁单飞）在同一事务里查看仍有效的租约。租期记在 `task.claimed`、`claim.renewed` 和 `task.handed_off` 的审计元数据 `lease_seconds`（整数秒，没有新列）。剩余时间小于 `max(60 秒, 租期的 20%)` 时，给当前持有人写一条 `claim.expiring`。同一次发放（该 epoch 上最新的领取、续租或交接）只写一条；续租或交接之后才可能再写一条。不知道租期的旧租约按 60 秒窗口处理。这条通知不带 `result_epoch` 或 `result_author`。持有人在扫描提交之后的下一次 `wait_inbox` 读到它。命令行 `claim --keepalive` 在进程内自行续租，不依赖这条通知。
+**`claim.expiring`。** bridge 不另起定时线程。已有的响应时效扫描（`escalate_overdue`，默认每 30 秒）先在全局排他锁里处理逾期任务，提交并放开这把锁之后，才在另一事务里查看即将到期的租约。后一个事务只拿升级循环的单飞咨询锁，不拿全局排他锁，所以读审计不会挡住续租。选择是一条语句：按 `x_claim(lease_expires_at)` 索引只看仍有效、且到期时刻落在警告地平线（最长租期 3600 秒的 20%，即 720 秒）内的租约，按 `lease_expires_at` 排序，`LIMIT` 与本轮升级批的上限相同。租期记在 `task.claimed`、`claim.renewed` 和 `task.handed_off` 的审计元数据 `lease_seconds`（整数秒，没有新列）。租期短于 120 秒从不警告（60 秒下限会让整段短租约都落在窗口里，每次续租都会再写一条）。更长的租约在剩余时间小于 `max(60 秒, 租期的 20%)` 时，给当前持有人写一条 `claim.expiring`。同一 epoch 的一个租约窗口只写一条。续租只有在把到期时刻推过上一个警告点时才开启新窗口；没有越过警告点的续租仍算原窗口，不会因为多了一条审计再通知一次。这条通知不带 `result_epoch` 或 `result_author`。持有人在扫描提交之后的下一次 `wait_inbox` 读到它。命令行 `claim --keepalive` 在进程内自行续租，不依赖这条通知。
 
 **`wait_inbox` 通知预览。** 为了不必为每条通知多读一次，`wait_inbox` 返回的每一行在上述元数据之外，在**读取时**由当前对象现算三个字段（不进入 outbox）：
 

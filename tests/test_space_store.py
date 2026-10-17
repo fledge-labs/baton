@@ -2353,3 +2353,89 @@ def test_claim_expiring_is_one_notification_per_lease_grant(pg):
     nudge_lease(pg, long["id"], 700)
     s.escalate_overdue(SERVICE_ACTOR)
     assert len(expiring(pg, pg.editor)) == 3
+
+
+def test_short_leases_never_warn_and_a_renew_starts_a_window_only_past_the_warning_point(pg):
+    s = pg.store
+    short = s.submit_task(pg.owner, operation(), "expiring-short", "Synthetic short", page_id=pg.page["id"],
+                          scopes=[{"kind": "path", "value": pg.prefix + "/expiring-short"}])
+    s.claim(pg.editor, operation(), short["id"], lease_seconds=119)
+    nudge_lease(pg, short["id"], 5)
+    s.escalate_overdue(SERVICE_ACTOR)
+    assert expiring(pg, pg.editor) == []
+    boundary = s.submit_task(pg.owner, operation(), "expiring-120", "Synthetic boundary", page_id=pg.page["id"],
+                             scopes=[{"kind": "path", "value": pg.prefix + "/expiring-120"}])
+    s.claim(pg.editor, operation(), boundary["id"], lease_seconds=120)
+    nudge_lease(pg, boundary["id"], 59)
+    s.escalate_overdue(SERVICE_ACTOR)
+    assert [row["object_id"] for row in expiring(pg, pg.editor)] == [boundary["id"]]
+
+    long = s.submit_task(pg.owner, operation(), "expiring-window", "Synthetic window", page_id=pg.page["id"],
+                         scopes=[{"kind": "path", "value": pg.prefix + "/expiring-window"}])
+    claimed = s.claim(pg.editor, operation(), long["id"], lease_seconds=3600)
+    with s._transaction(write=True) as conn:
+        conn.execute("""INSERT INTO baton.x_notify(id,recipient,recipient_account,event,object_type,object_id,thread_id,actor,actor_kind)
+            VALUES (%s,%s,%s,'claim.expiring','task',%s,%s,'baton-service','service')""",
+                     (uuid.uuid4(), pg.editor.principal, pg.editor.account, long["id"], long["id"]))
+    # 200s and 300s both end before the 3600s warning point, so the planted notice still covers this epoch.
+    s.renew(pg.editor, operation(), long["id"], claimed["epoch"], lease_seconds=200)
+    nudge_lease(pg, long["id"], 30)
+    s.escalate_overdue(SERVICE_ACTOR)
+    assert [row["object_id"] for row in expiring(pg, pg.editor) if row["object_id"] == long["id"]] == [long["id"]]
+    s.renew(pg.editor, operation(), long["id"], claimed["epoch"], lease_seconds=300)
+    nudge_lease(pg, long["id"], 30)
+    s.escalate_overdue(SERVICE_ACTOR)
+    assert [row["object_id"] for row in expiring(pg, pg.editor) if row["object_id"] == long["id"]] == [long["id"]]
+    # 3600s from now passes that warning point, so this renew opens a window the planted notice does not cover.
+    s.renew(pg.editor, operation(), long["id"], claimed["epoch"], lease_seconds=3600)
+    s.escalate_overdue(SERVICE_ACTOR)
+    assert [row["object_id"] for row in expiring(pg, pg.editor) if row["object_id"] == long["id"]] == [long["id"]]
+    nudge_lease(pg, long["id"], 700)
+    s.escalate_overdue(SERVICE_ACTOR)
+    assert [row["object_id"] for row in expiring(pg, pg.editor) if row["object_id"] == long["id"]] == [long["id"], long["id"]]
+
+
+def test_expiring_scan_is_limited_ordered_and_does_not_take_the_global_lock(pg):
+    s = pg.store
+    with s._transaction() as conn:
+        found = conn.execute("""SELECT indexdef FROM pg_indexes WHERE schemaname='baton' AND indexname='claim_lease_expiry'""").fetchone()
+        conn.execute("SET enable_seqscan=off")
+        plan = "\n".join(row["QUERY PLAN"] for row in conn.execute("""EXPLAIN SELECT task_id FROM baton.x_claim
+            WHERE lease_expires_at>clock_timestamp() AND lease_expires_at<=clock_timestamp()+720*interval '1 second'
+            ORDER BY lease_expires_at LIMIT 100""").fetchall())
+    assert found and "(lease_expires_at)" in found["indexdef"]
+    assert "claim_lease_expiry" in plan
+    soon = s.submit_task(pg.owner, operation(), "expiring-soon", "Synthetic soon", page_id=pg.page["id"],
+                         scopes=[{"kind": "path", "value": pg.prefix + "/expiring-soon"}])
+    later = s.submit_task(pg.owner, operation(), "expiring-later", "Synthetic later", page_id=pg.page["id"],
+                          scopes=[{"kind": "path", "value": pg.prefix + "/expiring-later"}])
+    s.claim(pg.editor, operation(), soon["id"], lease_seconds=300)
+    s.claim(pg.editor, operation(), later["id"], lease_seconds=300)
+    nudge_lease(pg, soon["id"], 10)
+    nudge_lease(pg, later["id"], 40)
+    s.escalate_overdue(SERVICE_ACTOR, limit=1)
+    assert [row["object_id"] for row in expiring(pg, pg.editor)] == [soon["id"]]
+    s.escalate_overdue(SERVICE_ACTOR, limit=1)
+    assert [row["object_id"] for row in expiring(pg, pg.editor)] == [soon["id"], later["id"]]
+
+    done = threading.Event()
+    errors = []
+
+    def scan():
+        try:
+            s._notify_expiring_claims(10)
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    config = json.loads(s.config_path.read_text())
+    with psycopg.connect(**config) as holder:
+        holder.execute("SELECT pg_advisory_lock(%s)", (LOCK_ID,))
+        thread = threading.Thread(target=scan)
+        thread.start()
+        finished = done.wait(5)
+        holder.execute("SELECT pg_advisory_unlock(%s)", (LOCK_ID,))
+    thread.join(5)
+    assert finished, "expiring scan blocked on the global lock"
+    assert errors == []
