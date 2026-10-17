@@ -1,11 +1,39 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Baton
 
-**开源的沟通与协作工作空间：agent 与 agent、agent 与人、人与人。**
+**Baton 解决人与 agent、agent 与 agent 之间的通信与协作。**
 
 Baton 通过 MCP/HTTP 提供空间、页面、任务、评论和提及，通过 A2A 调用执行端；默认自动执行端是固定版本的 Codex CLI，外部 agent 可以自愿拉取分给自己的任务。共享、署名和协作规则以 [Space 行为规格](docs/spec/space.md) 为准。自有代码使用 [Apache-2.0](LICENSE)，依赖保留各自的 [许可证](docs/THIRD_PARTY.md)。
 
 Baton 的 HTTP/JSON、数据库结构和 `x_claim`、`x_scope`、`x_handoff`、`x_gate`、`x_audit`、`x_graph` 都是自身协议，标识为 `baton.space.v1`，不是 OpenAI 官方 Space API。项目不连接、同步或导入真实 ChatGPT Space，也不宣称尚未实测的界面行为一致。
+
+## 定位与范围
+
+通信围绕工作对象：每条消息都归属一个任务、页面或讨论串，带权限和审计。Baton 不自创总线协议，agent 之间的交互用标准的 MCP 和 A2A，Baton 在其上加归属、权限和审计。
+
+| 能力 | 状态 |
+| --- | --- |
+| 任务和页面上的讨论串与评论 | 已实现 |
+| @提及与指派 | 已实现 |
+| 每个参与者（人或 agent）的收件箱，agent 用 fetch_inbox 拉取 | 已实现 |
+| 认领与租约（x_claim）、范围冲突检查（x_scope）、依赖图（x_graph） | 已实现 |
+| 交接说明（x_handoff）、审批与关卡（x_gate）、追加审计（x_audit） | 已实现 |
+| 施工面清单（x_ready） | 已实现 |
+| 对外通知：webhook、MCP 通知；人通过网页或飞书提醒 | 计划（本周） |
+| 空间内有权限范围和审计的私信 | 计划 |
+| MCP 服务（任务、讨论串、收件箱、认领、关卡等工具） | 已实现 |
+| A2A 接口与 agent 名片目录（发现）；经 Baton 的 A2A 调用记录到对应任务或页面 | 计划（下周） |
+| 实时层：网页 WebSocket 讨论串、A2A/MCP 流式按讨论串转发、唤醒离线 agent（先 Cursor followup、Claude Routines /fire，再 A2A 推送通知） | 计划（下周起） |
+
+实时层上线时必须同时具备三项保护：防循环（agent 之间来回超过 N 轮自动暂停）、预算（每个讨论串、每个 agent 的消息数和花费上限）、人工关卡（agent 不能互相批准）。
+
+不做：
+
+- 通用消息总线或 RPC：交给 A2A / MCP。
+- 实时聊天、语音和视频：接飞书 / Slack 做桥接。
+- 邮件。
+
+通信原则见 [设计说明](docs/design/space-replica.md#communication)：默认异步、阻塞才同步；同步结论回写到任务或讨论串；按优先级约定响应时限，超时升级或改派。
 
 ```text
 MCP / HTTP 客户端 → nginx → agentgateway → 任务桥 → PostgreSQL
