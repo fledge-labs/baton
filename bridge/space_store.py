@@ -57,6 +57,11 @@ CLAIM_EXPIRING_MIN_LEASE = 120
 # _integer caps a lease at 3600s, so a warning is never further out than 20% of that. The scan's index range stops there.
 CLAIM_EXPIRING_HORIZON_SECONDS = int(3600 * CLAIM_EXPIRING_FRACTION)
 BLOCK_REASONS = ("scope_conflict", "lease_held", "dependency_blocked", "waiting_input", "other")
+PERMISSION_OPTIONS = ("allow_once", "allow_always", "deny")
+PERMISSION_EVENTS = ("permission.requested", "permission.decided", "permission.granted", "permission.revoked")
+PERMISSION_GRANT_EVENTS = ("granted", "revoked")
+PERMISSION_MAX_PER_EPOCH = 10
+PERMISSION_CLI = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 WEBHOOK_LIMIT = 10
 WEBHOOK_MAX_ATTEMPTS = 8
 # Delay after failed attempt n (1-based); the seven delays between eight attempts total about an hour.
@@ -194,6 +199,13 @@ def _text(value, maximum=16000, field=None):
 def _integer(value, minimum=1, maximum=3600, field=None):
     if type(value) is not int or not minimum <= value <= maximum:
         raise StoreError("invalid", field, f"integer between {minimum} and {maximum}")
+    return value
+
+
+def _one_line(value, maximum, field):
+    if (not isinstance(value, str) or not value.strip() or len(value) > maximum
+            or re.search(r"[\x00-\x1f\x7f]", value)):
+        raise StoreError("invalid", field, f"non-blank single-line string of at most {maximum} characters")
     return value
 
 
@@ -766,7 +778,7 @@ class SpaceStore:
                    "created_via", "chain", "owner_kind", "self_approval", "root", "approvals", "approvals_required",
                    "required_approvals", "root_required", "scope_kind", "approver", "reason", "original_sha256", "edited_sha256",
                    "grace_seconds", "lease_seconds", "authority", "target_principal", "role_source", "from_role",
-                   "sla_minutes", "wait_minutes"}
+                   "sla_minutes", "wait_minutes", "request_id", "permission"}
         if not set(metadata) <= allowed:
             raise StoreError("invalid")
         conn.execute("""INSERT INTO baton.x_audit(id,event,agent,actor_account,actor_kind,requested_by,performed_by,
@@ -2064,6 +2076,185 @@ class SpaceStore:
             return view(conn)
         return self._mutate(actor, operation_id, "mark_blocked", {"task_id": task_id, "reason_code": reason_code, "note": note},
                             authorize, effect, lambda conn, old: view(conn))
+
+    def _permission_views(self, conn, task_id):
+        """Permission requests of a task, folded from its append-only audit events (request, decision, grant, revoke)."""
+        views = {}
+        rows = conn.execute("SELECT * FROM baton.x_audit WHERE task_id=%s AND event=ANY(%s) ORDER BY time,id",
+                            (task_id, list(PERMISSION_EVENTS))).fetchall()
+        for row in rows:
+            meta = row["metadata"]
+            view = views.get(meta.get("request_id"))
+            if row["event"] == "permission.requested":
+                views[meta["request_id"]] = {
+                    "request_id": meta["request_id"], "task_id": str(task_id), "epoch": meta["epoch"], "worker": row["agent"],
+                    "worker_account": row["actor_account"], **meta["permission"], "options": list(PERMISSION_OPTIONS),
+                    "status": "pending", "requested_at": row["time"], "decided_by": None, "decided_at": None,
+                    "authority": None, "grant": None, "granted_at": None, "revoked_at": None}
+            elif view is None:
+                continue
+            elif row["event"] == "permission.decided":
+                authority = "root" if meta.get("root") else f'delegated by {meta["grantor"]} via {meta["delegation_id"]}'
+                view.update(status=meta["decision"], decided_by=row["agent"], decided_at=row["time"], authority=authority)
+            elif row["event"] == "permission.granted":
+                view.update(grant="granted", granted_at=row["time"])
+            else:
+                view.update(grant="revoked", revoked_at=row["time"])
+        return views
+
+    def _permission_request(self, conn, task_id, request_id):
+        view = self._permission_views(conn, task_id).get(_uuid(request_id, "request_id"))
+        if view is None:
+            raise StoreError("not_found")
+        return view
+
+    def request_permission(self, actor, operation_id, task_id, epoch, cli, tool, directory=None, reason=None, excerpt=None,
+                           approvers=None):
+        """The live holder asks for input: its CLI hit a permission wall. The task keeps its claim and epoch.
+
+        Marks the task `waiting_input` (the state a reader sees), writes a thread comment with the structured request and
+        mentions the named approvers. The request itself lives in the append-only audit, so no schema change is needed.
+        """
+        _integer(epoch, 1, 2**63 - 1, "epoch")
+        if not isinstance(cli, str) or not PERMISSION_CLI.fullmatch(cli):
+            raise StoreError("invalid", "cli", "lowercase CLI name of at most 32 characters")
+        _one_line(tool, 200, "tool")
+        if directory is not None:
+            _one_line(directory, 500, "directory")
+        if reason is not None:
+            _one_line(reason, 300, "reason")
+        if excerpt is not None:
+            _text(excerpt, 2000, field="excerpt")
+        if approvers is None:
+            approvers = []
+        if not isinstance(approvers, list) or len(approvers) > 10:
+            raise StoreError("invalid", "approvers", "array of at most 10 principal identifiers")
+        approvers = sorted({_identifier(name, "approvers") for name in approvers})
+        def effect(conn):
+            self._live(conn, actor, task_id, epoch)
+            task = self._row(conn, "tasks", task_id)
+            views = self._permission_views(conn, task_id).values()
+            if any(view["status"] == "pending" for view in views):
+                raise StoreError("operation_conflict")
+            if sum(view["epoch"] == epoch for view in views) >= PERMISSION_MAX_PER_EPOCH:
+                raise StoreError("rate_limited")
+            request_id = str(uuid.uuid4())
+            permission = {"cli": cli, "tool": tool, "directory": directory, "reason": reason, "approvers": approvers,
+                          "excerpt_sha256": _sha256(excerpt) if excerpt else None}
+            self._task_audit(conn, actor, operation_id, "permission.requested", task, epoch=epoch, request_id=request_id,
+                             permission=permission)
+            conn.execute("UPDATE baton.tasks SET blocked_reason='waiting_input',blocked_by=%s,blocked_at=clock_timestamp() WHERE id=%s",
+                         (actor.principal, task_id))
+            structured = {"kind": "permission_request", "request_id": request_id, "task_id": task_id, "epoch": epoch,
+                          "worker": actor.principal, "cli": cli, "tool": tool, "directory": directory, "reason": reason,
+                          "approvers": approvers, "options": list(PERMISSION_OPTIONS), "excerpt": excerpt}
+            body = (f"[input required: permission] {actor.principal} needs `{tool}` allowed in its {cli} configuration "
+                    f"(request {request_id}). Approvers: {', '.join('@' + name for name in approvers) or 'none named'}. "
+                    "Decide with decide_permission: allow_once, allow_always or deny.\n"
+                    + json.dumps(structured, indent=2, sort_keys=True))
+            comment = self._comment(conn, actor, operation_id, str(task["page_id"]), body, task_id,
+                                    subject=f"[input required: permission] {task_id}", requested_by=task["owner"])
+            parties = [(task["owner"], task["owner_account"])]
+            targets = {task["owner"]: ("agent", False)}
+            for name in approvers:
+                who = self._directory_actor(name)
+                if who is not None:
+                    parties.append((who.principal, who.account))
+                    targets[who.principal] = ("person" if who.kind == "human" else "agent", True)
+            for target, (kind, action) in targets.items():
+                conn.execute("""INSERT INTO baton.mentions(id,comment_id,target_type,target_id,action_requested,requested_by)
+                    VALUES (%s,%s,%s,%s,%s,%s)""", (uuid.uuid4(), comment["id"], kind, target, action, actor.principal))
+            self._enqueue(conn, actor, "task.blocked", "task", task["id"], task["page_id"], parties, task_id)
+            return self._permission_views(conn, task_id)[request_id]
+        args = {"task_id": task_id, "epoch": epoch, "cli": cli, "tool": tool, "directory": directory, "reason": reason,
+                "excerpt": excerpt, "approvers": approvers}
+        return self._mutate(actor, operation_id, "request_permission", args,
+                            lambda conn: self._manual(conn, actor, task_id, "comment"), effect,
+                            lambda conn, old: self._permission_request(conn, task_id, old["request_id"]))
+
+    def _directory_actor(self, principal):
+        try:
+            who = self.directory(principal) if self.directory else None
+        except Exception:
+            return None
+        return who if isinstance(who, Actor) and who.principal == principal else None
+
+    def decide_permission(self, actor, operation_id, task_id, request_id, option, reason=None):
+        """An approver answers a pending permission request: the space root, or a principal holding a covering approver
+        delegation (the gate's authority). The requesting worker, anyone who held the claim this epoch and, unless root,
+        anyone sharing their account can never decide."""
+        _uuid(request_id, "request_id")
+        if not isinstance(option, str) or option not in PERMISSION_OPTIONS:
+            raise StoreError("invalid", "option", "one of " + ", ".join(PERMISSION_OPTIONS))
+        if reason is not None:
+            reason = _trimmed(reason, 500, "reason")
+        approval = {}
+        def authorize(conn):
+            task = self._manual(conn, actor, task_id)
+            request = self._permission_request(conn, task_id, request_id)
+            page = self._row(conn, "pages", str(task["page_id"]))
+            root = self._is_root(self._row(conn, "spaces", str(page["space_id"])), actor.principal, actor.account, actor.kind)
+            principals, accounts = self._executors(conn, task, request["epoch"])
+            principals.add(request["worker"])
+            accounts.add(request["worker_account"])
+            if actor.principal in principals or (not root and actor.account in accounts):
+                raise StoreError("forbidden")
+            approval.update(root=root, self_approval=False, chain=[] if root else self._approver_chain(conn, actor, task))
+        def effect(conn):
+            task = self._row(conn, "tasks", task_id)
+            request = self._permission_request(conn, task_id, request_id)
+            claim = conn.execute("SELECT holder FROM baton.x_claim WHERE task_id=%s AND lease_expires_at>clock_timestamp()", (task_id,)).fetchone()
+            if (request["status"] != "pending" or task["state"] != "claimed" or task["epoch"] != request["epoch"]
+                    or not claim or claim["holder"] != request["worker"]):
+                raise StoreError("stale_claim")
+            chain = approval["chain"]
+            leaf = chain[0] if chain else None
+            via = {"delegation_id": leaf["id"], "grantor": leaf["grantor"]} if leaf else {}
+            self._task_audit(conn, actor, operation_id, "permission.decided", task, epoch=request["epoch"], request_id=request_id,
+                             decision=option, approver=actor.principal, root=approval["root"],
+                             chain=[str(link["id"]) for link in chain], **({"reason": reason} if reason else {}), **via)
+            conn.execute("""UPDATE baton.tasks SET blocked_reason=NULL,blocked_by=NULL,blocked_at=NULL
+                WHERE id=%s AND blocked_reason='waiting_input' AND blocked_by=%s""", (task_id, request["worker"]))
+            body = (f"[permission decision] {option} for `{request['tool']}` (request {request_id}) by {actor.principal}; "
+                    f"authority: {self._authority(approval)}" + (f"; reason: {reason}" if reason else ""))
+            comment = self._comment(conn, actor, operation_id, str(task["page_id"]), body, task_id,
+                                    subject=f"[permission decision] {task_id}", requested_by=task["owner"])
+            parties = self._task_parties(conn, task)
+            self._enqueue(conn, actor, "comment.created", "comment", comment["id"], task["page_id"],
+                          [parties["owner"], parties["holder"], parties["assignee"]], task_id)
+            return self._permission_request(conn, task_id, request_id)
+        args = {"task_id": task_id, "request_id": request_id, "option": option, **({"reason": reason} if reason else {})}
+        return self._mutate(actor, operation_id, "decide_permission", args, authorize, effect,
+                            lambda conn, old: self._permission_request(conn, task_id, request_id))
+
+    def record_permission(self, actor, operation_id, task_id, request_id, event):
+        """The requesting worker reports that it applied (granted) or removed (revoked) the approved permission."""
+        _uuid(request_id, "request_id")
+        if not isinstance(event, str) or event not in PERMISSION_GRANT_EVENTS:
+            raise StoreError("invalid", "event", "one of " + ", ".join(PERMISSION_GRANT_EVENTS))
+        def authorize(conn):
+            self._manual(conn, actor, task_id, "comment")
+            request = self._permission_request(conn, task_id, request_id)
+            if (actor.principal, actor.account) != (request["worker"], request["worker_account"]):
+                raise StoreError("forbidden")
+        def effect(conn):
+            task = self._row(conn, "tasks", task_id)
+            request = self._permission_request(conn, task_id, request_id)
+            wanted = {"granted": (request["status"] in ("allow_once", "allow_always") and request["grant"] is None),
+                      "revoked": request["grant"] == "granted"}[event]
+            if not wanted:
+                raise StoreError("stale_claim")
+            self._task_audit(conn, actor, operation_id, "permission." + event, task, epoch=request["epoch"], request_id=request_id,
+                             decision=request["status"])
+            return self._permission_request(conn, task_id, request_id)
+        return self._mutate(actor, operation_id, "record_permission", {"task_id": task_id, "request_id": request_id, "event": event},
+                            authorize, effect, lambda conn, old: self._permission_request(conn, task_id, request_id))
+
+    def list_permissions(self, actor, task_id):
+        def read(conn):
+            self._task_for(conn, actor, task_id)
+            return list(self._permission_views(conn, _uuid(task_id, "task_id")).values())
+        return self._read(actor, read)
 
     def set_priority(self, actor, operation_id, task_id, priority):
         priority = _priority(priority)

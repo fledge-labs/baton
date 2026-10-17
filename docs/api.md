@@ -67,6 +67,10 @@ with urlopen(request) as response:
 - `plan(operation_id: str, graph: list[dict])` — 写入。
 - `set_work_face(operation_id: str, task_id: str, work_face: dict, base_commit: str | None = None)` — 写入。
 - `mark_blocked(operation_id: str, task_id: str, reason_code: str, note: str | None = None)` — 写入；见下文“阻塞标记”。
+- `request_permission(operation_id: str, task_id: str, epoch: int, cli: str, tool: str, directory: str | None = None, reason: str | None = None, excerpt: str | None = None, approvers: list[str] | None = None)` — 写入；见下文“权限请求”。
+- `decide_permission(operation_id: str, task_id: str, request_id: str, option: str, reason: str | None = None)` — 写入；`option` 为 `allow_once`、`allow_always`、`deny`。
+- `record_permission(operation_id: str, task_id: str, request_id: str, event: str)` — 写入；`event` 为 `granted` 或 `revoked`，只有请求的 worker 能报告。
+- `list_permissions(task_id: str)` — 读取；任务的权限请求及其决定、应用状态。
 - `ready(page_id: str | None = None, limit: int = 50)` — 读取。
 - `ready_for_role(role: str, limit: int = 50)` — 读取；某个角色的就绪队列，见“角色队列”。
 - `set_task_role(operation_id: str, task_id: str, role: str | None)` — 写入；任务 owner 或 Space 根在任务仍为 `queued` 时设置或清除（`null`）角色，见“角色队列”。
@@ -235,7 +239,7 @@ Baton 不会执行 `acceptance_command`。它只是显示给领取人和 gate �
 | `task.handed_off` | `handoff` | 新持有人 | task |
 | `task.failed` | 旧版内置 worker 行的历史事件；当前没有任何路径产生它，保留是为了让旧订阅与旧 outbox 行继续有效 | owner | task |
 | `task.overdue` | 后台升级循环发现任务超过 `respond_by` 仍无响应（见“响应时效与超时升级”） | `escalate_to`，与其不同时还有 owner | task |
-| `task.blocked` | `mark_blocked`（见“阻塞标记”） | 任务 owner（不含操作者） | task |
+| `task.blocked` | `mark_blocked`（见“阻塞标记”）；`request_permission`（见“权限请求”） | 任务 owner（不含操作者）；权限请求另含被点名的 approvers | task |
 | `claim.expiring` | 既有的响应时效扫描发现一条有效租约剩余不足 `max(60 秒, 租期的 20%)`，租期至少 120 秒，且该 epoch 的当前租约窗口还没有这条通知 | 当前持有人 | task |
 | `role.sla_breached` | 后台升级循环发现某角色最久的就绪任务等待超过该角色的 SLA（见“角色队列”） | Space 根与持有覆盖该 Space 的审批人委托的主体 | task |
 
@@ -353,6 +357,36 @@ view = httpx.post(BASE + "/v1/space/mark_blocked", headers=HEADERS, json={
     "reason_code": "scope_conflict", "note": "src/ 目录被另一个任务占用",
 }).json()["result"]
 print(view["blocked"])  # {"reason_code": "scope_conflict", "by": "...", "at": "..."}
+```
+
+## 权限请求
+
+本地执行器（`adapters/local_runner.py`）运行的 agent CLI 在 headless 模式下被自己的白名单拒绝（例如 agy 拒绝白名单外的 `rg`）时，不再“拒绝并退出”：执行器发一个**权限请求**，任务进入可见的 `input required: permission` 状态，等 approver 决定，批准后在**同一 epoch、同一租约、同一 worktree** 内恢复。这是 Baton 的 x_ 扩展（规格 X26），模型参考 A2A 的 `INPUT_REQUIRED` 与 MCP elicitation；它不执行、不核验任何本地配置修改，只保存请求、决定和审计。
+
+**为什么不是 `mark_blocked`。** `mark_blocked` 对持有有效租约的持有人返回 `409 stale_claim`，只能先放掉租约再标记，恢复就得重新 `claim` 并提高 epoch。所以用一个小的请求对象：不新增表，请求与决定都是追加审计事件，`list_permissions` 把它们折叠成视图；追加审计只有服务端能写，评论者（包括 worker 自己）伪造不了“已批准”。
+
+- **`request_permission`。** 调用者必须是该任务当前有效租约的持有人，`epoch` 必须等于当前 epoch，否则 `409 stale_claim`。`cli` 是小写 CLI 名（至多 32 字符），`tool` 是被拒绝的程序或工具（单行，至多 200 字符；解析不出时执行器发 `(unparsed)`），`directory`（至多 500）、`reason`（至多 300）为单行，`excerpt` 至多 2000 字符，是解析失败时附带的已脱敏有界原始输出片段，`approvers` 至多 10 个 principal。同一任务同时只能有一个待决请求（`409 operation_conflict`），每个 epoch 至多 10 个（`429 rate_limited`）。同一事务内：写审计 `permission.requested`（元数据含 `request_id`、`epoch` 和 `permission={cli,tool,directory,reason,approvers,excerpt_sha256}`，不含 excerpt 正文）；任务视图出现 `blocked={"reason_code":"waiting_input","by":<worker>}`，状态仍是 `claimed`、租约与 epoch 不变；线程写一条评论，首行 `[input required: permission] …`，其后是结构化 JSON：`{"kind":"permission_request","request_id","task_id","epoch","worker","cli","tool","directory","reason","approvers","options":["allow_once","allow_always","deny"],"excerpt"}`；对 `approvers` 里能解析的主体写 `action_requested=true` 的提及，并给它们和 owner 发 `task.blocked` 通知（收件人仍需页面 view 权限）。
+- **`decide_permission`。** 授权沿用 gate 的权威（见“审批关卡”）：Space 根（owner），或持有覆盖该任务的有效审批人委托的主体（整条链重新校验，否则 `403 delegation_required`），且对页面有 edit 权限。请求里的 `approvers` 只决定提醒谁，不是授权来源。请求的 worker 自己永远不能决定，在该请求的 epoch 持有过 claim 的 principal 也不能，非根主体与它们共用 account 同样不行（`403 forbidden`）。请求必须仍待决、任务仍是 `claimed` 且 epoch 与租约有效，否则 `409 stale_claim`；一个请求只能被决定一次。`option` 不是三个取值之一返回 `422 invalid`，未知请求 `404`。写审计 `permission.decided`（含 `decision`、`approver`、`root`、`chain`，以及非根时的 `delegation_id`、`grantor`），清除 `waiting_input` 标记，并在线程写 `[permission decision] …` 评论。同 `operation_id` 同输入重放返回同一视图，异输入 `409 operation_conflict`。
+- **`record_permission`。** 只有请求的 worker（principal 与 account 都匹配）能调用：`granted` 要求请求已被批准为 `allow_once` 或 `allow_always` 且尚未报告过 `granted`，`revoked` 要求已 `granted`，否则 `409 stale_claim`。写审计 `permission.granted` / `permission.revoked`。它不要求租约有效，所以任务结束后的撤销也能报告。
+- **`list_permissions`。** 返回 `[{"request_id","task_id","epoch","worker","worker_account","cli","tool","directory","reason","approvers","excerpt_sha256","options","status","requested_at","decided_by","decided_at","authority","grant","granted_at","revoked_at"}]`。`status` 为 `pending`、`allow_once`、`allow_always`、`deny`；`grant` 为 `null`、`granted`、`revoked`；`authority` 为 `root` 或 `delegated by <grantor> via <delegation id>`。需要任务的 view 权限。
+- **范围边界。** 这条路径只描述 worker 自己 CLI 的命令/工具白名单。没有任何字段能改变本地沙箱（`home_read`、网络、Keychain、可写路径）。拒绝时执行器释放租约后 `mark_blocked(reason_code="other", note="permission_denied: <tool> (request <id>)")`：`tasks.blocked_reason` 的 CHECK 约束只允许 `mark_blocked` 列出的五个原因码，本功能不改 schema，所以 `permission_denied` 写在 `note` 里，不是第六个原因码。
+- **接口。** HTTP `POST /v1/space/{operation}`，MCP 工具同名。`adapters/mcp_stdio.py` 的已知工具表没有加入这四个操作（它不是这条路径的客户端，执行器直接调用 HTTP）；通过 MCP 的 approver 用 `list_permissions` 查看、用 `decide_permission` 决定。客户端配置、检测器和撤销命令见 `onboarding/local-runner.md`。
+
+```python
+# SPDX-License-Identifier: Apache-2.0
+import uuid
+import httpx
+
+BASE = "https://example.com"  # 你的 Baton 地址
+HEADERS = {"Authorization": "Bearer <审批人的令牌>"}
+
+pending = [row for row in httpx.post(BASE + "/v1/space/list_permissions", headers=HEADERS, json={
+    "task_id": "<任务 UUID>"}).json()["result"] if row["status"] == "pending"]
+decided = httpx.post(BASE + "/v1/space/decide_permission", headers=HEADERS, json={
+    "operation_id": str(uuid.uuid4()), "task_id": "<任务 UUID>", "request_id": pending[0]["request_id"],
+    "option": "allow_once", "reason": "只读搜索，仅此一次",
+}).json()["result"]
+print(decided["status"], decided["authority"])  # allow_once root
 ```
 
 ## 历史 root scope 迁移与调度告警
