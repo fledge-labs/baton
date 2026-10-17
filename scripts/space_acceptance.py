@@ -133,6 +133,8 @@ def run(args):
         result='Synthetic reviewed result', evidence=['https://example.com/result'])
     assert candidate['state'] == 'awaiting_gate' and candidate['status'] != 'completed'
     peer.call('gate', 'self-approve', expected=403, task_id=first['id'], expected_epoch=candidate['result_epoch'], decision='pass')
+    reviewer.call('gate', 'no-delegation', expected=403, task_id=first['id'], expected_epoch=candidate['result_epoch'], decision='pass')
+    owner.call('delegation_create', 'approver-reviewer', delegate_principal='space-reviewer', reason='Space acceptance approver')
     final = reviewer.call('gate', 'review-pass', task_id=first['id'],
         expected_epoch=candidate['result_epoch'], decision='pass', evidence=['https://example.com/review'])
     assert final['state'] == 'done' and final['status'] == 'completed'

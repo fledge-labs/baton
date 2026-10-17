@@ -12,6 +12,7 @@ import os
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -350,8 +351,9 @@ def test_handoff_cannot_fill_an_originally_null_base_commit(pg):
     assert transferred["base_commit"] is None
 
 
-def test_manual_gates_reject_self_review_and_old_candidate(pg):
+def test_manual_gates_reject_self_review_and_old_candidate(pg, approver):
     s = pg.store
+    approver(s, pg.reviewer, by=pg.owner)
     task = manual(pg)
     claim = s.claim(pg.editor, operation(), task["id"])
     awaiting = s.submit_result(pg.editor, operation(), task["id"], claim["epoch"], "Candidate one")
@@ -384,15 +386,17 @@ def test_assigned_tasks_can_only_be_claimed_by_recipient_and_never_auto_dispatch
     assert not any(task["owner"] == pg.reader.principal for task in s.list_tasks(pg.owner))
 
 
-def test_human_can_review_connected_account_agent_but_agent_cannot_self_approve(pg):
+def test_agent_on_the_owner_account_is_not_root_and_owner_account_work_needs_the_flag(pg, approver):
     s = pg.store
+    approver(s, pg.reviewer, by=pg.owner)
     agent = Actor(pg.prefix + "-connected", pg.owner.account, "agent")
-    task = s.submit_task(pg.owner, operation(), "connected", "Synthetic work", page_id=pg.page["id"], assignee=agent,
-                         scopes=[{"kind": "path", "value": pg.prefix}])
+    task = s.create_task_block(pg.owner, operation(), pg.page["id"], "Synthetic connected", [{"kind": "path", "value": pg.prefix}],
+                               [pg.reviewer.principal], assignee=agent)
     claim = s.claim(agent, operation(), task["id"])
     s.submit_result(agent, operation(), task["id"], claim["epoch"], "Connected result")
     expect("forbidden", lambda: s.gate(agent, operation(), task["id"], claim["epoch"], "pass"))
-    assert s.gate(pg.owner, operation(), task["id"], claim["epoch"], "pass")["state"] == "done"
+    expect("forbidden", lambda: s.gate(pg.owner, operation(), task["id"], claim["epoch"], "pass"))
+    assert s.gate(pg.reviewer, operation(), task["id"], claim["epoch"], "pass")["state"] == "done"
 
 
 def test_assignment_changes_only_when_released_and_inbox_rechecks_access(pg):
@@ -557,8 +561,9 @@ def test_explicit_request_promotes_assignment_notice_and_sorts_by_latest_activit
     assert len(s.list_audit(pg.owner, task_id=task["id"])) == len(before)
 
 
-def test_graph_blocks_claim_until_dependency_has_current_epoch_pass(pg):
+def test_graph_blocks_claim_until_dependency_has_current_epoch_pass(pg, approver):
     s = pg.store
+    approver(s, pg.reviewer, by=pg.owner)
     parent = manual(pg, "parent")
     child = manual(pg, "child", assignee=pg.editor)
     plan = s.plan(pg.owner, operation(), [{"task_id": child["id"], "depends_on": [parent["id"]]}])
@@ -632,8 +637,9 @@ def test_graph_cycle_batch_is_atomic_and_concurrent_opposite_edges_cannot_both_c
     assert len(s.get_task(pg.owner, x["id"])["depends_on"]) + len(s.get_task(pg.owner, y["id"])["depends_on"]) == 1
 
 
-def test_graph_cannot_modify_any_previously_claimed_or_executed_task(pg):
+def test_graph_cannot_modify_any_previously_claimed_or_executed_task(pg, approver):
     s = pg.store
+    approver(s, pg.reviewer, by=pg.owner)
     parent, child = manual(pg, "parent"), manual(pg, "child")
     claim = s.claim(pg.editor, operation(), child["id"])
     graph = [{"task_id": child["id"], "depends_on": [parent["id"]]}]
@@ -713,8 +719,9 @@ def test_graph_requires_dependency_visibility_without_exposing_private_content(p
     assert len(s.list_blocks(pg.owner, pg.page["id"])) == before
 
 
-def test_creation_dependencies_are_atomic_with_auto_queue_admission(pg):
+def test_creation_dependencies_are_atomic_with_auto_queue_admission(pg, approver):
     s = pg.store
+    approver(s, pg.reviewer, by=pg.owner)
     parent = manual(pg, "parent")
     child = s.submit_task(pg.owner, operation(), "auto-dependent", "Synthetic dependent auto task",
                          page_id=pg.page["id"], depends_on=[parent["id"]])
@@ -856,8 +863,9 @@ def ready_ids(pg, actor):
     return {row["id"] for row in pg.store.ready(actor, pg.page["id"])}
 
 
-def test_incomplete_work_face_blocks_claim_and_ready_until_owner_completes(pg, tmp_path):
+def test_incomplete_work_face_blocks_claim_and_ready_until_owner_completes(pg, approver, tmp_path):
     s = pg.store
+    approver(s, pg.reviewer, by=pg.owner)
     marker = tmp_path / "executed"
     task = manual(pg, "wf-gate", scopes=disjoint(pg, "gate"), assignee=pg.editor, require_work_face=True)
     assert task["require_work_face"] is True and task["task_kind"] == "construction" and task["work_face"] is None
@@ -927,8 +935,9 @@ def test_claim_replay_rechecks_work_face(pg):
     expect("work_face_incomplete", lambda: s.claim(pg.editor, claim_op, task["id"]))
 
 
-def test_prep_task_gates_construction_through_graph_and_holder_sets_work_face(pg):
+def test_prep_task_gates_construction_through_graph_and_holder_sets_work_face(pg, approver):
     s = pg.store
+    approver(s, pg.reviewer, by=pg.owner)
     prep = manual(pg, "prep", scopes=disjoint(pg, "prep"), assignee=pg.editor, task_kind="prep")
     build = manual(pg, "build", scopes=disjoint(pg, "build"), assignee=pg.editor, depends_on=[prep["id"]], require_work_face=True)
     later = manual(pg, "later", scopes=disjoint(pg, "later"), assignee=pg.editor, depends_on=[prep["id"]], require_work_face=True)
@@ -993,8 +1002,9 @@ def test_set_work_face_requires_edit_and_owner_reviewer_or_live_prep_holder(pg):
     assert [row["performed_by"] for row in events] == [pg.editor.principal, pg.reviewer.principal, pg.owner.principal]
 
 
-def test_work_face_is_frozen_once_started_and_base_commit_is_set_once(pg):
+def test_work_face_is_frozen_once_started_and_base_commit_is_set_once(pg, approver):
     s = pg.store
+    approver(s, pg.reviewer, by=pg.owner)
     task = manual(pg, "wf-frozen", scopes=disjoint(pg, "frozen"), assignee=pg.editor, require_work_face=True)
     s.set_work_face(pg.owner, operation(), task["id"], face(), base_commit="base-1")
     expect("operation_conflict", lambda: s.set_work_face(pg.owner, operation(), task["id"], face(constraints=["changed"]), base_commit="base-2"))
@@ -1301,3 +1311,702 @@ def test_omitted_scopes_keep_their_legacy_digests(pg):
                                                        scopes=NONE, assignee=pg.editor))
     legacy_row = s.create_task_block(pg.owner, operation(), pg.page["id"], "Stored root", [], [pg.reviewer.principal])
     assert s.get_scopes(pg.owner, legacy_row["id"])["scopes"] == ROOT
+
+
+# R1 approver gate (DECISIONS 287/291): the space owner is the root approver; everyone else approves only under a
+# delegation that flows down from the root; nobody but the root approves their own work; policy can require two parties.
+
+def principal(pg, name, kind="agent"):
+    return Actor(pg.prefix + "-" + name, pg.prefix + "-" + name + "-account", kind)
+
+
+def awaiting(pg, suffix, reviewers, space=None, page=None, executor=None, **task_kwargs):
+    """A submitted candidate for a task whose configured reviewers are the given principals, none of them delegated yet."""
+    s = pg.store
+    space = space or pg.space
+    page = page or pg.page
+    executor = executor or pg.editor
+    creator = task_kwargs.pop("creator", pg.owner)
+    for actor in (*reviewers, executor):
+        s.share(pg.owner, operation(), "space", space["id"], "person", actor.account, "edit")
+    task = s.create_task_block(creator, operation(), page["id"], "Synthetic work " + suffix,
+                               [{"kind": "path", "value": pg.prefix + "/" + suffix}], [actor.principal for actor in reviewers], **task_kwargs)
+    claim = s.claim(executor, operation(), task["id"])
+    s.submit_result(executor, operation(), task["id"], claim["epoch"], "Candidate " + suffix)
+    return task, claim
+
+
+def grant(pg, delegate_to, by=None, **kwargs):
+    return pg.store.delegation_create(by or pg.owner, operation(), delegate_to, reason=kwargs.pop("reason", "DECISIONS 291"), **kwargs)
+
+
+def raw_delegation(pg, delegate_to, parent_id=None, grantor=None, created_hours=-2, expires_hours=-1, may_delegate=False, space_id=None):
+    """Insert a row directly with the runtime role's INSERT right, for states the API will not create."""
+    grantor = grantor or pg.owner
+    identity = uuid.uuid4()
+    with pg.store._transaction(write=True) as conn:
+        conn.execute("""INSERT INTO baton.x_delegation(id,grantor,grantor_account,grantor_kind,delegate,delegate_account,delegate_kind,
+            scope,space_id,may_delegate,parent_id,reason,created_via,created_by,created_at,expires_at) VALUES (%s,%s,%s,%s,%s,%s,%s,'approve',%s,%s,%s,
+            'DECISIONS 291','api',%s,clock_timestamp()+make_interval(hours=>%s),
+            CASE WHEN %s::int IS NULL THEN NULL ELSE clock_timestamp()+make_interval(hours=>%s::int) END)""",
+                     (identity, grantor.principal, grantor.account, grantor.kind, delegate_to.principal, delegate_to.account, delegate_to.kind,
+                      space_id, may_delegate, parent_id, grantor.principal, created_hours, expires_hours, expires_hours))
+    return str(identity)
+
+
+def gate_rows(pg, task_id):
+    with pg.store._transaction() as conn:
+        return conn.execute("SELECT * FROM baton.x_gate WHERE task_id=%s ORDER BY created_at", (task_id,)).fetchall()
+
+
+def reviewed_events(pg, task_id):
+    return [row for row in pg.store.list_audit(pg.owner, task_id=task_id) if row["event"] == "gate.reviewed"]
+
+
+def test_the_space_owner_is_root_and_approves_without_a_delegation(pg):
+    s = pg.store
+    task, claim = awaiting(pg, "root", [pg.reviewer])
+    assert s.delegation_list(pg.owner) == []
+    done = s.gate(pg.owner, operation(), task["id"], claim["epoch"], "pass")
+    assert done["state"] == "done" and done["approvals_required"] == 1 and done["approvals_passed"] == 1
+    row = gate_rows(pg, task["id"])[0]
+    assert (row["root"], row["self_approval"], row["delegation_id"], row["grantor"]) == (True, False, None, None)
+    event = reviewed_events(pg, task["id"])[0]
+    assert event["metadata"]["root"] is True and event["metadata"]["self_approval"] is False and event["metadata"]["chain"] == []
+    # An account that owns a different space has no authority over this one.
+    stranger_space = s.create_space(pg.reader, operation(), pg.prefix + "-stranger")
+    assert stranger_space["owner_account"] == pg.reader.account
+    s.share(pg.owner, operation(), "space", pg.space["id"], "person", pg.reader.account, "edit")
+    second, second_claim = awaiting(pg, "root-two", [pg.reader])
+    expect("delegation_required", lambda: s.gate(pg.reader, operation(), second["id"], second_claim["epoch"], "pass"))
+
+
+def test_non_root_without_a_covering_delegation_is_refused_humans_included(pg):
+    s = pg.store
+    judge = principal(pg, "judge")
+    task, claim = awaiting(pg, "nodel", [pg.reviewer, judge])
+    for reviewer in (pg.reviewer, judge):
+        expect("delegation_required", lambda reviewer=reviewer: s.gate(reviewer, operation(), task["id"], claim["epoch"], "pass"))
+        expect("delegation_required", lambda reviewer=reviewer: s.gate(reviewer, operation(), task["id"], claim["epoch"], "fail"))
+    assert s.get_task(pg.owner, task["id"])["state"] == "awaiting_gate"
+    outsider = principal(pg, "outsider", "human")
+    s.share(pg.owner, operation(), "space", pg.space["id"], "person", outsider.account, "edit")
+    grant(pg, outsider)
+    expect("forbidden", lambda: s.gate(outsider, operation(), task["id"], claim["epoch"], "pass"))
+    grant(pg, pg.reviewer)
+    assert s.gate(pg.reviewer, operation(), task["id"], claim["epoch"], "pass")["state"] == "done"
+
+
+def test_delegated_approval_records_the_chain_in_the_gate_audit(pg):
+    s = pg.store
+    judge = principal(pg, "judge-chain")
+    task, claim = awaiting(pg, "chain", [judge])
+    root = grant(pg, judge)
+    assert root["active"] and root["created_via"] == "api" and root["chain"] == [root["id"]] and root["parent_id"] is None
+    assert s.gate(judge, operation(), task["id"], claim["epoch"], "pass", ["synthetic-evidence"])["state"] == "done"
+    reviewed = reviewed_events(pg, task["id"])
+    assert len(reviewed) == 1 and reviewed[0]["agent"] == judge.principal
+    assert reviewed[0]["metadata"]["delegation_id"] == root["id"] and reviewed[0]["metadata"]["grantor"] == pg.owner.principal
+    assert reviewed[0]["metadata"]["chain"] == [root["id"]] and reviewed[0]["metadata"]["root"] is False
+    row = gate_rows(pg, task["id"])[0]
+    assert (str(row["delegation_id"]), row["grantor"], row["root"]) == (root["id"], pg.owner.principal, False)
+
+
+def test_only_the_space_owner_or_a_may_delegate_holder_can_grant(pg):
+    s = pg.store
+    middle, leaf, plain = principal(pg, "middle"), principal(pg, "leaf", "human"), principal(pg, "plain")
+    task, claim = awaiting(pg, "redeleg", [leaf])
+    expect("forbidden", lambda: s.delegation_create(pg.reviewer, operation(), leaf, reason="not the owner"))
+    expect("forbidden", lambda: s.delegation_create(pg.reader, operation(), leaf, space_id=pg.space["id"], reason="not the owner"))
+    other_space = s.create_space(pg.reader, operation(), pg.prefix + "-theirs")
+    expect("forbidden", lambda: s.delegation_create(pg.owner, operation(), leaf, space_id=other_space["id"], reason="owner of another space"))
+    grant(pg, plain)
+    expect("forbidden", lambda: s.delegation_create(plain, operation(), leaf, reason="DECISIONS 291"))
+    root = grant(pg, middle, may_delegate=True)
+    assert root["may_delegate"] is True
+    child = s.delegation_create(middle, operation(), leaf, reason="DECISIONS 291")
+    assert child["parent_id"] == root["id"] and child["grantor"] == middle.principal and child["grantor_kind"] == "agent"
+    assert child["chain"] == [child["id"], root["id"]] and child["created_by"] == middle.principal
+    assert s.gate(leaf, operation(), task["id"], claim["epoch"], "pass")["state"] == "done"
+    reviewed = reviewed_events(pg, task["id"])[0]
+    assert reviewed["metadata"]["chain"] == [child["id"], root["id"]]
+    assert reviewed["metadata"]["delegation_id"] == child["id"] and reviewed["metadata"]["grantor"] == middle.principal
+
+
+def test_the_root_grantor_can_be_any_kind_and_the_operator_path_is_bounded_by_the_same_rules(pg):
+    s = pg.store
+    judge = principal(pg, "judge-operator")
+    agent_space = s.create_space(pg.editor, operation(), pg.prefix + "-agent-owned")
+    assert (agent_space["owner_principal"], agent_space["owner_kind"]) == (pg.editor.principal, "agent")
+    twin = Actor(pg.prefix + "-owner-twin", pg.owner.account, "agent")
+    expect("invalid", lambda: s.operator_delegation_create(pg.reader, judge, "approve", pg.space["id"], None, False, "not the owner", "operator-a"))
+    expect("invalid", lambda: s.operator_delegation_create(twin, judge, "approve", pg.space["id"], None, False, "same account only", "operator-a"))
+    expect("invalid", lambda: s.operator_delegation_create(Actor(pg.owner.principal, pg.owner.account, "agent"), judge, "approve",
+                                                           pg.space["id"], None, False, "wrong kind", "operator-a"))
+    expect("invalid", lambda: s.operator_delegation_create(pg.editor, pg.editor, "approve", agent_space["id"], None, False, "to itself", "operator-a"))
+    expect("invalid", lambda: s.operator_delegation_create(pg.editor, judge, "gate", agent_space["id"], None, False, "old scope", "operator-a"))
+    root = s.operator_delegation_create(pg.editor, judge, "approve", agent_space["id"], None, False, "DECISIONS 291", "operator-a")
+    assert root["created_via"] == "operator" and root["created_by"] == "operator-a" and root["grantor_kind"] == "agent"
+    assert root["grantor"] == pg.editor.principal and root["parent_id"] is None and root["active"] is True
+    event = next(row for row in s.list_audit(pg.editor, space_id=agent_space["id"], limit=1000) if row["event"] == "delegation.created")
+    assert event["requested_by"] == pg.editor.principal and event["performed_by"] == "operator:operator-a"
+    page = s.create_page(pg.editor, operation(), agent_space["id"], "Agent page")
+    s.share(pg.editor, operation(), "space", agent_space["id"], "person", pg.reviewer.account, "edit")
+    s.share(pg.editor, operation(), "space", agent_space["id"], "person", judge.account, "edit")
+    task = s.create_task_block(pg.editor, operation(), page["id"], "Synthetic agent owned", [{"kind": "path", "value": pg.prefix}], [judge.principal])
+    claim = s.claim(pg.reviewer, operation(), task["id"])
+    s.submit_result(pg.reviewer, operation(), task["id"], claim["epoch"], "Candidate")
+    assert s.gate(judge, operation(), task["id"], claim["epoch"], "pass")["state"] == "done"
+
+
+def test_delegation_cycles_are_rejected_at_creation(pg):
+    s = pg.store
+    a, b, c = (principal(pg, name) for name in ("cycle-a", "cycle-b", "cycle-c"))
+    grant(pg, a, may_delegate=True)
+    s.delegation_create(a, operation(), b, may_delegate=True, reason="DECISIONS 291")
+    expect("invalid", lambda: s.delegation_create(a, operation(), a, reason="to itself"))
+    expect("invalid", lambda: s.delegation_create(b, operation(), a, reason="to someone above it in its own chain"))
+    expect("invalid", lambda: s.delegation_create(b, operation(), b, reason="to itself"))
+    expect("invalid", lambda: s.delegation_create(b, operation(), pg.owner, reason="to the root"))
+    expect("invalid", lambda: s.delegation_create(pg.owner, operation(), pg.owner, reason="the root to itself"))
+    assert s.delegation_create(b, operation(), c, reason="downward is fine")["chain"].__len__() == 3
+    with s._transaction() as conn:
+        assert conn.execute("SELECT count(*) AS n FROM baton.x_delegation WHERE delegate=%s", (a.principal,)).fetchone()["n"] == 1
+
+
+def test_child_delegation_never_exceeds_its_parent(pg):
+    s = pg.store
+    other = s.create_space(pg.owner, operation(), pg.prefix + "-narrow")
+    first, second, grandchild = principal(pg, "first"), principal(pg, "second"), principal(pg, "third")
+    soon = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+    later = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
+    root = grant(pg, first, may_delegate=True, space_id=pg.space["id"], expires_at=soon)
+    expect("invalid", lambda: s.delegation_create(first, operation(), second, reason="wider: all spaces", expires_at=soon))
+    expect("invalid", lambda: s.delegation_create(first, operation(), second, reason="other space", space_id=other["id"], expires_at=soon))
+    expect("invalid", lambda: s.delegation_create(first, operation(), second, reason="no expiry", space_id=pg.space["id"]))
+    expect("invalid", lambda: s.delegation_create(first, operation(), second, reason="later expiry", space_id=pg.space["id"], expires_at=later))
+    child = s.delegation_create(first, operation(), second, reason="same scope", space_id=pg.space["id"], expires_at=soon)
+    assert child["expires_at"] == root["expires_at"] and child["space_id"] == root["space_id"]
+    earlier = s.delegation_create(first, operation(), grandchild, reason="narrower", space_id=pg.space["id"],
+                                  expires_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())
+    assert earlier["active"]
+    broad_actor = principal(pg, "broad")
+    grant(pg, broad_actor, may_delegate=True)
+    narrow = s.delegation_create(broad_actor, operation(), second, reason="narrow below broad", space_id=other["id"])
+    assert narrow["space_id"] == other["id"] and len(narrow["chain"]) == 2
+
+
+def test_delegation_chain_depth_is_capped_at_three(pg):
+    s = pg.store
+    a, b, c, d = (principal(pg, name) for name in ("depth-a", "depth-b", "depth-c", "depth-d"))
+    grant(pg, a, may_delegate=True)
+    s.delegation_create(a, operation(), b, may_delegate=True, reason="DECISIONS 291")
+    third = s.delegation_create(b, operation(), c, may_delegate=True, reason="DECISIONS 291")
+    assert len(third["chain"]) == 3
+    expect("invalid", lambda: s.delegation_create(c, operation(), d, reason="a fourth link"))
+    task, claim = awaiting(pg, "depth", [c])
+    assert s.gate(c, operation(), task["id"], claim["epoch"], "pass")["state"] == "done"
+
+
+def test_revoking_a_parent_disables_every_child_and_broken_chains_do_not_approve(pg):
+    s = pg.store
+    middle, leaf = principal(pg, "mid"), principal(pg, "leafy", "human")
+    task, claim = awaiting(pg, "cascade", [leaf])
+    root = grant(pg, middle, may_delegate=True)
+    child = s.delegation_create(middle, operation(), leaf, reason="DECISIONS 291")
+    assert next(row for row in s.delegation_list(leaf) if row["id"] == child["id"])["active"]
+    s.delegation_revoke(pg.owner, operation(), root["id"])
+    listed = {row["id"]: row for row in s.delegation_list(leaf)}
+    assert listed[child["id"]]["active"] is False and listed[child["id"]]["revoked_at"] is None
+    expect("delegation_required", lambda: s.gate(leaf, operation(), task["id"], claim["epoch"], "pass"))
+    expect("forbidden", lambda: s.delegation_create(middle, operation(), principal(pg, "late"), reason="parent revoked"))
+    other = principal(pg, "orphan")
+    expired_parent = raw_delegation(pg, middle, may_delegate=True)
+    inactive_child = raw_delegation(pg, other, parent_id=expired_parent, grantor=middle, expires_hours=None, created_hours=-1)
+    assert [row["active"] for row in s.delegation_list(other) if row["id"] == inactive_child] == [False]
+    holder = principal(pg, "no-redelegation", "human")
+    unauthorized = raw_delegation(pg, leaf, parent_id=grant(pg, holder)["id"], grantor=holder, created_hours=0, expires_hours=None)
+    assert [row["active"] for row in s.delegation_list(leaf) if row["id"] == unauthorized] == [False]
+    not_owner = raw_delegation(pg, leaf, grantor=pg.reader, created_hours=0, expires_hours=None)
+    not_owner_space = raw_delegation(pg, leaf, grantor=pg.reader, created_hours=0, expires_hours=None, space_id=pg.space["id"])
+    assert [row["active"] for row in s.delegation_list(leaf) if row["id"] == not_owner_space] == [False]
+    assert not_owner
+    expect("delegation_required", lambda: s.gate(leaf, operation(), task["id"], claim["epoch"], "pass"))
+
+
+def test_expired_and_revoked_delegations_are_refused_and_replay_rechecks(pg):
+    s = pg.store
+    judge = principal(pg, "judge-exp")
+    task, claim = awaiting(pg, "expired", [judge])
+    expired = raw_delegation(pg, judge)
+    assert [row["active"] for row in s.delegation_list(judge) if row["id"] == expired] == [False]
+    expect("delegation_required", lambda: s.gate(judge, operation(), task["id"], claim["epoch"], "pass"))
+    first = grant(pg, judge)
+    revoked = s.delegation_revoke(pg.owner, operation(), first["id"])
+    assert revoked["revoked_by"] == pg.owner.principal and not revoked["active"]
+    expect("delegation_required", lambda: s.gate(judge, operation(), task["id"], claim["epoch"], "pass"))
+    second = grant(pg, judge, expires_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())
+    op = operation()
+    assert s.gate(judge, op, task["id"], claim["epoch"], "pass")["state"] == "done"
+    assert s.gate(judge, op, task["id"], claim["epoch"], "pass")["replay"] is True
+    s.delegation_revoke(pg.owner, operation(), second["id"])
+    expect("delegation_required", lambda: s.gate(judge, op, task["id"], claim["epoch"], "pass"))
+    assert len(reviewed_events(pg, task["id"])) == 1
+
+
+def test_a_grantee_is_bounded_to_the_space_and_roots_only_reach_spaces_their_grantor_owns(pg):
+    s = pg.store
+    other_space = s.create_space(pg.owner, operation(), pg.prefix + "-other")
+    other_page = s.create_page(pg.owner, operation(), other_space["id"], "Other page")
+    judge = principal(pg, "judge-space")
+    home_task, home_claim = awaiting(pg, "home", [judge])
+    foreign_task, foreign_claim = awaiting(pg, "foreign", [judge], other_space, other_page)
+    scoped = grant(pg, judge, space_id=pg.space["id"])
+    assert scoped["space_id"] == pg.space["id"]
+    expect("delegation_required", lambda: s.gate(judge, operation(), foreign_task["id"], foreign_claim["epoch"], "pass"))
+    assert s.gate(judge, operation(), home_task["id"], home_claim["epoch"], "pass")["state"] == "done"
+    grant(pg, judge, space_id=other_space["id"])
+    assert s.gate(judge, operation(), foreign_task["id"], foreign_claim["epoch"], "pass")["state"] == "done"
+
+
+def test_all_spaces_delegation_covers_every_space_the_root_owns(pg):
+    s = pg.store
+    other_space = s.create_space(pg.owner, operation(), pg.prefix + "-all")
+    other_page = s.create_page(pg.owner, operation(), other_space["id"], "All page")
+    judge = principal(pg, "judge-all", "human")
+    task, claim = awaiting(pg, "all", [judge], other_space, other_page)
+    root = grant(pg, judge)
+    assert root["space_id"] is None
+    assert s.gate(judge, operation(), task["id"], claim["epoch"], "pass")["state"] == "done"
+    foreign = s.create_space(pg.reader, operation(), pg.prefix + "-not-owned")
+    foreign_page = s.create_page(pg.reader, operation(), foreign["id"], "Foreign page")
+    s.share(pg.reader, operation(), "space", foreign["id"], "person", judge.account, "edit")
+    s.share(pg.reader, operation(), "space", foreign["id"], "person", pg.editor.account, "edit")
+    unowned = s.create_task_block(pg.reader, operation(), foreign_page["id"], "Synthetic foreign", [{"kind": "path", "value": pg.prefix + "/f"}], [judge.principal])
+    held = s.claim(pg.editor, operation(), unowned["id"])
+    s.submit_result(pg.editor, operation(), unowned["id"], held["epoch"], "Candidate")
+    expect("delegation_required", lambda: s.gate(judge, operation(), unowned["id"], held["epoch"], "pass"))
+
+
+def test_root_self_approval_needs_the_explicit_flag_and_is_recorded_as_such(pg):
+    s = pg.store
+    task = s.create_task_block(pg.owner, operation(), pg.page["id"], "Synthetic owner executes", [{"kind": "path", "value": pg.prefix + "/self"}], [pg.reviewer.principal])
+    claim = s.claim(pg.owner, operation(), task["id"])
+    s.submit_result(pg.owner, operation(), task["id"], claim["epoch"], "Owner candidate")
+    expect("forbidden", lambda: s.gate(pg.owner, operation(), task["id"], claim["epoch"], "pass"))
+    expect("forbidden", lambda: s.gate(pg.owner, operation(), task["id"], claim["epoch"], "pass", self_approval=False))
+    expect("invalid", lambda: s.gate(pg.owner, operation(), task["id"], claim["epoch"], "pass", self_approval="yes"))
+    assert s.get_task(pg.owner, task["id"])["state"] == "awaiting_gate"
+    done = s.gate(pg.owner, operation(), task["id"], claim["epoch"], "pass", self_approval=True)
+    assert done["state"] == "done"
+    row = gate_rows(pg, task["id"])[0]
+    assert (row["root"], row["self_approval"], row["reviewer"]) == (True, True, pg.owner.principal)
+    event = reviewed_events(pg, task["id"])[0]
+    assert event["metadata"]["self_approval"] is True and event["metadata"]["root"] is True and event["agent"] == pg.owner.principal
+    other, other_claim = awaiting(pg, "owner-approves-others", [pg.reviewer])
+    s.gate(pg.owner, operation(), other["id"], other_claim["epoch"], "pass", self_approval=True)
+    assert gate_rows(pg, other["id"])[0]["self_approval"] is False
+
+
+def test_non_root_self_approval_is_refused_even_with_the_flag(pg):
+    s = pg.store
+    first, second = principal(pg, "exec-first"), principal(pg, "exec-second")
+    for who in (first, second, pg.editor):
+        grant(pg, who)
+    s.share(pg.owner, operation(), "space", pg.space["id"], "person", first.account, "edit")
+    s.share(pg.owner, operation(), "space", pg.space["id"], "person", second.account, "edit")
+    task = s.create_task_block(pg.owner, operation(), pg.page["id"], "Synthetic handed off", [{"kind": "path", "value": pg.prefix + "/exec"}],
+                               [first.principal, second.principal, pg.editor.principal])
+    claim = s.claim(first, operation(), task["id"])
+    handed = s.handoff(first, operation(), task["id"], claim["epoch"], second)
+    s.submit_result(second, operation(), task["id"], handed["epoch"], "Candidate")
+    for refused in (second, first):
+        for flag in (False, True):
+            expect("forbidden", lambda refused=refused, flag=flag: s.gate(refused, operation(), task["id"], handed["epoch"], "pass", self_approval=flag))
+    alias = Actor(pg.prefix + "-exec-alias", first.account, "agent")
+    grant(pg, alias)
+    other = s.create_task_block(pg.owner, operation(), pg.page["id"], "Synthetic alias", [{"kind": "path", "value": pg.prefix + "/alias"}], [alias.principal])
+    held = s.claim(first, operation(), other["id"])
+    s.submit_result(first, operation(), other["id"], held["epoch"], "Candidate")
+    expect("forbidden", lambda: s.gate(alias, operation(), other["id"], held["epoch"], "pass", self_approval=True))
+    # The task owner created the request but neither submitted nor executed the result, so it approves as root.
+    assert s.gate(pg.owner, operation(), other["id"], held["epoch"], "pass")["state"] == "done"
+    assert s.gate(pg.owner, operation(), task["id"], handed["epoch"], "pass")["state"] == "done"
+
+
+def test_claim_holder_of_an_earlier_epoch_may_approve_a_later_epoch(pg):
+    s = pg.store
+    grant(pg, pg.editor)
+    grant(pg, pg.reviewer)
+    other = principal(pg, "later-worker")
+    s.share(pg.owner, operation(), "space", pg.space["id"], "person", other.account, "edit")
+    task = s.create_task_block(pg.owner, operation(), pg.page["id"], "Synthetic epochs", [{"kind": "path", "value": pg.prefix + "/epochs"}],
+                               [pg.editor.principal, pg.reviewer.principal])
+    first = s.claim(pg.editor, operation(), task["id"])
+    s.submit_result(pg.editor, operation(), task["id"], first["epoch"], "Candidate one")
+    assert s.gate(pg.reviewer, operation(), task["id"], first["epoch"], "fail")["state"] == "queued"
+    second = s.claim(other, operation(), task["id"])
+    s.submit_result(other, operation(), task["id"], second["epoch"], "Candidate two")
+    assert s.gate(pg.editor, operation(), task["id"], second["epoch"], "pass")["state"] == "done"
+
+
+def test_two_party_confirmation_by_task_override_needs_two_distinct_passes(pg):
+    s = pg.store
+    one, two = principal(pg, "party-one"), principal(pg, "party-two", "human")
+    grant(pg, one)
+    grant(pg, two)
+    task, claim = awaiting(pg, "twoparty", [one, two], approvals_required=2)
+    assert s.get_task(pg.owner, task["id"])["approvals_required"] == 2
+    op = operation()
+    first = s.gate(one, op, task["id"], claim["epoch"], "pass")
+    assert first["state"] == "awaiting_gate" and first["approvals_passed"] == 1 and first["approvals_required"] == 2
+    assert s.gate(one, op, task["id"], claim["epoch"], "pass")["replay"] is True
+    expect("forbidden", lambda: s.gate(one, operation(), task["id"], claim["epoch"], "pass"))
+    assert s.get_task(pg.owner, task["id"])["state"] == "awaiting_gate"
+    assert not any(row["event"] == "task.completed" for row in s.list_audit(pg.owner, task_id=task["id"]))
+    done = s.gate(two, operation(), task["id"], claim["epoch"], "pass")
+    assert done["state"] == "done" and done["approvals_passed"] == 2
+    events = reviewed_events(pg, task["id"])
+    assert [(row["metadata"]["approvals"], row["metadata"]["approvals_required"]) for row in events] == [(1, 2), (2, 2)]
+    assert len([row for row in s.list_audit(pg.owner, task_id=task["id"]) if row["event"] == "task.completed"]) == 1
+
+
+def test_a_fail_from_any_party_sends_a_two_party_task_back_and_old_passes_do_not_count(pg):
+    s = pg.store
+    one, two = principal(pg, "fail-one"), principal(pg, "fail-two")
+    grant(pg, one)
+    grant(pg, two)
+    task, claim = awaiting(pg, "twofail", [one, two], approvals_required=2)
+    s.gate(one, operation(), task["id"], claim["epoch"], "pass")
+    assert s.gate(two, operation(), task["id"], claim["epoch"], "fail")["state"] == "queued"
+    second = s.claim(pg.editor, operation(), task["id"])
+    s.submit_result(pg.editor, operation(), task["id"], second["epoch"], "Candidate two")
+    again = s.gate(one, operation(), task["id"], second["epoch"], "pass")
+    assert again["state"] == "awaiting_gate" and again["approvals_passed"] == 1
+    assert s.gate(two, operation(), task["id"], second["epoch"], "pass")["state"] == "done"
+
+
+def test_policy_requires_two_parties_for_matching_scopes_and_root_required_is_honoured(pg):
+    s = pg.store
+    one = principal(pg, "policy-one")
+    grant(pg, one)
+    expect("invalid", lambda: s.set_approval_policy(pg.space["id"], "path", pg.prefix, 3, False, "operator-a"))
+    expect("invalid", lambda: s.set_approval_policy(pg.space["id"], "path", pg.prefix, 1, "yes", "operator-a"))
+    expect("invalid", lambda: s.set_approval_policy(pg.space["id"], "glob", pg.prefix, 1, False, "operator-a"))
+    expect("not_found", lambda: s.set_approval_policy(str(uuid.uuid4()), "path", pg.prefix, 1, False, "operator-a"))
+    policy = s.set_approval_policy(pg.space["id"], "path", pg.prefix + "/guarded", 1, True, "operator-a")
+    assert (policy["required_approvals"], policy["root_required"]) == (1, True)
+    guarded, guarded_claim = awaiting(pg, "guarded/api", [one])
+    plain, plain_claim = awaiting(pg, "unguarded", [one])
+    assert s.get_task(pg.owner, plain["id"])["root_required"] is False
+    assert s.gate(one, operation(), plain["id"], plain_claim["epoch"], "pass")["state"] == "done"
+    view = s.get_task(pg.owner, guarded["id"])
+    assert view["root_required"] is True and view["approvals_required"] == 1
+    held = s.gate(one, operation(), guarded["id"], guarded_claim["epoch"], "pass")
+    assert held["state"] == "awaiting_gate" and held["approvals_passed"] == 1
+    assert s.gate(pg.owner, operation(), guarded["id"], guarded_claim["epoch"], "pass")["state"] == "done"
+    assert [row["metadata"]["root"] for row in reviewed_events(pg, guarded["id"])] == [False, True]
+
+
+def test_root_fail_is_final_when_the_root_is_required(pg):
+    s = pg.store
+    one = principal(pg, "final-one")
+    grant(pg, one)
+    s.set_approval_policy(pg.space["id"], "path", "", 1, True, "operator-a")
+    task, claim = awaiting(pg, "final", [one])
+    assert s.gate(one, operation(), task["id"], claim["epoch"], "pass")["state"] == "awaiting_gate"
+    assert s.gate(pg.owner, operation(), task["id"], claim["epoch"], "fail")["state"] == "queued"
+    second = s.claim(pg.editor, operation(), task["id"])
+    s.submit_result(pg.editor, operation(), task["id"], second["epoch"], "Candidate two")
+    assert s.gate(one, operation(), task["id"], second["epoch"], "pass")["state"] == "awaiting_gate"
+    assert s.gate(pg.owner, operation(), task["id"], second["epoch"], "pass")["state"] == "done"
+
+
+def test_one_human_organization_is_the_root_plus_one_delegated_approver(pg):
+    s = pg.store
+    helper = principal(pg, "only-helper")
+    grant(pg, helper)
+    s.set_approval_policy(pg.space["id"], "path", "", 2, True, "operator-a")
+    task, claim = awaiting(pg, "one-human", [helper])
+    assert s.gate(helper, operation(), task["id"], claim["epoch"], "pass")["state"] == "awaiting_gate"
+    done = s.gate(pg.owner, operation(), task["id"], claim["epoch"], "pass")
+    assert done["state"] == "done" and done["approvals_passed"] == 2
+
+
+def test_task_override_can_raise_a_policy_but_only_the_space_owner_can_lower_it(pg):
+    s = pg.store
+    one = principal(pg, "override-one")
+    grant(pg, one)
+    s.set_approval_policy(pg.space["id"], "path", "", 2, False, "operator-a")
+    by_owner = s.create_task_block(pg.owner, operation(), pg.page["id"], "Synthetic lowered", [{"kind": "path", "value": pg.prefix + "/o1"}],
+                                   [one.principal], approvals_required=1)
+    assert s.get_task(pg.owner, by_owner["id"])["approvals_required"] == 1
+    s.share(pg.owner, operation(), "space", pg.space["id"], "person", pg.editor.account, "edit")
+    by_editor = s.create_task_block(pg.editor, operation(), pg.page["id"], "Synthetic not lowered", [{"kind": "path", "value": pg.prefix + "/o2"}],
+                                    [one.principal], approvals_required=1)
+    assert s.get_task(pg.owner, by_editor["id"])["approvals_required"] == 2
+    default = s.create_task_block(pg.owner, operation(), pg.page["id"], "Synthetic default", [{"kind": "path", "value": pg.prefix + "/o3"}], [one.principal])
+    assert s.get_task(pg.owner, default["id"])["approvals_required"] == 2
+    for bad in (3, 0, True, "2", 1.0):
+        expect("invalid", lambda bad=bad: s.create_task_block(pg.owner, operation(), pg.page["id"], "Synthetic bad", [{"kind": "path", "value": pg.prefix}],
+                                                              [one.principal], approvals_required=bad))
+    expect("invalid", lambda: s.submit_task(pg.owner, operation(), "auto-override", "Synthetic auto", page_id=pg.page["id"], approvals_required=2))
+    assigned = s.submit_task(pg.owner, operation(), "assigned-override", "Synthetic assigned", page_id=pg.page["id"], assignee=pg.editor,
+                             scopes=[{"kind": "path", "value": pg.prefix + "/o4"}], approvals_required=2)
+    assert s.get_task(pg.owner, assigned["id"])["approvals_required"] == 2
+
+
+def test_policy_scopes_match_by_kind_and_prefix_and_changes_are_audited(pg):
+    s = pg.store
+    s.set_approval_policy(pg.space["id"], "path", pg.prefix + "/area", 2, False, "operator-a")
+    s.set_approval_policy(pg.space["id"], "migration", "7", 2, True, "operator-a")
+    task = s.create_task_block(pg.owner, operation(), pg.page["id"], "Synthetic scoped", [{"kind": "path", "value": pg.prefix + "/area/sub"}], [pg.reviewer.principal])
+    assert (s.get_task(pg.owner, task["id"])["approvals_required"], s.get_task(pg.owner, task["id"])["root_required"]) == (2, False)
+    sibling = s.create_task_block(pg.owner, operation(), pg.page["id"], "Synthetic sibling", [{"kind": "path", "value": pg.prefix + "/areas"}], [pg.reviewer.principal])
+    assert s.get_task(pg.owner, sibling["id"])["approvals_required"] == 1
+    migration = s.create_task_block(pg.owner, operation(), pg.page["id"], "Synthetic migration", [{"kind": "migration", "value": "007"}], [pg.reviewer.principal])
+    view = s.get_task(pg.owner, migration["id"])
+    assert (view["approvals_required"], view["root_required"]) == (2, True)
+    listed = s.list_approval_policies(pg.space["id"])
+    assert {(row["scope_kind"], row["scope_value"]) for row in listed} == {("path", pg.prefix + "/area"), ("migration", "7")}
+    s.set_approval_policy(pg.space["id"], "migration", "7", 1, False, "operator-b")
+    s.remove_approval_policy(pg.space["id"], "path", pg.prefix + "/area", "operator-b")
+    expect("not_found", lambda: s.remove_approval_policy(pg.space["id"], "path", pg.prefix + "/area", "operator-b"))
+    assert [(row["scope_kind"], row["required_approvals"]) for row in s.list_approval_policies(pg.space["id"])] == [("migration", 1)]
+    events = [row for row in s.list_audit(pg.owner, space_id=pg.space["id"], limit=1000) if row["event"].startswith("approval_policy.")]
+    assert [row["event"] for row in events] == ["approval_policy.set", "approval_policy.set", "approval_policy.set", "approval_policy.removed"]
+    assert all(row["performed_by"].startswith("operator:operator-") and row["metadata"]["scope_kind"] in {"path", "migration"} for row in events)
+    assert pg.prefix not in json.dumps(events)
+
+
+def test_worker_success_gate_needs_no_delegation_and_writes_none(pg):
+    s = pg.store
+    auto = s.submit_task(pg.owner, operation(), "auto-exempt", "Synthetic auto", page_id=pg.page["id"], scopes=[{"kind": "path", "value": pg.prefix}])
+    auto_claim = s.claim_next(SERVICE_ACTOR, operation())
+    assert auto_claim["task_id"] == auto["id"]
+    s.mark_dispatched(SERVICE_ACTOR, operation(), auto["id"], auto_claim["epoch"])
+    done = s.finish_auto(SERVICE_ACTOR, operation(), auto["id"], auto_claim["epoch"], "Demo output", operation(), "demo")
+    assert done["status"] == "completed" and done["approvals_required"] is None
+    row = gate_rows(pg, auto["id"])[0]
+    assert (row["delegation_id"], row["grantor"], row["root"], row["self_approval"]) == (None, None, False, False)
+    expect("forbidden", lambda: s.gate(SERVICE_ACTOR, operation(), auto["id"], auto_claim["epoch"], "pass"))
+
+
+def test_delegation_api_validation_and_authority(pg):
+    s = pg.store
+    judge = principal(pg, "judge-api")
+    for caller in (SERVICE_ACTOR, pg.editor, judge, pg.reviewer):
+        expect("forbidden", lambda caller=caller: s.delegation_create(caller, operation(), principal(pg, "target"), reason="DECISIONS 291"))
+    expect("forbidden", lambda: s.delegation_revoke(SERVICE_ACTOR, operation(), str(uuid.uuid4())))
+    expect("invalid", lambda: s.delegation_create(pg.owner, operation(), SERVICE_ACTOR, reason="DECISIONS 291"))
+    expect("invalid", lambda: s.delegation_create(pg.owner, operation(), pg.owner, reason="DECISIONS 291"))
+    expect("invalid", lambda: s.delegation_create(pg.owner, operation(), judge, scope="gate", reason="DECISIONS 291"))
+    expect("invalid", lambda: s.delegation_create(pg.owner, operation(), judge, may_delegate="yes", reason="DECISIONS 291"))
+    expect("invalid", lambda: s.delegation_create(pg.owner, operation(), judge, reason="x" * 501))
+    expect("invalid", lambda: s.delegation_create(pg.owner, operation(), judge, reason="   "))
+    expect("invalid", lambda: s.delegation_create(pg.owner, operation(), judge, reason=None))
+    expect("invalid", lambda: s.delegation_create(pg.owner, operation(), judge, space_id="not-a-uuid", reason="DECISIONS 291"))
+    expect("invalid", lambda: s.delegation_create(pg.owner, operation(), judge, expires_at="2099-01-01T00:00:00", reason="DECISIONS 291"))
+    expect("invalid", lambda: s.delegation_create(pg.owner, operation(), judge, expires_at="soon", reason="DECISIONS 291"))
+    expect("invalid", lambda: s.delegation_create(pg.owner, operation(), judge, expires_at="2001-01-01T00:00:00+00:00", reason="DECISIONS 291"))
+    expect("not_found", lambda: s.delegation_create(pg.owner, operation(), judge, space_id=str(uuid.uuid4()), reason="DECISIONS 291"))
+    assert len(grant(pg, judge, reason="r" * 500)["reason"]) == 500
+    given = grant(pg, judge, space_id=pg.space["id"], expires_at="2099-01-01T00:00:00Z")
+    expect("forbidden", lambda: s.delegation_revoke(pg.reviewer, operation(), given["id"]))
+    expect("forbidden", lambda: s.delegation_revoke(judge, operation(), given["id"]))
+    expect("not_found", lambda: s.delegation_revoke(pg.owner, operation(), str(uuid.uuid4())))
+    op = operation()
+    first = s.delegation_revoke(pg.owner, op, given["id"])
+    assert s.delegation_revoke(pg.owner, op, given["id"])["replay"] is True
+    assert s.delegation_revoke(pg.owner, operation(), given["id"])["revoked_at"] == first["revoked_at"]
+    events = [row["event"] for row in s.list_audit(pg.owner, space_id=pg.space["id"], limit=1000) if row["metadata"].get("delegation_id") == given["id"]]
+    assert events == ["delegation.created", "delegation.revoked"]
+    create_op = operation()
+    one = s.delegation_create(pg.owner, create_op, judge, reason="Same")
+    assert s.delegation_create(pg.owner, create_op, judge, reason="Same")["id"] == one["id"]
+    expect("operation_conflict", lambda: s.delegation_create(pg.owner, create_op, judge, reason="Different"))
+    assert one["id"] in {row["id"] for row in s.delegation_list(pg.owner)} and one["id"] in {row["id"] for row in s.delegation_list(judge)}
+    assert s.delegation_list(pg.reviewer) == [] and s.delegation_list(pg.editor) == []
+    assert given["id"] in {row["id"] for row in s.delegation_list(judge) if not row["active"]}
+
+
+def test_delegation_audit_metadata_is_identifiers_only(pg):
+    s = pg.store
+    middle, leaf = principal(pg, "meta-mid"), principal(pg, "meta-leaf")
+    root = grant(pg, middle, may_delegate=True, space_id=pg.space["id"], reason="Synthetic private reason text")
+    child = s.delegation_create(middle, operation(), leaf, space_id=pg.space["id"], reason="Synthetic private reason text")
+    s.delegation_revoke(middle, operation(), child["id"])
+    rows = [row for row in s.list_audit(pg.owner, space_id=pg.space["id"], limit=1000)
+            if row["metadata"].get("delegation_id") in {root["id"], child["id"]}]
+    assert [(row["event"], row["metadata"]["chain"]) for row in rows] == [
+        ("delegation.created", [root["id"]]), ("delegation.created", [child["id"], root["id"]]), ("delegation.revoked", [child["id"], root["id"]])]
+    for row in rows:
+        assert set(row["metadata"]) == {"delegation_id", "scope", "created_via", "chain"}
+        assert row["space_id"] == pg.space["id"] and "Synthetic private reason text" not in json.dumps(row)
+    assert rows[0]["actor_kind"] == "human" and rows[1]["actor_kind"] == "agent" and rows[1]["agent"] == middle.principal
+
+
+def test_runtime_role_can_only_revoke_delegations_and_only_append_claim_holders(pg):
+    judge = principal(pg, "judge-immutable")
+    given = grant(pg, judge)
+    with pg.store._transaction() as conn:
+        for statement in ("UPDATE baton.x_delegation SET reason='tampered'", "UPDATE baton.x_delegation SET expires_at=NULL",
+                          "UPDATE baton.x_delegation SET parent_id=NULL", "DELETE FROM baton.x_delegation", "TRUNCATE baton.x_delegation",
+                          "UPDATE baton.x_claim_holder SET holder='someone'", "DELETE FROM baton.x_claim_holder"):
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                with conn.transaction():
+                    conn.execute(statement)
+    config_path = os.environ.get("BATON_TEST_DATABASE_ADMIN_CONFIG")
+    if not config_path:
+        pytest.skip("Owner-trigger check needs explicitly authorized test admin config")
+    config = json.loads(Path(config_path).read_text())
+    with psycopg.connect(**config) as conn:
+        conn.execute("SET ROLE baton_owner")
+        for statement in ("UPDATE baton.x_delegation SET reason='tampered'", "UPDATE baton.x_delegation SET revoked_at=NULL, revoked_by=NULL",
+                          "DELETE FROM baton.x_delegation", "TRUNCATE baton.x_delegation CASCADE"):
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                with conn.transaction():
+                    conn.execute(statement)
+    pg.store.delegation_revoke(pg.owner, operation(), given["id"])
+    with psycopg.connect(**config) as conn:
+        conn.execute("SET ROLE baton_owner")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            with conn.transaction():
+                conn.execute("UPDATE baton.x_delegation SET revoked_by='someone-else' WHERE id=%s", (given["id"],))
+
+
+def test_table_constraints_reject_bad_delegations_policies_and_overrides(pg):
+    manual(pg, "constraint")
+    base = """INSERT INTO baton.x_delegation(id,grantor,grantor_account,grantor_kind,delegate,delegate_account,delegate_kind,
+        scope,reason,created_via,created_by,parent_id) VALUES (gen_random_uuid(),'g','a',%s,'d','da','agent',%s,%s,%s,'creator',%s)"""
+    with pg.store._transaction() as conn:
+        for params in (("service", "approve", "ok", "api", None), ("human", "gate", "ok", "api", None),
+                       ("human", "approve", "", "api", None), ("human", "approve", "x" * 501, "api", None), ("human", "approve", "ok", "script", None)):
+            with pytest.raises(psycopg.errors.CheckViolation):
+                with conn.transaction():
+                    conn.execute(base, params)
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            with conn.transaction():
+                conn.execute(base, ("agent", "approve", "ok", "api", str(uuid.uuid4())))
+        for required in (0, 3):
+            with pytest.raises(psycopg.errors.CheckViolation):
+                with conn.transaction():
+                    conn.execute("INSERT INTO baton.x_approval_policy(space_id,scope_kind,scope_value,required_approvals) VALUES (%s,'path','',%s)",
+                                 (pg.space["id"], required))
+        with pytest.raises(psycopg.errors.CheckViolation):
+            with conn.transaction():
+                conn.execute("UPDATE baton.tasks SET approvals_required=3 WHERE owner LIKE %s", (pg.prefix + "%",))
+
+
+def test_whole_space_policy_applies_to_tasks_with_scope_none_but_narrower_policies_do_not(pg):
+    s = pg.store
+    s.set_approval_policy(pg.space["id"], "path", pg.prefix + "/narrow", 2, True, "operator-a")
+    undeclared = s.create_task_block(pg.owner, operation(), pg.page["id"], "Synthetic undeclared scope", None, [pg.reviewer.principal])
+    assert undeclared["scopes"] == [{"kind": "none"}]
+    view = s.get_task(pg.owner, undeclared["id"])
+    assert (view["approvals_required"], view["root_required"]) == (1, False)
+    s.set_approval_policy(pg.space["id"], "path", "", 2, False, "operator-a")
+    assert s.get_task(pg.owner, undeclared["id"])["approvals_required"] == 2
+
+
+def test_create_space_records_the_creating_identity_as_the_root(pg):
+    assert (pg.space["owner_principal"], pg.space["owner_account"], pg.space["owner_kind"]) == (pg.owner.principal, pg.owner.account, "human")
+    agent_space = pg.store.create_space(pg.editor, operation(), pg.prefix + "-agent-space")
+    assert (agent_space["owner_principal"], agent_space["owner_kind"]) == (pg.editor.principal, "agent")
+    default = pg.store.submit_task(pg.editor, operation(), "default-space-owner", "Synthetic default", scopes=[{"kind": "path", "value": pg.prefix}])
+    with pg.store._transaction() as conn:
+        row = conn.execute("SELECT s.owner_principal,s.owner_kind FROM baton.spaces s JOIN baton.pages p ON p.space_id=s.id WHERE p.id=%s",
+                           (default["page_id"],)).fetchone()
+    assert row == {"owner_principal": pg.editor.principal, "owner_kind": "agent"}
+
+
+def test_another_principal_on_the_owner_account_is_not_root_and_needs_a_delegation(pg):
+    s = pg.store
+    twin = Actor(pg.prefix + "-owner-twin", pg.owner.account, "human")
+    agent_twin = Actor(pg.prefix + "-owner-agent", pg.owner.account, "agent")
+    wrong_kind = Actor(pg.owner.principal, pg.owner.account, "agent")
+    task, claim = awaiting(pg, "twins", [twin, agent_twin, wrong_kind])
+    for impostor in (twin, agent_twin, wrong_kind):
+        assert s.effective_role(impostor, "space", pg.space["id"])["role"] == "edit"
+        expect("delegation_required", lambda impostor=impostor: s.gate(impostor, operation(), task["id"], claim["epoch"], "pass"))
+        expect("forbidden", lambda impostor=impostor: s.delegation_create(impostor, operation(), principal(pg, "twin-target"), reason="not the root identity"))
+        expect("invalid", lambda impostor=impostor: s.operator_delegation_create(impostor, principal(pg, "twin-target"), "approve", pg.space["id"],
+                                                                                 None, False, "not the root identity", "operator-a"))
+    assert s.get_task(pg.owner, task["id"])["state"] == "awaiting_gate"
+    given = grant(pg, agent_twin)
+    done = s.gate(agent_twin, operation(), task["id"], claim["epoch"], "pass")
+    assert done["state"] == "done" and gate_rows(pg, task["id"])[0]["root"] is False
+    assert reviewed_events(pg, task["id"])[0]["metadata"]["chain"] == [given["id"]]
+
+
+def test_a_root_delegation_must_come_from_the_exact_owner_identity(pg):
+    s = pg.store
+    twin = Actor(pg.prefix + "-owner-twin2", pg.owner.account, "human")
+    judge = principal(pg, "judge-exact")
+    task, claim = awaiting(pg, "exact-root", [judge])
+    forged = raw_delegation(pg, judge, grantor=twin, created_hours=0, expires_hours=None, space_id=pg.space["id"])
+    forged_all = raw_delegation(pg, judge, grantor=twin, created_hours=0, expires_hours=None)
+    listed = {row["id"]: row for row in s.delegation_list(judge)}
+    assert listed[forged]["active"] is False and listed[forged_all]["active"] is True
+    expect("delegation_required", lambda: s.gate(judge, operation(), task["id"], claim["epoch"], "pass"))
+    grant(pg, judge)
+    assert s.gate(judge, operation(), task["id"], claim["epoch"], "pass")["state"] == "done"
+
+
+def test_a_space_without_an_owner_principal_has_no_root_until_an_operator_sets_it(pg):
+    s = pg.store
+    space_id = str(uuid.uuid4())
+    with s._transaction(write=True) as conn:
+        conn.execute("INSERT INTO baton.spaces(id,name,owner_account) VALUES (%s,%s,%s)", (space_id, pg.prefix + "-legacy", pg.owner.account))
+        conn.execute("INSERT INTO baton.pages(id,space_id,owner_account,title) VALUES (%s,%s,%s,'Legacy')", (str(uuid.uuid4()), space_id, pg.owner.account))
+    legacy = s.get_space(pg.owner, space_id)
+    assert legacy["owner_principal"] is None and legacy["owner_kind"] is None
+    page = s.list_pages(pg.owner, space_id)[0]
+    s.share(pg.owner, operation(), "space", space_id, "person", pg.editor.account, "edit")
+    task = s.create_task_block(pg.owner, operation(), page["id"], "Synthetic legacy", [{"kind": "path", "value": pg.prefix}], [pg.owner.principal])
+    claim = s.claim(pg.editor, operation(), task["id"])
+    s.submit_result(pg.editor, operation(), task["id"], claim["epoch"], "Candidate")
+    expect("delegation_required", lambda: s.gate(pg.owner, operation(), task["id"], claim["epoch"], "pass"))
+    expect("forbidden", lambda: s.delegation_create(pg.owner, operation(), principal(pg, "legacy-target"), space_id=space_id, reason="no root yet"))
+    expect("invalid", lambda: s.operator_delegation_create(pg.owner, principal(pg, "legacy-target"), "approve", space_id, None, False, "no root yet", "operator-a"))
+    assert s.get_task(pg.owner, task["id"])["state"] == "awaiting_gate"
+    expect("invalid", lambda: s.set_space_owner(space_id, pg.owner.principal, pg.reader.account, "human", "operator-a"))
+    expect("invalid", lambda: s.set_space_owner(space_id, pg.owner.principal, pg.owner.account, "service", "operator-a"))
+    expect("not_found", lambda: s.set_space_owner(str(uuid.uuid4()), pg.owner.principal, pg.owner.account, "human", "operator-a"))
+    updated = s.set_space_owner(space_id, pg.owner.principal, pg.owner.account, "human", "operator-a")
+    assert (updated["owner_principal"], updated["owner_kind"]) == (pg.owner.principal, "human")
+    assert s.gate(pg.owner, operation(), task["id"], claim["epoch"], "pass")["state"] == "done"
+    event = next(row for row in s.list_audit(pg.owner, space_id=space_id, limit=100) if row["event"] == "space.owner_set")
+    assert event["performed_by"] == "operator:operator-a" and event["requested_by"] == pg.owner.principal
+    assert event["metadata"] == {"owner_kind": "human"}
+
+
+def test_migration_backfills_owner_principal_from_the_space_creation_audit(pg):
+    config_path = os.environ.get("BATON_TEST_DATABASE_ADMIN_CONFIG")
+    if not config_path:
+        pytest.skip("Backfill check needs explicitly authorized test admin config")
+    s = pg.store
+    agent_space = s.create_space(pg.editor, operation(), pg.prefix + "-backfill")
+    unknown = str(uuid.uuid4())
+    mismatched = s.create_space(pg.reviewer, operation(), pg.prefix + "-mismatch")
+    with s._transaction(write=True) as conn:
+        conn.execute("UPDATE baton.spaces SET owner_principal=NULL,owner_kind=NULL WHERE id=ANY(%s::uuid[])",
+                     ([pg.space["id"], agent_space["id"], mismatched["id"]],))
+        conn.execute("UPDATE baton.spaces SET owner_account=%s WHERE id=%s", (pg.prefix + "-someone-else", mismatched["id"]))
+        conn.execute("INSERT INTO baton.spaces(id,name,owner_account) VALUES (%s,%s,%s)", (unknown, pg.prefix + "-no-audit", pg.owner.account))
+    schema = (Path(__file__).parents[1] / "bridge/space_schema.sql").read_text()
+    config = json.loads(Path(config_path).read_text())
+    with psycopg.connect(**config, autocommit=True) as conn:
+        conn.execute("SET ROLE baton_owner")
+        conn.execute(schema)
+        conn.execute(schema)
+    assert (s.get_space(pg.owner, pg.space["id"])["owner_principal"], s.get_space(pg.owner, pg.space["id"])["owner_kind"]) == (pg.owner.principal, "human")
+    assert (s.get_space(pg.editor, agent_space["id"])["owner_principal"], s.get_space(pg.editor, agent_space["id"])["owner_kind"]) == (pg.editor.principal, "agent")
+    with s._transaction() as conn:
+        rows = {str(row["id"]): row for row in conn.execute("SELECT id,owner_principal,owner_kind FROM baton.spaces WHERE id=ANY(%s::uuid[])",
+                                                            ([mismatched["id"], unknown],))}
+    assert rows[mismatched["id"]]["owner_principal"] is None and rows[unknown]["owner_principal"] is None
+    with s._transaction() as conn:
+        with pytest.raises(psycopg.errors.CheckViolation):
+            with conn.transaction():
+                conn.execute("UPDATE baton.spaces SET owner_principal='x' WHERE id=%s", (unknown,))

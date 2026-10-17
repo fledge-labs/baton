@@ -446,8 +446,10 @@ def build_parser():
     sub.add_argument("--task", required=True, type=uuid_arg)
     sub.add_argument("--epoch", required=True, type=int, help="epoch of the result under review")
     sub.add_argument("--decision", required=True, choices=("pass", "fail"))
-    sub.set_defaults(build=lambda a: ("gate", {"task_id": a.task, "expected_epoch": a.epoch,
-                                               "decision": a.decision}), write=True)
+    sub.add_argument("--self-approval", action="store_true",
+                     help="the space owner approving work it submitted or executed; refused for everyone else")
+    sub.set_defaults(build=lambda a: ("gate", {"task_id": a.task, "expected_epoch": a.epoch, "decision": a.decision,
+                                               **({"self_approval": True} if a.self_approval else {})}), write=True)
 
     sub = command("audit", "list_audit: append-only audit for a task or space")
     sub.add_argument("--task", type=uuid_arg)

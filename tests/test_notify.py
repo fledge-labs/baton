@@ -68,8 +68,9 @@ def team(api):
     return call, identities, space, page
 
 
-def test_each_trigger_writes_metadata_only_rows_for_the_right_recipients(team, api, pg_store):
+def test_each_trigger_writes_metadata_only_rows_for_the_right_recipients(team, api, pg_store, approver):
     call, identities, space, page = team
+    approver(pg_store, identities["reviewer"], by=identities["owner"])
     task = make_task(call, identities, page)
     assert events(notes(call, "worker")) == ["task.assigned"]
     assignment = notes(call, "worker")["notifications"][0]
@@ -135,8 +136,9 @@ def test_mentions_assignment_paths_and_handoff_notify_the_target(team):
     assert submitted["assignee"] == identities["replacement"]["agent"]
 
 
-def test_outbox_rows_are_atomic_with_the_business_effect_and_replay_safe(team, api, pg_store, modules):
+def test_outbox_rows_are_atomic_with_the_business_effect_and_replay_safe(team, api, pg_store, modules, approver):
     call, identities, space, page = team
+    approver(pg_store, identities["reviewer"], by=identities["owner"])
     server = modules[1]
     owner, worker = (server.actor_from_identity(identities[name]) for name in ("owner", "worker"))
     counts = lambda: (query(pg_store, "SELECT count(*) AS n FROM baton.x_notify")[0]["n"],
@@ -329,8 +331,9 @@ def public_dns(monkeypatch, mapping=None):
     monkeypatch.setattr(webhooks, "_getaddrinfo", fake)
 
 
-def test_signed_delivery_carries_metadata_only_and_only_the_callers_notifications(team, receiver, modules, pg_store):
+def test_signed_delivery_carries_metadata_only_and_only_the_callers_notifications(team, receiver, modules, pg_store, approver):
     call, identities, space, page = team
+    approver(pg_store, identities["reviewer"], by=identities["owner"])
     worker_id, worker_secret = subscribe(call, "worker", receiver.url("/worker"), ["task.assigned", "gate.decided"])
     reviewer_id, reviewer_secret = subscribe(call, "reviewer", receiver.url("/reviewer"))
     task = make_task(call, identities, page)

@@ -49,6 +49,7 @@ ERRORS = {
     "stale_claim": (409, "Claim is no longer current"),
     "revision_conflict": (409, "Revision is no longer current"),
     "gate_required": (409, "Required gate has not passed"),
+    "delegation_required": (403, "An active approver delegation covering the task is required"),
     "dependency_blocked": (409, "Task dependencies are not complete"),
     "graph_cycle": (409, "Dependency graph contains a cycle"),
     "work_face_incomplete": (409, "Task work face is incomplete"),
@@ -157,7 +158,7 @@ class SafeFastMCP(FastMCP):
             if name in {"submit_task", "get_task", "list_tasks", "fetch_inbox"}:
                 allowed = {"submit_task": {"idempotency_key", "prompt", "page_id", "scopes", "assignee_principal", "depends_on",
                                            "work_face", "require_work_face", "task_kind", "priority", "escalate_to",
-                                           "fallback_assignee"}, "get_task": {"task_id"},
+                                           "fallback_assignee", "approvals_required"}, "get_task": {"task_id"},
                            "list_tasks": set(), "fetch_inbox": set()}[name]
                 if not isinstance(arguments, dict):
                     raise BridgeError("invalid", [{"field": "arguments", "expected": "object"}])
@@ -229,10 +230,12 @@ PUBLIC_OPERATIONS = {
     "list_attribution": (False, {"block_id": (str, ...)}),
     "create_task_block": (True, {"page_id": (str, ...), "prompt": (str, ...), "scopes": (list[dict] | None, None), "reviewers": (list[str], ...), "base_commit": (str | None, None), "context": (Any, None), "evidence": (Any, None), "assignee_principal": (str | None, None), "depends_on": (list[str] | None, None),
                           "work_face": (dict[str, Any] | None, None), "require_work_face": (bool, False), "task_kind": (str, "construction"),
-                          "priority": (str, "normal"), "escalate_to": (str | None, None), "fallback_assignee": (str | None, None)}),
+                          "priority": (str, "normal"), "escalate_to": (str | None, None), "fallback_assignee": (str | None, None),
+                          "approvals_required": (int | None, None)}),
     "submit_task": (True, {"idempotency_key": (str, ...), "prompt": (str, ...), "page_id": (str | None, None), "scopes": (list[dict] | None, None), "assignee_principal": (str | None, None), "depends_on": (list[str] | None, None),
                     "work_face": (dict[str, Any] | None, None), "require_work_face": (bool, False), "task_kind": (str, "construction"),
-                    "priority": (str, "normal"), "escalate_to": (str | None, None), "fallback_assignee": (str | None, None)}),
+                    "priority": (str, "normal"), "escalate_to": (str | None, None), "fallback_assignee": (str | None, None),
+                    "approvals_required": (int | None, None)}),
     "assign_task": (True, {"task_id": (str, ...), "target_principal": (str, ...)}),
     "set_priority": (True, {"task_id": (str, ...), "priority": (str, ...)}),
     "mark_blocked": (True, {"task_id": (str, ...), "reason_code": (str, ...), "note": (str | None, None)}),
@@ -250,7 +253,12 @@ PUBLIC_OPERATIONS = {
     "renew": (True, {"task_id": (str, ...), "epoch": (int, ...), "lease_seconds": (int, 300)}),
     "submit_result": (True, {"task_id": (str, ...), "epoch": (int, ...), "result": (str, ...), "evidence": (Any, None)}),
     "handoff": (True, {"task_id": (str, ...), "epoch": (int, ...), "target_principal": (str, ...), "base_commit": (str | None, None), "context": (Any, None), "evidence": (Any, None), "lease_seconds": (int, 300)}),
-    "gate": (True, {"task_id": (str, ...), "expected_epoch": (int, ...), "decision": (str, ...), "evidence": (Any, None)}),
+    "gate": (True, {"task_id": (str, ...), "expected_epoch": (int, ...), "decision": (str, ...), "evidence": (Any, None),
+                    "self_approval": (bool, False)}),
+    "delegation_create": (True, {"delegate_principal": (str, ...), "scope": (str, "approve"), "space_id": (str | None, None),
+                                 "expires_at": (str | None, None), "may_delegate": (bool, False), "reason": (str, ...)}),
+    "delegation_revoke": (True, {"delegation_id": (str, ...)}),
+    "delegation_list": (False, {}),
     "get_claim": (False, {"task_id": (str, ...)}),
     "list_claims": (False, {}),
     "get_scopes": (False, {"task_id": (str, ...)}),
@@ -421,6 +429,11 @@ async def invoke(operation, payload, request):
         actor = request_actor(request)
         if PUBLIC_OPERATIONS[operation][0]:
             arguments["operation_id"] = uuid_id(arguments["operation_id"])
+        if operation == "delegation_create":
+            who = common.resolve_principal(arguments.pop("delegate_principal"))
+            if not who:
+                raise BridgeError("invalid", [{"field": "delegate_principal", "expected": "a principal registered in Baton"}])
+            arguments["delegate"] = actor_from_identity(who)
         if operation in {"handoff", "assign_task"}:
             who = common.resolve_principal(arguments.pop("target_principal"))
             if not who:
@@ -464,7 +477,8 @@ async def submit_task(idempotency_key: str, prompt: str, ctx: Context, page_id: 
                       scopes: list[dict] | None = None, assignee_principal: str | None = None,
                       depends_on: list[str] | None = None, work_face: dict[str, Any] | None = None,
                       require_work_face: bool = False, task_kind: str = "construction", priority: str = "normal",
-                      escalate_to: str | None = None, fallback_assignee: str | None = None) -> dict:
+                      escalate_to: str | None = None, fallback_assignee: str | None = None,
+                      approvals_required: int | None = None) -> dict:
     """Submit a task; a named assignee uses the manual claim/review path. Reuse keys on retry."""
     request = ctx.request_context.request
     actor = request_actor(request)
@@ -473,7 +487,8 @@ async def submit_task(idempotency_key: str, prompt: str, ctx: Context, page_id: 
                         "prompt": prompt, "page_id": page_id, "scopes": scopes,
                         "assignee_principal": assignee_principal, "depends_on": depends_on,
                         "work_face": work_face, "require_work_face": require_work_face, "task_kind": task_kind,
-                        "priority": priority, "escalate_to": escalate_to, "fallback_assignee": fallback_assignee}, request)
+                        "priority": priority, "escalate_to": escalate_to, "fallback_assignee": fallback_assignee,
+                        "approvals_required": approvals_required}, request)
 
 
 @mcp.tool()
