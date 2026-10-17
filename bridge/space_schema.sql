@@ -100,6 +100,9 @@ ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS responded_at timestamptz;
 ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS escalated_at timestamptz;
 ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS escalate_to text;
 ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS fallback_assignee text;
+ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS blocked_reason text CHECK (blocked_reason IN ('scope_conflict','lease_held','dependency_blocked','waiting_input','other'));
+ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS blocked_by text;
+ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS blocked_at timestamptz;
 CREATE INDEX IF NOT EXISTS tasks_overdue ON baton.tasks(respond_by) WHERE state IN ('queued','claimed') AND responded_at IS NULL AND escalated_at IS NULL AND respond_by IS NOT NULL;
 CREATE TABLE IF NOT EXISTS baton.task_dependencies (
     task_id uuid NOT NULL REFERENCES baton.tasks(id),
@@ -183,11 +186,15 @@ CREATE TABLE IF NOT EXISTS baton.x_notify (
     object_type text NOT NULL CHECK (object_type IN ('task','page','comment')), object_id uuid NOT NULL,
     thread_id uuid, created_at timestamptz NOT NULL DEFAULT clock_timestamp(), seq bigserial NOT NULL UNIQUE
 );
+-- Who caused the notification; previews of content are computed at read time and are never stored.
+ALTER TABLE baton.x_notify ADD COLUMN IF NOT EXISTS actor text;
+ALTER TABLE baton.x_notify ADD COLUMN IF NOT EXISTS actor_kind text;
 CREATE INDEX IF NOT EXISTS notify_recipient ON baton.x_notify(recipient,seq);
 CREATE TABLE IF NOT EXISTS baton.x_webhook (
     id uuid PRIMARY KEY, principal text NOT NULL, account text NOT NULL, url text NOT NULL,
     events jsonb, secret bytea NOT NULL, created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
+ALTER TABLE baton.x_webhook ADD COLUMN IF NOT EXISTS include_preview boolean NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS webhook_principal ON baton.x_webhook(principal);
 CREATE TABLE IF NOT EXISTS baton.x_webhook_delivery (
     subscription_id uuid NOT NULL REFERENCES baton.x_webhook(id) ON DELETE CASCADE,

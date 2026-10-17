@@ -170,7 +170,7 @@ def test_inherited_access_and_replay_revocation_are_rechecked(api):
     assert call("worker", "effective_role", resource_type="page", resource_id=child["id"])["role"] == "edit"
     call("owner", "share", operation_id=op(), resource_type="space", resource_id=space["id"],
          subject_type="person", subject_id=identities["worker"]["account"], role=None)
-    assert call("worker", "comment", 403, operation_id=comment_op, page_id=child["id"], body="Private comment")["code"] == "forbidden"
+    assert call("worker", "comment", 404, operation_id=comment_op, page_id=child["id"], body="Private comment")["code"] == "not_found"
     assert call("worker", "fetch_inbox")["messages"] == []
 
 
@@ -502,8 +502,8 @@ def test_set_work_face_http_flow_enforces_gate_authority_and_error_codes(api):
     assert call("worker", "claim", 409, operation_id=op(), task_id=task["task_id"])["code"] == "work_face_incomplete"
     assert call("worker", "ready", page_id=page["id"]) == []
 
-    for label in ("stranger", "worker"):
-        assert call(label, "set_work_face", 403, operation_id=op(), task_id=task["task_id"], work_face=work_face())["code"] == "forbidden"
+    assert call("stranger", "set_work_face", 404, operation_id=op(), task_id=task["task_id"], work_face=work_face())["code"] == "not_found"
+    assert call("worker", "set_work_face", 403, operation_id=op(), task_id=task["task_id"], work_face=work_face())["code"] == "forbidden"
     for body in ({"work_face": {**work_face(), "extra": 1}}, {"work_face": "text"}, {"work_face": work_face(acceptance_command=" ")},
                  {"work_face": work_face(environment=["x"] * 21)}, {"work_face": work_face(), "base_commit": ""}, {}):
         assert call("owner", "set_work_face", 422, operation_id=op(), task_id=task["task_id"], **body)["code"] == "invalid"
@@ -584,9 +584,9 @@ def test_set_work_face_is_published_through_schema_and_mcp_with_the_same_dispatc
     assert replay["result"]["replay"] is True
     conflict, raw = mcp_call(client, tokens["owner"], "set_work_face", {**arguments, "base_commit": "other-base"}, 43)
     assert conflict is None and raw["content"][0]["text"].startswith("operation_conflict")
-    for denied in ("worker", "stranger"):
+    for denied, code in (("worker", "forbidden"), ("stranger", "not_found")):
         error, raw = mcp_call(client, tokens[denied], "set_work_face", {**arguments, "operation_id": op()}, 44)
-        assert error is None and raw["content"][0]["text"].startswith("forbidden")
+        assert error is None and raw["content"][0]["text"].startswith(code)
     invalid, raw = mcp_call(client, tokens["owner"], "set_work_face", {**arguments, "operation_id": op(), "work_face": {**work_face(), "extra": 1}}, 45)
     assert invalid is None and raw["content"][0]["text"].startswith("invalid")
     rejected, raw = mcp_call(client, tokens["owner"], "submit_task", {"idempotency_key": "mcp-extra", "prompt": "Extra", "unknown": 1}, 46)

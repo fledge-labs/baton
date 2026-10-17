@@ -44,8 +44,8 @@ def run(args):
     share('remove-direct', None, resource_type='page', resource_id=pid)
     assert peer.call('effective_role', resource_type='page', resource_id=pid)['role'] == 'comment'
     share('remove-inherited', None)
-    peer.call('get_page', expected=(403, 404), page_id=pid)
-    peer.call('comment', 'allowed-comment', expected=(403, 404), page_id=pid, body='feedback')
+    peer.call('get_page', expected=404, page_id=pid)
+    peer.call('comment', 'allowed-comment', expected=404, page_id=pid, body='feedback')
     passed.append('roles_inheritance_revocation_and_replay')
 
     team = owner.call('create_team', 'team', name='Acceptance team')
@@ -53,7 +53,7 @@ def run(args):
     share('team-edit', 'edit', subject=team['id'], subject_type='team')
     assert peer.call('effective_role', resource_type='page', resource_id=pid)['role'] == 'edit'
     owner.call('set_team_member', 'team-remove', team_id=team['id'], account='space-peer', member=False)
-    peer.call('get_page', expected=(403, 404), page_id=pid)
+    peer.call('get_page', expected=404, page_id=pid)
     share('peer-edit', 'edit')
     share('reviewer-edit', 'edit', subject='space-reviewer')
     passed.append('team_membership_is_live')

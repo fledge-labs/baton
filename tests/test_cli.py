@@ -645,8 +645,11 @@ def test_watch_persists_next_seq_and_resumes_without_replay(cli, bridge, workspa
                     "--page", page["id"], "--assignee", worker, "--scope", "path=src/watch")
     note = first.next()
     assert note["event"] == "task.assigned" and note["object_id"] == task["task_id"]
-    assert note["recipient"] == worker and "Do the thing" not in json.dumps(note)
-    assert first.interrupt() == (0, "")
+    assert note["recipient"] == worker and note["body_preview"] == "Do the thing"
+    rc, err = first.interrupt()
+    assert rc == 0 and err.splitlines() == [
+        "notification seq=%d task.assigned task=%s from=%s(human) - [assigned] Do the thing"
+        % (note["seq"], task["task_id"], bridge.identities["owner"]["agent"])]
     assert state.read_text().strip() == str(note["seq"])
     assert stat.S_IMODE(state.stat().st_mode) == 0o600
     assert stat.S_IMODE(state.parent.stat().st_mode) == 0o700
@@ -655,7 +658,9 @@ def test_watch_persists_next_seq_and_resumes_without_replay(cli, bridge, workspa
     second = Watcher(cli, bridge, "worker", "--state", state, "--timeout", "2")
     again = second.next()
     assert again["event"] == "comment.created" and again["seq"] > note["seq"]
-    assert second.interrupt() == (0, "")
+    assert again["subject"] == "comment on " + task["task_id"] and again["body_preview"] == "Second event"
+    rc, err = second.interrupt()
+    assert rc == 0 and err.count("\n") == 1 and "comment.created" in err and "seq=%d " % again["seq"] in err
     assert state.read_text().strip() == str(again["seq"])
 
 
@@ -899,3 +904,249 @@ def test_two_footprintless_tasks_can_be_claimed_at_once_through_the_cli(cli, bri
     assert first["scopes"] == second["scopes"] == [{"kind": "none"}]
     assert run_json(cli, bridge, "worker", "claim", "--task", first["task_id"])["state"] == "claimed"
     assert run_json(cli, bridge, "worker", "claim", "--task", second["task_id"])["state"] == "claimed"
+
+
+# --- Dogfooding batch 1: comments --task, block, field details, resilient watch ----------------
+
+def test_comments_task_reads_a_tasks_thread_and_rejects_ambiguous_flags(cli, bridge, workspace):
+    _, page = workspace
+    worker = bridge.identities["worker"]["agent"]
+    task = run_json(cli, bridge, "owner", "submit", "--key", "df2-" + uuid.uuid4().hex, "--prompt", "Thread probe",
+                    "--page", page["id"], "--assignee", worker)
+    run_json(cli, bridge, "owner", "comment", "--page", page["id"], "--thread", task["task_id"], "--body", "Hello thread")
+    by_task = run_json(cli, bridge, "worker", "comments", "--task", task["task_id"])
+    assert last_request(bridge)[1] == {"task_id": task["task_id"]}
+    by_thread = run_json(cli, bridge, "worker", "comments", "--page", page["id"], "--thread", task["task_id"])
+    assert last_request(bridge)[1] == {"page_id": page["id"], "thread_id": task["task_id"]}
+    assert by_task == by_thread and "Hello thread" in json.dumps(by_task)
+    assert run_as(cli, bridge, "worker", "comments", "--task", task["task_id"], "--page", page["id"]).rc == 2
+    assert run_as(cli, bridge, "worker", "comments", "--task", task["task_id"], "--thread", task["task_id"]).rc == 2
+    assert run_as(cli, bridge, "worker", "comments").rc == 2
+    assert run_as(cli, bridge, "worker", "comments", "--task", "nope").rc == 2
+    hidden = run_as(cli, bridge, "owner", "comments", "--task", str(uuid.uuid4()))
+    assert hidden.rc == 1 and hidden.err == "baton_cli: error: not_found (HTTP 404)\n"
+
+
+def test_block_marks_a_task_blocked_with_a_reason_and_note(cli, bridge, workspace, tmp_path):
+    _, page = workspace
+    worker = bridge.identities["worker"]["agent"]
+    task = run_json(cli, bridge, "owner", "submit", "--key", "df7-" + uuid.uuid4().hex, "--prompt", "Block probe",
+                    "--page", page["id"], "--assignee", worker)
+    operation = str(uuid.uuid4())
+    result = run_as(cli, bridge, "worker", "block", "--task", task["task_id"], "--reason", "scope_conflict",
+                    "--note", "src is claimed", "--operation-id", operation)
+    assert result.rc == 0, result.err
+    assert last_request(bridge)[1] == {"task_id": task["task_id"], "reason_code": "scope_conflict",
+                                       "note": "src is claimed", "operation_id": operation}
+    assert result.json()["blocked"]["reason_code"] == "scope_conflict"
+    assert result.err == "task %s state=queued epoch=0\n" % task["task_id"]
+    note_file = tmp_path / "note.txt"
+    note_file.write_text("from a file\n", encoding="utf-8")
+    second = run_as(cli, bridge, "worker", "block", "--task", task["task_id"], "--reason", "waiting_input", "--note-file", note_file)
+    assert second.rc == 0 and last_request(bridge)[1]["note"] == "from a file\n"
+    bare = run_as(cli, bridge, "worker", "block", "--task", task["task_id"], "--reason", "other", "--no-summary")
+    assert bare.rc == 0 and "note" not in last_request(bridge)[1] and bare.err == ""
+    thread = run_json(cli, bridge, "owner", "comments", "--task", task["task_id"])
+    assert [item["body"] for item in thread if item["body"].startswith("[blocked]")] == [
+        "[blocked] scope_conflict: src is claimed", "[blocked] waiting_input: from a file\n", "[blocked] other"]
+    assert run_as(cli, bridge, "worker", "block", "--task", task["task_id"], "--reason", "nonsense").rc == 2
+    assert run_as(cli, bridge, "worker", "block", "--task", task["task_id"]).rc == 2
+    refused = run_as(cli, bridge, "reviewer", "block", "--task", task["task_id"], "--reason", "other")
+    assert refused.rc == 1 and "forbidden (HTTP 403)" in refused.err
+
+
+def test_validation_details_are_printed_with_only_plain_text(cli, bridge):
+    result = run_as(cli, bridge, "owner", "call", "create_space", "--json", '{"name": 5, "bogus": "synthetic-input-value"}',
+                    "--operation-id", str(uuid.uuid4()))
+    assert result.rc == 1
+    assert result.err.splitlines()[0] == "baton_cli: error: invalid (HTTP 422)"
+    assert "baton_cli:   name: expected string" in result.err
+    assert "baton_cli:   bogus: expected not a field of this operation; see GET /v1/space/schema" in result.err
+    assert "synthetic-input-value" not in result.err and "operation_id=" in result.err
+    module = load_cli_module()
+    assert module.well_formed_details([{"field": "ok", "expected": "fine"}, {"field": "a\nb", "expected": "x"},
+                                       {"field": "ok", "expected": "bad\x1b[31m"}, "junk", {"field": 1}]) == [("ok", "fine")]
+    assert module.well_formed_details("junk") == [] and len(module.well_formed_details([{"field": "f", "expected": "e"}] * 99)) == 20
+
+
+def test_backoff_doubles_up_to_sixty_seconds_and_only_transient_errors_retry():
+    module = load_cli_module()
+    assert [module.backoff_delay(n) for n in range(1, 9)] == [1, 2, 4, 8, 16, 32, 60, 60]
+    assert module.backoff_delay(10_000) == 60
+    assert module.transient(module.NetworkError("timeout")) and module.transient(module.NetworkError("tls: x"))
+    for status in (500, 502, 503, 504, 429):
+        assert module.transient(module.BatonError("storage_unavailable", status))
+    for status in (400, 401, 403, 404, 409, 422, 200):
+        assert not module.transient(module.BatonError("x", status))
+
+
+class Scripted:
+    """Plain loopback HTTP server that answers wait_inbox from a script: ('status', n), ('drop',) or ('json', obj)."""
+
+    def __init__(self, script):
+        import http.server
+        outer = self
+        self.script, self.seen, self.hold = list(script), [], threading.Event()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                outer.seen.append(json.loads(self.rfile.read(length)))
+                step = outer.script.pop(0) if outer.script else ("hold",)
+                if step[0] == "hold":
+                    outer.hold.wait(30)
+                    return
+                if step[0] == "drop":
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                    return
+                status, body = (step[1], {"x_protocol": "baton.space.v1", "error": {"code": "storage_unavailable", "message": "x"}}) \
+                    if step[0] == "status" else (200, {"x_protocol": "baton.space.v1", "result": step[1]})
+                data = json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = "http://127.0.0.1:%d" % self.server.server_port
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.hold.set()
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def start_watch(cli, tmp_path, scripted, *extra):
+    token = "synthetic-" + uuid.uuid4().hex
+    cli.secrets.append(token)
+    process = subprocess.Popen(
+        [sys.executable, str(CLI), "--url", scripted.url, "--token-file", str(token_file(tmp_path / "wt", "w", token)),
+         "watch", "--state", str(tmp_path / "state.seq"), "--timeout", "1", *map(str, extra)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=clean_env(cli.home))
+    return process
+
+
+def stop_watch(cli, process):
+    process.send_signal(signal.SIGTERM)
+    out, err = process.communicate(timeout=20)
+    cli.guard(out, err)
+    return process.returncode, out, err
+
+
+NOTE = {"id": "44444444-4444-4444-8444-444444444444", "seq": 5, "event": "task.assigned", "object_type": "task",
+        "object_id": TASK_A, "thread_id": TASK_A, "created_at": "2026-01-01T00:00:00+00:00", "recipient": "worker",
+        "actor": {"principal": "nangua", "kind": "human"}, "subject": "[assigned] Synthetic", "body_preview": "Synthetic"}
+
+
+def test_watch_reconnects_with_backoff_after_5xx_and_network_drops_then_keeps_running(cli, tmp_path):
+    scripted = Scripted([("status", 503), ("drop",), ("json", {"notifications": [NOTE], "next_seq": 5}),
+                         ("json", {"notifications": [], "next_seq": 5})])
+    started = time.monotonic()
+    process = start_watch(cli, tmp_path, scripted)
+    try:
+        line = process.stdout.readline()
+        assert time.monotonic() - started >= 3, "one second, then two seconds of backoff"
+        assert json.loads(line) == NOTE
+        deadline = time.monotonic() + 10
+        while len(scripted.seen) < 5 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert len(scripted.seen) >= 5, "the watch keeps polling after recovering"
+        assert [call["after_seq"] for call in scripted.seen[:3]] == [0, 0, 0] and scripted.seen[3]["after_seq"] == 5
+        assert process.poll() is None
+    finally:
+        rc, out, err = stop_watch(cli, process)
+        scripted.close()
+    assert rc == 0 and out == ""
+    lines = err.splitlines()
+    assert lines[0] == "baton_cli: watch: storage_unavailable (HTTP 503); reconnecting in 1s"
+    assert lines[1] == "baton_cli: watch: connection failed; reconnecting in 2s"
+    assert lines[2] == ("notification seq=5 task.assigned task=%s from=nangua(human) - [assigned] Synthetic" % TASK_A)
+    assert (tmp_path / "state.seq").read_text() == "5\n"
+
+
+def test_watch_stops_on_errors_that_retrying_cannot_fix(cli, tmp_path):
+    scripted = Scripted([])
+    scripted.script.append(("status", 401))
+    scripted.server.RequestHandlerClass  # the scripted 401 uses the same error body shape
+    process = start_watch(cli, tmp_path, scripted)
+    try:
+        out, err = process.communicate(timeout=20)
+    finally:
+        scripted.close()
+    assert process.returncode == 1 and out == "" and err.startswith("baton_cli: error: storage_unavailable (HTTP 401)")
+
+
+def test_watch_summary_can_be_turned_off_and_stdout_stays_pure_json(cli, tmp_path):
+    scripted = Scripted([("json", {"notifications": [NOTE], "next_seq": 5})])
+    process = start_watch(cli, tmp_path, scripted, "--no-summary")
+    try:
+        assert json.loads(process.stdout.readline()) == NOTE
+    finally:
+        rc, out, err = stop_watch(cli, process)
+        scripted.close()
+    assert rc == 0 and out == "" and err == ""
+
+
+def test_watch_exec_runs_once_per_notification_with_json_on_stdin_and_never_interpolates_fields(cli, tmp_path):
+    hostile = {**NOTE, "subject": "[assigned] $(touch PWNED1) `touch PWNED2`; touch PWNED3 \x1b[31mred"}
+    second = {**NOTE, "id": "55555555-5555-4555-8555-555555555555", "seq": 6}
+    scripted = Scripted([("json", {"notifications": [hostile, second], "next_seq": 6})])
+    collector = tmp_path / "collect.py"
+    collector.write_text("import sys\nopen(sys.argv[1], 'a').write(sys.stdin.read())\n")
+    received = tmp_path / "received.jsonl"
+    command = "%s %s %s" % (sys.executable, collector, received)
+    process = start_watch(cli, tmp_path, scripted, "--exec", command)
+    try:
+        assert json.loads(process.stdout.readline()) == hostile
+        assert json.loads(process.stdout.readline()) == second
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and (not received.exists() or len(received.read_text().splitlines()) < 2):
+            time.sleep(0.05)
+    finally:
+        rc, out, err = stop_watch(cli, process)
+        scripted.close()
+    assert rc == 0
+    assert [json.loads(line) for line in received.read_text().splitlines()] == [hostile, second]
+    assert not list(tmp_path.glob("PWNED*")) and not list(Path.cwd().glob("PWNED*"))
+    assert "\x1b" not in err and "touch PWNED1" in err, "the terminal summary shows the text but not control characters"
+
+
+def test_watch_exec_failures_are_reported_and_do_not_stop_the_watch(cli, tmp_path):
+    scripted = Scripted([("json", {"notifications": [NOTE], "next_seq": 5})])
+    process = start_watch(cli, tmp_path, scripted, "--no-summary", "--exec", "exit 3")
+    try:
+        assert json.loads(process.stdout.readline()) == NOTE
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not (tmp_path / "state.seq").read_text().startswith("5"):
+            time.sleep(0.05)
+    finally:
+        rc, out, err = stop_watch(cli, process)
+        scripted.close()
+    assert rc == 0 and err == "baton_cli: watch: --exec command exited with status 3\n"
+    assert (tmp_path / "state.seq").read_text() == "5\n"
+    slow = Scripted([("json", {"notifications": [NOTE], "next_seq": 5})])
+    process = start_watch(cli, tmp_path, slow, "--no-summary", "--exec", "sleep 30", "--exec-timeout", "1")
+    try:
+        assert json.loads(process.stdout.readline()) == NOTE
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not (tmp_path / "state.seq").read_text().startswith("5"):
+            time.sleep(0.05)
+    finally:
+        rc, out, err = stop_watch(cli, process)
+        slow.close()
+    assert rc == 0 and "timed out" in err
+
+
+def test_watch_rejects_a_non_positive_exec_timeout(cli, tmp_path):
+    scripted = Scripted([])
+    try:
+        process = start_watch(cli, tmp_path, scripted, "--exec", "true", "--exec-timeout", "0")
+        out, err = process.communicate(timeout=20)
+    finally:
+        scripted.close()
+    assert process.returncode == 2 and "--exec-timeout must be positive" in err

@@ -8,7 +8,11 @@ import inspect
 import json
 import logging
 import os
+import re
+import threading
 import time
+import types
+import typing
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -54,9 +58,90 @@ ERRORS = {
 
 
 class BridgeError(ValueError):
-    def __init__(self, code):
+    def __init__(self, code, details=None):
         self.code = code if code in ERRORS else "storage_unavailable"
+        # Field-level hints ({"field", "expected"}) for 422 responses; static text only, never request values.
+        self.details = list(details or []) if self.code == "invalid" else []
         super().__init__(ERRORS[self.code][1])
+
+
+MAX_DETAILS = 20
+FIELD_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+UUID_FIELDS = frozenset({"operation_id", "space_id", "page_id", "parent_id", "block_id", "task_id", "comment_id",
+                         "proposal_id", "team_id", "thread_id", "subscription_id", "resource_id"})
+TYPE_NAMES = {"string_type": "string", "int_type": "integer", "int_parsing": "integer", "int_from_float": "integer",
+              "bool_type": "boolean", "bool_parsing": "boolean", "list_type": "array", "dict_type": "object",
+              "model_type": "object", "model_attributes_type": "object", "none_required": "null",
+              "float_type": "number", "float_parsing": "number", "too_short": "non-empty value",
+              "string_too_long": "shorter string", "string_too_short": "non-empty string"}
+UNKNOWN_FIELD = "not a field of this operation; see GET /v1/space/schema"
+
+
+def describe(annotation):
+    """Short, value-free description of a request field's type, derived from its pydantic annotation."""
+    origin, arguments = typing.get_origin(annotation), typing.get_args(annotation)
+    if annotation is Any:
+        return "any JSON value"
+    if annotation is type(None):
+        return "null"
+    if origin in (typing.Union, types.UnionType):
+        parts = []
+        for part in arguments:
+            text = describe(part)
+            if text not in parts:
+                parts.append(text)
+        return " or ".join(parts)
+    if origin is list:
+        return "array of " + describe(arguments[0]) if arguments else "array"
+    if origin is dict or annotation is dict:
+        return "object"
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return "object with keys " + ", ".join(annotation.model_fields)
+    return {str: "string", int: "integer", bool: "boolean", float: "number"}.get(annotation, "valid value")
+
+
+def field_path(location):
+    path = ""
+    for part in location:
+        if isinstance(part, int):
+            path += f"[{part}]"
+        else:
+            path += ("." if path else "") + (part if isinstance(part, str) and FIELD_NAME.fullmatch(part) else "?")
+    return path or "body"
+
+
+def validation_details(errors, model=None):
+    """Turn pydantic/FastAPI error records into field/expected pairs, reading only locations and error types."""
+    fields = model.model_fields if model is not None else {}
+    details = []
+    for error in errors:
+        location, kind = tuple(error.get("loc", ())), error.get("type", "")
+        if location and location[0] in {"body", "query", "path"} and len(location) > 1 and location[0] not in fields:
+            location = location[1:]
+        field = field_path(location)
+        top = location[0] if location and isinstance(location[0], str) else None
+        known = fields.get(top) if len(location) == 1 else None
+        if kind == "extra_forbidden":
+            expected = UNKNOWN_FIELD
+            if len(location) == 1 and not FIELD_NAME.fullmatch(str(top)):
+                field = "<unknown>"
+        elif known is not None:
+            expected = describe(known.annotation)
+            if top in UUID_FIELDS:
+                expected = expected.replace("string", "UUID string")
+            if kind == "missing":
+                expected = "required " + expected
+        else:
+            expected = ("required value" if kind == "missing" else TYPE_NAMES.get(kind, "valid value"))
+        item = {"field": field, "expected": expected}
+        if item not in details:
+            details.append(item)
+    return details[:MAX_DETAILS]
+
+
+def unknown_field_details(arguments, allowed):
+    return [{"field": key if FIELD_NAME.fullmatch(key) else "<unknown>", "expected": UNKNOWN_FIELD}
+            for key in sorted(map(str, set(arguments) - allowed))][:MAX_DETAILS]
 
 
 class SafeFastMCP(FastMCP):
@@ -74,22 +159,31 @@ class SafeFastMCP(FastMCP):
                                            "work_face", "require_work_face", "task_kind", "priority", "escalate_to",
                                            "fallback_assignee"}, "get_task": {"task_id"},
                            "list_tasks": set(), "fetch_inbox": set()}[name]
-                if not isinstance(arguments, dict) or set(arguments) - allowed:
-                    raise BridgeError("invalid")
+                if not isinstance(arguments, dict):
+                    raise BridgeError("invalid", [{"field": "arguments", "expected": "object"}])
+                if set(arguments) - allowed:
+                    raise BridgeError("invalid", unknown_field_details(arguments, allowed))
             else:
                 MODELS[canonical].model_validate(arguments)
             return await super().call_tool(name, arguments)
         except Exception as exc:
-            code = "invalid"
+            code, details = "invalid", []
             current = exc
             for _ in range(8):
                 if isinstance(current, BridgeError):
-                    code = current.code
+                    code, details = current.code, current.details
+                    break
+                if isinstance(current, ValidationError):
+                    details = validation_details(current.errors(include_url=False, include_context=False, include_input=False),
+                                                 MODELS.get(ALIASES.get(name, name)))
                     break
                 current = getattr(current, "__cause__", None)
                 if current is None:
                     break
-            raise ToolError(code + ": " + ERRORS[code][1]) from None
+            message = code + ": " + ERRORS[code][1]
+            if details:
+                message += "; details=" + json.dumps(details, separators=(",", ":"))
+            raise ToolError(message) from None
 
 
 allowed_hosts, allowed_origins = transport_origins()
@@ -126,7 +220,7 @@ PUBLIC_OPERATIONS = {
     "create_team": (True, {"name": (str, ...)}),
     "set_team_member": (True, {"team_id": (str, ...), "account": (str, ...), "member": (bool, ...)}),
     "comment": (True, {"page_id": (str, ...), "body": (str, ...), "thread_id": (str | None, None), "selection": (Any, None)}),
-    "list_comments": (False, {"page_id": (str, ...), "thread_id": (str | None, None)}),
+    "list_comments": (False, {"page_id": (str | None, None), "thread_id": (str | None, None), "task_id": (str | None, None)}),
     "mention": (True, {"comment_id": (str, ...), "target_type": (str, ...), "target_id": (str, ...)}),
     "proposal_create": (True, {"block_id": (str, ...), "expected_revision": (int, ...), "proposed_content": (Any, ...), "selection": (Any, None)}),
     "proposal_review": (True, {"proposal_id": (str, ...), "decision": (str, ...), "content": (Any, None)}),
@@ -141,6 +235,7 @@ PUBLIC_OPERATIONS = {
                     "priority": (str, "normal"), "escalate_to": (str | None, None), "fallback_assignee": (str | None, None)}),
     "assign_task": (True, {"task_id": (str, ...), "target_principal": (str, ...)}),
     "set_priority": (True, {"task_id": (str, ...), "priority": (str, ...)}),
+    "mark_blocked": (True, {"task_id": (str, ...), "reason_code": (str, ...), "note": (str | None, None)}),
     "plan": (True, {"graph": (list[GraphEntry], ...)}),
     "set_work_face": (True, {"task_id": (str, ...), "work_face": (dict[str, Any], ...), "base_commit": (str | None, None)}),
     "ready": (False, {"page_id": (str | None, None), "limit": (int, 50)}),
@@ -148,7 +243,7 @@ PUBLIC_OPERATIONS = {
     "list_tasks": (False, {"limit": (int, 50)}),
     "fetch_inbox": (False, {"limit": (int, 30)}),
     "wait_inbox": (False, {"after_seq": (int, 0), "timeout_seconds": (int, 25), "limit": (int, 50)}),
-    "webhook_subscribe": (True, {"url": (str, ...), "events": (list[str] | None, None)}),
+    "webhook_subscribe": (True, {"url": (str, ...), "events": (list[str] | None, None), "include_preview": (bool, False)}),
     "webhook_list": (False, {}),
     "webhook_delete": (True, {"subscription_id": (str, ...)}),
     "claim": (True, {"task_id": (str, ...), "lease_seconds": (int, 300)}),
@@ -167,6 +262,17 @@ MODELS = {
                        **({"operation_id": (str, ...)} if mutation else {}), **fields)
     for name, (mutation, fields) in PUBLIC_OPERATIONS.items()
 }
+
+
+def valid_uuid(value):
+    """An omitted optional id is fine (the store treats None and "" alike); anything else must be a UUID."""
+    if not value:
+        return True
+    try:
+        uuid_id(value)
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return True
 
 
 def principal_directory(principal):
@@ -238,7 +344,7 @@ async def store_call(method, *args, **kwargs):
         store = get_store()
         result = await asyncio.to_thread(getattr(store, method), *args, **kwargs)
     except StoreError as exc:
-        raise BridgeError(exc.code) from None
+        raise BridgeError(exc.code, exc.details) from None
     except BridgeError:
         raise
     except Exception:
@@ -298,10 +404,20 @@ def public_task(row):
 
 async def invoke(operation, payload, request):
     operation = ALIASES.get(operation, operation)
-    if operation not in PUBLIC_OPERATIONS or not isinstance(payload, dict):
-        raise BridgeError("invalid")
+    if operation not in PUBLIC_OPERATIONS:
+        raise BridgeError("invalid", [{"field": "operation", "expected": "an operation listed by GET /v1/space/schema"}])
+    if not isinstance(payload, dict):
+        raise BridgeError("invalid", [{"field": "body", "expected": "JSON object"}])
     try:
-        arguments = MODELS[operation].model_validate(payload).model_dump()
+        try:
+            arguments = MODELS[operation].model_validate(payload).model_dump()
+        except ValidationError as exc:
+            raise BridgeError("invalid", validation_details(
+                exc.errors(include_url=False, include_context=False, include_input=False), MODELS[operation])) from None
+        malformed = [{"field": name, "expected": "UUID string in canonical lowercase form"}
+                     for name in sorted(UUID_FIELDS & arguments.keys()) if not valid_uuid(arguments[name])]
+        if malformed:
+            raise BridgeError("invalid", malformed)
         actor = request_actor(request)
         if PUBLIC_OPERATIONS[operation][0]:
             arguments["operation_id"] = uuid_id(arguments["operation_id"])
@@ -336,7 +452,7 @@ async def invoke(operation, payload, request):
         if not result.get("replay"):
             audit("thread.submitted", task_id=result.get("task_id", result.get("id")),
                   thread_id=result.get("thread_id"), agent=actor.principal)
-    if operation in {"get_task", "submit_task", "create_task_block", "assign_task", "set_work_face", "set_priority", "claim", "renew", "handoff", "submit_result", "gate"}:
+    if operation in {"get_task", "submit_task", "create_task_block", "assign_task", "set_work_face", "set_priority", "mark_blocked", "claim", "renew", "handoff", "submit_result", "gate"}:
         return public_task(result)
     if operation in {"list_tasks", "ready"}:
         return [public_task(row) for row in result]
@@ -503,8 +619,30 @@ async def dispatch(task):
             await renewer
 
 
+SCOPE_WARNING_SECONDS = 300
+_SCOPE_WARNED = {}
+_SCOPE_WARNED_LOCK = threading.Lock()
+
+
+def warn_scope_skip(task_id, blocking_task_id):
+    """Log that a queued automatic task is waiting on a scope held elsewhere, at most once per task per 5 minutes.
+
+    Only the two task ids are written, so a stuck task is visible to the operator without exposing any content.
+    """
+    now = time.monotonic()
+    with _SCOPE_WARNED_LOCK:
+        last = _SCOPE_WARNED.get(task_id)
+        if last is not None and now - last < SCOPE_WARNING_SECONDS:
+            return
+        for key in [key for key, stamp in _SCOPE_WARNED.items() if now - stamp >= SCOPE_WARNING_SECONDS]:
+            del _SCOPE_WARNED[key]
+        _SCOPE_WARNED[task_id] = now
+    audit("dispatch.blocked_by_scope", task_id=task_id, blocked_by=blocking_task_id, agent=SERVICE.principal, level="warning")
+
+
 async def claim_next():
-    return await store_call("claim_next", SERVICE, str(uuid.uuid4()), lease_seconds=LEASE_SECONDS)
+    return await store_call("claim_next", SERVICE, str(uuid.uuid4()), lease_seconds=LEASE_SECONDS,
+                            on_scope_skip=warn_scope_skip)
 
 
 async def recover_auto():
@@ -614,12 +752,13 @@ app = FastAPI(lifespan=lifespan)
 @app.exception_handler(BridgeError)
 async def bridge_error(request, exc):
     status, message = ERRORS[exc.code]
-    return JSONResponse(status_code=status, content={"x_protocol": PROTOCOL, "error": {"code": exc.code, "message": message}})
+    error = {"code": exc.code, "message": message, **({"details": exc.details} if exc.details else {})}
+    return JSONResponse(status_code=status, content={"x_protocol": PROTOCOL, "error": error})
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_error(request, exc):
-    return await bridge_error(request, BridgeError("invalid"))
+    return await bridge_error(request, BridgeError("invalid", validation_details(exc.errors())))
 
 
 @app.get("/healthz")

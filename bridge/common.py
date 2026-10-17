@@ -64,7 +64,7 @@ def audit(event, **fields):
     for key, value in fields.items():
         if value is None:
             continue
-        if key in {"task_id", "a2a_task_id", "request_id", "operation_id", "thread_id", "probe_id"}:
+        if key in {"task_id", "a2a_task_id", "request_id", "operation_id", "thread_id", "probe_id", "blocked_by"}:
             try:
                 record[key] = uuid_id(value)
             except (ValueError, TypeError, AttributeError):

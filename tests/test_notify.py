@@ -32,6 +32,7 @@ def ip4(*octets):
 
 
 PAYLOAD_KEYS = {"id", "seq", "event", "object_type", "object_id", "thread_id", "created_at", "recipient"}
+PREVIEW_KEYS = {"actor", "subject", "body_preview"}
 PROMPT, COMMENT, RESULT = "synthetic-prompt-body", "synthetic-comment-body", "synthetic-result-body"
 PRIVATE_TEXT = (PROMPT, COMMENT, RESULT)
 
@@ -72,7 +73,7 @@ def test_each_trigger_writes_metadata_only_rows_for_the_right_recipients(team, a
     task = make_task(call, identities, page)
     assert events(notes(call, "worker")) == ["task.assigned"]
     assignment = notes(call, "worker")["notifications"][0]
-    assert set(assignment) == PAYLOAD_KEYS
+    assert set(assignment) == PAYLOAD_KEYS | PREVIEW_KEYS
     assert assignment["object_type"] == "task" and assignment["object_id"] == task["task_id"]
     assert assignment["thread_id"] == task["task_id"] and assignment["recipient"] == identities["worker"]["agent"]
     for label in ("owner", "reviewer", "replacement", "stranger"):
@@ -99,8 +100,6 @@ def test_each_trigger_writes_metadata_only_rows_for_the_right_recipients(team, a
     assert events(notes(call, "worker"))[-1] == "gate.decided"
     assert "gate.decided" not in events(notes(call, "reviewer"))
 
-    private = json.dumps([notes(call, label) for label in ("owner", "worker", "reviewer", "replacement")])
-    assert not any(text in private for text in PRIVATE_TEXT)
     audit = json.dumps(call("owner", "list_audit", task_id=task["task_id"]))
     assert not any(text in audit for text in PRIVATE_TEXT)
 
@@ -338,7 +337,7 @@ def test_signed_delivery_carries_metadata_only_and_only_the_callers_notification
     claim = call("worker", "claim", operation_id=op(), task_id=task["task_id"])
     call("worker", "submit_result", operation_id=op(), task_id=task["task_id"], epoch=claim["epoch"], result=RESULT)
     call("reviewer", "gate", operation_id=op(), task_id=task["task_id"], expected_epoch=claim["epoch"], decision="pass")
-    call("stranger", "comment", 403, operation_id=op(), page_id=page["id"], body=COMMENT, thread_id=task["task_id"])
+    call("stranger", "comment", 404, operation_id=op(), page_id=page["id"], body=COMMENT, thread_id=task["task_id"])
     assert deliver(modules) == 3
 
     by_path = {}
@@ -365,6 +364,38 @@ def test_signed_delivery_carries_metadata_only_and_only_the_callers_notification
     assert deliver(modules) == 0
     assert sorted(item["delivered"] for item in call("worker", "webhook_list") + call("reviewer", "webhook_list")) == [1, 2]
     assert worker_id != reviewer_id
+
+
+def test_webhook_previews_are_opt_in_per_subscription_and_checked_at_delivery(team, receiver, modules, pg_store):
+    call, identities, space, page = team
+    plain_id, plain_secret = subscribe(call, "worker", receiver.url("/plain"), ["task.assigned"])
+    body = dict(operation_id=op(), url=receiver.url("/preview"), events=["task.assigned"], include_preview=True)
+    opted = call("worker", "webhook_subscribe", **body)
+    assert call("worker", "webhook_subscribe", **body)["subscription_id"] == opted["subscription_id"]
+    assert call("worker", "webhook_subscribe", 409, **{**body, "include_preview": False})["code"] == "operation_conflict"
+    listing = {item["subscription_id"]: item["include_preview"] for item in call("worker", "webhook_list")}
+    assert listing == {plain_id: False, opted["subscription_id"]: True}
+    assert call("worker", "webhook_subscribe", 422, operation_id=op(), url=receiver.url(), include_preview="yes")["code"] == "invalid"
+
+    task = make_task(call, identities, page)
+    assert deliver(modules) == 2
+    by_path = {request["path"]: request for request in receiver.requests}
+    assert set(json.loads(by_path["/plain"]["body"])) == PAYLOAD_KEYS and PROMPT.encode() not in by_path["/plain"]["body"]
+    detailed = json.loads(by_path["/preview"]["body"])
+    assert set(detailed) == PAYLOAD_KEYS | PREVIEW_KEYS and detailed["object_id"] == task["task_id"]
+    assert detailed["actor"] == {"principal": identities["owner"]["agent"], "kind": "human"}
+    assert detailed["subject"] == "[assigned] " + PROMPT and detailed["body_preview"] == PROMPT
+    expected = "sha256=" + hmac.new(bytes.fromhex(opted["signing_secret"]), by_path["/preview"]["body"], hashlib.sha256).hexdigest()
+    assert hmac.compare_digest(by_path["/preview"]["headers"]["X-Baton-Signature"], expected)
+    audit = json.dumps(query(pg_store, "SELECT metadata FROM baton.x_audit WHERE event='webhook.delivered'"))
+    assert PROMPT not in audit
+
+    receiver.requests.clear()
+    revoked = make_task(call, identities, page)
+    call("owner", "share", operation_id=op(), resource_type="space", resource_id=space["id"],
+         subject_type="person", subject_id=identities["worker"]["account"], role=None)
+    assert deliver(modules) == 0 and receiver.requests == [], "no preview leaves for a recipient who lost view permission"
+    assert revoked["task_id"] != task["task_id"]
 
 
 def test_retries_follow_backoff_then_dead_letter_with_one_final_audit(team, receiver, modules, pg_store):
@@ -491,7 +522,8 @@ def test_signing_secret_is_returned_once_and_never_listed_stored_in_results_or_a
     assert second["signing_secret"] != secret
     listing = call("worker", "webhook_list")
     assert len(listing) == 2 and secret not in json.dumps(listing) and "signing_secret" not in json.dumps(listing)
-    assert all(set(item) == {"subscription_id", "url", "events", "created_at", "pending", "delivered", "dead"} for item in listing)
+    assert all(set(item) == {"subscription_id", "url", "events", "include_preview", "created_at", "pending", "delivered", "dead"}
+               for item in listing)
     assert call("reviewer", "webhook_list") == []
     make_task(call, identities, page)
     persisted = json.dumps([
@@ -564,7 +596,7 @@ def test_definite_worker_failure_notifies_the_owner_in_the_same_transaction(team
     result = notes(call, "owner")
     assert events(result) == ["task.failed"], "exactly one row, even after an idempotent replay"
     failure = result["notifications"][0]
-    assert set(failure) == PAYLOAD_KEYS and failure["object_type"] == "task"
+    assert set(failure) == PAYLOAD_KEYS | {"actor", "subject"} and failure["object_type"] == "task"
     assert failure["object_id"] == task["task_id"] == failure["thread_id"] and failure["recipient"] == identities["owner"]["agent"]
     for label in ("reviewer", "worker", "replacement", "stranger"):
         assert notes(call, label)["notifications"] == []

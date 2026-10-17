@@ -19,7 +19,10 @@ import re
 import signal
 import socket
 import ssl
+import subprocess
 import sys
+import threading
+import time
 import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -35,6 +38,13 @@ AGENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}")
 SUMMARY_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 SUMMARY_STATE_RE = re.compile(r"[a-z][a-z_]{0,31}")
 ERROR_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+BLOCK_REASONS = ("scope_conflict", "lease_held", "dependency_blocked", "waiting_input", "other")
+DETAIL_FIELD_RE = re.compile(r"[A-Za-z0-9_.\[\]<>?-]{1,100}")
+DETAIL_EXPECTED_RE = re.compile(r"[\x20-\x7e]{1,200}")
+MAX_DETAILS = 20
+NOTIFICATION_EVENT_RE = re.compile(r"[a-z]+\.[a-z_]+")
+BACKOFF_START, BACKOFF_CAP = 1, 60
+EXEC_TIMEOUT = 300
 
 
 class UsageError(Exception):
@@ -44,9 +54,9 @@ class UsageError(Exception):
 class BatonError(Exception):
     """Baton or an intermediary answered with an error (exit 1)."""
 
-    def __init__(self, code, status):
+    def __init__(self, code, status, details=()):
         super().__init__(code)
-        self.code, self.status = code, status
+        self.code, self.status, self.details = code, status, tuple(details)
 
 
 class NetworkError(Exception):
@@ -226,11 +236,26 @@ class Client:
                     and "result" in payload and "error" not in payload):
                 return payload["result"]
             raise BatonError("bad_response", status)
-        code = "http_error"
+        code, details = "http_error", []
         error = payload.get("error") if isinstance(payload, dict) else None
         if isinstance(error, dict) and isinstance(error.get("code"), str) and ERROR_CODE_RE.fullmatch(error["code"]):
             code = error["code"]
-        raise BatonError(code, status)
+            details = well_formed_details(error.get("details"))
+        raise BatonError(code, status, details)
+
+
+def well_formed_details(value):
+    """Keep only field/expected pairs made of plain printable text: server text is never echoed unfiltered."""
+    if not isinstance(value, list):
+        return []
+    result = []
+    for item in value[:MAX_DETAILS]:
+        field = item.get("field") if isinstance(item, dict) else None
+        expected = item.get("expected") if isinstance(item, dict) else None
+        if (isinstance(field, str) and DETAIL_FIELD_RE.fullmatch(field)
+                and isinstance(expected, str) and DETAIL_EXPECTED_RE.fullmatch(expected)):
+            result.append((field, expected))
+    return result
 
 
 def uuid_arg(value):
@@ -321,12 +346,12 @@ def build_parser():
                     formatter_class=argparse.RawDescriptionHelpFormatter)
     subcommands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
 
-    def command(name, help_text, summary=None, **kwargs):
+    def command(name, help_text, summary=None, summary_help=None, **kwargs):
         sub = subcommands.add_parser(name, help=help_text, description=help_text, **kwargs)
         if summary is not None:
             sub.add_argument("--summary", action=argparse.BooleanOptionalAction, default=summary,
-                             help="print one 'task <id> state=<state> epoch=<n>' line to stderr "
-                                  "(default: %s)" % ("on" if summary else "off"))
+                             help="%s (default: %s)" % (summary_help or "print one 'task <id> state=<state> epoch=<n>' line to stderr",
+                                                        "on" if summary else "off"))
         # Connection options are also accepted after the subcommand; SUPPRESS keeps
         # a value given before it (or its default) from being overwritten.
         for flag, dest in (("--url", "url"), ("--token-file", "token_file"), ("--ca-file", "ca_file"),
@@ -395,6 +420,19 @@ def build_parser():
     text_group(sub, "body", "body", "comment text")
     sub.set_defaults(build=build_comment, write=True)
 
+    sub = command("comments", "list_comments: comments of a page or thread, or of a task with --task")
+    sub.add_argument("--task", type=uuid_arg, help="a task id: reads that task's page and thread (not with --page/--thread)")
+    sub.add_argument("--page", type=uuid_arg)
+    sub.add_argument("--thread", type=uuid_arg, help="only this thread (a task's thread id is its task id)")
+    sub.set_defaults(build=build_comments)
+
+    sub = command("block", "mark_blocked: say why you cannot claim a task you are assigned to or review", summary=True)
+    add_write_options(sub)
+    sub.add_argument("--task", required=True, type=uuid_arg)
+    sub.add_argument("--reason", required=True, choices=BLOCK_REASONS, help="why the task cannot be claimed")
+    text_group(sub, "note", "note", "optional free-text detail for the owner", required=False)
+    sub.set_defaults(build=build_block, write=True)
+
     sub = command("result", "submit_result: report a result for a claimed task", summary=True)
     add_write_options(sub)
     sub.add_argument("--task", required=True, type=uuid_arg)
@@ -426,13 +464,20 @@ def build_parser():
                      help="set operation_id in the arguments (writes need one; reads must not have one)")
     sub.set_defaults(build=build_call)
 
-    sub = command("watch", "loop on wait_inbox, one JSON line per notification, resuming from a state file")
+    sub = command("watch", "loop on wait_inbox, one JSON line per notification on stdout, resuming from a state file; "
+                           "reconnects with exponential backoff (cap 60 s) after network, TLS and 5xx errors",
+                  summary=True, summary_help="print one human-readable line per notification to stderr")
     sub.add_argument("--agent", type=agent_arg, help="agent id, names the default state file")
     sub.add_argument("--state", metavar="PATH",
                      help="sequence state file (default: ~/.local/state/baton/<agent>.seq, mode 600)")
     sub.add_argument("--timeout", type=int, default=DEFAULT_WAIT_SECONDS, metavar="SECONDS",
                      help="server-side wait per poll, 1-55 (default: %(default)s)")
     sub.add_argument("--limit", type=int)
+    sub.add_argument("--exec", dest="exec_command", metavar="COMMAND",
+                     help="run COMMAND once per notification with the notification JSON on stdin; "
+                          "no field is ever substituted into the command")
+    sub.add_argument("--exec-timeout", type=float, default=EXEC_TIMEOUT, metavar="SECONDS",
+                     help="stop a --exec command that runs longer than this (default: %(default)s)")
     sub.set_defaults(run=run_watch)
     return parser
 
@@ -461,6 +506,23 @@ def build_comment(args):
     arguments = {"page_id": args.page, "body": text_value(args, "body")}
     arguments.update(opt(args, thread_id="thread"))
     return "comment", arguments
+
+
+def build_comments(args):
+    if args.task is not None:
+        if args.page is not None or args.thread is not None:
+            raise UsageError("--task cannot be combined with --page or --thread")
+        return "list_comments", {"task_id": args.task}
+    if args.page is None:
+        raise UsageError("comments needs --task or --page")
+    return "list_comments", opt(args, page_id="page", thread_id="thread")
+
+
+def build_block(args):
+    arguments = {"task_id": args.task, "reason_code": args.reason}
+    if args.note is not None or args.note_file is not None:
+        arguments["note"] = text_value(args, "note")
+    return "mark_blocked", arguments
 
 
 def build_audit(args):
@@ -593,16 +655,114 @@ def save_seq(path, seq):
 
 
 class Stopper:
-    """Turn SIGINT/SIGTERM into a clean exit, without cutting a batch off mid-way."""
+    """Turn SIGINT/SIGTERM into a clean exit, without cutting a batch off mid-way.
+
+    The handler only sets a flag. Blocking work runs where the main thread can notice the flag between short
+    waits, so a signal can never raise inside unrelated code (an import, a weakref callback, a state write).
+    """
+
+    POLL = 0.2
+    STOPPED = object()
 
     def __init__(self):
         self.stop = False
-        self.waiting = False
 
     def handle(self, signum, frame):
         self.stop = True
-        if self.waiting:
-            raise KeyboardInterrupt
+
+    def run(self, work):
+        """Run work() in a helper thread; return its result, or STOPPED as soon as a signal arrived."""
+        outcome = {}
+
+        def target():
+            try:
+                outcome["value"] = work()
+            except BaseException as error:  # re-raised in the main thread below
+                outcome["error"] = error
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        while thread.is_alive():
+            thread.join(self.POLL)
+            if self.stop and thread.is_alive():
+                return self.STOPPED
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["value"]
+
+    def sleep(self, seconds):
+        deadline = time.monotonic() + seconds
+        while not self.stop:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(self.POLL, remaining))
+
+
+def backoff_delay(failures):
+    """Seconds to wait after the nth consecutive failure: 1, 2, 4, ... capped at 60."""
+    return min(BACKOFF_CAP, BACKOFF_START * 2 ** min(failures - 1, 16))
+
+
+def transient(error):
+    """Failures worth reconnecting for: the network, TLS, a 5xx from Baton or an intermediary, or 429."""
+    return isinstance(error, NetworkError) or (isinstance(error, BatonError) and (error.status >= 500 or error.status == 429))
+
+
+def plain(text, limit):
+    """Printable ASCII only, so another principal's text cannot inject control sequences into a terminal."""
+    cleaned = "".join(ch if " " <= ch <= "~" else "?" for ch in str(text))
+    return cleaned[:limit]
+
+
+def notification_line(notification):
+    """One human-readable line; only well-formed identifiers are echoed, the subject is sanitised."""
+    parts = ["notification"]
+    if type(notification.get("seq")) is int:
+        parts.append("seq=" + str(notification["seq"]))
+    event = notification.get("event")
+    if isinstance(event, str) and NOTIFICATION_EVENT_RE.fullmatch(event):
+        parts.append(event)
+    kind, identity = notification.get("object_type"), notification.get("object_id")
+    if kind in ("task", "comment", "page") and isinstance(identity, str) and SUMMARY_UUID_RE.fullmatch(identity):
+        parts.append(kind + "=" + identity)
+    actor = notification.get("actor")
+    principal = actor.get("principal") if isinstance(actor, dict) else None
+    if isinstance(principal, str) and AGENT_RE.fullmatch(principal):
+        kind_name = actor.get("kind")
+        parts.append("from=" + principal + ("(" + kind_name + ")" if kind_name in ("human", "agent", "service") else ""))
+    if isinstance(notification.get("subject"), str):
+        parts.append("- " + plain(notification["subject"], 100))
+    return " ".join(parts)
+
+
+def run_exec(command, notification, timeout):
+    """Run the user's command once with the notification on stdin.
+
+    The command string is passed to the shell exactly as given; no notification field is ever substituted
+    into it. Its output goes to stderr so stdout stays one JSON object per line. It runs in its own process
+    group so a timeout also stops anything it started.
+    """
+    payload = (dump_json(notification, separators=(",", ":")) + "\n").encode("utf-8")
+    sys.stderr.flush()
+    try:
+        child = subprocess.Popen(command, shell=True, stdin=subprocess.PIPE, stdout=sys.stderr, stderr=sys.stderr,
+                                 start_new_session=True)
+    except OSError:
+        say("watch: --exec command could not be started")
+        return
+    try:
+        child.communicate(payload, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except OSError:
+            child.kill()
+        child.wait()
+        say("watch: --exec command timed out and was stopped")
+    else:
+        if child.returncode != 0:
+            say("watch: --exec command exited with status " + str(child.returncode))
 
 
 def run_watch(args):
@@ -610,6 +770,8 @@ def run_watch(args):
         raise UsageError("--timeout must be between 1 and 55 for watch")
     if args.state is None and args.agent is None:
         raise UsageError("watch needs --agent (default state file name) or --state")
+    if not args.exec_timeout > 0:
+        raise UsageError("--exec-timeout must be positive")
     path = Path(args.state) if args.state else default_state_path(args.agent)
     client = make_client(args)
     seq = load_seq(path)
@@ -617,23 +779,37 @@ def run_watch(args):
     stopper = Stopper()
     signal.signal(signal.SIGINT, stopper.handle)
     signal.signal(signal.SIGTERM, stopper.handle)
+    failures = 0
     while not stopper.stop:
         arguments = {"after_seq": seq, "timeout_seconds": args.timeout}
         if args.limit is not None:
             arguments["limit"] = args.limit
-        stopper.waiting = True
         try:
-            result = client.call("wait_inbox", arguments, read_timeout=args.request_timeout + args.timeout)
-        except KeyboardInterrupt:
+            result = stopper.run(lambda: client.call("wait_inbox", arguments, read_timeout=args.request_timeout + args.timeout))
+        except (NetworkError, BatonError) as error:
+            if stopper.stop:
+                break
+            if not transient(error):
+                raise
+            failures += 1
+            delay = backoff_delay(failures)
+            reason = error.category if isinstance(error, NetworkError) else error.code + " (HTTP " + str(error.status) + ")"
+            say("watch: " + reason + "; reconnecting in " + str(delay) + "s")
+            stopper.sleep(delay)
+            continue
+        if result is Stopper.STOPPED:
             break
-        finally:
-            stopper.waiting = False
+        failures = 0
         notifications = result.get("notifications") if isinstance(result, dict) else None
         next_seq = result.get("next_seq") if isinstance(result, dict) else None
         if not isinstance(notifications, list) or type(next_seq) is not int:
             raise BatonError("bad_response", 200)
         for notification in notifications:
             emit_json(notification, separators=(",", ":"))
+            if args.summary and isinstance(notification, dict):
+                print(notification_line(notification), file=sys.stderr, flush=True)
+            if args.exec_command:
+                run_exec(args.exec_command, notification, args.exec_timeout)
         if next_seq > seq:
             # Persist only after the lines are out: a crash replays rather than loses.
             save_seq(path, next_seq)
@@ -657,6 +833,8 @@ def main(argv=None):
         return EXIT_USAGE
     except BatonError as error:
         say("error: " + error.code + " (HTTP " + str(error.status) + ")")
+        for field, expected in error.details:
+            say("  " + field + ": expected " + expected)
         retry_hint(error)
         return EXIT_BATON
     except NetworkError as error:
