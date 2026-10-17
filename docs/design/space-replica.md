@@ -2,6 +2,32 @@
 
 Status: approved direction (owner, 2026-10-16). MCP Agent Mail is removed from Baton. Its license rider restricts OpenAI, Anthropic and parties acting for them, which conflicts with "free for everyone".
 
+## Positioning and scope
+
+Baton solves communication and collaboration between people and agents, and between agents.
+
+Communication is anchored to work objects: every message belongs to a task, page or thread and carries permissions and audit. Baton defines no bus protocol of its own: agents interact over standard MCP and A2A, and Baton adds attribution, permissions and audit on top.
+
+| Capability | Status |
+| --- | --- |
+| Discussion threads and comments on tasks and pages | implemented |
+| @mentions and assignments | implemented |
+| Per-participant inbox (human or agent); agents pull with fetch_inbox | implemented |
+| Claim and lease (x_claim), scope conflict checks (x_scope), dependency graph (x_graph) | implemented |
+| Handoff notes (x_handoff), approval and gates (x_gate), append-only audit (x_audit) | implemented |
+| Work-face checklist (x_ready) | implemented |
+| Outbound notifications: webhooks, MCP notifications; people via web board or Feishu reminder | planned (this week) |
+| Direct messages within a space with scoped permissions and audit | planned |
+| MCP server (tasks, threads, inbox, claim, gate tools, etc.) | implemented |
+| A2A interface and agent-card directory (discovery); A2A calls through Baton recorded on the corresponding task or page | planned (next week) |
+| Real-time layer: web WebSocket threads, A2A/MCP streaming forwarded per thread, wake-up for offline agents (Cursor followup first, then Claude Routines /fire, then A2A push notifications) | planned (from next week) |
+
+Out of scope:
+
+- A general message bus or RPC (use A2A/MCP).
+- Real-time chat, voice and video (bridge to Feishu/Slack).
+- Email.
+
 ## Principle
 Follow the official semantics of OpenAI's **ChatGPT Space**, the same way WAG replicates the Agents API. Where Space defines a behaviour, Baton matches it. Where Space is silent, Baton adds its own documented `x_` extension. Sources are official pages only: learn.chatgpt.com/docs/space/ (overview, pages, collaboration, agents) and the DevDay 2026 recap. Cite the page for every rule in the spec.
 
@@ -24,6 +50,26 @@ Follow the official semantics of OpenAI's **ChatGPT Space**, the same way WAG re
 
 ## What it replaces
 Agent Mail's inbox, threads and file reservations become comment threads plus mentions (the inbox is "mentions and assignments for me") plus `x_claim`/`x_scope`. The MCP tools stay: `submit_task`, `get_task`, `list_tasks`, `fetch_inbox`. They gain `claim`, `renew`, `handoff`, `comment`, `mention`, `plan` (create or extend a task graph) and `ready` (list claimable tasks).
+
+## Communication
+
+### Two layers
+
+- **Async (this week):** threads, @mentions, assignments and inboxes are persisted. Delivery: agents pull with fetch_inbox; webhooks; MCP notifications; people see the web board or a Feishu reminder. Acceptance: Baton replaces the 南瓜↔北瓜 file mailbox (南瓜 creates a task assigned to 北瓜 in Baton, 北瓜 claims it and reports under the task, 南瓜 reviews and passes the gate in the same task; the owner no longer relays; the mailbox remains only as a fallback).
+- **Real-time (from next week):** web WebSocket threads for people and running agents; A2A/MCP streaming forwarded per thread; wake-up adapters that turn a message into one trigger on the recipient's platform when it is offline (Cursor followup first, then Claude Routines /fire, then A2A push notifications).
+- Real-time ships only together with three safeguards: loop guard (auto-pause after more than N agent-to-agent turns), budgets (per-thread and per-agent message count and spend caps), and a human gate (agents cannot approve each other).
+
+### Principles
+
+1. Async by default, sync only when blocked: agents normally collaborate through tasks and threads; escalate to a real-time channel or a wake-up only when one side cannot continue without a reply.
+2. Sync outcomes are written back: when a real-time conversation ends, its conclusions and decisions are written back to the task or thread as minutes; nothing may live only in the conversation.
+3. Response-time agreements: each priority has a response deadline; on timeout the item escalates to the responsible person or is reassigned to another agent.
+
+### A2A and MCP integration
+
+- Baton serves MCP (tasks, threads, inbox, claim, gate tools) and an A2A interface with an agent-card directory for discovery.
+- Every A2A call that passes through Baton is recorded on its task or page with permissions and audit.
+- Only standard protocols; no custom bus.
 
 ## Order of work
 1. `docs/spec/space.md`: the semantics above, each rule with its official source URL and marked "official" or "x_ extension".
