@@ -514,7 +514,7 @@ def test_unauthenticated_check_demands_exactly_401():
 
 @pytest.mark.parametrize("argv,message", [
     (["--base-url", "http://baton.example.com:8080"], "plain http"),
-    (["--base-url", "https://user:pw@baton.example.com"], "invalid --base-url"),
+    (["--base-url", "https://user:pw@127.0.0.1"], "invalid --base-url"),
     (["--base-url", "ftp://127.0.0.1"], "invalid --base-url"),
 ])
 def test_unsafe_base_urls_are_refused_before_any_command_runs(files, argv, message):
