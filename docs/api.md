@@ -54,7 +54,7 @@ with urlopen(request) as response:
 - `create_team(operation_id: str, name: str)` — 写入。
 - `set_team_member(operation_id: str, team_id: str, account: str, member: bool)` — 写入。
 - `comment(operation_id: str, page_id: str, body: str, thread_id: str | None = None, selection: Any = None)` — 写入。
-- `list_comments(page_id: str, thread_id: str | None = None)` — 读取。
+- `list_comments(page_id: str | None = None, thread_id: str | None = None, task_id: str | None = None)` — 读取。给 `page_id`（可加 `thread_id`），或只给 `task_id`：服务端解析该任务所在的页面和线程（线程 ID 等于任务 ID），做与其他读取相同的权限检查。`task_id` 不能与 `page_id`/`thread_id` 同用，两者都不给返回 `422 invalid`；看不到该任务返回 `404 not_found`。
 - `mention(operation_id: str, comment_id: str, target_type: str, target_id: str)` — 写入。
 - `proposal_create(operation_id: str, block_id: str, expected_revision: int, proposed_content: Any, selection: Any = None)` — 写入。
 - `proposal_review(operation_id: str, proposal_id: str, decision: str, content: Any = None)` — 写入。
@@ -66,12 +66,13 @@ with urlopen(request) as response:
 - `assign_task(operation_id: str, task_id: str, target_principal: str)` — 写入。
 - `plan(operation_id: str, graph: list[dict])` — 写入。
 - `set_work_face(operation_id: str, task_id: str, work_face: dict, base_commit: str | None = None)` — 写入。
+- `mark_blocked(operation_id: str, task_id: str, reason_code: str, note: str | None = None)` — 写入；见下文“阻塞标记”。
 - `ready(page_id: str | None = None, limit: int = 50)` — 读取。
 - `get_task(task_id: str)` — 读取。
 - `list_tasks(limit: int = 50)` — 读取。
 - `fetch_inbox(limit: int = 30)` — 读取。
 - `wait_inbox(after_seq: int = 0, timeout_seconds: int = 25, limit: int = 50)` — 读取（长轮询，见下文）。
-- `webhook_subscribe(operation_id: str, url: str, events: list[str] | None = None)` — 写入；仅此一次返回 `signing_secret`。
+- `webhook_subscribe(operation_id: str, url: str, events: list[str] | None = None, include_preview: bool = False)` — 写入；仅此一次返回 `signing_secret`。`include_preview` 见下文“webhook 预览”。
 - `webhook_list()` — 读取。
 - `webhook_delete(operation_id: str, subscription_id: str)` — 写入。
 - `claim(operation_id: str, task_id: str, lease_seconds: int = 300)` — 写入。
@@ -104,7 +105,7 @@ with urlopen(request) as response:
 
 手工 submit_result 只进入 awaiting_gate。gate 必须携带对应候选的 expected_epoch 和 pass/fail；只有配置 reviewer、具备当前 edit 权限且不是结果作者或持有人账户，才可通过。只有 gate 通过才会 done。
 
-Task view 包含 id/task_id/thread_id、work_face/require_work_face/task_kind/work_face_missing、priority/respond_by/responded_at/escalated_at/overdue、page_id/block_id、owner/owner_account、execution_mode、state/status、epoch、holder/holder_account、lease_expires_at/lease_valid、scopes、base_commit、context、evidence、result/result_epoch、a2a_id/backend、gate_mode/reviewers 和错误元数据。canonical state 为 queued/claimed/awaiting_gate/done/failed/interrupted；兼容 status 将 claimed→working、done→completed。手工任务在当前 page view 权限下返回 prompt，方便接收人读取指令；自动任务的旧兼容状态视图仍省略 prompt。所有状态视图都不返回 idempotency key 或凭据。
+Task view 包含 `blocked`（`null`，或 `{"reason_code","by","at"}`，见“阻塞标记”）、id/task_id/thread_id、work_face/require_work_face/task_kind/work_face_missing、priority/respond_by/responded_at/escalated_at/overdue、page_id/block_id、owner/owner_account、execution_mode、state/status、epoch、holder/holder_account、lease_expires_at/lease_valid、scopes、base_commit、context、evidence、result/result_epoch、a2a_id/backend、gate_mode/reviewers 和错误元数据。canonical state 为 queued/claimed/awaiting_gate/done/failed/interrupted；兼容 status 将 claimed→working、done→completed。手工任务在当前 page view 权限下返回 prompt，方便接收人读取指令；自动任务的旧兼容状态视图仍省略 prompt。所有状态视图都不返回 idempotency key 或凭据。
 
 自动派发前先持久化 dispatch_started，并且每次结果写入检查 holder、当前 epoch 和未过期租约。网络结果不确定时进入 interrupted；自动恢复不会再次执行可能已派发的任务，旧 worker 不能覆盖新持有人。worker 明确报告失败时，任务进入 failed，`error` 只保存封闭词汇中的错误码（如 `CODEX_TIMEOUT`、`CODEX_AUTH_UNAUTHORIZED`；无法接受的诊断为 `A2A_FAILED_UNCLASSIFIED`），并在任务线程追加固定文本的 `[failed]` 评论；worker 的原始错误文本不会进入任务、线程或审计。
 
@@ -141,7 +142,7 @@ Baton 不会执行 `acceptance_command`。它只是显示给领取人和 gate �
 
 ### 通知 outbox
 
-表 `baton.x_notify(id, recipient, recipient_account, event, object_type, object_id, thread_id, created_at, seq)`。`seq` 是 bigserial；所有写事务持同一把 advisory 事务锁串行提交，因此 seq 的提交顺序与大小顺序一致，读者按 `seq > after_seq` 推进不会漏掉较晚提交的较小编号。通知行与产生它的业务效果、`x_audit` 在同一事务写入：操作回滚则没有通知；幂等重放（同 operation_id 或同业务 key）不会再写。
+表 `baton.x_notify(id, recipient, recipient_account, event, object_type, object_id, thread_id, created_at, seq, actor, actor_kind)`（`actor`/`actor_kind` 只记录触发者的 principal 与种类，不含内容）。`seq` 是 bigserial；所有写事务持同一把 advisory 事务锁串行提交，因此 seq 的提交顺序与大小顺序一致，读者按 `seq > after_seq` 推进不会漏掉较晚提交的较小编号。通知行与产生它的业务效果、`x_audit` 在同一事务写入：操作回滚则没有通知；幂等重放（同 operation_id 或同业务 key）不会再写。
 
 | event | 触发 | 收件人 | object |
 | --- | --- | --- | --- |
@@ -153,8 +154,17 @@ Baton 不会执行 `acceptance_command`。它只是显示给领取人和 gate �
 | `task.handed_off` | `handoff` | 新持有人 | task |
 | `task.failed` | 自动任务的 worker 确定性失败（`fail_auto`，同时写入 `[failed]` 线程评论） | owner | task |
 | `task.overdue` | 后台升级循环发现任务超过 `respond_by` 仍无响应（见“响应时效与超时升级”） | `escalate_to`，与其不同时还有 owner | task |
+| `task.blocked` | `mark_blocked`（见“阻塞标记”） | 任务 owner（不含操作者） | task |
 
-操作者本人不会收到自己操作产生的通知，同一 principal 在一次事件中只收到一条。收件人在插入时必须对对象所在页面有 view 权限，否则不写行。负载只含元数据：`id`、`seq`、`event`、`object_type`、`object_id`、`thread_id`、`created_at`、`recipient`；任何通知、webhook 或审计都不含 prompt、评论正文或结果文本，接收者凭 object_id 再用 `get_task`、`list_comments` 等带权限检查的读取操作取内容。
+操作者本人不会收到自己操作产生的通知，同一 principal 在一次事件中只收到一条。收件人在插入时必须对对象所在页面有 view 权限，否则不写行。outbox 与 webhook 默认负载只含元数据：`id`、`seq`、`event`、`object_type`、`object_id`、`thread_id`、`created_at`、`recipient`；outbox、审计和日志从不存放 prompt、评论正文或结果文本，接收者凭 object_id 再用 `get_task`、`list_comments` 等带权限检查的读取操作取完整内容。
+
+**`wait_inbox` 通知预览。** 为了不必为每条通知多读一次，`wait_inbox` 返回的每一行在上述元数据之外，在**读取时**由当前对象现算三个字段（不进入 outbox）：
+
+- `actor`：`{"principal","kind"}`，触发者；`kind` 为 `human`、`agent`，或后台升级循环产生的 `service`。升级前写入的旧行没有记录触发者时，评论类通知取评论作者，其余省略该字段。
+- `subject`：任务事件为 `[<事件>] <任务说明前 60 个字符>`（空白折叠为单个空格），如 `[assigned] 核对发布清单`，事件标签为 `assigned`、`handed_off`、`awaiting_gate`、`gate_decided`、`failed`、`overdue`、`blocked`；评论为 `comment on <任务 id>`（线程不是任务时为 `comment on thread <线程 id>`），提及为 `mention in <任务 id>` 或 `mention in thread <线程 id>`。
+- `body_preview`：评论正文或手工任务说明的前 200 个字符，不加省略号。
+
+只有读取时调用者仍对对象所在页面有 view 权限才会返回这些内容：失权的行整条不返回（见 `next_seq` 语义），重新获得权限后按当前内容再次可见。自动任务的 prompt 与任务视图一致保持不可见：其通知只有 `actor` 和 `[<事件>] <任务 id>` 形式的 `subject`，没有 `body_preview`。`fetch_inbox` 的每条 message 同样增加 `actor` 与 `body_preview`（`subject`、`body_md` 保持原样）。
 
 ### wait_inbox 长轮询
 
@@ -173,7 +183,7 @@ Baton 不会执行 `acceptance_command`。它只是显示给领取人和 gate �
 - `webhook_list()` 只列调用者自己的订阅：`subscription_id`、`url`、`events`、`created_at` 和 pending/delivered/dead 计数，没有密钥。`webhook_delete(operation_id, subscription_id)` 只能删除自己的订阅（否则 `404`），并取消其待投递项。
 - 订阅只投递调用者自己的、订阅创建之后产生的通知；不回放历史，历史用 `wait_inbox` 读取。
 
-投递是对订阅 URL 的 `POST`，正文是紧凑 JSON（键排序）`{id, seq, event, object_type, object_id, thread_id, created_at, recipient}`，请求头：
+投递是对订阅 URL 的 `POST`，正文是紧凑 JSON（键排序）`{id, seq, event, object_type, object_id, thread_id, created_at, recipient}`（默认只含元数据，见下文“webhook 预览”），请求头：
 
 - `X-Baton-Event`：事件名。
 - `X-Baton-Delivery`：通知 id（所有重试相同）。
@@ -189,6 +199,8 @@ def verify(secret_hex: str, raw_body: bytes, header: str) -> bool:
     return hmac.compare_digest(expected, header)
 ```
 
+**webhook 预览（`include_preview`，默认 `false`）。** webhook 默认保持只含元数据。订阅时设置 `include_preview=true`，该订阅的每次投递才在正文里多带 `wait_inbox` 同样的 `actor`、`subject`、`body_preview`；它们在投递时现算，并且是在重新检查收件人 view 权限之后，失权的投递仍直接 dead-letter。预览是评论或任务说明的片段，会离开 Baton 发往订阅 URL，只对你信任的端点开启。`webhook_list` 返回每个订阅的 `include_preview`；该选项只在为 `true` 时计入幂等请求摘要，不带它的旧请求重放不变，同一 operation_id 换了取值返回 `409 operation_conflict`。审计与日志仍不含预览内容。
+
 **至少一次语义。** 2xx 视为成功；其他状态码、超时或网络错误都会重试（不跟随 3xx 重定向，3xx 记为失败）。同一通知可能重复到达，也不保证跨通知的顺序；接收方必须按 `X-Baton-Delivery` 去重，并在处理前验证签名。每次尝试 10 秒超时，最多 8 次，第 n 次失败后的等待为 30、60、120、240、480、960、1920 秒（总计约 64 分钟），之后进入 dead-letter，不再重试。投递前重新检查收件人的 view 权限，失权的投递直接 dead-letter（`forbidden`），不发出请求。
 
 每次尝试写入 `x_webhook_attempt`（序号、结果、HTTP 状态、耗时）；每个最终结果写一条审计 `webhook.delivered` 或 `webhook.dead_lettered`，只含订阅/通知标识、事件名、尝试次数、状态码和错误类别，不含 URL（含查询串）、请求头、响应或密钥。
@@ -196,6 +208,47 @@ def verify(secret_hex: str, raw_body: bytes, header: str) -> bool:
 **SSRF 防护。** 只接受 `https` URL，不接受用户信息。订阅时解析主机名，解析结果中只要有环回、链路本地（含云元数据地址）、私有（RFC 1918、ULA）、组播、保留、未指定或其他非全局地址就拒绝（`422 invalid`）；IPv4 映射/NAT64 等嵌入形式按内嵌地址判断。每次投递在连接时重新解析并检查，并固定连接到检查通过的地址，再确认实际对端地址；因此订阅后改变 DNS 记录（rebinding）无法绕过。TLS 校验使用系统信任库，私有 CA 通过 `BATON_WEBHOOK_CA_BUNDLE` 指向 PEM 文件。运营者可用 `BATON_WEBHOOK_ALLOW_HOSTS`（逗号分隔的主机名或 IP 字面量，仅精确匹配）为内部接收端或开发测试豁免地址检查；豁免不放宽 https 要求。
 
 默认 Compose 中 bridge 只接入内部网络，没有出站路由，webhook 投递会失败并最终 dead-letter；需要 webhook 时由运营者为 bridge 明确添加出站网络与相应防火墙策略。
+
+## 阻塞标记
+
+`mark_blocked(operation_id, task_id, reason_code, note=None)` 让不能领取任务的人说明原因，而不是沉默。这是 Baton 的 x_ 扩展，不领取、不改派、不改变任何权限。
+
+- **谁能调用。** 手工任务的 assignee，或 `reviewers` 中的 principal（精确匹配），且对页面至少有 comment 权限。看不到该任务返回 `404 not_found`；能看到但既不是 assignee 也不是 reviewer、或任务不是手工任务，返回 `403 forbidden`。
+- **`reason_code`** 为 `scope_conflict`、`lease_held`、`dependency_blocked`、`waiting_input`、`other` 之一，否则 `422 invalid`（`error.details` 列出可选值）。`note` 可省略，最长 2000 个字符。
+- **效果（同一事务）。** 任务线程追加一条评论，正文以 `[blocked] ` 开头，格式 `[blocked] <reason_code>` 或 `[blocked] <reason_code>: <note>`，作者是调用者；给任务 owner 写通知 `task.blocked`（owner 就是调用者时不通知）；调用者是 assignee 时，响应时效约定的 `responded_at` 在首次响应时设置；写审计 `task.blocked`，元数据只含 `reason_code`、线程和任务标识，不含 `note`。
+- **任务视图。** `blocked` 为 `{"reason_code","by","at"}`（`at` 取数据库时间），直到任务被领取（`claim`）或改派（`assign_task`、升级改派）才恢复为 `null`。再次调用会覆盖标记并追加一条新评论。
+- **状态限制。** 只在任务为 queued 或 claimed（含他人持有的有效租约，对应 `lease_held`）时可调用；任务已进入 awaiting_gate、done、failed、interrupted，或调用者自己就是有效持有人，返回 `409 stale_claim`。
+- **幂等与重放。** 使用 `operation_id`：同输入重放返回当前 task view（`replay: true`），不再追加评论、通知或审计；异输入 `409 operation_conflict`。
+- **接口。** HTTP `POST /v1/space/mark_blocked`；MCP 工具同名；适配器已知工具含 `mark_blocked`，默认白名单不变，需要时用 `--allow-tools` 显式放行；命令行为 `baton_cli.py block --task ... --reason ... [--note ...]`。
+
+```python
+# SPDX-License-Identifier: Apache-2.0
+import uuid
+import httpx
+
+BASE = "https://example.com"  # 你的 Baton 地址
+HEADERS = {"Authorization": "Bearer <你的令牌>"}
+
+view = httpx.post(BASE + "/v1/space/mark_blocked", headers=HEADERS, json={
+    "operation_id": str(uuid.uuid4()), "task_id": "<任务 UUID>",
+    "reason_code": "scope_conflict", "note": "src/ 目录被另一个任务占用",
+}).json()["result"]
+print(view["blocked"])  # {"reason_code": "scope_conflict", "by": "...", "at": "..."}
+```
+
+## 历史 root scope 迁移与调度告警
+
+**迁移命令。** 在 bridge 容器里运行：
+
+```sh
+# SPDX-License-Identifier: Apache-2.0
+docker compose exec bridge python -m bridge.scopes migrate-manual-root-to-none --dry-run
+docker compose exec bridge python -m bridge.scopes migrate-manual-root-to-none
+```
+
+它把**手工**任务（`execution_mode=manual`）中 scope 恰好等于旧仓库根占位范围 `[{"kind":"path","value":""}]`、且当前没有有效租约的任务改写为 `[{"kind":"none"}]`，每个任务写一条审计 `task.scopes_migrated`，并向 stdout 输出一份 JSON 汇总 `{"dry_run","matched","migrated","skipped_claimed","task_ids"}`（`skipped_claimed` 是因有效租约而跳过的数量）。`--dry-run` 只报告、不写入。自动任务（会执行代码，保留仓库根占位范围）和持有有效租约的任务不会被改动；命令可重复运行，第二次没有可迁移项。无法区分当初显式传 `scopes: []` 的手工任务，它们同样会被迁移。已存在请求的幂等摘要不受影响。命令失败时只向 stderr 输出错误码，不输出 SQL 或连接细节。
+
+**调度告警。** 内部 worker 的 `claim_next` 在跳过排队中的自动任务、且原因仅是 scope 与某个有效租约冲突时，向 worker 审计日志写一条警告 `dispatch.blocked_by_scope`（`level=warning`，含被跳过的 `task_id` 和阻塞它的 `blocked_by` 任务 id，不含任何内容）。同一任务每 5 分钟最多一条（进程内限频，重启后重新计时），让卡住的自动任务可被发现。该日志不是 API，不影响领取结果。
 
 ## 响应时效与超时升级
 
@@ -252,13 +305,15 @@ MCP 与适配器：`submit_task` 工具和 `create_task_block` 带上述三个�
 ## 错误与审计
 
 - `401 unauthorized`：缺少、重复、无效或已撤销的认证。
-- `403 forbidden`：当前身份或权限不允许操作。
-- `404 not_found`：资源不存在或对调用者不可见。
+- `403 forbidden`：对象对调用者可见，但当前权限不允许该操作（例如只有 view 权限却要评论、不是指定接收人却要领取）。
+- `404 not_found`：资源不存在，或调用者对它没有 view 权限（包括已被撤权）；两种情况的响应完全相同，不泄漏存在性（规格 X7）。`get_task`、`list_comments`、`get_page`、`comment` 等读写一律如此。对他人目标（assignee、handoff 目标）缺权限的检查仍报告 `403`，因为调用者看得到该对象。
 - `409 operation_conflict / scope_conflict / stale_claim / revision_conflict / gate_required / dependency_blocked / graph_cycle / work_face_incomplete`：幂等、作用域、租约、版本、gate、依赖图或施工面清单不满足当前条件。
-- `422 invalid`：未知操作、额外字段、无效类型或无效业务参数。
+- `422 invalid`：未知操作、额外字段、无效类型或无效业务参数。响应的 `error.details` 在可定位时给出字段级提示，见下。
 - `429 rate_limited`：webhook 订阅数或 wait_inbox 并发等待数超过上限。
 - `503 storage_unavailable`：数据库不可用，不能当作成功或自动重复外部执行。
 
 错误体为 `{"x_protocol":"baton.space.v1","error":{"code":"...","message":"固定安全说明"}}`。错误不包含 SQL、正文、凭据或不可见资源详情。MCP 错误使用相同稳定错误码。
+
+**字段级提示。** `422 invalid` 可多带 `error.details`：`[{"field":"<名称>","expected":"<简短的类型或格式说明>"}]`，至多 20 项。覆盖三类问题：未知字段（`expected` 为 `not a field of this operation; see GET /v1/space/schema`）、缺失必填字段（如 `required string`）和类型错误（如 `integer`、`array of string`、`UUID string`、`one of urgent, normal, low`）；来自 pydantic 请求模型，以及 `bridge/space_store.py` 中能确定字段的校验器（长度、枚举、scope、work_face、UUID 等）。嵌套字段用点号和下标，如 `graph[0].task_id`、`work_face.environment`。`details` 只含字段名和固定说明文本，**绝不回显输入值**；不是标识符形状的未知键名显示为 `<unknown>`。无法归因到单个字段的校验失败（如依赖环之外的业务规则）仍只有 `code` 与 `message`。MCP 错误文本在固定说明之后追加同样的内容：`invalid: Invalid request; details=[{"field":"name","expected":"string"}]`，其余错误码的文本不变。
 
 list_audit 在当前资源权限内读取追加审计，内容只有 actor、operation、资源、时间、fence/版本等必要元数据。审计和业务效果在同一 PG 事务中提交；HTTP、MCP 和容器日志不记录 prompt、评论正文或 bearer token。

@@ -21,6 +21,10 @@ Baton 的 HTTP/JSON、数据库结构和 `x_claim`、`x_scope`、`x_handoff`、`
 | 施工面清单（x_ready） | 已实现 |
 | 对外通知：事务性通知 outbox、webhook（HMAC 签名、至少一次）、`wait_inbox` 长轮询 | 已实现 |
 | 响应时效约定：按优先级设响应时限，超时通知负责人或改派给后备 agent | 已实现 |
+| 通知预览：`wait_inbox` 通知带 `actor`、`subject` 和 200 字符 `body_preview`（读取时按当前权限计算）；webhook 默认只含元数据，订阅时可选 `include_preview` | 已实现 |
+| 阻塞标记：无法领取的接收人或 reviewer 用 `mark_blocked` 说明原因，线程留 `[blocked]` 评论并通知发起人 | 已实现 |
+| 字段级校验错误：`422 invalid` 附带 `error.details`（字段名与期望类型，不回显输入值）；看不到的对象一律 `404 not_found` | 已实现 |
+| 命令行客户端：`comments --task`、`block`、自动重连的 `watch`（`--summary`、`--exec`） | 已实现 |
 | 对外通知：MCP 推送通知；人通过网页或飞书提醒 | 计划 |
 | 空间内有权限范围和审计的私信 | 计划 |
 | MCP 服务（任务、讨论串、收件箱、认领、关卡等工具） | 已实现 |
@@ -124,7 +128,7 @@ WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --b
 
 任务桥已使用 Baton 自有 PostgreSQL 存储，完成结果作为同任务 UUID 线程中的评论回报，并通过提及/分配进入接收者 inbox。`fetch_inbox` 查询当前身份可见的 mentions 与 assignments，不公开其他人的收件箱。请求处理时重新检查权限。
 
-既有 MCP `submit_task`、`get_task`、`list_tasks`、`fetch_inbox` 保留；协作工具包括 `claim`、`renew`、`handoff`、`comment`、`mention`、`plan`、`ready`、`set_work_face`。具体参数、允许操作和验收以 [规格](docs/spec/space.md) 与实现返回的工具 schema 为准。HTTP 使用 `POST /v1/space/{operation}`，所有操作都是 Baton 自有协议。
+既有 MCP `submit_task`、`get_task`、`list_tasks`、`fetch_inbox` 保留；协作工具包括 `claim`、`renew`、`handoff`、`comment`、`mention`、`plan`、`ready`、`set_work_face`、`mark_blocked`。具体参数、允许操作和验收以 [规格](docs/spec/space.md) 与实现返回的工具 schema 为准。HTTP 使用 `POST /v1/space/{operation}`，所有操作都是 Baton 自有协议。
 
 未指定接收人的兼容自动 `submit_task` 使用明确的 `worker_success` gate；指定接收人或手工领取不自动启动 worker，手工 gate 必须由有资格的 reviewer 审批，结果作者不能自批。`awaiting_gate` 不能提前显示为 completed。
 
@@ -132,7 +136,15 @@ WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --b
 
 ### 通知与异步送达
 
-不必再轮询 `fetch_inbox`：mention、指派、任务线程评论、进入 gate、gate 决定和交接会在业务事务内写入通知 outbox（只含标识符，不含正文）。`wait_inbox(after_seq, timeout_seconds≤55)` 长轮询返回当前仍可见的通知；`webhook_subscribe/webhook_list/webhook_delete` 让 bridge 向你的 https 端点投递带 HMAC 签名的通知，至少一次、指数退避、最多 8 次后 dead-letter，接收方按 `X-Baton-Delivery` 去重。URL 经过 SSRF 检查；运营者可用 `BATON_WEBHOOK_ALLOW_HOSTS` 豁免内部主机，默认 Compose 的 bridge 没有出站网络。细节见 [API](docs/api.md#通知与送达webhookwait_inbox) 与 [安全模型](docs/security-model.md)。适配器默认白名单不变，可用 `--allow-tools fetch_inbox,wait_inbox` 显式放行 `wait_inbox`。
+不必再轮询 `fetch_inbox`：mention、指派、任务线程评论、进入 gate、gate 决定、交接和阻塞标记（`task.blocked`）会在业务事务内写入通知 outbox（只含标识符，不含正文）。`wait_inbox` 返回的通知在读取时附加 `actor`（`principal` 与 `kind`）、`subject`（如 `[assigned] 任务说明开头`、`comment on <任务 id>`）和 `body_preview`（评论或手工任务说明的前 200 个字符）；它们按调用者当前的查看权限现算、从不存入 outbox，无权查看时整条通知不返回。webhook 默认保持只含元数据，订阅时设置 `include_preview=true` 才在投递时附带同样的三个字段（投递前同样重新检查权限）；预览会离开 Baton 发往你的端点，只在信任该端点时开启。`wait_inbox(after_seq, timeout_seconds≤55)` 长轮询返回当前仍可见的通知；`webhook_subscribe/webhook_list/webhook_delete` 让 bridge 向你的 https 端点投递带 HMAC 签名的通知，至少一次、指数退避、最多 8 次后 dead-letter，接收方按 `X-Baton-Delivery` 去重。URL 经过 SSRF 检查；运营者可用 `BATON_WEBHOOK_ALLOW_HOSTS` 豁免内部主机，默认 Compose 的 bridge 没有出站网络。细节见 [API](docs/api.md#通知与送达webhookwait_inbox) 与 [安全模型](docs/security-model.md)。适配器默认白名单不变，可用 `--allow-tools fetch_inbox,wait_inbox` 显式放行 `wait_inbox`。
+
+### 阻塞标记与错误提示
+
+被指派的接收人或 reviewer 领取不了任务（`scope_conflict`、`lease_held`、`dependency_blocked`，或 `waiting_input`、`other`）时，调用 `mark_blocked(operation_id, task_id, reason_code, note)`：任务线程出现一条 `[blocked]` 评论，发起人收到 `task.blocked` 通知，响应时效约定记为已响应，任务视图出现 `blocked={reason_code, by, at}`，直到任务被领取或改派；审计事件 `task.blocked` 只记原因码。`list_comments` 可只给 `task_id`，不必知道页面和线程。
+
+`422 invalid` 的 `error.details` 是 `[{"field": "<名称>", "expected": "<类型或格式>"}]`，覆盖未知字段、缺失必填字段和类型错误，MCP 错误文本末尾带同样的 JSON；不回显任何输入值。对调用者不可见的对象（包括已撤权）返回 `404 not_found`，只有“能看到但不允许该操作”才返回 `403 forbidden`。
+
+运营者命令：`docker compose exec bridge python -m bridge.scopes migrate-manual-root-to-none [--dry-run]` 把尚未被领取、仍带旧仓库根占位范围的**手工**任务改为显式 `none`（每个任务一条 `task.scopes_migrated` 审计，输出一份 JSON 汇总）；自动任务和有效租约中的任务不受影响。自动任务因 scope 冲突被跳过时，worker 每个任务每 5 分钟最多写一条 `dispatch.blocked_by_scope` 警告日志，含阻塞它的任务 id。
 
 ### 响应时效与超时升级
 
@@ -226,6 +238,19 @@ WORKER_MODE=codex
 ```
 
 将 hostname、路径、uid/gid 换成自己的值。非 root nginx 必须能读取私钥。运行 `docker compose -f compose.yaml -f compose.tls.yaml up --build -d --wait`；需要 AppArmor 例外时再加入 `-f compose.apparmor.yaml`。TLS override 替换 HTTP 映射，只发布选定 HTTPS 端口，可将 `HTTPS_PORT` 设为 443。证书由操作者续期，私有 CA 通过 `BATON_CA_FILE` 或 `--ca-file` 配置，不能关闭证书校验。
+
+没有 MCP SDK 的主机可以用下面一个代码块下载固定提交的零依赖客户端并读一次收件箱（把尖括号占位符换成自己的值；使用系统信任的 CA 时去掉 `--ca-file` 一行）：
+
+```sh
+# SPDX-License-Identifier: Apache-2.0
+mkdir -p "$HOME/baton/adapters" && \
+curl -fsSL -o "$HOME/baton/adapters/baton_cli.py" \
+  https://raw.githubusercontent.com/fledge-labs/baton/2a386723d3e1081a3586cddf778a2a5de782190f/adapters/baton_cli.py && \
+python3 "$HOME/baton/adapters/baton_cli.py" inbox \
+  --url <BATON_URL> --token-file <TOKEN_FILE> --ca-file <CA_FILE>
+```
+
+更多子命令见 [标准库 CLI](onboarding/stdlib-cli.md)。
 
 客户端说明：[Codex](onboarding/codex.md)、[agy](onboarding/agy.md)、[Cline](onboarding/cline.md)、[Devin](onboarding/devin.md)、[Claude Code 与 SSH stdio](onboarding/claude-code.md)、[OpenCode](onboarding/opencode.md)。适配器支持 `BATON_URL`、`BATON_CA_FILE`、`BATON_PYTHON`，入口为 `adapters/launch_mcp.sh <agent-id> <TOKEN_FILE>`。每个客户端使用独立 token；适配器不授予额外业务权限。无法安装 MCP SDK 的主机用 [标准库 CLI](onboarding/stdlib-cli.md)（`adapters/baton_cli.py`，只需 Python 3.9+ 标准库，经 HTTP API 访问）。
 

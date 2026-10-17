@@ -2,6 +2,19 @@
 
 # 标准库命令行客户端：没有 MCP SDK 的主机
 
+**首次运行。** 复制下面一个代码块即可：它从固定提交下载 `baton_cli.py` 并读取一次收件箱。把三个尖括号占位符换成自己的值（`<BATON_URL>` 形如 `https://example.com`，`<TOKEN_FILE>` 是 0600 的令牌文件，`<CA_FILE>` 是私有 CA 的 PEM；使用系统信任的 CA 时去掉 `--ca-file` 一行）。
+
+```sh
+# SPDX-License-Identifier: Apache-2.0
+mkdir -p "$HOME/baton/adapters" && \
+curl -fsSL -o "$HOME/baton/adapters/baton_cli.py" \
+  https://raw.githubusercontent.com/fledge-labs/baton/2a386723d3e1081a3586cddf778a2a5de782190f/adapters/baton_cli.py && \
+python3 "$HOME/baton/adapters/baton_cli.py" inbox \
+  --url <BATON_URL> --token-file <TOKEN_FILE> --ca-file <CA_FILE>
+```
+
+URL 中的 40 位十六进制是固定的提交，下载内容不会随分支更新而改变。需要 `comments`、`block` 或新的 `watch` 行为时，把它换成你确认过的、包含这些功能的提交，再重复上面的下载。以下各节假定文件位于 `$HOME/baton/adapters/baton_cli.py`。
+
 `adapters/baton_cli.py` 是单文件、零依赖的 Baton 命令行客户端，只需要 Python 3.9+ 标准库，不需要 venv、pip 或 MCP SDK。适用于只能运行系统自带 `python3` 的主机，例如一台没有安装任何第三方包的 VPS。
 
 它直接调用 Baton 自有的 HTTP API（`POST /v1/space/{operation}`，见 [API](../docs/api.md)），不使用 MCP。每个子命令对应一个操作，成功时把操作的 `result` 以 JSON 打印到 stdout。权限、租约和 gate 规则与 MCP 完全相同，客户端不会扩大任何权限。需要 MCP 工具的 agent 仍按 [指定接收人](named-agent.md) 配置适配器。
@@ -14,7 +27,9 @@
 - 不读取 `HTTP_PROXY`/`HTTPS_PROXY`，也不跟随重定向，令牌只发给 `--url` 指定的主机。
 - 错误信息只显示 Baton 的稳定错误码和 HTTP 状态，例如 `baton_cli: error: stale_claim (HTTP 409)`；网络和 TLS 错误只显示固定类别，不含服务端文本或 URL。
 
-退出码：`0` 成功；`1` Baton 返回错误；`2` 用法或本地配置错误；`3` 网络或 TLS 错误。
+退出码：`0` 成功；`1` Baton 返回错误；`2` 用法或本地配置错误；`3` 网络或 TLS 错误（`watch` 除外：它遇到这些错误会自动重连，见下文）。
+
+遇到 `422 invalid` 时，服务端会给出字段级提示，CLI 在错误码之后每个字段打印一行 `baton_cli:   <字段>: expected <期望的类型或格式>`。提示不含你提交的任何值；只有由普通可打印字符组成的字段名和说明才会显示。
 
 ## 准备
 
@@ -57,6 +72,7 @@ openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/
 | `inbox` | `fetch_inbox` | `--limit` |
 | `wait` | `wait_inbox` | `--after-seq`（默认 0）、`--timeout`（默认 25，0–55 秒）、`--limit` |
 | `task` | `get_task` | `TASK_ID` 或 `--task` |
+| `comments` | `list_comments` | `--task`（按任务读取其页面和线程），或 `--page` 加可选的 `--thread`；`--task` 不能与 `--page`/`--thread` 同用 |
 | `tasks` | `list_tasks` | `--limit` |
 | `ready` | `ready` | `--page`、`--limit` |
 | `submit` | `submit_task` | `--key`，`--prompt` 或 `--prompt-file`，`--page`、`--assignee`、`--scope kind=value`（可重复，kind 为 path/module/migration；`--scope none` 表示不触碰任何仓库路径，不能与其他 scope 组合）、`--depends-on`（可重复或逗号分隔） |
@@ -65,14 +81,15 @@ openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/
 | `comment` | `comment` | `--page`、`--thread`、`--body` 或 `--body-file` |
 | `result` | `submit_result` | `--task`、`--epoch`，`--result` 或 `--result-file` |
 | `gate` | `gate` | `--task`、`--epoch`、`--decision pass\|fail` |
+| `block` | `mark_blocked` | `--task`、`--reason scope_conflict\|lease_held\|dependency_blocked\|waiting_input\|other`，可选 `--note` 或 `--note-file` |
 | `audit` | `list_audit` | `--task` 或 `--space`、`--limit` |
 | `call` | 任意操作 | `call <operation> --json '<参数对象>'`，或 `--json-file` |
-| `watch` | 循环 `wait_inbox` | `--agent`、`--state`、`--timeout`、`--limit` |
+| `watch` | 循环 `wait_inbox` | `--agent`、`--state`、`--timeout`、`--limit`、`--summary/--no-summary`、`--exec`、`--exec-timeout` |
 
-- 写操作（`submit`、`claim`、`renew`、`comment`、`result`、`gate`）自动生成 UUIDv4 `operation_id`，也可用 `--operation-id` 指定。读操作不发送 `operation_id`。`call` 不替你生成：写操作需要在 `--json` 里放 `operation_id`，或用 `--operation-id`。
+- 写操作（`submit`、`claim`、`renew`、`comment`、`result`、`gate`、`block`）自动生成 UUIDv4 `operation_id`，也可用 `--operation-id` 指定。读操作不发送 `operation_id`。`call` 不替你生成：写操作需要在 `--json` 里放 `operation_id`，或用 `--operation-id`。
 - `--prompt-file`、`--body-file`、`--result-file`、`--json-file` 传 `-` 表示读取 stdin。`--epoch` 在 `gate` 中对应 API 的 `expected_epoch`，即被审阅结果所属的 epoch。
 - stdout 始终是纯 JSON，并以 UTF-8 输出原文（`ensure_ascii=False`），中文不会被转义成 `\uXXXX`。
-- `claim`、`renew`、`result`、`gate` 默认再向 stderr 打印一行摘要，如 `task <id> state=claimed epoch=3`；用 `--no-summary` 关闭，`submit`、`task`、`comment`、`call` 可用 `--summary` 打开。stdout 不受影响。
+- `claim`、`renew`、`result`、`gate`、`block` 默认再向 stderr 打印一行摘要，如 `task <id> state=claimed epoch=3`；用 `--no-summary` 关闭，`submit`、`task`、`comment`、`call` 可用 `--summary` 打开。stdout 不受影响。`watch` 的 `--summary` 含义不同，见下文。
 - 省略 scope 时，带 `--assignee` 的手工任务默认声明 `none`（不占用任何 scope，多个无文件足迹的审阅、文档任务可同时领取）；不带 `--assignee` 的自动任务仍使用保守的仓库根占位范围。
 - 写操作失败后，stderr 会多打一行 `operation_id=...`。网络中断后不知道操作是否生效时，用同一个 `--operation-id` 重试，服务端保证只产生一次效果；不要重新生成。
 
@@ -102,10 +119,11 @@ python3 "$HOME/baton/adapters/baton_cli.py" --token-file "$HOME/.config/baton/na
 # SPDX-License-Identifier: Apache-2.0
 # 1. wait：从上次的位置长轮询，最多等 25 秒；下次以 next_seq 继续
 baton wait --after-seq 0 --timeout 25
-# {"notifications":[{"event":"task.assigned","object_type":"task","object_id":"<TASK_ID>","seq":7,...}],"next_seq":7}
+# {"notifications":[{"event":"task.assigned","object_type":"task","object_id":"<TASK_ID>","seq":7,
+#   "actor":{"principal":"nangua","kind":"human"},"subject":"[assigned] 写发布说明","body_preview":"...",...}],"next_seq":7}
 TASK=<上面的 object_id>
 
-# 读取任务（通知只含元数据；prompt 要用 task 读取），并核对请求者、范围
+# 读取任务（通知里的 body_preview 只是前 200 个字符；完整说明用 task 读取），并核对请求者、范围
 baton task "$TASK"
 
 # 2. claim：保存返回的 epoch，后续写操作都要带它
@@ -124,6 +142,20 @@ printf '%s\n' "发布说明已写入 docs/release-notes.md" \
 ```
 
 `result` 之后任务停在 `awaiting_gate`，结果还不算完成。接收人不能给自己的结果打 `gate`，这样的调用会得到 `forbidden (HTTP 403)`。
+
+## 无法领取时：block
+
+被指派的接收人（或任务的 reviewer）领取不了任务时，不必沉默等待。`block` 在任务线程发一条 `[blocked]` 评论、通知任务发起人（通知事件 `task.blocked`），并让任务视图出现 `blocked={reason_code, by, at}`，直到任务被领取或改派：
+
+```sh
+# SPDX-License-Identifier: Apache-2.0
+# reason 为 scope_conflict、lease_held、dependency_blocked、waiting_input、other 之一
+baton block --task "$TASK" --reason scope_conflict --note "src/ 目录被另一个任务占用"
+# 任何有该任务查看权限的人都能读线程，不必知道页面 ID
+baton comments --task "$TASK"
+```
+
+它不会领取任务，也不改变指派；接收人的响应时效按“已响应”计算。非接收人、非 reviewer 得到 `forbidden (HTTP 403)`，看不到该任务的身份得到 `not_found (HTTP 404)`。
 
 ## 审阅人流程：gate
 
@@ -154,7 +186,7 @@ baton audit --task "$TASK"
 
 ## 常驻监听：watch
 
-`watch` 循环调用 `wait_inbox`，每条通知打印一行 JSON，并把最后的 `next_seq` 保存到状态文件，下次启动从这里继续，断线或重启不丢事件：
+`watch` 循环调用 `wait_inbox`，每条通知在 stdout 打印一行 JSON，并把最后的 `next_seq` 保存到状态文件，下次启动从这里继续，断线或重启不丢事件：
 
 ```sh
 # SPDX-License-Identifier: Apache-2.0
@@ -164,22 +196,23 @@ python3 "$HOME/baton/adapters/baton_cli.py" --token-file "$HOME/.config/baton/be
 
 - 状态文件默认是 `~/.local/state/baton/<agent>.seq`（`--agent` 决定文件名），可用 `--state` 指定。文件权限 0600，目录 0700；内容损坏时以退出码 2 停止，不会悄悄从 0 重放。
 - 先打印、再保存位置：进程在两步之间被杀时会重放最后一批，不会丢；处理通知的一方应按 `id` 去重。
-- 每条通知只含元数据，用 `task`、`inbox` 等读取操作取内容。通知只是提示，不会自动领取或执行任务。
-- `SIGINT`（Ctrl-C）和 `SIGTERM` 让它在当前批次处理完后以 0 退出。网络或 TLS 错误以 3 退出，Baton 错误以 1 退出；交给 systemd 之类的守护进程按 `Restart=on-failure` 重启即可，重启后从状态文件继续。
+- 通知行含 `actor`（`principal` 与 `kind`）、`subject`（如 `[assigned] 任务说明开头`、`comment on <任务 id>`）和 `body_preview`（评论或手工任务说明的前 200 个字符）。这些字段在读取时按当前查看权限计算，权限被撤销后整条通知不再返回；自动任务的说明保持不可见。通知只是提示，不会自动领取或执行任务。
+- **自动重连。** 网络错误、TLS 错误和 5xx（以及 429）不会让 `watch` 退出：它在 stderr 写一行原因，按 1、2、4、8、16、32、60 秒的指数退避（上限 60 秒）重试，成功后退避归零，并无限期运行。4xx 等重试无法解决的错误（令牌无效 401、权限不足、参数错误）仍以退出码 1 停止；用法错误以 2 停止。
+- **`--summary`（默认开启）。** 每条通知另向 stderr 打印一行便于人读的摘要，如 `notification seq=7 task.assigned task=<id> from=nangua(human) - [assigned] 核对发布清单`。`subject` 里的非可打印字符会被替换，不会向终端注入控制序列；`--no-summary` 关闭。stdout 始终只有 JSON 行。
+- **`--exec '<命令>'`。** 每条通知运行一次该命令，通知的 JSON 从 stdin 传入。命令字符串原样交给 shell，通知里的任何字段都不会被拼进命令、参数或环境变量，因此 `subject` 中的 `$(...)`、反引号和分号不会被执行；命令自己从 stdin 读取并解析 JSON。命令的输出写到 stderr，退出码非 0 只记一行警告而不会停止 watch，运行超过 `--exec-timeout`（默认 300 秒）的命令连同它启动的进程一起被终止。位置在命令处理完这一批之后才保存。
+- `SIGINT`（Ctrl-C）和 `SIGTERM` 让它在当前批次处理完后以 0 退出；等待中的请求会被放弃，几分之一秒内退出。仍可交给 systemd 之类的守护进程按 `Restart=on-failure` 管理。
 
-把每行通知交给自己的处理程序：
+把每条通知交给自己的处理程序，不必再自己写读取循环：
 
 ```sh
 # SPDX-License-Identifier: Apache-2.0
 python3 "$HOME/baton/adapters/baton_cli.py" --token-file "$HOME/.config/baton/beigua.token" \
-  watch --agent beigua | while IFS= read -r line; do
-    printf '%s\n' "$line" | python3 "$HOME/baton/handle_notification.py"
-  done
+  watch --agent beigua --exec 'python3 "$HOME/baton/handle_notification.py"'
 ```
 
 ## 排错
 
 - 退出码 3 且提示 `tls: handshake or certificate verification failed`：CA 不受信任或主机名与证书不符。检查 `--ca-file`、证书的 SAN 以及 `--url` 里的主机名，不要尝试关闭校验（没有这个选项）。
 - 退出码 3 且提示 `tls: server public key does not match --pin-sha256`：服务端公钥与指纹不一致。证书是否更换了密钥、是否连到了错误的主机，需要先确认，再更新指纹。
-- 退出码 1 的 `unauthorized (HTTP 401)`：令牌无效或已撤销；`forbidden (HTTP 403)`：当前身份没有该操作的权限；其余错误码见 [API](../docs/api.md#错误与审计)。
+- 退出码 1 的 `unauthorized (HTTP 401)`：令牌无效或已撤销；`forbidden (HTTP 403)`：能看到对象但当前身份没有该操作的权限；`not_found (HTTP 404)`：对象不存在，或当前身份看不到它（两种情况不可区分）；其余错误码见 [API](../docs/api.md#错误与审计)。
 - 退出码 2：用法或配置问题，stderr 的第一行说明了是哪一项，从不回显令牌或 URL。
