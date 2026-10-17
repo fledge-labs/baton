@@ -1023,7 +1023,7 @@ UNPARSED_TOOL = "(unparsed)"
 GRANTABLE_TOOLS = frozenset({"rg"})
 # Shown in the shim's header. The CLI allowlist entry is only the shim path; this text is not a CLI rule.
 POLICY_ARGS = {
-    "rg": "[! --pre ! --pre-glob]",
+    "rg": "[! -z ! --search-zip ! --pre ! --pre-glob ! --hostname-bin]",
 }
 # Quotes, backslashes and shell control characters. Grantability is decided on the raw captured line, before shlex.
 UNTRUSTED_COMMAND_RE = re.compile(r"""['"\\;&|`$()><\n]""")
@@ -1076,10 +1076,69 @@ def _inside_worktree(path, worktree):
 
 
 def _rg_problem(argv, worktree):
-    stop = argv.index("--") if "--" in argv else len(argv)
-    for arg in argv[1:stop]:
-        if arg in ("--pre", "--pre-glob") or arg.startswith("--pre=") or arg.startswith("--pre-glob="):
-            return "rg --pre and --pre-glob run another program and are never granted"
+    """None when this rg argv does not launch another program.
+
+    Audited against `rg --help` of ripgrep 15.1.0-cursor5 (rev c3e3c2f7ec) on the build image. The only options
+    in that help that name or start an executable are:
+
+    - `-z` / `--search-zip`, which runs gzip, bzip2, xz, lz4, lzma, brotli or zstd from `PATH` and overrides `--pre`
+    - `--pre` / `--pre=COMMAND`, which runs COMMAND for each path
+    - `--pre-glob` / `--pre-glob=GLOB`, which selects the paths `--pre` runs on
+    - `--hostname-bin` / `--hostname-bin=COMMAND`, which runs COMMAND with no arguments and uses its stdout
+
+    `--generate` writes man pages and shell completions to stdout. `--engine`, `--hyperlink-format`, `--glob` and
+    the ignore-file options do not name an executable. `--no-pre` and `--no-search-zip` only disable the feature.
+    This build rejects a long name that is not exact, except a one-letter `--X`, which is the short flag (`--z` is
+    `-z`, `--p` is pretty). A longer prefix of a launcher name is still refused, including `--pr`, `--pre-g` and
+    `--search`, so a later rg that accepts abbreviations cannot run them. The same name with `=VALUE` is refused
+    even when this rg rejects the value (`--search-zip=1`, `--pre=`).
+
+    A short cluster is read left to right. `z` refuses unless a value-taking short option already consumed the rest
+    of the cluster or the next argument: `-iz`, `-uz` and `-ze` are search-zip; `-ez` and `-e -z` are a pattern.
+    """
+    launchers = ("search-zip", "pre-glob", "pre", "hostname-bin")
+    # Long options that take the next argv when written without `=`. Launcher names are listed so a value is not
+    # inspected after a refusal, and so a future edit that stops refusing one of them still skips its operand.
+    value_long = {
+        "regexp", "file", "pre", "pre-glob", "dfa-size-limit", "encoding", "engine", "max-count",
+        "regex-size-limit", "threads", "glob", "iglob", "ignore-file", "cursor-ignore", "max-depth",
+        "max-filesize", "type", "type-not", "type-add", "type-clear", "after-context", "before-context",
+        "color", "colors", "context", "context-separator", "field-context-separator", "field-match-separator",
+        "hostname-bin", "hyperlink-format", "max-columns", "path-separator", "replace", "sort", "sortr",
+        "generate",
+    }
+    value_short = set("efEmjgdtTABCMr")
+    reason = "rg -z/--search-zip, --pre, --pre-glob and --hostname-bin run another program and are never granted"
+
+    def launches(name):
+        if name == "z" or name in launchers:
+            return True
+        return len(name) > 1 and any(item.startswith(name) for item in launchers)
+
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            break
+        if not isinstance(arg, str) or arg == "-" or not arg.startswith("-"):
+            index += 1
+            continue
+        if arg.startswith("--"):
+            body = arg[2:]
+            name, separator, _value = body.partition("=")
+            if launches(name):
+                return reason
+            takes_value = separator != "=" and (name in value_long or (len(name) == 1 and name in value_short))
+            index += 2 if takes_value else 1
+            continue
+        cluster, consumed = arg[1:], False
+        for position, flag in enumerate(cluster):
+            if flag == "z":
+                return reason
+            if flag in value_short:
+                consumed = position == len(cluster) - 1
+                break
+        index += 2 if consumed else 1
     return None
 
 
@@ -1467,7 +1526,7 @@ def main():
     if chosen is None:
         sys.exit(_note(GRANTS[0] if GRANTS else {}, problem or "refused"))
     # rg reads RIPGREP_CONFIG_PATH and ~/.ripgreprc unless --no-config is set. The flag is forced here, after the
-    # argv policy, so a config file cannot put --pre back. The environment is replaced, not inherited.
+    # argv policy, so a config file cannot put -z, --pre or --hostname-bin back. The environment is replaced, not inherited.
     command = [REAL, "--no-config", *sys.argv[1:]] if TOOL == "rg" else [REAL, *sys.argv[1:]]
     try:
         os.execve(REAL, command, _exec_env())

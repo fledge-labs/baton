@@ -1611,6 +1611,21 @@ def test_only_rg_is_a_grantable_program(tool):
     assert not lr.is_ungrantable(tool)
 
 
+def test_the_installed_rg_help_names_only_the_documented_program_launchers():
+    """The refusal list is the executable-naming options in this image's rg --help, plus --pre-glob."""
+    version = subprocess.check_output(["rg", "--version"], text=True)
+    assert "ripgrep 15.1.0-cursor5" in version
+    named = set()
+    for line in subprocess.check_output(["rg", "-h"], text=True).splitlines():
+        label = line.strip().split("  ", 1)[0].strip()
+        if not label or label.startswith("<"):
+            continue
+        if "COMMAND" in line or "--search-zip" in label or label.startswith("-z,"):
+            named.add(label.split(",")[-1].strip().split("=")[0])
+    assert named == {"--pre", "--search-zip", "--hostname-bin"}
+    assert "--pre-glob" in subprocess.check_output(["rg", "-h"], text=True)
+
+
 def test_sed_is_not_grantable_until_it_has_its_own_design():
     assert lr.is_ungrantable("sed")
     assert "allow-list" in lr.argument_problem("sed", "sed -n 's/a/b/p'", "/work/wt")
@@ -1619,12 +1634,39 @@ def test_sed_is_not_grantable_until_it_has_its_own_design():
 @pytest.mark.parametrize("command,fragment", [
     ("rg -n TODO src", None),
     ("rg --pretty TODO", None),
+    ("rg --pcre2 TODO", None),
+    ("rg --p TODO", None),
+    ("rg --s Hello", None),
+    ("rg --no-pre TODO", None),
+    ("rg --no-search-zip TODO", None),
+    ("rg -e -z file", None),
+    ("rg -ez hello file", None),
+    ("rg --regexp -z hello", None),
     ("rg -- --pre", None),
+    ("rg -- -z", None),
+    ("rg -- --search-zip", None),
     ("/usr/bin/rg -n TODO", None),
     ("rg --pre cmd TODO", "--pre"),
     ("rg --pre-glob '*.py' TODO", "shell"),
     ("rg TODO --pre=cmd", "--pre"),
+    ("rg --pre= TODO", "--pre"),
     ("rg --pre-glob=*.c TODO", "--pre"),
+    ("rg -z hello", "-z"),
+    ("rg --z hello", "-z"),
+    ("rg --search-zip hello", "search-zip"),
+    ("rg --search-zip=1 hello", "search-zip"),
+    ("rg --search hello", "search-zip"),
+    ("rg -iz hello", "-z"),
+    ("rg -uz hello", "-z"),
+    ("rg -nuz hello", "-z"),
+    ("rg -ze hello", "-z"),
+    ("rg -e hello -z", "-z"),
+    ("rg --color never -z hello", "-z"),
+    ("rg --pr cmd", "--pre"),
+    ("rg --pre-g *.c TODO", "--pre"),
+    ("rg --hostname-bin true", "hostname-bin"),
+    ("rg --hostname-bin=true hello", "hostname-bin"),
+    ("rg --hostname true", "hostname-bin"),
     ("sed -n 's/a/b/p' file", "allow-list"),
     ("sed -ne 'e touch marker' input", "allow-list"),
     ("git status", "allow-list"),
@@ -2583,6 +2625,35 @@ def test_the_shim_carries_the_argument_policy_and_the_worktree(tmp_path, monkeyp
     _, data = permission_worker_config(tmp_path, monkeypatch, rule_template="{tool} {directory} {directory}")
     with pytest.raises(lr.ConfigError):
         lr.parse_config(data)
+
+
+@pytest.mark.parametrize("argv,fragment", [
+    (["-z", "hello"], "-z"),
+    (["--search-zip", "hello"], "search-zip"),
+    (["-iz", "hello"], "-z"),
+    (["-uz", "hello"], "-z"),
+    (["--pre="], "--pre"),
+    (["--z", "hello"], "-z"),
+    (["--hostname-bin", "true"], "hostname-bin"),
+])
+def test_the_shim_refuses_rg_options_that_launch_another_program(tmp_path, monkeypatch, argv, fragment):
+    _, keeper, recorder = keeper_for(tmp_path, monkeypatch)
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "hello.txt").write_text("hello\n", encoding="utf-8")
+    record = keeper.grant(request_view("r-launch"), "rg", str(work))
+    shim_text = Path(record["shim"]).read_text(encoding="utf-8")
+    assert "--no-config" in shim_text and "PATH" in shim_text
+    refused = subprocess.run([record["shim"], *argv], cwd=work, capture_output=True, text=True)
+    assert refused.returncode != 0 and fragment in refused.stderr and "baton shim:" in refused.stderr
+    assert refused.stdout == ""
+    keeper.drain_spool()
+    refusal = next(call for call in recorder.calls if call[1]["event"] == "shim_refused")
+    assert fragment in refusal[1]["reason"]
+    allowed = subprocess.run([record["shim"], "-n", "hello", "hello.txt"], cwd=work, capture_output=True, text=True)
+    assert allowed.returncode == 0 and "hello" in allowed.stdout and "baton shim:" not in allowed.stderr
+    pattern = subprocess.run([record["shim"], "-e", "-z", "hello.txt"], cwd=work, capture_output=True, text=True)
+    assert pattern.returncode == 1 and "baton shim:" not in pattern.stderr
 
 
 def test_the_shim_rejects_rg_pre_and_allow_once_lasts_until_the_runner_revokes_it(tmp_path, monkeypatch):
