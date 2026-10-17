@@ -31,22 +31,21 @@ def atomic_write(path, data, mode=0o600, owner=None):
     finally:
         if os.path.exists(tmp):os.unlink(tmp)
 
-def secret_path(root,agent,role):
-    return root/'secrets/bridge/dispatcher.token' if role=='dispatcher' else root/'secrets/clients'/f'{agent}.token'
+def secret_path(root,agent):
+    return root/'secrets/clients'/f'{agent}.token'
 
-def provision(root,identities,agent,role,kind=None,account=None,*,token=None):
+def provision(root,identities,agent,kind=None,account=None,*,token=None):
     token=secrets.token_urlsafe(48) if token is None else token
     prior=identities.get(agent,{})
-    kind=kind or prior.get('kind') or ('service' if role=='dispatcher' else 'agent')
+    kind=kind or prior.get('kind') or 'agent'
     account=account or prior.get('account') or agent
-    identities[agent]={'agent':agent,'role':role,'kind':kind,'account':account,'hash':hashlib.sha256(token.encode()).hexdigest(),'active':True}
-    owner=(SERVICE_UID,SERVICE_GID) if role=='dispatcher' else None
-    atomic_write(secret_path(root,agent,role),token+'\n',owner=owner)
+    identities[agent]={'agent':agent,'role':'client','kind':kind,'account':account,'hash':hashlib.sha256(token.encode()).hexdigest(),'active':True}
+    atomic_write(secret_path(root,agent),token+'\n')
 
 def render_gateway(identities):
     template=Path(__file__).resolve().parents[1]/'deploy/gateway.template.json'
     config=json.loads(template.read_text());config.pop('_license',None)
-    keys=[{'keyHash':'sha256:'+v['hash'],'metadata':{k:v[k] for k in ('agent','role','kind','account')}} for v in identities.values() if v['active']]
+    keys=[{'keyHash':'sha256:'+v['hash'],'metadata':{k:v[k] for k in ('agent','role','kind','account')}} for v in identities.values() if v['active'] and v['role']=='client']
     for bind in config['binds']:
         for listener in bind['listeners']:
             for route in listener['routes']:route['policies']['apiKey']['keys']=keys
@@ -72,30 +71,24 @@ def initialize_database(root):
     if app_config.exists() and json.loads(app_config.read_text())!=config:
         raise ValueError('Database configuration differs; restore the matching credential files')
     atomic_write(app_config,json.dumps(config)+'\n',owner=(SERVICE_UID,SERVICE_GID))
-    # runc cannot create a nested mountpoint once this parent volume is read-only.
-    bridge_mount=app_config.parent/'bridge'
-    bridge_mount.mkdir(exist_ok=True,mode=0o700)
-    os.chmod(bridge_mount,0o700)
-    if os.geteuid()==0:os.chown(bridge_mount,SERVICE_UID,SERVICE_GID)
 
 def initialize(root,identities):
-    for name in ['config','secrets/clients','secrets/bridge','secrets/codex-home','secrets/database-admin','secrets/database-app','data/bridge','data/codex','data/postgres']:
+    for name in ['config','secrets/clients','secrets/database-admin','secrets/database-app','data/bridge','data/postgres']:
         p=root/name;p.mkdir(parents=True,exist_ok=True,mode=0o700)
         if name=='config':os.chmod(p,0o755)
         elif os.geteuid()==0 and name!='secrets/clients':
             uid,gid=(POSTGRES_UID,POSTGRES_GID) if name in ('secrets/database-admin','data/postgres') else (SERVICE_UID,SERVICE_GID)
             os.chown(p,uid,gid);os.chmod(p,0o700)
     initialize_database(root)
-    worker='codex-worker'
-    if worker not in identities:provision(root,identities,worker,'dispatcher')
-    elif not secret_path(root,worker,'dispatcher').exists():
-        raise ValueError('Dispatcher credential missing; restore it or explicitly rotate the dispatcher identity')
+    # Registries written before the built-in worker was removed may hold its internal identity; it can no longer authenticate.
+    for entry in identities.values():
+        if entry.get('role')!='client':entry['active']=False
 
 def deliver(root,identities,agent,path,uid,gid):
     entry=identities[agent]
-    if entry['role']!='client':raise ValueError('Internal dispatcher credentials cannot be exported as client credentials')
+    if entry['role']!='client':raise ValueError('Retired internal identities cannot be exported as client credentials')
     if not entry['active']:raise ValueError('Cannot export a revoked identity')
-    raw=secret_path(root,agent,entry['role']).read_text()
+    raw=secret_path(root,agent).read_text()
     if hashlib.sha256(raw.strip().encode()).hexdigest()!=entry['hash']:raise ValueError('Stored credential does not match registry')
     owner=(uid,gid) if uid is not None and gid is not None else None
     atomic_write(path,raw,owner=owner)
@@ -111,7 +104,7 @@ def read_client_token(path):
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--runtime',type=Path,default=Path('/runtime'))
-    parser.add_argument('action',choices=['init','issue','revoke','rotate','export','list','import-auth','import-api-key','import-client'])
+    parser.add_argument('action',choices=['init','issue','revoke','rotate','export','list','import-client'])
     parser.add_argument('agent',nargs='?')
     parser.add_argument('--output',type=Path)
     parser.add_argument('--source',type=Path)
@@ -129,7 +122,7 @@ def main(argv=None):
     imported_token=None
     if args.action=='import-client':
         if not args.agent or not args.source:parser.error('import-client requires an agent identifier and --source')
-        if args.agent=='codex-worker':parser.error('Reserved internal identity cannot be imported')
+        if args.agent=='codex-worker':parser.error('Reserved legacy internal identity cannot be imported')
         if args.output is not None or args.operation_id is not None or args.uid is not None or args.gid is not None:
             parser.error('import-client does not accept export or rotation options')
         imported_token=read_client_token(args.source)
@@ -154,35 +147,23 @@ def main(argv=None):
         # The offline administrator explicitly upgrades legacy identity records.
         # Runtime authentication must never infer or accept caller-supplied mapping.
         for agent,entry in ids.items():
-            entry.setdefault('kind','service' if entry['role']=='dispatcher' else 'agent')
+            entry.setdefault('kind','agent')
             entry.setdefault('account',agent)
         if args.action=='list':
             print(json.dumps([{k:v[k] for k in ['agent','role','kind','account','active']} for v in ids.values()]));return
         if args.action=='init':initialize(root,ids)
-        elif args.action in ('import-auth','import-api-key'):
-            if not args.source:parser.error('--source is required')
-            if args.action=='import-auth':
-                credential=json.loads(args.source.read_text())
-                if not isinstance(credential,dict) or not (credential.get('tokens') or credential.get('OPENAI_API_KEY')):parser.error('Unsupported authentication file')
-            else:
-                key=args.source.read_text().strip()
-                if len(key)<16 or any(c.isspace() for c in key):parser.error('Invalid API key file')
-                credential={'auth_mode':'apikey','OPENAI_API_KEY':key}
-            atomic_write(root/'secrets/codex-home/auth.json',json.dumps(credential)+'\n',owner=(SERVICE_UID,SERVICE_GID))
-            print('Model authentication imported; contents suppressed');return
         elif args.action=='issue':
             if not args.agent:parser.error('Agent identifier required')
             if args.agent in ids:parser.error('Identity already exists; use explicit rotate to replace its credential')
-            provision(root,ids,args.agent,'client',args.kind,args.account)
+            provision(root,ids,args.agent,args.kind,args.account)
         elif args.action=='import-client':
-            provision(root,ids,args.agent,'client',args.kind or 'agent',args.account or args.agent,token=imported_token)
+            provision(root,ids,args.agent,args.kind or 'agent',args.account or args.agent,token=imported_token)
         elif args.action in ('rotate','revoke','export'):
             if args.agent not in ids:parser.error('Unknown identity')
             if args.action=='revoke':ids[args.agent]['active']=False
             elif args.action=='rotate':
                 if not args.operation_id:parser.error('rotate requires a stable --operation-id')
-                if ids[args.agent]['role']!='client' and (args.kind is not None or args.account is not None):
-                    parser.error('Internal service principal mapping cannot be changed')
+                if ids[args.agent]['role']!='client':parser.error('Retired internal identities cannot be rotated')
                 journal=root/'config/credential-operations.json';ops=json.loads(journal.read_text()) if journal.exists() else {}
                 op=args.agent+'/'+args.operation_id
                 if op in ops:
@@ -190,7 +171,7 @@ def main(argv=None):
                     if (args.kind is not None and args.kind!=ids[args.agent]['kind']) or (args.account is not None and args.account!=ids[args.agent]['account']):
                         parser.error('Rotation operation already used for different principal mapping')
                 else:
-                    role=ids[args.agent]['role'];provision(root,ids,args.agent,role,args.kind,args.account)
+                    provision(root,ids,args.agent,args.kind,args.account)
                     ops[op]=ids[args.agent]['hash'];atomic_write(journal,json.dumps(ops)+'\n')
             elif not args.output:parser.error('export requires --output')
         atomic_write(registry,json.dumps(ids,indent=2)+'\n',0o644)

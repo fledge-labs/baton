@@ -55,8 +55,8 @@
       for (const task of data.tasks) {
         const node = textElement('div', '', 'task');
         node.append(textElement('strong', task.status + ' · ' + task.id));
-        node.append(textElement('p', 'Backend: ' + (task.backend || 'pending') + ' · Submission thread: ' + task.submission_thread_status + ' · Completion report: ' + task.thread_status, 'meta'));
-        node.append(textElement('pre', task.result || task.error || 'Waiting for the worker.'));
+        node.append(textElement('p', 'Assigned to: ' + (task.assignee || 'unassigned') + ' · Submission thread: ' + task.submission_thread_status + ' · Completion report: ' + task.thread_status, 'meta'));
+        node.append(textElement('pre', task.result || task.error || 'Waiting for an agent to finish this task.'));
         if (task.thread_error) node.append(textElement('p', task.thread_error, 'meta'));
         $('tasks').append(node);
       }
@@ -65,7 +65,7 @@
       for (const message of data.inbox) {
         const node = textElement('div', '', 'task');
         node.append(textElement('strong', message.subject || 'Comment'));
-        node.append(textElement('p', (message.from || 'Worker') + ' · ' + (message.created_ts || '') + ' · Thread: ' + (message.thread_id || ''), 'meta'));
+        node.append(textElement('p', (message.from || 'Agent') + ' · ' + (message.created_ts || '') + ' · Thread: ' + (message.thread_id || ''), 'meta'));
         if (message.task_id) node.append(textElement('p', 'Task: ' + message.state + ' · Assigned to: ' + (message.assignee || 'Unassigned'), 'meta'));
         if (message.action_requested) node.append(textElement('p', 'Action requested by: ' + message.requested_by, 'meta'));
         node.append(textElement('pre', message.body_md || ''));

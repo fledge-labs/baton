@@ -6,7 +6,7 @@
 
 ## 操作者准备
 
-使用独立测试 Baton 实例。管理员通过 `tokens.py issue` 签发普通客户端身份；已有预签发文件则用 `import-client` 安全导入，不能把客户端设成 dispatcher。每个身份有自己的令牌。
+使用独立测试 Baton 实例。管理员通过 `tokens.py issue` 签发普通客户端身份；已有预签发文件则用 `import-client` 安全导入，每个身份有自己的令牌。
 
 令牌交给该身份的负责人，经已有 SSH/SCP 渠道放到接收方主机的 `~/.config/baton/beigua.token`，目录权限 0700、文件权限 0600。令牌不经过聊天，不交给任务发起人，也不放入命令参数。先确认目标主机和操作者；Baton 不主动登录接收方主机，不安装或强制启动 agent。
 
@@ -46,7 +46,7 @@ adapters/launch_mcp.sh beigua "$HOME/.config/baton/beigua.token" --allow-tools @
 2. 用 `share` 给接收人的账户明确授予该页面的 edit 权限。身份与账户的绑定由管理员设置；分配任务不会自动扩大权限。
 3. 调用 `submit_task`，携带稳定的 `idempotency_key`、任务说明 `prompt`、`page_id`、`assignee_principal: "beigua"` 和声明范围 `scopes`。
 
-指定接收人的任务进入手工拉取模式，不会被内置 Codex worker 抢走。默认审阅人是发起人的 principal。`assignee` 是允许领取的人，`holder` 是当前有效租约持有人，派单不会伪造接收方已领取。
+指定接收人的任务进入手工拉取模式，只有该接收人能领取。不带 `assignee_principal` 的 `submit_task` 同样是手工任务，但未指派：任何对该页面有 edit 权限的主体都能在 `ready` 里看到并领取它，范围省略时为 `none`。Baton 不执行任何任务，两种情况下都由接收方自愿拉取。默认审阅人是发起人的 principal。`assignee` 是允许领取的人，`holder` 是当前有效租约持有人，派单不会伪造接收方已领取。
 
 也可以先创建 `create_task_block` 并配置 reviewers，再调用 `assign_task(task_id, target_principal, operation_id)`。在任务线程中 `comment` 后调用 `mention(comment_id, target_type="agent", target_id="beigua", operation_id)` 可发出行动请求；提及不会暗中改派任务或授予权限。需要独占指定领取时，应显式设置 assignee。
 

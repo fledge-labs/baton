@@ -2,8 +2,12 @@
 """Baton Space v1: PostgreSQL authority, authenticated actors and fenced effects.
 
 The schema is installed by a separate migration owner. Runtime connections never
-run DDL. The Codex execution-deduplication SQLite journal is a separate worker
-journal; Space content, queue, claims, notifications and audit live here.
+run DDL. Baton never executes tasks: Space content, queue, claims, notifications
+and audit live here, and execution belongs to external agents that claim tasks.
+
+Rows written by the removed built-in worker stay readable: ``execution_mode='codex'``,
+``gate_mode='worker_success'`` and the ``a2a_id``/``backend``/``dispatch_started_at``
+columns are legacy values that nothing writes any more.
 """
 
 import hashlib
@@ -22,7 +26,6 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from bridge import webhooks
-from bridge.failures import TASK_FAILURE_CODES, Failure
 
 LOCK_ID = 0x4241544F4E
 ROLES = {None: 0, "view": 1, "comment": 2, "edit": 3}
@@ -44,7 +47,6 @@ SUBJECT_TITLE_CHARS = 60
 EVENT_LABELS = {"task.assigned": "assigned", "task.handed_off": "handed_off", "task.awaiting_gate": "awaiting_gate",
                 "gate.decided": "gate_decided", "task.failed": "failed", "task.overdue": "overdue", "task.blocked": "blocked"}
 BLOCK_REASONS = ("scope_conflict", "lease_held", "dependency_blocked", "waiting_input", "other")
-SCOPE_WARNING_SECONDS = 300
 WEBHOOK_LIMIT = 10
 WEBHOOK_MAX_ATTEMPTS = 8
 # Delay after failed attempt n (1-based); the seven delays between eight attempts total about an hour.
@@ -117,7 +119,9 @@ class Actor:
             raise StoreError("invalid")
 
 
-SERVICE_ACTOR = Actor("codex-worker", "baton-service", "agent")
+SERVICE_ACTOR = Actor("baton-service", "baton-service", "agent")
+# The removed worker's service principal. It still appears in old rows, so it stays reserved.
+LEGACY_SERVICE_PRINCIPAL = "codex-worker"
 
 
 def _json(value):
@@ -210,15 +214,14 @@ def normalize_scopes(scopes):
     return sorted(result, key=lambda item: (item["kind"], item.get("value", "")))
 
 
-def _stored_scopes(requested, normalized, manual):
+def _stored_scopes(requested, normalized):
     """Scopes persisted for a task.
 
-    Omitted scopes (None) mean "no repository footprint" for manual tasks. Automatic
-    tasks execute code, so they keep the conservative root placeholder. The
+    Omitted scopes (None) mean "no repository footprint": the explicit "none" scope. The
     request digest still hashes the legacy placeholder for omitted scopes, so
     requests persisted before the "none" kind existed replay unchanged.
     """
-    if manual and requested is None:
+    if requested is None:
         return [{"kind": "none"}]
     return normalized
 
@@ -339,12 +342,12 @@ def _work_face_request(work_face, require_work_face, task_kind):
     return face, require_work_face, _task_kind(task_kind)
 
 
-def _approvals_request(value, manual):
-    """The task-level approvals override: 1 or 2, and only for tasks a person decides (the automatic worker_success gate has none)."""
+def _approvals_request(value):
+    """The task-level approvals override: 1 or 2."""
     if value is None:
         return None
-    if type(value) is not int or value not in (1, 2) or not manual:
-        raise StoreError("invalid", "approvals_required", "1 or 2, only on tasks a person reviews (not automatic worker_success tasks)")
+    if type(value) is not int or value not in (1, 2):
+        raise StoreError("invalid", "approvals_required", "1 or 2")
     return value
 
 
@@ -421,8 +424,8 @@ def _expiry(value):
 
 
 def _delegation_request(grantor, delegate, scope, space_id, expires_at, may_delegate, reason):
-    if (not isinstance(delegate, Actor) or delegate.principal == SERVICE_ACTOR.principal or delegate.account == SERVICE_ACTOR.account
-            or delegate.principal == grantor.principal):
+    if (not isinstance(delegate, Actor) or delegate.principal in {SERVICE_ACTOR.principal, LEGACY_SERVICE_PRINCIPAL}
+            or delegate.account == SERVICE_ACTOR.account or delegate.principal == grantor.principal):
         raise StoreError("invalid", "delegate_principal", "a connected principal other than the grantor and the service")
     if not isinstance(scope, str) or scope != APPROVE:
         raise StoreError("invalid", "scope", "approve")
@@ -493,7 +496,8 @@ class SpaceStore:
 
     @staticmethod
     def _user(actor):
-        if not isinstance(actor, Actor) or actor.principal == SERVICE_ACTOR.principal or actor.account == SERVICE_ACTOR.account:
+        if (not isinstance(actor, Actor) or actor.principal in {SERVICE_ACTOR.principal, LEGACY_SERVICE_PRINCIPAL}
+                or actor.account == SERVICE_ACTOR.account):
             raise StoreError("forbidden")
 
     @staticmethod
@@ -597,8 +601,8 @@ class SpaceStore:
     @staticmethod
     def _audit(conn, actor, operation_id, event, space_id=None, task_id=None, requested_by=None, performed_by=None, **metadata):
         allowed = {"page_id", "block_id", "thread_id", "epoch", "revision", "proposal_id", "team_id", "subject_type",
-                   "role", "decision", "backend", "a2a_task_id", "input_sha256", "output_sha256", "error_code",
-                   "count", "target_type", "execution_mode", "old_epoch", "work_face_keys", "work_face_sha256", "stage",
+                   "role", "decision", "input_sha256", "output_sha256", "error_code",
+                   "count", "target_type", "execution_mode", "old_epoch", "work_face_keys", "work_face_sha256",
                    "subscription_id", "notification_id", "attempts", "http_status", "notify_event", "object_type",
                    "priority", "escalate_to", "from_assignee", "to_assignee", "reason_code", "delegation_id", "grantor", "scope",
                    "created_via", "chain", "owner_kind", "self_approval", "root", "approvals", "approvals_required",
@@ -1014,7 +1018,7 @@ class SpaceStore:
 
         Call only after the recipient's current view permission on the object's page was confirmed. Nothing
         here is stored in the outbox, so a revoked or edited object never leaves a stale copy behind.
-        Automatic tasks keep their prompts private, as in the task view, so only their id is shown.
+        Legacy automatic (codex) rows keep their prompts private, as in the task view, so only their id is shown.
         """
         actor = {"principal": row["actor"], "kind": row["actor_kind"]} if row.get("actor") and row.get("actor_kind") else None
         subject = body = None
@@ -1196,8 +1200,7 @@ class SpaceStore:
             row.update(approvals_required=None, root_required=False, approvals_passed=0)
         row["overdue"] = bool(row["respond_by"] is not None and row["responded_at"] is None and row["state"] not in {"done", "failed"}
                               and conn.execute("SELECT %s<clock_timestamp() AS late", (row["respond_by"],)).fetchone()["late"])
-        authority = self._authorization_context(actor, row)
-        row["depends_on"], row["has_hidden_dependencies"] = self._visible_dependencies(conn, authority, task_id)
+        row["depends_on"], row["has_hidden_dependencies"] = self._visible_dependencies(conn, actor, task_id)
         return row
 
     @staticmethod
@@ -1224,16 +1227,6 @@ class SpaceStore:
             raise StoreError("work_face_incomplete")
 
     @staticmethod
-    def _authorization_context(actor, task):
-        # This is an authorization context, never the mutation/audit actor.
-        # Service effects remain attributed to SERVICE_ACTOR throughout.
-        if actor == SERVICE_ACTOR:
-            if task["execution_mode"] != "codex":
-                raise StoreError("forbidden")
-            return Actor(task["owner"], task["owner_account"], task["owner_kind"])
-        return actor
-
-    @staticmethod
     def _dependencies(conn, task_id):
         return [str(row["depends_on"]) for row in conn.execute(
             "SELECT depends_on FROM baton.task_dependencies WHERE task_id=%s ORDER BY depends_on", (task_id,))]
@@ -1257,9 +1250,7 @@ class SpaceStore:
             raise StoreError("forbidden")
 
     def _dependencies_satisfied(self, conn, actor, task_id):
-        task = self._row(conn, "tasks", task_id)
-        authority = self._authorization_context(actor, task)
-        self._require_dependency_access(conn, authority, task_id)
+        self._require_dependency_access(conn, actor, task_id)
         blocked = conn.execute("""SELECT 1 FROM baton.task_dependencies e JOIN baton.tasks d ON d.id=e.depends_on
             WHERE e.task_id=%s AND (d.state<>'done' OR d.result_epoch IS DISTINCT FROM d.epoch OR NOT EXISTS (
                 SELECT 1 FROM baton.x_gate g WHERE g.task_id=d.id AND g.epoch=d.epoch AND g.decision='pass')) LIMIT 1""",
@@ -1430,7 +1421,7 @@ class SpaceStore:
             priority,respond_by,escalate_to,fallback_assignee,approvals_required,approvals_override_root)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,clock_timestamp()+%s*interval '1 minute',%s,%s,%s,%s) RETURNING *""",
             (task_id, page_id, block_id, actor.principal, actor.account, actor.kind, assignee.principal if assignee else None,
-             idempotency_key, input_hash, prompt, mode, "worker_success" if mode == "codex" else "reviewer", Jsonb(reviewers),
+             idempotency_key, input_hash, prompt, mode, "reviewer", Jsonb(reviewers),
              Jsonb(scopes), base_commit, Jsonb(_items(context)), Jsonb(_items(evidence)),
              None if work_face is None else Jsonb(work_face), require_work_face, task_kind,
              priority, self.response_minutes[priority] if assignee else None, escalate_to or actor.principal, fallback_assignee,
@@ -1474,7 +1465,7 @@ class SpaceStore:
         _identifier(idempotency_key, "idempotency_key")
         _text(prompt, field="prompt")
         normalized = normalize_scopes(scopes)
-        stored = _stored_scopes(scopes, normalized, manual=assignee is not None)
+        stored = _stored_scopes(scopes, normalized)
         dependencies = _dependency_ids(depends_on)
         face, require_work_face, task_kind = _work_face_request(work_face, require_work_face, task_kind)
         if assignee is not None and not isinstance(assignee, Actor):
@@ -1482,7 +1473,7 @@ class SpaceStore:
         if assignee is not None and assignee.principal == actor.principal:
             raise StoreError("invalid", 'assignee_principal', 'principal different from the requester')
         priority, escalate_to, fallback_assignee, response_args = _response_request(priority, escalate_to, fallback_assignee, actor.principal, assignee)
-        approvals_required = _approvals_request(approvals_required, assignee is not None)
+        approvals_required = _approvals_request(approvals_required)
         args = {"idempotency_key": idempotency_key, "prompt": prompt, "page_id": page_id, "scopes": _request_scopes(normalized),
                 "assignee": asdict(assignee) if assignee else None}
         # Preserve v1 hashes for already-persisted submissions without dependencies.
@@ -1509,8 +1500,8 @@ class SpaceStore:
                     raise StoreError("operation_conflict")
                 return {**self._task_view(conn, actor, str(prior["id"])), "_business_replay": True}
             chosen = page_id or self._default_page(conn, actor, operation_id)
-            return self._new_task(conn, actor, operation_id, chosen, prompt, stored, "manual" if assignee else "codex",
-                                  [actor.principal] if assignee else [], digest, idempotency_key=idempotency_key, assignee=assignee, depends_on=dependencies,
+            return self._new_task(conn, actor, operation_id, chosen, prompt, stored, "manual",
+                                  [actor.principal], digest, idempotency_key=idempotency_key, assignee=assignee, depends_on=dependencies,
                                   work_face=face, require_work_face=require_work_face, task_kind=task_kind,
                                   priority=priority, escalate_to=escalate_to, fallback_assignee=fallback_assignee,
                                   approvals_required=approvals_required)
@@ -1523,7 +1514,7 @@ class SpaceStore:
                           priority="normal", escalate_to=None, fallback_assignee=None, approvals_required=None):
         _text(prompt, field="prompt")
         normalized = normalize_scopes(scopes)
-        stored = _stored_scopes(scopes, normalized, manual=True)
+        stored = _stored_scopes(scopes, normalized)
         dependencies = _dependency_ids(depends_on)
         face, require_work_face, task_kind = _work_face_request(work_face, require_work_face, task_kind)
         if not isinstance(reviewers, list) or not reviewers or len(reviewers) > 100:
@@ -1537,7 +1528,7 @@ class SpaceStore:
         if assignee is not None and not isinstance(assignee, Actor):
             raise StoreError("invalid")
         priority, escalate_to, fallback_assignee, response_args = _response_request(priority, escalate_to, fallback_assignee, actor.principal, assignee)
-        approvals_required = _approvals_request(approvals_required, True)
+        approvals_required = _approvals_request(approvals_required)
         args = {"page_id": page_id, "prompt": prompt, "scopes": _request_scopes(normalized), "reviewers": reviewers,
                 "base_commit": base_commit, "context": context, "evidence": evidence, "assignee": asdict(assignee) if assignee else None}
         if dependencies:
@@ -1574,9 +1565,9 @@ class SpaceStore:
             return [self._task_view(conn, actor, str(row["id"])) for row in rows if self._role(conn, actor, "page", str(row["page_id"]))][:limit]
         return self._read(actor, read)
 
-    def _expire(self, conn, operation_id, auto_only=False):
+    def _expire(self, conn, operation_id):
         rows = conn.execute("""SELECT t.* FROM baton.tasks t JOIN baton.x_claim c ON c.task_id=t.id
-            WHERE c.lease_expires_at<=clock_timestamp() AND (NOT %s OR t.execution_mode='codex')""", (auto_only,)).fetchall()
+            WHERE c.lease_expires_at<=clock_timestamp()""").fetchall()
         for task in rows:
             conn.execute("DELETE FROM baton.x_claim WHERE task_id=%s", (task["id"],))
             state = "interrupted" if task["execution_mode"] == "codex" and task["dispatch_started_at"] else "queued"
@@ -1585,10 +1576,6 @@ class SpaceStore:
             if state == "interrupted":
                 self._task_audit(conn, SERVICE_ACTOR, operation_id, "task.interrupted", task, epoch=task["epoch"])
         return len(rows)
-
-    def recover_auto(self, actor, operation_id):
-        return self._mutate(actor, operation_id, "recover_auto", {}, lambda conn: self._service(actor),
-                            lambda conn: {"released": self._expire(conn, operation_id, auto_only=True)})
 
     @staticmethod
     def _live(conn, actor, task_id, epoch):
@@ -1607,25 +1594,12 @@ class SpaceStore:
             raise StoreError("forbidden")
         return task
 
-    def _auto(self, conn, actor, task_id, require_owner=True):
-        self._service(actor)
-        task = self._row(conn, "tasks", task_id)
-        if task["execution_mode"] != "codex" or task["gate_mode"] != "worker_success":
-            raise StoreError("forbidden")
-        if require_owner:
-            authority = self._authorization_context(actor, task)
-            self._require(conn, authority, "page", str(task["page_id"]), "edit", hidden="forbidden")
-            self._require_dependency_access(conn, authority, task_id)
-        return task
-
     @staticmethod
     def _record_holder(conn, task_id, epoch, who):
         conn.execute("INSERT INTO baton.x_claim_holder(task_id,epoch,holder,holder_account) VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING",
                      (task_id, epoch, who.principal, who.account))
 
     def _take_claim(self, conn, actor, operation_id, task, lease_seconds):
-        if actor == SERVICE_ACTOR:
-            self._auto(conn, actor, str(task["id"]))
         if task["state"] != "queued" or conn.execute("SELECT 1 FROM baton.x_claim WHERE task_id=%s AND lease_expires_at>clock_timestamp()", (task["id"],)).fetchone():
             raise StoreError("scope_conflict")
         if not self._dependencies_satisfied(conn, actor, str(task["id"])):
@@ -1643,7 +1617,7 @@ class SpaceStore:
         self._record_holder(conn, task["id"], epoch, actor)
         if task["assignee"] == actor.principal:
             conn.execute("UPDATE baton.tasks SET responded_at=COALESCE(responded_at,clock_timestamp()) WHERE id=%s", (task["id"],))
-        self._task_audit(conn, actor, operation_id, "worker.claimed" if task["execution_mode"] == "codex" else "task.claimed", task, epoch=epoch)
+        self._task_audit(conn, actor, operation_id, "task.claimed", task, epoch=epoch)
         return self._task_view(conn, actor, str(task["id"]), include_prompt=True)
 
     def claim(self, actor, operation_id, task_id, lease_seconds=300):
@@ -1664,49 +1638,8 @@ class SpaceStore:
             return self._task_view(conn, actor, task_id, include_prompt=True)
         return self._mutate(actor, operation_id, "claim", {"task_id": task_id, "lease_seconds": lease_seconds}, authorize, effect, replay)
 
-    def claim_next(self, actor, operation_id, lease_seconds=300, on_scope_skip=None):
-        """Claim the oldest runnable automatic task.
-
-        `on_scope_skip(task_id, blocking_task_id)` is told about each queued task passed over only because a
-        live claim overlaps its scopes. It is a log hook: it cannot change the outcome and its failures are ignored.
-        """
+    def renew(self, actor, operation_id, task_id, epoch, lease_seconds=300):
         _integer(lease_seconds, field="lease_seconds")
-        def effect(conn):
-            self._expire(conn, operation_id)
-            for task in conn.execute("SELECT * FROM baton.tasks WHERE execution_mode='codex' AND state='queued' ORDER BY created_at,id").fetchall():
-                try:
-                    self._auto(conn, actor, str(task["id"]))
-                    satisfied = self._dependencies_satisfied(conn, actor, str(task["id"]))
-                except StoreError as exc:
-                    if exc.code == "forbidden":
-                        continue
-                    raise
-                if not satisfied or self._work_face_missing(task):
-                    continue
-                live = conn.execute("SELECT task_id,scopes FROM baton.x_claim WHERE lease_expires_at>clock_timestamp() ORDER BY task_id").fetchall()
-                blocker = next((row["task_id"] for row in live if scopes_overlap(task["scopes"], row["scopes"])), None)
-                if blocker is None:
-                    return self._take_claim(conn, actor, operation_id, task, lease_seconds)
-                if on_scope_skip is not None:
-                    try:
-                        on_scope_skip(str(task["id"]), str(blocker))
-                    except Exception:
-                        pass
-            return None
-        def replay(conn, old):
-            if old is not None:
-                self._auto(conn, actor, old["task_id"])
-                self._live(conn, actor, old["task_id"], old["epoch"])
-                if not self._dependencies_satisfied(conn, actor, old["task_id"]):
-                    raise StoreError("dependency_blocked")
-                self._require_work_face(self._row(conn, "tasks", old["task_id"]))
-                return self._task_view(conn, actor, old["task_id"], include_prompt=True)
-        return self._mutate(actor, operation_id, "claim_next", {"lease_seconds": lease_seconds}, lambda conn: self._service(actor), effect, replay)
-
-    def _renew(self, actor, operation_id, task_id, epoch, lease_seconds, automatic):
-        _integer(lease_seconds, field="lease_seconds")
-        method = "renew_auto" if automatic else "renew"
-        authorize = lambda conn: self._auto(conn, actor, task_id) if automatic else self._manual(conn, actor, task_id)
         def effect(conn):
             self._live(conn, actor, task_id, epoch)
             conn.execute("UPDATE baton.x_claim SET lease_expires_at=clock_timestamp()+%s*interval '1 second' WHERE task_id=%s", (lease_seconds, task_id))
@@ -1715,27 +1648,8 @@ class SpaceStore:
         def replay(conn, old):
             self._live(conn, actor, task_id, epoch)
             return self._task_view(conn, actor, task_id)
-        return self._mutate(actor, operation_id, method, {"task_id": task_id, "epoch": epoch, "lease_seconds": lease_seconds}, authorize, effect, replay)
-
-    def renew(self, actor, operation_id, task_id, epoch, lease_seconds=300):
-        return self._renew(actor, operation_id, task_id, epoch, lease_seconds, False)
-
-    def renew_auto(self, actor, operation_id, task_id, epoch, lease_seconds=300):
-        return self._renew(actor, operation_id, task_id, epoch, lease_seconds, True)
-
-    def mark_dispatched(self, actor, operation_id, task_id, epoch):
-        def effect(conn):
-            self._live(conn, actor, task_id, epoch)
-            task = self._row(conn, "tasks", task_id)
-            if task["dispatch_started_at"] is not None:
-                raise StoreError("operation_conflict")
-            conn.execute("UPDATE baton.tasks SET dispatch_started_at=clock_timestamp() WHERE id=%s", (task_id,))
-            self._task_audit(conn, actor, operation_id, "task.dispatched", task, epoch=epoch)
-            return self._task_view(conn, actor, task_id)
-        def replay(conn, old):
-            self._live(conn, actor, task_id, epoch)
-            return self._task_view(conn, actor, task_id)
-        return self._mutate(actor, operation_id, "mark_dispatched", {"task_id": task_id, "epoch": epoch}, lambda conn: self._auto(conn, actor, task_id), effect, replay)
+        return self._mutate(actor, operation_id, "renew", {"task_id": task_id, "epoch": epoch, "lease_seconds": lease_seconds},
+                            lambda conn: self._manual(conn, actor, task_id), effect, replay)
 
     def handoff(self, actor, operation_id, task_id, epoch, target, base_commit=None, context=None, evidence=None, lease_seconds=300):
         _integer(lease_seconds, field="lease_seconds")
@@ -1874,7 +1788,7 @@ class SpaceStore:
     def migrate_manual_root_scopes(self, actor, dry_run=False):
         """Operator migration: manual tasks still carrying the legacy root placeholder get the explicit "none" scope.
 
-        Automatic tasks keep the root placeholder because they execute code, and a task with a live claim is
+        Legacy automatic (codex) tasks keep the root placeholder, and a task with a live claim is
         never touched, so a held scope reservation cannot change under its holder. One audit event per task.
         """
         self._service(actor)
@@ -2020,8 +1934,8 @@ class SpaceStore:
 
     @staticmethod
     def _executors(conn, task, epoch):
-        """Principals and accounts that submitted or held the claim for this epoch, plus the service worker."""
-        principals, accounts = {SERVICE_ACTOR.principal}, {SERVICE_ACTOR.account}
+        """Principals and accounts that submitted or held the claim for this epoch."""
+        principals, accounts = set(), set()
         if task["result_author"]:
             principals.add(task["result_author"])
             accounts.add(task["result_author_account"])
@@ -2151,82 +2065,6 @@ class SpaceStore:
         # New fields join the request digest only when used, so a retry of an operation recorded before they existed still matches.
         args.update({key: value for key, value in (("edited_result", edited_result), ("reason", reason)) if value is not None})
         return self._mutate(actor, operation_id, "gate", args, authorize, effect, replay)
-
-    def finish_auto(self, actor, operation_id, task_id, epoch, result, a2a_id, backend, a2a_state="completed"):
-        _text(result, 32000)
-        _uuid(a2a_id)
-        if not isinstance(backend, str) or backend not in {"demo", "codex"} or a2a_state != "completed":
-            raise StoreError("gate_required")
-        def effect(conn):
-            self._live(conn, actor, task_id, epoch)
-            task = self._row(conn, "tasks", task_id)
-            if task["dispatch_started_at"] is None:
-                raise StoreError("gate_required")
-            conn.execute("""UPDATE baton.tasks SET state='done',result=%s,result_epoch=%s,result_author=%s,result_author_account=%s,
-                a2a_id=%s,backend=%s WHERE id=%s""", (result, epoch, actor.principal, actor.account, a2a_id, backend, task_id))
-            conn.execute("DELETE FROM baton.x_claim WHERE task_id=%s", (task_id,))
-            conn.execute("INSERT INTO baton.x_gate(id,task_id,epoch,decision,reviewer,reviewer_account,evidence) VALUES (%s,%s,%s,'pass',%s,%s,%s)",
-                         (uuid.uuid4(), task_id, epoch, actor.principal, actor.account, Jsonb({"a2a_id": a2a_id, "state": a2a_state, "backend": backend})))
-            digest = hashlib.sha256(result.encode()).hexdigest()
-            self._task_audit(conn, actor, operation_id, "worker.completed", task, epoch=epoch, backend=backend, a2a_task_id=a2a_id, output_sha256=digest)
-            self._task_audit(conn, actor, operation_id, "task.completed", task, epoch=epoch, backend=backend, a2a_task_id=a2a_id, output_sha256=digest)
-            self._notify_task(conn, actor, operation_id, task, "completed", result)
-            self._enqueue(conn, actor, "gate.decided", "task", task["id"], task["page_id"], [self._task_parties(conn, task)["owner"]], task["id"])
-            return self._task_view(conn, actor, task_id)
-        def replay(conn, old):
-            task = self._row(conn, "tasks", task_id)
-            if task["epoch"] != epoch or task["state"] != "done":
-                raise StoreError("stale_claim")
-            return self._task_view(conn, actor, task_id)
-        return self._mutate(actor, operation_id, "finish_auto", {"task_id": task_id, "epoch": epoch, "result": result, "a2a_id": a2a_id, "backend": backend, "a2a_state": a2a_state},
-                            lambda conn: self._auto(conn, actor, task_id), effect, replay)
-
-    def fail_auto(self, actor, operation_id, task_id, epoch, error_code, a2a_id):
-        """Record a definite worker failure by closed code and report it in the task thread."""
-        _uuid(a2a_id)
-        if not isinstance(error_code, str) or error_code not in TASK_FAILURE_CODES:
-            raise StoreError("invalid")
-        failure = Failure(error_code)
-        def effect(conn):
-            self._live(conn, actor, task_id, epoch)
-            task = self._row(conn, "tasks", task_id)
-            if task["dispatch_started_at"] is None:
-                raise StoreError("gate_required")
-            conn.execute("UPDATE baton.tasks SET state='failed',error=%s,a2a_id=%s WHERE id=%s", (error_code, a2a_id, task_id))
-            conn.execute("DELETE FROM baton.x_claim WHERE task_id=%s", (task_id,))
-            self._task_audit(conn, actor, operation_id, "worker.failed", task, epoch=epoch, a2a_task_id=a2a_id,
-                             error_code=error_code, stage=failure.stage)
-            self._task_audit(conn, actor, operation_id, "task.failed", task, epoch=epoch, a2a_task_id=a2a_id,
-                             error_code=error_code, stage=failure.stage)
-            self._notify_task(conn, actor, operation_id, task, "failed", failure.report())
-            self._enqueue(conn, actor, "task.failed", "task", task["id"], task["page_id"], [self._task_parties(conn, task)["owner"]], task["id"])
-            return self._task_view(conn, actor, task_id)
-        def replay(conn, old):
-            task = self._row(conn, "tasks", task_id)
-            if task["epoch"] != epoch or task["state"] != "failed":
-                raise StoreError("stale_claim")
-            return self._task_view(conn, actor, task_id)
-        return self._mutate(actor, operation_id, "fail_auto", {"task_id": task_id, "epoch": epoch, "error_code": error_code, "a2a_id": a2a_id},
-                            lambda conn: self._auto(conn, actor, task_id), effect, replay)
-
-    def interrupt_auto(self, actor, operation_id, task_id, epoch, error_code="dispatch_uncertain"):
-        if not isinstance(error_code, str) or error_code not in {"dispatch_uncertain", "worker_failed", "execution_failed", "lease_lost", "restart", "cancelled"}:
-            raise StoreError("invalid")
-        def effect(conn):
-            self._live(conn, actor, task_id, epoch)
-            task = self._row(conn, "tasks", task_id)
-            state = "failed" if error_code in {"worker_failed", "execution_failed"} else "interrupted"
-            conn.execute("UPDATE baton.tasks SET state=%s,error=%s WHERE id=%s", (state, error_code, task_id))
-            conn.execute("DELETE FROM baton.x_claim WHERE task_id=%s", (task_id,))
-            self._task_audit(conn, actor, operation_id, "task." + state, task, epoch=epoch, error_code=error_code)
-            return self._task_view(conn, actor, task_id)
-        def replay(conn, old):
-            task = self._row(conn, "tasks", task_id)
-            if task["epoch"] != epoch or task["state"] not in {"failed", "interrupted"}:
-                raise StoreError("stale_claim")
-            return self._task_view(conn, actor, task_id)
-        return self._mutate(actor, operation_id, "interrupt_auto", {"task_id": task_id, "epoch": epoch, "error_code": error_code},
-                            lambda conn: self._auto(conn, actor, task_id, require_owner=False), effect, replay)
 
     def get_claim(self, actor, task_id):
         return self.get_task(actor, task_id)
@@ -2560,7 +2398,7 @@ class SpaceStore:
         return state
 
     def webhook_claim_due(self, actor, limit=20):
-        """Lease due deliveries to the bridge worker. Returned secrets are internal and must never be logged."""
+        """Lease due deliveries to the bridge delivery loop. Returned secrets are internal and must never be logged."""
         self._service(actor)
         _integer(limit, 1, 100)
         with self._transaction(write=True) as conn:

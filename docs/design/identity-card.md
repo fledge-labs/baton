@@ -175,7 +175,7 @@ A message records the card id and the card version (hash) at the time it was sen
 
 ## 7. Relation to today's Baton
 
-Today (implemented, unchanged by this document): each token maps to a principal with `agent` (the principal name), `role`, `kind` (`agent`, `human`, or the internal `service` for the dispatcher) and `account` (the connected account); only the SHA-256 hash of the token is stored; `active` is the only status; only an offline administrator can set `kind` and `account` (`scripts/tokens.py` and the `admin` commands in the [README](../../README.md)). Tokens are long-lived bearer tokens.
+Today (implemented, unchanged by this document): each token maps to a principal with `agent` (the principal name), `role`, `kind` (`agent` or `human`; the former internal `service` kind belonged to the removed built-in worker's dispatcher and no longer authenticates) and `account` (the connected account); only the SHA-256 hash of the token is stored; `active` is the only status; only an offline administrator can set `kind` and `account` (`scripts/tokens.py` and the `admin` commands in the [README](../../README.md)). Tokens are long-lived bearer tokens.
 
 Mapping:
 
@@ -205,7 +205,7 @@ Operator-managed on self-hosted test instances: the instance signing key; issuin
 - Whether the member view of a card (memberships and delegations) is signed separately from the public view.
 - Delegation cascade: when a grantor's delegation is revoked or expires, do downstream delegations end at once (proposed) or stay until reviewed?
 - Organization as a card kind or as an entry inside the accountable chain (the model above uses an entry; the owner asked for human and agent kinds only).
-- Internal service principals (`service` kind, for example the dispatcher): no card, or a card of kind `agent` whose accountable party is the instance operator.
+- Internal service principals (the `baton-service` actor that delivers webhooks and escalates; it has no client credential): no card, or a card of kind `agent` whose accountable party is the instance operator.
 - Token format: opaque tokens with a store lookup (simplest instant revocation) or JWT access tokens ([RFC 9068](https://www.rfc-editor.org/rfc/rfc9068) profile, offline verification, bounded revocation).
 - Default token lifetime and the status-list cache lifetime that define the documented revocation bound.
 - DPoP key custody for agents on shared or ephemeral hosts (non-exportable keys, per-session keys), and key loss and recovery.

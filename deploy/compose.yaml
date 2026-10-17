@@ -17,13 +17,10 @@ x-app-build: &app-build
   dockerfile: deploy/Dockerfile
 x-admin-volumes: &admin-volumes
   - config:/runtime/config
-  - bridge-secrets:/runtime/secrets/bridge
   - database-admin-secrets:/runtime/secrets/database-admin
   - database-app-secrets:/runtime/secrets/database-app
-  - codex-home:/runtime/secrets/codex-home
   - client-secrets:/runtime/secrets/clients
   - bridge-data:/runtime/data/bridge
-  - codex-data:/runtime/data/codex
   - postgres-data:/runtime/data/postgres
 services:
   initialize:
@@ -77,7 +74,6 @@ services:
     depends_on:
       initialize: {condition: service_completed_successfully}
       bridge: {condition: service_healthy}
-      codex: {condition: service_started}
   bridge:
     <<: [*service, *app]
     command: [python, -m, bridge.server]
@@ -85,11 +81,10 @@ services:
       BATON_STATE: /data
       BATON_CONFIG: /config
       BATON_DATABASE_CONFIG: /run/secrets/database.json
-      GATEWAY_INTERNAL: http://gateway:3000
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
       BATON_RESPONSE_MINUTES: ${BATON_RESPONSE_MINUTES:-}
       BATON_SCOPE_CASE_INSENSITIVE: ${BATON_SCOPE_CASE_INSENSITIVE:-}
-    volumes: [config:/config:ro, database-app-secrets:/run/secrets:ro, bridge-secrets:/run/secrets/bridge:ro, bridge-data:/data]
+    volumes: [config:/config:ro, database-app-secrets:/run/secrets:ro, bridge-data:/data]
     tmpfs: ["/tmp:size=32m,mode=1777"]
     networks: [private, database]
     depends_on:
@@ -100,34 +95,6 @@ services:
       interval: 5s
       timeout: 3s
       retries: 15
-  codex:
-    <<: [*service, *app]
-    command: [python, -m, bridge.codex_agent]
-    security_opt:
-      - no-new-privileges:true
-      - seccomp=./security/codex-seccomp.json
-      - apparmor=unconfined
-    environment:
-      BATON_STATE: /data
-      BATON_CONFIG: /config
-      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
-      WORKER_MODE: ${WORKER_MODE:-codex}
-      CODEX_MODEL: ${CODEX_MODEL:-}
-    volumes: [config:/config:ro, codex-data:/data, codex-home:/home/agent/.codex]
-    # Keep helper aliases out of the credential tree. Codex falls back to its
-    # immutable executable and bundled bubblewrap; credentials remain writable
-    # by the harness but inaccessible to model-generated tools.
-    tmpfs: ["/tmp:size=64m,mode=1777", "/work:size=64m,uid=10001,gid=10001,mode=0700", "/home/agent/.codex/tmp:size=1m,uid=0,gid=0,mode=0555"]
-    networks: [private, worker-egress]
-    pids_limit: 128
-    depends_on:
-      initialize: {condition: service_completed_successfully}
-    healthcheck:
-      test: [CMD, python, -m, bridge.worker_health, check]
-      interval: 30s
-      timeout: 5s
-      start_period: 90s
-      retries: 3
   database:
     <<: *service
     image: postgres:17.11-bookworm@sha256:3645570cccdfa447589da9f57dd740faa29b30938e861289a5574b6ca6b03826
@@ -168,14 +135,10 @@ networks:
   private: {internal: true}
   database: {internal: true}
   ingress: {}
-  worker-egress: {}
 volumes:
   config: {}
-  bridge-secrets: {}
   database-admin-secrets: {}
   database-app-secrets: {}
-  codex-home: {}
   client-secrets: {}
   bridge-data: {}
-  codex-data: {}
   postgres-data: {}

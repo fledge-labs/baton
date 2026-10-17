@@ -5,7 +5,6 @@ import importlib
 import hashlib
 import json
 import os
-import sys
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,36 +22,20 @@ def modules(tmp_path, monkeypatch):
     monkeypatch.setenv("BATON_STATE", str(tmp_path / "data"))
     monkeypatch.setenv("BATON_CONFIG", str(tmp_path / "config"))
     monkeypatch.setenv("PUBLIC_URL", "http://localhost:8080")
-    monkeypatch.setenv("WORKER_MODE", "demo")
     monkeypatch.delenv("BATON_DATABASE_CONFIG", raising=False)
-    from bridge import common, server, codex_agent
+    from bridge import common, server
     importlib.reload(common)
-    monkeypatch.setattr(common, "SECRETS", tmp_path / "secrets")
-    monkeypatch.setattr(common, "CODEX_HOME", tmp_path / "codex-home")
-    common.SECRETS.mkdir()
-    (common.SECRETS / "bridge").mkdir()
-    common.CODEX_HOME.mkdir()
     common.CONFIG.mkdir()
-    # The old synthetic name still verifies generic credential redaction. No
-    # Agent Mail process, request or dependency is involved.
-    (common.SECRETS / "mail.token").write_text("synthetic-mail-credential")
-    (common.SECRETS / "bridge/dispatcher.token").write_text("synthetic-dispatcher-credential")
     importlib.reload(server)
-    importlib.reload(codex_agent)
-    monkeypatch.setattr(codex_agent, "WORK_ROOT", tmp_path / "work")
-    codex_agent.WORK_ROOT.mkdir()
-    codex_agent.init_db()
 
-    async def idle_worker():
+    async def idle_loop():
         import asyncio
         await asyncio.Event().wait()
 
-    # HTTP boundary tests drive dispatch explicitly; opening TestClient must
-    # never send a request to any external worker.
-    monkeypatch.setattr(server, "worker_loop", idle_worker)
-    monkeypatch.setattr(server, "webhook_loop", idle_worker)
-    monkeypatch.setattr(server, "escalation_loop", idle_worker)
-    return common, server, codex_agent
+    # HTTP boundary tests must never start background delivery or escalation.
+    monkeypatch.setattr(server, "webhook_loop", idle_loop)
+    monkeypatch.setattr(server, "escalation_loop", idle_loop)
+    return common, server
 
 
 @pytest.fixture
@@ -69,7 +52,7 @@ def make_context(identity_prefix):
 
 @pytest.fixture
 def register_identity(modules):
-    """Register synthetic actors explicitly for dispatch-time authorization."""
+    """Register synthetic actors explicitly in the identity registry."""
     common = modules[0]
     def register(who):
         path = common.CONFIG / "identities.json"
@@ -131,56 +114,17 @@ def pg_store(modules, tmp_path, monkeypatch):
             connection.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database)))
 
 
-FAKE_CODEX = '''#!{python}
-import json, os, sys, time
-from pathlib import Path
-
-home = Path(os.environ["CODEX_HOME"])
-if sys.argv[1:] == ["--version"]:
-    print("codex-cli 0.154.0")
-    sys.exit(0)
-scenario = json.loads((home / "scenario.json").read_text())
-(home / "invocation.json").write_text(json.dumps({{"argv": sys.argv[1:], "cwd": os.getcwd()}}))
-with (home / "calls.log").open("a") as calls:
-    calls.write("x")
-final = sys.argv[sys.argv.index("--output-last-message") + 1]
-sys.stdin.read()
-for step in scenario["steps"]:
-    time.sleep(step.get("delay", 0))
-    if "event" in step:
-        print(json.dumps(step["event"]), flush=True)
-    if "raw" in step:
-        print(step["raw"], flush=True)
-    if "stderr" in step:
-        print(step["stderr"], file=sys.stderr, flush=True)
-    for path, text in step.get("files", {{}}).items():
-        Path(path).write_text(text)
-    if "symlink" in step:
-        os.symlink(step["symlink"], "result.txt")
-    if step.get("hang"):
-        time.sleep(3600)
-if scenario["result"] is not None:
-    Path(final).write_text(scenario["result"])
-sys.exit(scenario["exit"])
-'''
-
-
 @pytest.fixture
-def fake_codex(modules, tmp_path, monkeypatch):
-    """A synthetic `codex` on PATH that emits scripted --json events; no model, network or credentials."""
-    common = modules[0]
-    directory = tmp_path / "bin"
-    directory.mkdir()
-    program = directory / "codex"
-    program.write_text(FAKE_CODEX.format(python=sys.executable))
-    program.chmod(0o755)
-    monkeypatch.setenv("PATH", str(directory) + os.pathsep + os.environ["PATH"])
-
-    def script(steps=(), result="BATON_CANARY_OK", exit=0):
-        (common.CODEX_HOME / "scenario.json").write_text(json.dumps(
-            {"steps": list(steps), "result": result, "exit": exit}))
-    script()
-    return script
+def legacy_codex(pg_store):
+    """Rewrite a task row into the shape the removed built-in worker left behind (nothing writes it any more)."""
+    def convert(task_id, *, state="queued", dispatched=False, backend=None, error=None):
+        with pg_store._transaction(write=True) as conn:
+            conn.execute("""UPDATE baton.tasks SET execution_mode='codex',gate_mode='worker_success',reviewers='[]'::jsonb,
+                scopes='[{"kind":"path","value":""}]'::jsonb,assignee=NULL,state=%s,backend=%s,error=%s,
+                dispatch_started_at=CASE WHEN %s THEN clock_timestamp() END WHERE id=%s""",
+                         (state, backend, error, dispatched, task_id))
+        return task_id
+    return convert
 
 
 @pytest.fixture

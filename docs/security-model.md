@@ -3,15 +3,15 @@
 
 ## 凭据与认证主体
 
-客户端 token 由系统随机数生成，原值只在 0600 秘密文件中；gateway 和注册表保存 SHA-256 及身份元数据。摘要也是运行状态，不能提交。gateway 和应用双层校验，client 与内部 dispatcher 分角色授权。
+客户端 token 由系统随机数生成，原值只在 0600 秘密文件中；gateway 和注册表保存 SHA-256 及身份元数据。摘要也是运行状态，不能提交。gateway 和应用双层校验，只接受 `client` 角色。
 
-仅离线管理员可设定 `kind=human|agent` 与 `account` 的认证映射。轮换默认保留映射，改变映射需要新的显式管理操作；业务请求不能自行声明真实 actor 或提升为 human。内部 dispatcher 使用 service 记录，不可作为用户 connected account，也不能导出给客户端。运行时对缺失映射失败闭锁；兼容旧注册表由管理员 `init` 显式补齐，不在 API 中猜测。
+仅离线管理员可设定 `kind=human|agent` 与 `account` 的认证映射。轮换默认保留映射，改变映射需要新的显式管理操作；业务请求不能自行声明真实 actor 或提升为 human。Baton 不再有内部服务账号的客户端凭据：旧注册表里的 `dispatcher` 记录不再能认证，`init` 会把它置为 inactive，也不会写入 gateway；名称 `codex-worker` 作为旧行中的历史服务主体保留，不能签发或导入。运行时对缺失映射失败闭锁；兼容旧注册表由管理员 `init` 显式补齐，不在 API 中猜测。
 
 `initialize`/ops `admin` 是离线、短生命周期的 root 管理进程，仅额外持 CHOWN、DAC_OVERRIDE、FOWNER 来初始化指定卷。Docker 管理员属于可信边界。导出文件默认 0600，`--uid/--gid` 仅调整明确指定的交付文件。多文件凭据轮换没有跨文件事务；进程中断须核对注册表、操作账本和秘密文件，不能假装原子成功。
 
 ## 数据库角色与秘密文件
 
-数据库管理卷保存 `postgres.password`、`app.password`，仅 PostgreSQL 与一次性 migrate 服务挂载，文件及目录归 UID/GID 999。应用数据库卷单独保存 UID/GID 10001 的 `database.json`；bridge 通过 `BATON_DATABASE_CONFIG=/run/secrets/database.json` 读取，不持 bootstrap 凭据。dispatcher 在嵌套的 `/run/secrets/bridge/dispatcher.token`。worker 没有数据库秘密卷或数据库网络。
+数据库管理卷保存 `postgres.password`、`app.password`，仅 PostgreSQL 与一次性 migrate 服务挂载，文件及目录归 UID/GID 999。应用数据库卷单独保存 UID/GID 10001 的 `database.json`；bridge 通过 `BATON_DATABASE_CONFIG=/run/secrets/database.json` 读取，不持 bootstrap 凭据。bridge 不再挂载其他秘密卷。
 
 PostgreSQL 使用文件型 `POSTGRES_PASSWORD_FILE`，Compose 不注入密码环境值；迁移器在进程内从文件读取，通过 psycopg 传递，不把秘密放进 argv、URL、日志或 SQL 错误输出。重复 init 保留原密码，已初始化数据库缺失凭据时拒绝随机重建。管理工具不会自动把旧实例的 SQLite/消息状态移入 PostgreSQL。
 
@@ -21,9 +21,9 @@ DBA 登录是 `baton_bootstrap`；它只由数据库初始化与短期迁移服�
 
 ## 委托链与审批关卡
 
-审批关卡：只有持有审批人委托的主体（人或 agent）才能批准，任何人不能批准自己提交或执行的工作。**Space owner 是根审批人**：根是创建 Space 时记录的一个精确身份（`spaces.owner_principal` + `owner_account` + `owner_kind`，不分 kind），天然拥有审批权，不需要委托记录；共用账户不等于根（A15 的精确 principal 匹配）：同账户的其他 principal、人类账户下的 agent、同名但 kind 不同的主体都必须持有委托。没有 `owner_principal` 的 Space（旧数据无法由 `space.created` 审计事件回填）没有根，直到运维人员用 `python -m bridge.delegations set-space-owner`（要求账户等于该 Space 现有 owner 账户，写 `space.owner_set` 审计）设置；该命令改变谁是根，信任边界与运维路径相同；委托只从根向下流动。其他主体：配置的 reviewer 决定请谁审阅，覆盖该任务的有效审批人委托决定其能否批准，两者缺一不可，人类也不例外；服务自动写入的 `worker_success` gate 例外。
+审批关卡：只有持有审批人委托的主体（人或 agent）才能批准，任何人不能批准自己提交或执行的工作。**Space owner 是根审批人**：根是创建 Space 时记录的一个精确身份（`spaces.owner_principal` + `owner_account` + `owner_kind`，不分 kind），天然拥有审批权，不需要委托记录；共用账户不等于根（A15 的精确 principal 匹配）：同账户的其他 principal、人类账户下的 agent、同名但 kind 不同的主体都必须持有委托。没有 `owner_principal` 的 Space（旧数据无法由 `space.created` 审计事件回填）没有根，直到运维人员用 `python -m bridge.delegations set-space-owner`（要求账户等于该 Space 现有 owner 账户，写 `space.owner_set` 审计）设置；该命令改变谁是根，信任边界与运维路径相同；委托只从根向下流动。其他主体：配置的 reviewer 决定请谁审阅，覆盖该任务的有效审批人委托决定其能否批准，两者缺一不可，人类也不例外。旧版内置 worker 写下的 `worker_success` 历史行仍可读取，但不再有任何路径写入或批准它们。
 
-自批：除根以外，gate 拒绝结果作者、在被审批 epoch 持有过 claim 的 principal 或 account（`x_claim_holder` 追加记录，handoff 时原持有人计入新 epoch）和执行 worker 身份；只创建请求的任务 owner 可以批准。根可以批准自己的工作，但必须在 gate 调用里显式给出 `self_approval=true`，否则被拒绝；这类批准在 `x_gate`（`self_approval`、`root`）和审计里如实标记，不会冒充别人的批准。因为按 account 判断，连接在 owner 账户上的 agent 也是根，同样受这条标志约束。
+自批：除根以外，gate 拒绝结果作者以及在被审批 epoch 持有过 claim 的 principal 或 account（`x_claim_holder` 追加记录，handoff 时原持有人计入新 epoch）；只创建请求的任务 owner 可以批准。根可以批准自己的工作，但必须在 gate 调用里显式给出 `self_approval=true`，否则被拒绝；这类批准在 `x_gate`（`self_approval`、`root`）和审计里如实标记，不会冒充别人的批准。因为按 account 判断，连接在 owner 账户上的 agent 也是根，同样受这条标志约束。
 
 委托链：根委托的授权人是该 Space 的根身份；持有该 Space 中有效 `may_delegate=true` 委托的主体可以授予子委托，`parent_id` 指向它持有的那条。被委托方永远不能超过授权人（Space 相同或更窄，过期不晚于父委托），任何祖先被撤销、过期或不满足上述约束，子委托立即失效；gate 时在同一数据库事务内重新校验整条链，包括授权人必须是父委托的被委托方、链的根授权人必须正是任务所在 Space 的根身份（principal、account、kind 全部相等，所以委托不会伸进根授权人不拥有的 Space，也不会因同账户的别的主体而成立）、链最多 3 层，重放同一请求时再校验一次。创建时拒绝会形成环的委托：不能授予自己、自己上方的根或链上已有的人（按 principal 判断）。审批人角色只授予批准权，不授予读写权限，也不会让主体成为 reviewer。每次创建、撤销和 gate 都在审计中记录完整链（从叶到根的委托 ID）。
 
@@ -35,19 +35,13 @@ DBA 登录是 `baton_bootstrap`；它只由数据库初始化与短期迁移服�
 
 ## 网络与执行隔离
 
-默认 HTTP 仅绑定回环地址；外部访问必须启用 TLS override 与有效证书。后端没有 published ports。PostgreSQL 使用单独 internal network，仅 bridge 和 migrate 连接；worker 的 harness 通过自身 egress 调用模型，工具网络由内层沙箱禁止。页面 Host/Origin 白名单由 PUBLIC_URL 推导。
+默认 HTTP 仅绑定回环地址；外部访问必须启用 TLS override 与有效证书。后端没有 published ports。PostgreSQL 使用单独 internal network，仅 bridge 和 migrate 连接；Baton 不执行任务，没有执行端容器、模型凭据或工具沙箱。页面 Host/Origin 白名单由 PUBLIC_URL 推导。
 
 应用使用固定依赖、非 root、只读根、cap_drop=ALL、no-new-privileges；没有 privileged、host network 或 Docker socket。PostgreSQL 与 migrate 的 UID/GID 是 999，应用是 10001；管理初始化权限独立列出，不混入长期业务服务。
 
-Codex 0.154.0 工具沙箱拒绝读取 `/data`、`/config`、`/run/secrets`、`/home/agent/.codex`，只允许当前任务目录写入，禁止工具联网。harness 的模型认证与沙箱工具分离。结果的已知秘密过滤只是额外措施，不能替代访问控制。
+Baton 是通信与协作层，不执行任务：执行属于通过 MCP、HTTP 或适配器（如 `adapters/baton_cli.py`）连接的外部 agent，它们的运行环境、模型凭据和沙箱由各自的操作者负责，不在 Baton 的信任边界内。bridge 不对 agent 提交的结果做秘密过滤，因此客户端不应把凭据写进结果、评论或证据；服务端只靠权限模型和审计元数据约束可见范围。
 
-worker 以 `codex exec --json` 运行，只依据带类型的 CLI 错误事件和少量固定 stderr 模式分类失败；原始 stderr、stdout、prompt 和模型文本不写日志、审计或 A2A。A2A 失败只携带带版本的 `baton_failure` 数据片段（`version`、`code`、`stage`），bridge 只接受 worker 的已知错误码，其余一律降为固定的 `A2A_FAILED_UNCLASSIFIED`；任务 `error` 只保存错误码，失败说明以固定中文文本写入任务线程评论。
-
-worker `/healthz` 位于现有 dispatcher 认证之后，仅在 cgroup v2 资源采样新鲜且最近一次真实 canary 成功时返回 200，否则 503；容器健康检查使用只读的 `python -m bridge.worker_health check`，只读取 worker 发布的快照文件。canary 与业务任务走同一条执行路径和同一把执行锁，预算仍为 30 秒（业务 300 秒），沙箱权限不变。每次 Codex 执行（含 canary）记录各阶段的单调时钟毫秒数、cgroup `cpu.stat`/`io.stat`/`pgmajfault` 增量和是否冷启动；审计行及执行/探针记录只含这些数字和固定集合内的事件类型名，不含任何消息文本，无法读取的值记为 null 而不是 0。
-
-基础配置仅 worker 使用 `apparmor=unconfined` 与 Moby 基线上六项 syscall 例外，以支持嵌套 bubblewrap。它减少外层 LSM 保护，不能当作原始 Docker 默认隔离。Ubuntu 的非特权 userns 限制可能仍阻止启动；可选 override 使用管理员预加载的 `baton-codex-userns-v1`，其 `flags=(unconfined)` 加 `userns` 是明确例外，不是完整 AppArmor 策略。项目不关闭全局限制或自动加载宿主策略。内层隔离必须由目标主机的 `scripts/sandbox_probe.py` 验证，不得用危险 bypass 获得成功。
-
-这是受信任操作者的独立实验，不是已验证的敌对多租户代码执行平台；不接生产系统、生产数据或敏感源代码。浏览器只在内存中保留 bearer，渲染使用 textContent，不保存 localStorage 或记录 Authorization。
+这是受信任操作者的独立实验，不是已验证的敌对多租户平台；不接生产系统、生产数据或敏感源代码。浏览器只在内存中保留 bearer，渲染使用 textContent，不保存 localStorage 或记录 Authorization。
 
 ## Webhook 签名、SSRF 防护与至少一次送达
 
@@ -63,8 +57,8 @@ Webhook 签名密钥在订阅时由服务端以 32 字节随机数生成，只�
 
 PostgreSQL 全局关闭 SQL、慢查询采样和错误参数日志，普通 SQL 错误不记录到服务器日志；`log_min_messages=fatal` 只保留 FATAL/PANIC 诊断，错误 verbosity 为 terse。此选择牺牲详细 SQL 排障信息以避免错误消息、失败行或参数带出正文；可用性由 pg_isready、迁移结果和业务健康检查核验。含角色密码的迁移会话进一步抑制普通日志，异常只输出固定失败说明。相关参数见 [PostgreSQL 17 日志文档](https://www.postgresql.org/docs/17/runtime-config-logging.html)。
 
-边缘与 worker 的白名单 JSONL 用于关联请求和执行，不是防篡改账本。Docker 日志轮转；数据库、worker 私有回执和秘密卷的备份、保留、访问控制由操作者负责。`x_audit` 不能替代受控备份，`down -v` 会删除项目命名卷，不能用于自动升级或修复。
+边缘、网关与 bridge 的白名单 JSONL 用于关联请求，不是防篡改账本。Docker 日志轮转；数据库和秘密卷的备份、保留、访问控制由操作者负责。`x_audit` 不能替代受控备份，`down -v` 会删除项目命名卷，不能用于自动升级或修复。
 
-撤销 token 阻断新请求，不自动取消已经启动的 worker。外部执行结果不确定时保持 interrupted 并人工核对，不盲目重跑。演示结果不能冒充真实 Codex；手工 gate 与自动 worker_success 必须区分，不等同生产发布批准。
+撤销 token 阻断新请求，不会取消外部 agent 已经在做的工作，也不会释放它持有的租约；租约到期后任务回到队列。手工 gate 不等同生产发布批准。
 
 发布前执行全历史秘密扫描、私有信息扫描、SPDX 与 Signed-off-by 检查。运行回执保存在仓库外；所有贡献提交遵守 [DCO](../CONTRIBUTING.md)。

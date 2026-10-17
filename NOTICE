@@ -3,7 +3,3 @@ Copyright 2026 The Baton Authors
 
 Baton first-party code is licensed under Apache License 2.0 (see LICENSE).
 Third-party dependencies retain their own terms (see docs/THIRD_PARTY.md).
-
-The modified seccomp configuration is derived from Moby profiles.
-Copyright The Moby Authors. Licensed under Apache-2.0.
-Source commit: 4b8214fc4971e06172938a1f1554ccff6647ee80.

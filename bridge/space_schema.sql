@@ -85,6 +85,9 @@ CREATE TABLE IF NOT EXISTS baton.proposal_revisions (
     author_principal text NOT NULL, author_account text NOT NULL, author_kind text NOT NULL,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(), PRIMARY KEY(proposal_id,revision)
 );
+-- Legacy values: the built-in worker was removed, so nothing writes execution_mode 'codex', gate_mode
+-- 'worker_success', backend, a2a_id or dispatch_started_at any more. The check constraints keep admitting
+-- them so old databases migrate unchanged and rows the worker wrote stay readable.
 CREATE TABLE IF NOT EXISTS baton.tasks (
     id uuid PRIMARY KEY, page_id uuid NOT NULL REFERENCES baton.pages(id), block_id uuid NOT NULL UNIQUE REFERENCES baton.blocks(id),
     owner text NOT NULL, owner_account text NOT NULL, owner_kind text NOT NULL, assignee text,

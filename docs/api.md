@@ -6,7 +6,7 @@
 
 ## 连接与身份
 
-任意 runtime 可向 `https://example.com/v1/space/{operation}` 发送 JSON `POST`，使用部署者签发的 bearer token。所有请求经过相同的 gateway client ACL 与 bridge 身份验证；内部 dispatcher token 不能使用这些公共操作。`GET https://example.com/v1/space/schema` 在认证后返回完整参数 JSON Schema、读写标记、别名和协议版本。
+任意 runtime 可向 `https://example.com/v1/space/{operation}` 发送 JSON `POST`，使用部署者签发的 bearer token。所有请求经过相同的 gateway client ACL 与 bridge 身份验证；没有内部服务账号可以使用这些公共操作。`GET https://example.com/v1/space/schema` 在认证后返回完整参数 JSON Schema、读写标记、别名和协议版本。
 
 身份由管理员注册表确定，包含 principal、connected account 和 human/agent kind；每次请求重读注册表，以便撤销立即生效。请求体不能设置当前 actor。`share.role`、`set_team_member.account`、`create_block.kind` 是对应业务对象的目标字段，不会改变调用者身份。`handoff.target_principal` 由服务端重新解析为目标账户；客户端不能提交目标 Actor 对象。
 
@@ -94,23 +94,26 @@ with urlopen(request) as response:
 
 `create_block.kind` 为 text/file/prompt/agent_instructions；手工任务必须通过 `create_task_block` 创建，不能用普通块绕过 gate。`content` 是 Baton 的 JSON 内容格式。更新和提案接受都检查 expected_revision。`proposal_review.decision` 为 accept/reject/revise；接受或修订以及 revert_block 需要 human 身份和当前 edit 权限。
 
-`scopes` 是 `[{"kind":"path","value":"src/component"}]` 形式的列表；kind 可为 path/module/migration/none。`{"kind":"none"}`（没有 `value`）表示任务不触碰任何仓库路径、模块或 migration：它不与任何 claim 冲突，不能与其他 scope 条目组合（否则 `422 invalid`）。省略 `scopes` 时：手工任务（`create_task_block`，以及带 `assignee_principal` 的 `submit_task`）默认存储 `[{"kind":"none"}]`；自动任务（不带 assignee 的 `submit_task`）会执行代码，仍存储保守的仓库根占位范围 `[{"kind":"path","value":""}]`。显式传 `[]` 保持旧行为，两类任务都存储仓库根占位范围。已存在的任务不会被改写；省略 `scopes` 的请求在计算幂等摘要时仍按旧的仓库根占位范围处理，因此已持久化的请求重放不受影响。`create_task_block` 的 `scopes` 现在可省略。全部 Space 共享 global namespace。path 冲突按目录前缀判定：规范化（仓库相对、`/` 分隔、去除重复分隔符、结尾 `/` 与 `.` 段，拒绝绝对路径与 `..`）后两个路径相等，或其中一个是另一个在 `/` 边界上的目录前缀时重叠（`docs/design` 与 `docs/design/roadmap.md`、`docs` 重叠，与 `docs/designer`、`src` 不重叠）；空路径（仓库根占位范围）与任何 path 重叠。声明互不重叠路径的任务（如 `src/a` 与 `docs/b`）可以同时 `claim`；重叠的 `claim` 返回 `409 scope_conflict`。`claim`、`claim_next` 和 `ready` 使用同一规则，已有 claim 不受影响。比较默认大小写敏感；运营者设置环境变量 `BATON_SCOPE_CASE_INSENSITIVE=1`（默认关闭）后改为大小写不敏感。module 覆盖整个仓库，与 path、module 和任意 migration 都冲突；migration 使用规范化标识的精确相等检查；`none` 永不重叠。**已知限制：** Baton 不解析符号链接、硬链接或其他别名；通过不同路径指向同一批文件的声明不会被检测为重叠（见 spec A17），请用真实的规范路径声明。`reviewers` 是获准审核该手工任务的 principal ID 列表；服务端还检查这些主体当前权限与独立账户边界。
+`scopes` 是 `[{"kind":"path","value":"src/component"}]` 形式的列表；kind 可为 path/module/migration/none。`{"kind":"none"}`（没有 `value`）表示任务不触碰任何仓库路径、模块或 migration：它不与任何 claim 冲突，不能与其他 scope 条目组合（否则 `422 invalid`）。省略 `scopes` 时，所有任务（`create_task_block`，以及不论是否带 `assignee_principal` 的 `submit_task`）都默认存储 `[{"kind":"none"}]`。显式传 `[]` 保持旧行为，存储仓库根占位范围 `[{"kind":"path","value":""}]`；旧版内置 worker 写下的行也保留这个占位范围。已存在的任务不会被改写；省略 `scopes` 的请求在计算幂等摘要时仍按旧的仓库根占位范围处理，因此已持久化的请求重放不受影响。`create_task_block` 的 `scopes` 现在可省略。全部 Space 共享 global namespace。path 冲突按目录前缀判定：规范化（仓库相对、`/` 分隔、去除重复分隔符、结尾 `/` 与 `.` 段，拒绝绝对路径与 `..`）后两个路径相等，或其中一个是另一个在 `/` 边界上的目录前缀时重叠（`docs/design` 与 `docs/design/roadmap.md`、`docs` 重叠，与 `docs/designer`、`src` 不重叠）；空路径（仓库根占位范围）与任何 path 重叠。声明互不重叠路径的任务（如 `src/a` 与 `docs/b`）可以同时 `claim`；重叠的 `claim` 返回 `409 scope_conflict`。`claim` 和 `ready` 使用同一规则，已有 claim 不受影响。比较默认大小写敏感；运营者设置环境变量 `BATON_SCOPE_CASE_INSENSITIVE=1`（默认关闭）后改为大小写不敏感。module 覆盖整个仓库，与 path、module 和任意 migration 都冲突；migration 使用规范化标识的精确相等检查；`none` 永不重叠。**已知限制：** Baton 不解析符号链接、硬链接或其他别名；通过不同路径指向同一批文件的声明不会被检测为重叠（见 spec A17），请用真实的规范路径声明。`reviewers` 是获准审核该手工任务的 principal ID 列表；服务端还检查这些主体当前权限与独立账户边界。
 
 `comment` 返回绑定 page/thread 的评论；`mention.target_type` 为 person/agent，target_id 始终是显式 principal。服务端从有效 registry 验证 person 对应 human、agent 对应 agent；connected account 不是人物收件地址。提及不会直接触发任意运行时执行；接收者在读取或行动时仍需当前权限。评论、提及和 assignments 存入 PostgreSQL；fetch_inbox 只读取发给当前主体且当前仍可访问的条目。返回的 requested_by、action_requested 以及每线程 requests 列表保留实际提及请求者，评论作者不会覆盖后来发起提及的人。
 
 ## 任务、租约与 gate
 
-`submit_task` 未指定接收人时创建自动任务，保留稳定业务 idempotency_key；即使换 operation_id，同一 principal/key 也不会创建第二任务。自动任务只能由窄服务接口派发给 worker，采用明确标注的 worker_success gate。Demo backend 始终返回 backend=demo，不代表真实 Codex 验收。
+Baton 不执行任务。`submit_task` 总是创建一条手工任务（`execution_mode=manual`、`gate_mode=reviewer`），保留稳定业务 idempotency_key；即使换 operation_id，同一 principal/key 也不会创建第二任务。reviewer 默认是请求者，gate 规则不变（见下文“审批关卡”），范围省略时为 `none`。MCP 工具签名没有变化。
 
-指定 `assignee_principal` 的 submit_task 进入手工路径，默认 reviewer 为请求者；目标必须已具有页面 edit 权限，服务端不会自动分享。submit_task 不能把请求者自己设为接收人。`assign_task` 只允许为尚未领取或旧租约已失效的任务指定接收人；有效租约内通过 handoff 交接。已有接收人的任务只能由该 principal 领取，其他具有 edit 的人也不能抢占。fetch_inbox 将当前有效的 assignments 与 mentions 合并。
+- **不带 `assignee_principal`：** 创建未指派（`assignee` 为 null）的任务，没有响应时限。任何对该任务所在页面有 edit 权限的主体都会在 `ready` 里看到它，并可以 `claim`；先领取的持有租约，其余人看到的是 `scope_conflict`/不再 ready。没有 edit 权限的主体看不到它（`404 not_found`）。默认页面（省略 `page_id` 时创建的请求者私有 Space）只有请求者有权限，要让别人领取，请传共享页面的 `page_id`，或先共享该页面。
+- **带 `assignee_principal`：** 进入指派路径，只有该 principal 能领取；目标必须已具有页面 edit 权限，服务端不会自动分享。submit_task 不能把请求者自己设为接收人。
 
-`create_task_block` 创建手工任务，绝不自动派发。领取和交接返回 task view，其中 epoch 是单调 fence，lease_expires_at 来自数据库时钟。renew、submit_result 和 handoff 必须带当前 epoch；续租重放不延长第二次，过期旧 fence 即使重放旧操作也失败。base_commit 是任务创建后的不可变基线（包括 null）；handoff 只能省略它或重复原值。未提供的 context/evidence 保留，thread_id 不变。
+旧版内置 worker 写下的 `execution_mode='codex'`、`gate_mode='worker_success'` 行是历史值：仍可读取（视图继续省略 prompt），但 `claim`、`gate`、`mark_blocked` 等手工操作对它们返回 `403 forbidden`，也不会出现在 `ready`；`list_tasks` 仍能看到它们。`submit_task` 用同一 idempotency_key 重放早先的无接收人请求，会返回那条历史任务。对排队中、从未被派发的历史任务，`assign_task` 可以把它显式交给一个具名 agent，之后按手工路径处理。`assign_task` 只允许为尚未领取或旧租约已失效的任务指定接收人；有效租约内通过 handoff 交接。已有接收人的任务只能由该 principal 领取，其他具有 edit 的人也不能抢占。fetch_inbox 将当前有效的 assignments 与 mentions 合并。
+
+`create_task_block` 创建手工任务（`reviewers` 必填）。领取和交接返回 task view，其中 epoch 是单调 fence，lease_expires_at 来自数据库时钟。renew、submit_result 和 handoff 必须带当前 epoch；续租重放不延长第二次，过期旧 fence 即使重放旧操作也失败。base_commit 是任务创建后的不可变基线（包括 null）；handoff 只能省略它或重复原值。未提供的 context/evidence 保留，thread_id 不变。
 
 手工 submit_result 只进入 awaiting_gate。gate 必须携带对应候选的 expected_epoch 和 pass/fail/edit（edit 是带修改的批准，计为一次 pass）；只有 Space owner（根），或配置 reviewer、具备当前 edit 权限、持有审批人委托且不是结果作者或执行者的主体，才可通过；需要双人确认时还要两个不同审批人都通过。只有 gate 通过才会 done。
 
-**审批关卡。** 只有持有审批人委托的主体（人或 agent）才能批准，任何人不能批准自己提交或执行的工作。Space 的 owner（创建时记录的精确身份：`owner_principal` + `owner_account` + `owner_kind`，不分 kind）是**根审批人**，天然拥有审批权，不需要委托，也不必在 reviewers 里；同账户的其他 principal、人类账户下的 agent、同名但 kind 不同的主体都不是根。没有 `owner_principal` 的 Space 没有根，直到运维人员用 `set-space-owner` 设置。其他主体做 gate 必须同时满足：（1）是任务配置的 reviewer，并有当前页面 edit 权限，否则 `403 forbidden`；（2）持有覆盖该任务的有效审批人委托（范围 `approve`，`space_id` 为空或等于任务所在 Space，被委托方 principal、account、kind 匹配，整条委托链未过期、未撤销，且链的根授权人正是任务所在 Space 的根身份），否则 `403 delegation_required`；（3）不是结果作者，也不是在被审批 epoch 持有过 claim 的 principal 或 account（含 handoff 的原持有人）或执行 worker，否则 `403 forbidden`。只创建了请求、没有提交或执行结果的任务 owner 可以批准。**根可以批准自己提交或执行的工作，但必须带 `self_approval=true`**，否则 `403 forbidden`；非根带该标志仍被拒绝。服务自动写入的 `worker_success` gate 不受影响。`gate.reviewed` 审计和 `x_gate` 记录带 `self_approval`、`root`，非根的批准还带 `delegation_id` 与 `grantor`，审计另含完整委托链 `chain` 以及已计入的 `approvals` 和 `approvals_required`；同一 `operation_id` 的重试会重新检查整条链，委托失效后同样返回 `delegation_required`。
+**审批关卡。** 只有持有审批人委托的主体（人或 agent）才能批准，任何人不能批准自己提交或执行的工作。Space 的 owner（创建时记录的精确身份：`owner_principal` + `owner_account` + `owner_kind`，不分 kind）是**根审批人**，天然拥有审批权，不需要委托，也不必在 reviewers 里；同账户的其他 principal、人类账户下的 agent、同名但 kind 不同的主体都不是根。没有 `owner_principal` 的 Space 没有根，直到运维人员用 `set-space-owner` 设置。其他主体做 gate 必须同时满足：（1）是任务配置的 reviewer，并有当前页面 edit 权限，否则 `403 forbidden`；（2）持有覆盖该任务的有效审批人委托（范围 `approve`，`space_id` 为空或等于任务所在 Space，被委托方 principal、account、kind 匹配，整条委托链未过期、未撤销，且链的根授权人正是任务所在 Space 的根身份），否则 `403 delegation_required`；（3）不是结果作者，也不是在被审批 epoch 持有过 claim 的 principal 或 account（含 handoff 的原持有人），否则 `403 forbidden`。只创建了请求、没有提交或执行结果的任务 owner 可以批准。**根可以批准自己提交或执行的工作，但必须带 `self_approval=true`**，否则 `403 forbidden`；非根带该标志仍被拒绝。没有任何服务写入的 gate。`gate.reviewed` 审计和 `x_gate` 记录带 `self_approval`、`root`，非根的批准还带 `delegation_id` 与 `grantor`，审计另含完整委托链 `chain` 以及已计入的 `approvals` 和 `approvals_required`；同一 `operation_id` 的重试会重新检查整条链，委托失效后同样返回 `delegation_required`。
 
-**双人确认。** 任务可以要求两个批准：运维人员为某个范围配置策略（`python -m bridge.delegations policy-set`，见 README），或创建任务时在 `create_task_block`（或带 assignee 的 `submit_task`）传 `approvals_required`（1 或 2；非法值返回 `422 invalid`，自动任务不允许）；任务的值可以提高策略要求，只有创建者是 Space owner 时才能降低。要求 2 个批准时，任务只有在两个不同的审批人（不同 principal 和 account）对同一个 `result_epoch` 都 pass 之后才变成 done，第一个 pass 后仍是 `awaiting_gate`，同一审批人再次 pass 返回 `403 forbidden`。策略的 `root_required` 要求根必须是其中之一，根 pass 之前任务不会 done。任何有权方的 fail（包括根的 fail）都把任务退回 `queued`，旧 epoch 的 pass 不再计数。task view 带有效的 `approvals_required`、已通过的 `approvals_passed` 和 `root_required`。
+**双人确认。** 任务可以要求两个批准：运维人员为某个范围配置策略（`python -m bridge.delegations policy-set`，见 README），或创建任务时在 `create_task_block`（或 `submit_task`）传 `approvals_required`（1 或 2；非法值返回 `422 invalid`）；任务的值可以提高策略要求，只有创建者是 Space owner 时才能降低。要求 2 个批准时，任务只有在两个不同的审批人（不同 principal 和 account）对同一个 `result_epoch` 都 pass 之后才变成 done，第一个 pass 后仍是 `awaiting_gate`，同一审批人再次 pass 返回 `403 forbidden`。策略的 `root_required` 要求根必须是其中之一，根 pass 之前任务不会 done。任何有权方的 fail（包括根的 fail）都把任务退回 `queued`，旧 epoch 的 pass 不再计数。task view 带有效的 `approvals_required`、已通过的 `approvals_passed` 和 `root_required`。
 
 **审批 UX：带修改批准与审批人身份（DF-14′）。** 这是 Baton 自有 x_扩展。
 
@@ -120,11 +123,9 @@ with urlopen(request) as response:
 - **响应里的审批人身份。** `gate` 的返回值是 task view 加一个 `gate` 对象：`{"decision","counted_as","epoch","approver","approver_account","approver_kind","root","self_approval","authority","delegation_id","grantor","edited","approvals","approvals_required","complete"}`。`decision` 是请求的决定（`pass`/`fail`/`edit`），`counted_as` 对 edit 为 `pass`；`authority` 说明权限如何取得，只有三种写法：`root`、`root (self-approval)`、`delegated by <grantor> via <delegation id>`。同一 `operation_id` 的重放返回最初的 `gate` 对象。命令行 `gate` 的 `--summary` 行在 `task <id> state=… epoch=…` 之后追加 `gate=<decision> approver=<principal> authority=<…>`。
 - **兼容。** 旧请求（不带 `edited_result`、`reason`）的幂等摘要不变；新增列由幂等迁移添加，`check_schema` 要求它们存在。
 
-Task view 包含 `original_result`/`result_edits`（见“审批 UX”）、`blocked`（`null`，或 `{"reason_code","by","at"}`，见“阻塞标记”）、id/task_id/thread_id、work_face/require_work_face/task_kind/work_face_missing、priority/respond_by/responded_at/escalated_at/overdue、page_id/block_id、owner/owner_account、execution_mode、state/status、epoch、holder/holder_account、lease_expires_at/lease_valid、scopes、base_commit、context、evidence、result/result_epoch、a2a_id/backend、gate_mode/reviewers 和错误元数据。canonical state 为 queued/claimed/awaiting_gate/done/failed/interrupted；兼容 status 将 claimed→working、done→completed。手工任务在当前 page view 权限下返回 prompt，方便接收人读取指令；自动任务的旧兼容状态视图仍省略 prompt。所有状态视图都不返回 idempotency key 或凭据。
+Task view 包含 `original_result`/`result_edits`（见“审批 UX”）、`blocked`（`null`，或 `{"reason_code","by","at"}`，见“阻塞标记”）、id/task_id/thread_id、work_face/require_work_face/task_kind/work_face_missing、priority/respond_by/responded_at/escalated_at/overdue、page_id/block_id、owner/owner_account、execution_mode、state/status、epoch、holder/holder_account、lease_expires_at/lease_valid、scopes、base_commit、context、evidence、result/result_epoch、a2a_id/backend（仅旧版 worker 行有值）、gate_mode/reviewers 和错误元数据。canonical state 为 queued/claimed/awaiting_gate/done/failed/interrupted；兼容 status 将 claimed→working、done→completed。手工任务在当前 page view 权限下返回 prompt，方便接收人读取指令；旧版 worker 行的状态视图仍省略 prompt。所有状态视图都不返回 idempotency key 或凭据。
 
-自动派发前先持久化 dispatch_started，并且每次结果写入检查 holder、当前 epoch 和未过期租约。网络结果不确定时进入 interrupted；自动恢复不会再次执行可能已派发的任务，旧 worker 不能覆盖新持有人。worker 明确报告失败时，任务进入 failed，`error` 只保存封闭词汇中的错误码（如 `CODEX_TIMEOUT`、`CODEX_AUTH_UNAUTHORIZED`；无法接受的诊断为 `A2A_FAILED_UNCLASSIFIED`），并在任务线程追加固定文本的 `[failed]` 评论；worker 的原始错误文本不会进入任务、线程或审计。
-
-在写入 dispatch_started 前，bridge 重新读取 registry，要求提交者仍是 active client，且 principal、connected account 和 kind 与任务保存的身份一致。撤销或改变映射后，排队任务以 cancelled 停止，不向 A2A 发出请求；这一检查不承诺取消此前已经发出的执行。页面及依赖权限仍由 store 以任务保存的原提交者身份重新校验，内部 service 身份不扩大执行授权。
+每次结果写入都检查 holder、当前 epoch 和未过期租约，旧持有人不能覆盖新持有人；租约到期后任务回到 `queued`，由别的主体重新 `claim`，没有自动重跑。`failed` 与 `interrupted` 状态以及 `error` 列（如旧版的 `CODEX_TIMEOUT`、`dispatch_uncertain`）只会出现在旧版 worker 留下的行上，当前代码不再写入。
 
 ## 审批人委托（delegation）
 
@@ -140,11 +141,11 @@ owner 尚无人类身份时，用运维命令在 bridge 容器内记录 owner �
 
 ## x_graph 依赖图
 
-create_task_block 和 submit_task 接受可选 `depends_on` 前置任务 UUID 列表，依赖和任务在同一事务创建，且依赖字段属于幂等请求摘要。有依赖的自动任务应在提交时传入该字段，避免 worker 在之后的 plan 请求前先领取任务。
+create_task_block 和 submit_task 接受可选 `depends_on` 前置任务 UUID 列表，依赖和任务在同一事务创建，且依赖字段属于幂等请求摘要。有依赖的任务应在提交时传入该字段，避免别的主体在之后的 plan 请求前先领取任务。
 
 `plan` 原子建立或扩展已有任务之间的依赖；只允许尚未执行、epoch 为 0 的 queued 任务，不能利用过期 claim 或执行后重新排队来改图。每个 graph 条目必须严格为 `{"task_id":"任务UUID","depends_on":["前置任务UUID"]}`；未知字段、错误类型或无效 UUID 返回 invalid，环返回 graph_cycle，整次变更回滚。新依赖、已有依赖及重放都检查当前可见性。plan 不创建任务，也不调用 planner 或模型；成功结果为 `{graph:[{task_id,depends_on}],replay:boolean}`。
 
-`ready` 返回 task view 列表，只列出当前调用者可以手动领取的任务，可按 page_id 过滤；task view 中的 depends_on 仅包含当前可见的前置任务 UUID，has_hidden_dependencies 标识是否还有不可见依赖。隐藏依赖不会出现在 ready 中，也不能用旧已知 ID 绕过领取检查。前置任务必须处于当前 done 状态，且它当前 epoch 的 gate 已通过。claim 与内部自动 claim_next 在领取时重新检查依赖，因此先前的 ready 结果不是领取许可，也不能绕过撤权、租约、作用域或指定接收人的限制。依赖未满足时返回 dependency_blocked；不要仅检查历史 completed 文本。
+`ready` 返回 task view 列表，只列出当前调用者可以手动领取的任务，可按 page_id 过滤；task view 中的 depends_on 仅包含当前可见的前置任务 UUID，has_hidden_dependencies 标识是否还有不可见依赖。隐藏依赖不会出现在 ready 中，也不能用旧已知 ID 绕过领取检查。前置任务必须处于当前 done 状态，且它当前 epoch 的 gate 已通过。claim 在领取时重新检查依赖，因此先前的 ready 结果不是领取许可，也不能绕过撤权、租约、作用域或指定接收人的限制。依赖未满足时返回 dependency_blocked；不要仅检查历史 completed 文本。
 
 例如先创建 A 与 B，再发送 `{"operation_id":"稳定UUID","graph":[{"task_id":"B的UUID","depends_on":["A的UUID"]}]}` 到 `https://example.com/v1/space/plan`。重试使用同一个 operation_id；只有 A 的当前结果经 gate 通过，B 才可能出现在接收人的 ready 列表中。此依赖协议是 Baton 的 x_ 扩展。
 
@@ -165,7 +166,7 @@ Baton 不会执行 `acceptance_command`。它只是显示给领取人和 gate �
 示例：先用 `create_task_block` 创建准备任务（`"task_kind":"prep"`）和施工任务（`"depends_on":["准备任务UUID"],"require_work_face":true`），准备任务的持有人在领取后向 `https://example.com/v1/space/set_work_face` 发送 `{"operation_id":"稳定UUID","task_id":"施工任务UUID","work_face":{"environment":["python 3.12"],"fixtures":["seed.sql"],"constraints":["不访问网络"],"migration":null,"acceptance_command":"pytest -q"},"base_commit":"基线提交"}`。
 ## 通知与送达（webhook、wait_inbox）
 
-此前 agent 只能反复调用 `fetch_inbox` 轮询。Baton 现在在同一 PostgreSQL 事务内写入通知 outbox，并提供两种异步送达：长轮询 `wait_inbox`，以及由 bridge 内部 worker 投递的 webhook。二者都只是“有新事项”的提示，不会启动任何执行；接收者仍须自愿读取、领取并行动，权限在读取与投递时重新检查。HTTP 与 MCP 使用同一 operation dispatcher：`POST https://example.com/v1/space/wait_inbox`，MCP 工具同名。
+此前 agent 只能反复调用 `fetch_inbox` 轮询。Baton 现在在同一 PostgreSQL 事务内写入通知 outbox，并提供两种异步送达：长轮询 `wait_inbox`，以及由 bridge 后台循环投递的 webhook。二者都只是“有新事项”的提示，不会启动任何执行；接收者仍须自愿读取、领取并行动，权限在读取与投递时重新检查。HTTP 与 MCP 使用同一 operation dispatcher：`POST https://example.com/v1/space/wait_inbox`，MCP 工具同名。
 
 ### 通知 outbox
 
@@ -177,9 +178,9 @@ Baton 不会执行 `acceptance_command`。它只是显示给领取人和 gate �
 | `task.assigned` | `submit_task`/`create_task_block` 带 assignee，或 `assign_task` | 新接收人 | task |
 | `comment.created` | `comment` 写入某任务的线程 | 该任务的 owner、assignee、当前持有人、reviewers（不含评论作者） | comment |
 | `task.awaiting_gate` | `submit_result` 使任务进入 awaiting_gate；通知带 `result_epoch` 与 `result_author`（见下） | reviewers | task |
-| `gate.decided` | `gate` 决定（pass、fail 或 edit），以及自动任务的 worker_success 通过 | owner、assignee、持有人（提交结果的 holder） | task |
+| `gate.decided` | `gate` 决定（pass、fail 或 edit） | owner、assignee、持有人（提交结果的 holder） | task |
 | `task.handed_off` | `handoff` | 新持有人 | task |
-| `task.failed` | 自动任务的 worker 确定性失败（`fail_auto`，同时写入 `[failed]` 线程评论） | owner | task |
+| `task.failed` | 旧版内置 worker 行的历史事件；当前没有任何路径产生它，保留是为了让旧订阅与旧 outbox 行继续有效 | owner | task |
 | `task.overdue` | 后台升级循环发现任务超过 `respond_by` 仍无响应（见“响应时效与超时升级”） | `escalate_to`，与其不同时还有 owner | task |
 | `task.blocked` | `mark_blocked`（见“阻塞标记”） | 任务 owner（不含操作者） | task |
 
@@ -193,7 +194,7 @@ Baton 不会执行 `acceptance_command`。它只是显示给领取人和 gate �
 - `subject`：任务事件为 `[<事件>] <任务说明前 60 个字符>`（空白折叠为单个空格），如 `[assigned] 核对发布清单`，事件标签为 `assigned`、`handed_off`、`awaiting_gate`、`gate_decided`、`failed`、`overdue`、`blocked`；评论为 `comment on <任务 id>`（线程不是任务时为 `comment on thread <线程 id>`），提及为 `mention in <任务 id>` 或 `mention in thread <线程 id>`。
 - `body_preview`：评论正文或手工任务说明的前 200 个字符，不加省略号。
 
-只有读取时调用者仍对对象所在页面有 view 权限才会返回这些内容：失权的行整条不返回（见 `next_seq` 语义），重新获得权限后按当前内容再次可见。自动任务的 prompt 与任务视图一致保持不可见：其通知只有 `actor` 和 `[<事件>] <任务 id>` 形式的 `subject`，没有 `body_preview`。`fetch_inbox` 的每条 message 同样增加 `actor` 与 `body_preview`（`subject`、`body_md` 保持原样）。
+只有读取时调用者仍对对象所在页面有 view 权限才会返回这些内容：失权的行整条不返回（见 `next_seq` 语义），重新获得权限后按当前内容再次可见。旧版 worker 行的 prompt 与任务视图一致保持不可见：其通知只有 `actor` 和 `[<事件>] <任务 id>` 形式的 `subject`，没有 `body_preview`。`fetch_inbox` 的每条 message 同样增加 `actor` 与 `body_preview`（`subject`、`body_md` 保持原样）。
 
 ### wait_inbox 长轮询
 
@@ -275,9 +276,7 @@ docker compose exec bridge python -m bridge.scopes migrate-manual-root-to-none -
 docker compose exec bridge python -m bridge.scopes migrate-manual-root-to-none
 ```
 
-它把**手工**任务（`execution_mode=manual`）中 scope 恰好等于旧仓库根占位范围 `[{"kind":"path","value":""}]`、且当前没有有效租约的任务改写为 `[{"kind":"none"}]`，每个任务写一条审计 `task.scopes_migrated`，并向 stdout 输出一份 JSON 汇总 `{"dry_run","matched","migrated","skipped_claimed","task_ids"}`（`skipped_claimed` 是因有效租约而跳过的数量）。`--dry-run` 只报告、不写入。自动任务（会执行代码，保留仓库根占位范围）和持有有效租约的任务不会被改动；命令可重复运行，第二次没有可迁移项。无法区分当初显式传 `scopes: []` 的手工任务，它们同样会被迁移。已存在请求的幂等摘要不受影响。命令失败时只向 stderr 输出错误码，不输出 SQL 或连接细节。
-
-**调度告警。** 内部 worker 的 `claim_next` 在跳过排队中的自动任务、且原因仅是 scope 与某个有效租约冲突时，向 worker 审计日志写一条警告 `dispatch.blocked_by_scope`（`level=warning`，含被跳过的 `task_id` 和阻塞它的 `blocked_by` 任务 id，不含任何内容）。同一任务每 5 分钟最多一条（进程内限频，重启后重新计时），让卡住的自动任务可被发现。该日志不是 API，不影响领取结果。
+它把**手工**任务（`execution_mode=manual`）中 scope 恰好等于旧仓库根占位范围 `[{"kind":"path","value":""}]`、且当前没有有效租约的任务改写为 `[{"kind":"none"}]`，每个任务写一条审计 `task.scopes_migrated`，并向 stdout 输出一份 JSON 汇总 `{"dry_run","matched","migrated","skipped_claimed","task_ids"}`（`skipped_claimed` 是因有效租约而跳过的数量）。`--dry-run` 只报告、不写入。旧版 `codex` 行（保留仓库根占位范围）和持有有效租约的任务不会被改动；命令可重复运行，第二次没有可迁移项。无法区分当初显式传 `scopes: []` 的手工任务，它们同样会被迁移。已存在请求的幂等摘要不受影响。命令失败时只向 stderr 输出错误码，不输出 SQL 或连接细节。
 
 ## 响应时效与超时升级
 
@@ -285,7 +284,7 @@ docker compose exec bridge python -m bridge.scopes migrate-manual-root-to-none
 
 **字段与默认值。** `submit_task` 与 `create_task_block` 接受可选 `priority`（`urgent`/`normal`/`low`，默认 `normal`）、`escalate_to`（principal，默认任务 owner）和 `fallback_assignee`（principal，可选，不能等于 assignee）；非法值返回 `422 invalid`。三者只在非默认时计入幂等请求摘要，不带它们的旧请求摘要不变；显式写默认值与省略等价。
 
-**时限策略。** 时限只适用于有 assignee 的手工路径任务。时钟在 assignee 被设置时启动：创建时带 assignee，或 `assign_task`/`handoff` 改为新的 assignee（同一 assignee 重复指派不重置），此时 `respond_by = 数据库当前时间 + 该优先级的分钟数`，同时清空 `responded_at` 与 `escalated_at`。没有 assignee 的任务（包括自动任务）没有 `respond_by`，直到被指派。分钟数是 bridge 配置，默认 `urgent=20,normal=60,low=1440`，可用环境变量覆盖：
+**时限策略。** 时限只适用于有 assignee 的手工路径任务。时钟在 assignee 被设置时启动：创建时带 assignee，或 `assign_task`/`handoff` 改为新的 assignee（同一 assignee 重复指派不重置），此时 `respond_by = 数据库当前时间 + 该优先级的分钟数`，同时清空 `responded_at` 与 `escalated_at`。没有 assignee 的任务（包括不带接收人的 `submit_task`）没有 `respond_by`，直到被指派。分钟数是 bridge 配置，默认 `urgent=20,normal=60,low=1440`，可用环境变量覆盖：
 
 ```text
 BATON_RESPONSE_MINUTES="urgent=20,normal=60,low=1440"
@@ -353,7 +352,7 @@ MCP 与适配器：`submit_task` 工具和 `create_task_block` 带上述三个�
 - `409 operation_conflict / scope_conflict / stale_claim / revision_conflict / gate_required / dependency_blocked / graph_cycle / work_face_incomplete`：幂等、作用域、租约、版本、gate、依赖图或施工面清单不满足当前条件。
 - `422 invalid`：未知操作、额外字段、无效类型或无效业务参数。响应的 `error.details` 在可定位时给出字段级提示，见下。
 - `429 rate_limited`：webhook 订阅数或 wait_inbox 并发等待数超过上限。
-- `503 storage_unavailable`：数据库不可用，不能当作成功或自动重复外部执行。
+- `503 storage_unavailable`：数据库不可用，不能当作成功；重试须沿用同一 operation_id。
 
 错误体为 `{"x_protocol":"baton.space.v1","error":{"code":"...","message":"固定安全说明"}}`。错误不包含 SQL、正文、凭据或不可见资源详情。MCP 错误使用相同稳定错误码。
 
