@@ -209,7 +209,7 @@ def verify(secret_hex: str, raw_body: bytes, header: str) -> bool:
 BATON_RESPONSE_MINUTES="urgent=20,normal=60,low=1440"
 ```
 
-可以只写部分优先级，其余保持默认；每项是 1 到 525600 的整数，格式非法时 bridge 启动失败，而不是静默回退。
+默认 Compose 会把宿主环境中的该变量传给 bridge（留空即默认值）。可以只写部分优先级，其余保持默认；每项是 1 到 525600 的整数，格式非法时 bridge 启动失败，而不是静默回退。
 
 **什么算响应。** assignee 领取任务（`claim`），或 assignee/当前持有人在该任务线程发表评论（`comment`）。`responded_at` 只在第一次响应时设置。其他人的评论、系统生成的线程消息都不算。
 
