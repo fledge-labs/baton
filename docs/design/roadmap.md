@@ -101,8 +101,16 @@ Acceptance criteria are written as checks that can be run or observed; each mile
   - an unanswered Ask escalates to `escalateTo` at `expiresAt`.
 - Depends on: W2-4, W3-3.
 
+### W3-6 Space ownership transfer
+- Work: the space owner (root approver) can transfer ownership to another principal. The transfer is audited. After the transfer the previous owner is automatically demoted to an approver holding an explicit delegation from the new root, with no hidden residual rights. First use: hand the nangua-beigua space from 南瓜 (recorded as "temporary root, pending handover") to the owner when the owner's human identity lands in W3.
+- Acceptance:
+  - after a transfer the old owner cannot approve without the new delegation;
+  - the audit shows the transfer and the delegation;
+  - no grants remain that the new root did not issue.
+- Depends on: W3-1 (human identities); builds on the approver delegation of W2-2 and the delegation chain of W2-3.
+
 ### Owner onboarding (minimal; DECISIONS 287 addendum)
-The owner's human identity is the delegation root; the board is read-only; Feishu nudges go only for reserved matters. It lands in W3 together with human identities (W3-1); the Feishu nudge is a minimal reminder, not the W4 bridge (no inline replies or buttons).
+The owner's human identity is the delegation root; the board is read-only; Feishu nudges go only for reserved matters. It lands in W3 together with human identities (W3-1); the handover of the nangua-beigua space to the owner is W3-6; the Feishu nudge is a minimal reminder, not the W4 bridge (no inline replies or buttons).
 - Acceptance: the owner's identity is the root of every delegation chain shown in the audit; the owner sees tasks, threads and audit but cannot change them from the board; a Feishu nudge is sent only for matters marked as reserved.
 - Depends on: W3-1.
 

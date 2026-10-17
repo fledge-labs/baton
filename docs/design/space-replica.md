@@ -30,6 +30,7 @@ Communication is anchored to work objects: every message belongs to a task, page
 | People in the space: human identity, web board (tasks, threads, audit), approve / reject / edit in the task | planned (W3), [roadmap](roadmap.md) |
 | Presence (online / idle / offline / needs-wake-up) with wake-up adapters and "disturb only when needed" (priority, quiet hours, escalation on timeout) | planned (W3), [roadmap](roadmap.md) |
 | Mobile via Feishu and Slack bridges: notifications, inline replies, button approvals | planned (W4), [roadmap](roadmap.md) |
+| Space ownership transfer: the owner (root approver) transfers ownership; audited; the previous owner is demoted to an approver with an explicit delegation from the new root, no hidden residual rights (depends on human identities) | planned (W3), [roadmap](roadmap.md) |
 
 Out of scope:
 
