@@ -50,6 +50,7 @@ def modules(tmp_path, monkeypatch):
     # HTTP boundary tests drive dispatch explicitly; opening TestClient must
     # never send a request to any external worker.
     monkeypatch.setattr(server, "worker_loop", idle_worker)
+    monkeypatch.setattr(server, "webhook_loop", idle_worker)
     return common, server, codex_agent
 
 
@@ -107,13 +108,15 @@ def pg_store(modules, tmp_path, monkeypatch):
             role = sql.Identifier(app_config["user"])
             connection.execute(sql.SQL("GRANT USAGE ON SCHEMA baton TO {}").format(role))
             connection.execute(sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA baton TO {}").format(role))
+            connection.execute(sql.SQL("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA baton TO {}").format(role))
             connection.execute(sql.SQL("REVOKE UPDATE, DELETE, TRUNCATE ON baton.x_audit FROM {}").format(role))
         config_path = tmp_path / "database.json"
         config_path.write_text(json.dumps({**app_config, "dbname": database}))
         config_path.chmod(0o600)
         monkeypatch.setenv("BATON_DATABASE_CONFIG", str(config_path))
         server = modules[1]
-        server._STORE = server.SpaceStore.from_env()
+        server._STORE = None
+        server.get_store()
         server._STORE.check_schema(server.SERVICE)
         yield server._STORE
     finally:

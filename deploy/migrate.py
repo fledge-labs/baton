@@ -71,6 +71,7 @@ def migrate():
         conn.execute('GRANT USAGE ON SCHEMA baton TO baton_app')
         conn.execute('REVOKE ALL ON ALL TABLES IN SCHEMA baton FROM baton_app')
         conn.execute('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA baton TO baton_app')
+        conn.execute('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA baton TO baton_app')
         conn.execute('REVOKE ALL ON TABLE baton.x_audit FROM baton_app')
         conn.execute('GRANT SELECT, INSERT ON TABLE baton.x_audit TO baton_app')
         conn.execute('REVOKE ALL ON TABLE baton.schema_version FROM baton_app')

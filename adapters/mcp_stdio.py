@@ -21,7 +21,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
-TOOLS = {"submit_task", "get_task", "list_tasks", "fetch_inbox", "create_space", "get_space", "list_spaces",
+TOOLS = {"submit_task", "get_task", "list_tasks", "fetch_inbox", "wait_inbox", "create_space", "get_space", "list_spaces",
          "create_page", "get_page", "list_pages", "create_block", "get_block", "list_blocks", "update_block",
          "revert_block", "share", "effective_role", "create_team", "set_team_member", "comment", "list_comments",
          "mention", "proposal_create", "proposal_review", "get_proposal", "list_proposals", "list_attribution",
