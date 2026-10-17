@@ -10,6 +10,7 @@ Baton 自有代码和原创配置示例使用 [Apache-2.0](../LICENSE)。第三�
 
 - **agentgateway `v1.6.0`**：MCP/HTTP 网关；SPDX `Apache-2.0`。[该版本 LICENSE](https://github.com/agentgateway/agentgateway/blob/v1.6.0/LICENSE)。镜像固定为 `sha256:9d3e6044ddcdc0878b1787f77bd401252b95e22684203fb5e874c4c42d2ed90c`，完整镜像引用见版本清单。
 - **MCP Python SDK `mcp==1.30.0`**：stdio 适配器及 MCP 协议支持；SPDX `MIT`。[`v1.30.0` LICENSE](https://github.com/modelcontextprotocol/python-sdk/blob/v1.30.0/LICENSE)。
+- **cryptography `cryptography==50.0.2`**：A2A Agent Card 的 ES256（P-256 ECDSA）签名与验证、签名密钥生成（`bridge/a2a_public.py`）；包的 license expression 为 SPDX `Apache-2.0 OR BSD-3-Clause`（可任选其一）。[固定版本 LICENSE](https://github.com/pyca/cryptography/blob/50.0.2/LICENSE)、[LICENSE.APACHE](https://github.com/pyca/cryptography/blob/50.0.2/LICENSE.APACHE)、[LICENSE.BSD](https://github.com/pyca/cryptography/blob/50.0.2/LICENSE.BSD)、[包元数据](https://pypi.org/project/cryptography/50.0.2/)。已在 `deploy/requirements.txt` 中精确固定并带哈希；wheel 内含的 OpenSSL 保留其自己的许可证。
 
 ## PostgreSQL 与驱动
 

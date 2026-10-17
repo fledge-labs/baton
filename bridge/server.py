@@ -25,9 +25,9 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 
-from bridge import common, webhooks
+from bridge import a2a_public, common, webhooks
 from bridge.common import AuthMiddleware, audit, safe_id, transport_origins, uuid_id
-from bridge.space_store import SERVICE_ACTOR, Actor, SpaceStore, StoreError
+from bridge.space_store import SERVICE_ACTOR, Actor, StoreError
 
 PROTOCOL = common.SPACE_PROTOCOL
 SERVICE = SERVICE_ACTOR
@@ -46,6 +46,7 @@ ERRORS = {
     "dependency_blocked": (409, "Task dependencies are not complete"),
     "graph_cycle": (409, "Dependency graph contains a cycle"),
     "work_face_incomplete": (409, "Task work face is incomplete"),
+    "task_canceled": (409, "Task was canceled through A2A"),
     "rate_limited": (429, "Too many requests"),
     "storage_unavailable": (503, "Storage is unavailable"),
 }
@@ -288,7 +289,7 @@ def principal_directory(principal):
 def get_store():
     global _STORE
     if _STORE is None:
-        _STORE = SpaceStore.from_env(principal_directory)
+        _STORE = a2a_public.CancelAwareStore.from_env(principal_directory)
     return _STORE
 
 
@@ -630,6 +631,16 @@ async def space_schema():
     }, "aliases": ALIASES}
 
 
+@app.post(a2a_public.RPC_PATH)
+async def a2a_rpc(request: Request):
+    return await a2a_public.handle_rpc(request, store=get_store(), call=store_call, actor=request_actor(request), waker=WAKEUP)
+
+
+@app.get(a2a_public.DIRECTORY_PATH)
+async def a2a_directory(request: Request):
+    return await a2a_public.directory_response(a2a_public.Context(get_store(), store_call, request_actor(request), waker=WAKEUP))
+
+
 @app.get("/board/data")
 async def board_data(request: Request):
     tasks = await invoke("list_tasks", {}, request)
@@ -639,7 +650,7 @@ async def board_data(request: Request):
 
 
 app.mount("/", mcp.streamable_http_app())
-app = AuthMiddleware(app, role="client")
+app = a2a_public.PublicDiscovery(AuthMiddleware(app, role="client"))
 
 
 if __name__ == "__main__":
