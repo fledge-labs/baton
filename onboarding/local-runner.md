@@ -59,6 +59,9 @@ worktree 保留在磁盘上供审阅（改动不会自动提交或推送）。�
       "workdir_root": "<WORK_ROOT>/huanggua",
       "task_timeout_seconds": 1800,
       "home": "real",
+      "home_read": [
+        "~/.codex"
+      ],
       "env_passthrough": [],
       "sandbox": {
         "backend": "sandbox-exec",
@@ -80,6 +83,9 @@ worktree 保留在磁盘上供审阅（改动不会自动提交或推送）。�
       "workdir_root": "<WORK_ROOT>/haimigua",
       "task_timeout_seconds": 1800,
       "home": "real",
+      "home_read": [
+        "~/.config/grok"
+      ],
       "env_passthrough": [],
       "sandbox": {
         "backend": "sandbox-exec",
@@ -101,6 +107,9 @@ worktree 保留在磁盘上供审阅（改动不会自动提交或推送）。�
       "workdir_root": "<WORK_ROOT>/mugua",
       "task_timeout_seconds": 1800,
       "home": "real",
+      "home_read": [
+        "~/.gemini/antigravity-cli"
+      ],
       "env_passthrough": [],
       "sandbox": {
         "backend": "sandbox-exec",
@@ -124,6 +133,10 @@ worktree 保留在磁盘上供审阅（改动不会自动提交或推送）。�
       "workdir_root": "<WORK_ROOT>/sigua",
       "task_timeout_seconds": 1800,
       "home": "real",
+      "home_read": [
+        "~/.config/opencode",
+        "~/.local/share/opencode"
+      ],
       "env_passthrough": [],
       "sandbox": {
         "backend": "sandbox-exec",
@@ -146,6 +159,9 @@ worktree 保留在磁盘上供审阅（改动不会自动提交或推送）。�
       "workdir_root": "<WORK_ROOT>/kugua",
       "task_timeout_seconds": 1800,
       "home": "real",
+      "home_read": [
+        "~/.cline"
+      ],
       "env_passthrough": [],
       "sandbox": {
         "backend": "sandbox-exec",
@@ -168,6 +184,10 @@ worktree 保留在磁盘上供审阅（改动不会自动提交或推送）。�
       "workdir_root": "<WORK_ROOT>/digua",
       "task_timeout_seconds": 1800,
       "home": "real",
+      "home_read": [
+        "~/.config/devin",
+        "~/.local/share/devin"
+      ],
       "env_passthrough": [],
       "sandbox": {
         "backend": "sandbox-exec",
@@ -189,6 +209,9 @@ worktree 保留在磁盘上供审阅（改动不会自动提交或推送）。�
       "workdir_root": "<WORK_ROOT>/xianggua",
       "task_timeout_seconds": 1800,
       "home": "real",
+      "home_read": [
+        "~/.config/dsh"
+      ],
       "env_passthrough": [],
       "env_from_keychain": {
         "DEEPSEEK_API_KEY": "fledge-deepseek-key"
@@ -228,7 +251,7 @@ worktree 保留在磁盘上供审阅（改动不会自动提交或推送）。�
 
 西瓜（Muse）worker 暂时不加入（temporarily not joining）：示例里保留了它的完整模板，但 `"enabled": false`，执行器会跳过它，既不读取它的令牌，也不轮询 Baton。要启用时把它改成 `true`（或删掉这一行，默认是 `true`），并先核对下文“与 Muse 自带沙箱叠加”里标注“未验证”的各项。
 
-`home: "real"` 与 `extra_write_paths` 里的 `<…_STATE_DIR>` 是占位：这些 CLI 的登录态和会话通常写在真实 `HOME` 下，需要操作者确认各自的实际目录并填入（目录必须已存在，否则该 worker 拒绝启动）；本仓库没有验证各 CLI 的状态目录。Linux 上把 `backend` 换成 `bwrap`。
+`home_read` 是各 CLI 只读放行的配置/登录态目录（`HOME` 默认拒绝，见“沙箱：HOME 默认拒绝”），`extra_write_paths` 里的 `<…_STATE_DIR>` 是占位：这些 CLI 写会话和缓存的目录需要操作者确认并填入（`extra_write_paths` 目录必须已存在，否则该 worker 拒绝启动）。本仓库没有验证各 CLI 的实际目录，`home_read` 示例里除 Codex 外都要在操作者的机器上核对。西瓜（Muse）的模板没有 `home_read`，启用前需要补上。Linux 上把 `backend` 换成 `bwrap`。
 
 可选的全局字段：`pin_sha256`（叶证书公钥 SHA-256 钉扎，同 `baton_cli.py --pin-sha256`）、`default_branch`（默认 `main`）、`request_timeout`、`lease_margin_seconds`（默认 60）、`renew_interval_seconds`、`retry_delay_seconds`（失败后重试前的等待，默认 30）、`output_cap_bytes`、`poll_timeout_seconds`。未知字段会被拒绝，避免拼写错误悄悄失效。
 
@@ -250,6 +273,8 @@ worker 字段：
 | `env_from_keychain` | 对象：环境变量名 → macOS Keychain 通用密码的服务名；启动子进程时才读取，只给该 worker 的子进程。只支持 macOS，且必须有沙箱，见“香瓜”一节 |
 | `sandbox.backend` | `sandbox-exec`、`bwrap` 或 `none` |
 | `sandbox.allow_network` | 默认 `true`；设为 `false` 时 CLI 无法访问模型 API |
+| `home_read` | 路径列表，必须在 `HOME` 之内：该 CLI 自己真正需要读取的配置/登录态目录。沙箱默认拒绝读写整个 `HOME`，只放行这里列出的路径（只读）、任务 worktree 和临时目录；见“沙箱：HOME 默认拒绝”。默认空 |
+| `allow_keychain` | 布尔值，默认 `false`。默认每个有沙箱的 worker 都被拒绝读取 macOS Keychain；设为 `true` 会关闭这项防护，并在日志里打印醒目警告 |
 | `sandbox.extra_write_paths` | 沙箱内额外可写的已存在目录（例如 CLI 把登录态或会话写在 `HOME` 下） |
 
 用 `python3 adapters/local_runner.py --config <CONFIG_FILE> --check` 检查配置和每个 worker，再不带 `--check` 启动。`SIGINT`/`SIGTERM` 会终止正在运行的子进程并退出。
@@ -299,11 +324,12 @@ worker 字段：
 - **输出脱敏**：捕获到的子进程输出里，该值与令牌同样做字面脱敏（含截断处残留的片段），发评论和结果前处理。
 - **缺失处理**：任何一项读取失败（不存在、为空、Keychain 锁定或无法运行 `security`）都让该任务失败：不启动命令，`mark_blocked(reason_code="other", note="keychain item missing")`，并按 `max_failures_per_task` 计失败。消息固定，不透露任何条目（包括其他条目）的名称。
 - **平台与沙箱**：只支持 macOS。在其他平台上，带 `env_from_keychain` 的 worker 会被拒绝启动（配置错误，不会悄悄忽略）。同时必须配置 `none` 以外的沙箱后端，否则同样拒绝启动：没有沙箱时，子进程自己就能运行 `security` 读取整个 Keychain。
-- **沙箱对 Keychain 的限制**（`sandbox-exec` 配置，仅对使用 `env_from_keychain` 的 worker 生成）：
+- **沙箱对 Keychain 的限制**（`sandbox-exec` 配置；**默认对每个有沙箱的 worker 都生效**，不只是使用 `env_from_keychain` 的 worker）：
   - 禁止读取文件：`~/Library/Keychains` 和 `/Library/Keychains`（以真实路径为准）。
   - 禁止 `mach-lookup` 的服务，正好是这五个：`com.apple.SecurityServer`、`com.apple.securityd`、`com.apple.security.agent`、`com.apple.secd`、`com.apple.security.authhost`。
-  - 这样子进程除了注入的那个环境变量，没有别的途径拿到 Keychain 里的密钥。
-  - 该配置文本由测试检查内容，但没有在 macOS 上真实执行；上面五个服务名是否覆盖了目标 macOS 版本上所有 Keychain 相关服务，**未验证**。副作用同样未验证：`/Library/Keychains` 里管理员安装的根证书对子进程不可读，访问依赖这些证书的内网 TLS 站点可能失败；依赖 Keychain 保存登录态的 CLI 在这个沙箱里也会失败，所以不要给这类 worker 配 `env_from_keychain`。
+  - 这样子进程除了注入的那个环境变量，没有别的途径拿到 Keychain 里的密钥。`env_from_keychain` 照常可用，因为读 Keychain 的是执行器而不是子进程。
+  - 只有 worker 设置 `allow_keychain: true` 才会取消这些限制：执行器启动时会写一行 `WARNING allow_keychain=true`，文档和日志都提醒——这样该 CLI（以及任何让它照做的任务文字）可以读 Keychain 里的任何东西并经网络发出去，除非 CLI 确实要用 Keychain 保存登录态，否则不要开。
+  - 该配置文本由测试检查内容，但没有在 macOS 上真实执行；上面五个服务名是否覆盖了目标 macOS 版本上所有 Keychain 相关服务，**未验证**。副作用同样未验证：`/Library/Keychains` 里管理员安装的根证书对子进程不可读，访问依赖这些证书的内网 TLS 站点可能失败；依赖 Keychain 保存登录态的 CLI 在这个沙箱里会失败：这种 CLI 要么改用 `env_from_keychain` 之类的环境变量注入，要么对该 worker 显式设 `allow_keychain: true` 并接受上述风险。
 
 **限制，请明确知晓**：被注入的 API key 就在子进程自己的环境变量里（这正是目的），所以恶意或被攻破的 CLI 完全可以通过网络把**这把 key** 发出去。沙箱只能阻止它读取**其他**密钥（其他 Keychain 条目、令牌目录、`~/.ssh` 等），不能保护已经交给它的这一把。因此要给这把 key 设置最小额度、独立的账号和告警，并默认网络放行的前提下假设它可能泄露。执行器的脱敏只覆盖发回 Baton 的文本，不能阻止子进程自己把它发往别处。
 
@@ -323,10 +349,46 @@ worker 字段：
 
 - `muse exec` 从 stdin 还是文件读取提示词，具体参数是什么。模板里的 `["muse", "exec"]` 加 `stdin` 只是占位，请对照 `muse exec --help` 调整；若它需要文件参数，把 `prompt_via` 改为 `file` 并在 argv 中放一项 `{prompt_file}`。
 - macOS 的 `sandbox-exec` 通常不允许在已经受限的进程里再套一层 Seatbelt。如果 Muse 在 `muse exec` 启动时会自行施加系统沙箱，它在执行器的沙箱里可能失败（未验证）。遇到这种情况，用 `muse sandbox` 检查并把 Muse 自己的沙箱配成关闭或“已由外层沙箱限制”（具体子命令和选项未验证），保留执行器的沙箱；不要反过来关闭执行器的沙箱。
-- Muse 的登录态或配置放在哪里（`HOME` 下哪个目录、是否用 Keychain）未验证。模板用 `home: "real"` 并把状态目录写进 `sandbox.extra_write_paths`（`<MUSE_STATE_DIR>` 是占位）；确认实际目录后填写，目录不存在时该 worker 拒绝启动。
+- Muse 的登录态或配置放在哪里（`HOME` 下哪个目录、是否用 Keychain）未验证。模板用 `home: "real"`，并需要把它的配置/登录目录写进 `home_read`、把要写入的目录写进 `sandbox.extra_write_paths`（`<MUSE_STATE_DIR>` 是占位）；沙箱默认拒绝整个 `HOME`，也默认拒绝 Keychain，如果 Muse 把登录态放在 Keychain，它在沙箱里会失败，需要 `allow_keychain: true` 并接受其风险（均未验证）。确认实际目录后填写，`extra_write_paths` 目录不存在时该 worker 拒绝启动。
 - Muse 是否读取需要透传的环境变量（API key 等）未验证，需要时再加进 `env_passthrough`。
 
 建议先用不含敏感内容的小任务验证：先在执行器沙箱之外手工跑 `muse sandbox` 看当前状态，再让执行器跑一个只写一个文件的任务，核对评论、结果和 worktree 里的改动。
+
+## 沙箱：HOME 默认拒绝
+
+**威胁模型**：任务文字是不可信数据，而 CLI 默认可以联网。一个被提示词注入的任务，可以让 CLI 去读它能读到的任何文件，再经网络发出去。所以沙箱不能只遮住几个已知的敏感目录，而要把操作者的整个 `HOME` 当作“默认拒绝”：其他 CLI 的登录目录、云厂商 CLI 配置（`~/.aws`、`~/.config/hcloud`、`~/.config/gh`、`~/.docker/config.json`、`~/.kube`、`~/.netrc`、`~/.gnupg`）、浏览器资料、其他仓库和产物，默认全部读不到。
+
+对每个有沙箱的 worker（两种后端相同）：
+
+- `sandbox-exec`：先对 `HOME`（以及它的真实路径）整体 `deny file-read*` 和 `deny file-write*`，再重新放行任务 worktree 和临时目录的读写、`extra_write_paths` 的读写，以及该 worker 自己的 `home_read` 的**只读**。`HOME` 之外的系统路径保持 `(allow default)`，CLI 才能运行。为了让 `stat`/`realpath` 之类调用不失败，只对 `HOME` 及放行路径的各级上级目录放行元数据（`file-read-metadata`），目录内容仍然读不到。
+- `bwrap`：先用空的 tmpfs 盖住 `HOME`，再只读绑定每个 `home_read` 路径，再读写绑定 worktree 和临时目录；最后把这些 tmpfs 重新挂成只读，所以 `HOME` 里除了放行的路径，既读不到也写不了。
+- 执行器自动只读放行两样东西（只要它们在 `HOME` 里）：命令第一个元素解析出的可执行文件（例如 `~/.local/bin/devin`），以及目标仓库的 git 目录（让 worktree 里的 `git status` 能用；它含仓库历史和配置，所以仓库的 remote 不要带内嵌凭据）。CLI 的运行时目录（例如 `nvm`/`npm` 的全局安装目录、虚拟环境）不会自动放行，需要时自己写进 `home_read`。
+- CLI 需要写会话、缓存或登录态的目录，写进 `sandbox.extra_write_paths`（读写），而不是 `home_read`（只读）。
+
+`home_read` 在加载配置时校验，不合格就拒绝启动：每项必须在 `HOME` 之内（不能是 `HOME` 本身），不能是、不能包含、也不能落在这些路径里：任一令牌目录、`state_dir`、配置文件、`~/.ssh`、任一 worker 的 `workdir_root`；按真实路径比较，符号链接也不能绕过。每个 worker 只能放行自己 CLI 的目录：如果它的某项是、包含或落在另一个 worker 的 `home_read` 项里，而它自己没有列出同一项，就被拒绝。`extra_write_paths` 受同样的保护检查，并且不能是 `HOME` 或包含 `HOME`。
+
+各 CLI 的 `home_read` 示例（来自上面的配置示例）。标“核对”的目录**没有从官方文档确认**，必须在操作者自己的机器上核对（CLI 实际把配置、登录态放在哪里，运行时有没有别的依赖目录），多放一个目录就多一份泄露面，少放则 CLI 无法登录或启动：
+
+| 代号 | `home_read` | 依据 |
+| --- | --- | --- |
+| 黄瓜（Codex） | `~/.codex` | Codex 默认的配置目录（`CODEX_HOME`）；仍请核对 |
+| 哈密瓜（grok） | `~/.config/grok` | 核对：本地 grok CLI 的实际目录未确认 |
+| 木瓜（agy） | `~/.gemini/antigravity-cli` | 来自 [agy 接入页](agy.md)引用的官方权限配置路径；`~/.gemini` 的其他子目录可能放着别的 CLI 的凭据，所以只放行这一个；核对登录态位置 |
+| 丝瓜（opencode） | `~/.config/opencode`、`~/.local/share/opencode` | 核对：配置与认证数据的实际位置 |
+| 苦瓜（Cline） | `~/.cline` | 来自 [Cline 接入页](cline.md)引用的官方文档路径（`~/.cline/data/settings`）；核对 |
+| 地瓜（Devin CLI） | `~/.config/devin`、`~/.local/share/devin` | 核对：Devin CLI 的实际目录未确认；可执行文件 `~/.local/bin/devin` 自动放行 |
+| 香瓜（dsh） | `~/.config/dsh` | 核对：dsh 的实际目录未确认；API key 用 `env_from_keychain` 注入，不需要放行 Keychain |
+
+沙箱**能**防什么：被注入的任务读走 `HOME` 里其他 CLI 的登录目录和云凭据、浏览器资料、其他仓库和产物；读走令牌目录、`~/.ssh`、执行器状态和配置、其他 worker 的 worktree 和 `home_read`；读 macOS Keychain（默认）；写 worktree、临时目录和 `extra_write_paths` 之外的任何位置。
+
+沙箱**不能**防什么：
+
+- 该 CLI **自己**的 `home_read` 目录和注入的环境变量：它们本来就要交给 CLI，被攻破的 CLI 可以读出来发走（包括 CLI 的登录 token 和模型 API key）。
+- worktree 里的全部内容（目标仓库在 `base_commit` 的快照）以及仓库 git 目录里的历史。
+- `HOME` 之外、操作者账户本来就能读的位置：系统目录、`/tmp`、`/opt`、`/srv`、挂载的外部卷、位于 `HOME` 之外的仓库和产物。要保护的东西请放在 `HOME` 里，或使用专用账户或虚拟机。
+- 网络：默认放行，所以任何能读到的内容都可以发出去。
+- `backend: "none"`：没有任何隔离。
+- macOS 的 `sandbox-exec` 规则（HOME 拒绝、再放行、元数据放行、Keychain 拒绝）由测试检查生成的配置文本，**没有在 macOS 上真实执行**；上线前请在目标机器上用一个读取 `~/.aws` 之类无害文件的任务验证。
 
 ## 安全模型
 
@@ -336,7 +398,9 @@ worker 字段：
 - **Keychain 注入的 key**：`env_from_keychain` 的值只在启动时读取、只给该 worker 的子进程，不落盘、不写日志并从输出里脱敏；子进程自己能看到它，沙箱不能保护这一把 key（见“香瓜”一节）。
 - **沙箱**（`sandbox-exec` 或 `bwrap`）：
   - 禁止读取：令牌所在的整个目录（`~/.config/baton-runner/`，不只是当前 worker 的令牌文件）、`~/.ssh`、执行器的 `state_dir` 和配置文件、其他 worker 的 `workdir_root`（以及本 worker 其他任务的 worktree）。
-  - 禁止写入：任务 worktree、该任务的临时目录以及 `extra_write_paths` 之外的所有位置。`bwrap` 下系统整体只读，用 tmpfs 盖住上述目录。
+  - `HOME` 默认拒绝读写：只放行该 worker 自己的 `home_read`（只读）、worktree、临时目录和 `extra_write_paths`，详见上一节。
+  - macOS Keychain 默认拒绝（`allow_keychain: true` 才取消，并打印警告）。
+  - 禁止写入：任务 worktree、该任务的临时目录以及 `extra_write_paths` 之外的所有位置。`bwrap` 下系统整体只读，用 tmpfs 盖住上述目录，再把这些 tmpfs 挂成只读。
   - 子进程在独立进程组；`bwrap` 另有独立 PID 命名空间，超时或停止时整组被杀。
 - **审批绕过开关与隐式自动批准**：`implicit_auto_approve` 为 `true` 的 worker 与下面的情形同样处理。`command` 含已知的绕过审批开关时（`--dangerously-skip-permissions`、`--dangerously-bypass-approvals-and-sandbox`、`--yolo`、`--full-auto`、`--auto`、`--auto-approve`、`-y`、`--yes`、`bypassPermissions`，不区分大小写，也匹配 `--flag=值` 形式），沙箱后端为 `none` 的 worker 会被拒绝启动并写日志。执行器不会悄悄增删任何参数；用不用这些开关由操作者决定。
 - **日志**：不打印任何密钥，日志行只含任务 ID、principal、退出码和耗时。评论、结果和证据里对每个已知令牌值（以及 `env_passthrough` 的值）做字面脱敏，包括截断处残留的令牌片段。
@@ -344,7 +408,7 @@ worker 字段：
 限制，请明确知晓：
 
 - **网络默认放行**：CLI 要访问模型 API，所以默认不限制网络。沙箱不能阻止 CLI 把它能读到的内容发往外部。只有在 CLI 完全不需要网络时才设 `allow_network: false`。
-- CLI 以**操作者自己的系统账户**运行，只是被沙箱收窄：沙箱外的其他可读文件（例如 `~/.aws`、浏览器资料、仓库之外的源码）仍然可读，`home: "real"` 时尤其如此。不要把敏感数据放在这个账户可读的位置，或使用专用账户/虚拟机。
+- CLI 以**操作者自己的系统账户**运行，只是被沙箱收窄：`HOME` 默认拒绝，但 `HOME` 之外该账户能读的文件（系统目录、`/tmp`、其他位置的仓库和产物）仍然可读，已放行的 `home_read` 目录也对 CLI 完全可读。不要把敏感数据放在这个账户在 `HOME` 之外可读的位置，或使用专用账户/虚拟机。
 - 沙箱不是虚拟机：它依赖内核和 `bwrap`/`sandbox-exec` 的正确性。`backend: "none"` 下没有任何隔离，同账户的子进程还可能观察执行器进程。`sandbox-exec` 在 macOS 上已被标为弃用但仍可用。`sandbox-exec` 的配置文本由测试检查内容，但没有在 CI 里的 macOS 上真实执行，上线前请在目标机器上用无害任务验证。
 - 使用哪些 CLI 开关由操作者决定。执行器只拒绝“绕过审批却没有沙箱”的组合，并不判断 `--sandbox workspace-write`、网络开关等其他参数是否合适。
 - 评论和结果里是 CLI 的原始输出摘要（已脱敏、已截断），审阅人应把它当作不可信文本。
