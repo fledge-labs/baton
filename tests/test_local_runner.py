@@ -1606,9 +1606,14 @@ def test_anything_off_the_allow_list_is_never_grantable(tool):
     assert lr.is_ungrantable(tool)
 
 
-@pytest.mark.parametrize("tool", ["rg", "sed", "/usr/bin/rg", "RG"])
-def test_only_rg_and_sed_are_grantable_programs(tool):
+@pytest.mark.parametrize("tool", ["rg", "/usr/bin/rg", "RG"])
+def test_only_rg_is_a_grantable_program(tool):
     assert not lr.is_ungrantable(tool)
+
+
+def test_sed_is_not_grantable_until_it_has_its_own_design():
+    assert lr.is_ungrantable("sed")
+    assert "allow-list" in lr.argument_problem("sed", "sed -n 's/a/b/p'", "/work/wt")
 
 
 @pytest.mark.parametrize("command,fragment", [
@@ -1617,26 +1622,11 @@ def test_only_rg_and_sed_are_grantable_programs(tool):
     ("rg -- --pre", None),
     ("/usr/bin/rg -n TODO", None),
     ("rg --pre cmd TODO", "--pre"),
-    ("rg --pre-glob '*.py' TODO", "--pre"),
+    ("rg --pre-glob '*.py' TODO", "shell"),
     ("rg TODO --pre=cmd", "--pre"),
     ("rg --pre-glob=*.c TODO", "--pre"),
-    ("sed -n 's/a/b/p' file", None),
-    ("sed -e 's/a/bee/g'", None),
-    ("sed '# the letter e is a comment'", None),
-    ("sed '1,$d'", "shell"),
-    ("sed -e 's/a/b/e'", "s///e"),
-    ("sed 'e'", "e command"),
-    ("sed 's/a/b/;e'", "shell"),
-    ("sed '1e'", "e command"),
-    ("sed -f /tmp/script", "-f"),
-    ("sed -i 's/a/b/'", "worktree"),
-    ("sed -i 's/a/b/' /etc/passwd", "worktree"),
-    ("sed -i 's/a/b/' /work/wt/file", None),
-    ("sed 'w /etc/x'", "worktree"),
-    ("sed 'w /work/wt/out'", None),
-    ("sed 's/a/b/w /etc/x'", "worktree"),
-    ("sed 's/a/b/w /work/wt/out'", None),
-    ("sed 'w ../outside'", "worktree"),
+    ("sed -n 's/a/b/p' file", "allow-list"),
+    ("sed -ne 'e touch marker' input", "allow-list"),
     ("git status", "allow-list"),
     ("git diff --stat", "allow-list"),
     ("git diff --output=/tmp/out", "allow-list"),
@@ -1649,8 +1639,6 @@ def test_grantable_tools_keep_a_fixed_argument_policy(command, fragment):
     tool = command.split()[0].strip("'")
     if tool.startswith("/"):
         tool = "rg"
-    elif tool.startswith("sed"):
-        tool = "sed"
     elif tool.startswith("git"):
         tool = "git"
     got = lr.argument_problem(tool, command, "/work/wt")
@@ -1661,31 +1649,43 @@ def test_grantable_tools_keep_a_fixed_argument_policy(command, fragment):
 
 
 @pytest.mark.parametrize("command", [
-    "rg x && python3", "rg x || python3", "rg x | sh", "sed 's/a/b/'; sh", "rg `id`", "rg $(id)",
-    "rg foo > /tmp/out", "rg foo < /etc/passwd", "rg a\nb",
+    "rg x && python3", "rg x || python3", "rg x | sh", "rg `id`", "rg $(id)",
+    "rg foo > /tmp/out", "rg foo < /etc/passwd", "rg a\nb", "rg 'foo'", "rg foo\\bar",
 ])
 def test_shell_control_operators_are_refused_before_shlex(command):
-    tool = "sed" if command.startswith("sed") else "rg"
-    got = lr.argument_problem(tool, command, "/work/wt")
+    got = lr.argument_problem("rg", command, "/work/wt")
     assert got and "shell" in got, got
 
 
-def test_a_truncated_command_is_refused_and_the_shim_still_sees_the_full_argv():
+def test_a_long_command_is_judged_on_the_full_capture_not_the_clipped_field():
     hidden = "rg -n " + ("a" * 400) + " --pre=sh"
     clipped = lr.one_line(hidden, lr.FIELD_CHARS)
     assert "--pre" not in clipped and lr.argument_problem("rg", clipped, "/work/wt") is None
-    assert "truncated" in lr.argument_problem("rg", hidden, "/work/wt")
+    assert "--pre" in lr.argument_problem("rg", hidden, "/work/wt")
     output = 'Permission denied: run_command "%s" is not in permissions.allow (cwd: /work/wt)\n' % hidden
     denial = lr.detect_denial("agy", output)
-    assert denial.tool == "rg" and denial.command_full == hidden and "--pre" not in denial.command
+    assert denial.tool == "rg" and denial.command_full == hidden and denial.capture_problem is None
+    assert "--pre" not in denial.command
     permissions = lr.PermissionConfig("agy", "/x", ["boss"])
-    assert "truncated" in lr.refusal_grant_problem(permissions, "w1", denial.tool, denial.command_full, "/work/wt", [])
+    assert "--pre" in lr.refusal_grant_problem(permissions, "w1", denial.tool, denial.command_full, "/work/wt", [])
     compound = lr.detect_denial("agy", 'Permission denied: run_command "rg x && python3" is not in permissions.allow\n')
-    assert "shell" in lr.refusal_grant_problem(permissions, "w1", compound.tool, compound.command_full, "/work/wt", [])
+    assert compound.capture_problem and "shell" in compound.capture_problem
     assert "--pre" in lr.argv_problem("rg", ["rg", "a" * 5000, "--pre=sh"], "/work/wt")
 
 
-def test_sed_cannot_write_through_a_symlink_that_leaves_the_worktree(tmp_path):
+def test_a_capture_cut_by_a_delimiter_or_a_following_line_is_not_grantable():
+    cut = lr.detect_denial("agy", 'Permission denied: run_command "rg foo" is not in permissions.allow" ; rm -rf x\n')
+    assert cut.tool == "rg" and cut.command_full == "rg foo" and cut.capture_problem
+    assert "continues" in cut.capture_problem
+    quoted = lr.detect_denial("agy", 'Permission denied: run_command "rg \'foo\'" is not in permissions.allow\n')
+    assert quoted.command_full == "rg 'foo'" and quoted.capture_problem and "shell" in quoted.capture_problem
+    following = lr.detect_denial("opencode", "permission requested: bash (rg foo); auto-rejecting\n; rm\n")
+    assert following.tool == "rg" and following.command_full == "rg foo" and "more than one line" in following.capture_problem
+    whole = lr.detect_denial("agy", 'Permission denied: run_command "rg -n TODO" is not in permissions.allow\n')
+    assert whole.capture_problem is None and whole.command_full == "rg -n TODO"
+
+
+def test_a_symlink_is_resolved_before_dotdot_is_collapsed(tmp_path):
     work = tmp_path / "wt"
     outside = tmp_path / "outside"
     work.mkdir()
@@ -1695,10 +1695,11 @@ def test_sed_cannot_write_through_a_symlink_that_leaves_the_worktree(tmp_path):
     (work / "file-link").symlink_to(outside / "target")
     (work / "inside.txt").write_text("x")
     root = str(work)
-    assert "worktree" in lr.argument_problem("sed", "sed 'w link/out'", root)
-    assert "worktree" in lr.argument_problem("sed", "sed -i 's/a/b/' file-link", root)
-    assert lr.argument_problem("sed", "sed -i 's/a/b/' inside.txt", root) is None
-    assert lr.argument_problem("sed", "sed 'w inside-out.txt'", root) is None
+    assert lr._inside_worktree("inside.txt", root)
+    assert not lr._inside_worktree("file-link", root)
+    assert not lr._inside_worktree("link/out", root)
+    assert not lr._inside_worktree("link/../target", root)
+    assert lr._inside_worktree("missing/../inside.txt", root)
 
 
 def test_one_line_never_adds_a_newline_or_exceeds_its_limit():
@@ -1902,7 +1903,8 @@ def test_a_grant_is_written_audited_and_withdrawn_through_the_ledger(tmp_path, m
     assert record["directory"] == "/work/w1" and record["rule"] == agy_rule()
     assert "--pre" in shim_text and "/work/w1" in shim_text and record["real"] in shim_text
     assert record["real"] not in json.loads(settings.read_text())["permissions"]["allow"]
-    assert recorder.calls == [("record_permission", {"task_id": "t1", "request_id": "r1", "event": "granted"})]
+    assert recorder.calls[0][0] == "record_permission"
+    assert recorder.calls[0][1]["event"] == "granted" and recorder.calls[0][1]["operation_id"]
     assert keeper.revoke(record["id"]) is True and keeper.revoke(record["id"]) is None
     assert json.loads(settings.read_text())["permissions"]["allow"] == ["mine"]
     assert recorder.calls[-1][1]["event"] == "revoked"
@@ -1930,6 +1932,37 @@ def test_overlapping_grants_of_the_same_rule_keep_it_until_the_last_is_withdrawn
     assert json.loads(settings.read_text())["permissions"]["allow"] == []
 
 
+def test_a_lost_grant_response_is_replayed_before_the_revoke_is_reported(tmp_path, monkeypatch):
+    settings, keeper, recorder = keeper_for(tmp_path, monkeypatch)
+    store = {}
+
+    def write(operation, arguments):
+        operation_id = arguments["operation_id"]
+        if operation_id not in store:
+            store[operation_id] = dict(arguments)
+        if arguments.get("event") == "granted" and write.lose:
+            raise lr.cli.NetworkError("reset")
+        recorder.calls.append((operation, dict(arguments)))
+        return {"event": store[operation_id]["event"]}
+
+    write.lose = True
+    keeper.baton.write = write
+    with pytest.raises(lr.RunnerError, match="withdrawn"):
+        keeper.grant(request_view(), "rg", "/work/w1")
+    assert json.loads(settings.read_text())["permissions"]["allow"] == []
+    record = next(iter(keeper.ledger.load().values()))
+    assert record["status"] == "revoked" and record["granted_reported"] is False and record["revoked_reported"] is False
+    assert record["granted_operation_id"]
+    write.lose = False
+    keeper.reconcile()
+    events = [call[1]["event"] for call in recorder.calls]
+    assert events == ["granted", "revoked"]
+    assert recorder.calls[0][1]["operation_id"] == record["granted_operation_id"]
+    loaded = keeper.ledger.load()[record["id"]]
+    assert loaded["granted_reported"] is True and loaded["revoked_reported"] is True
+    assert keeper.ledger.unreported() == []
+
+
 def test_a_grant_that_cannot_be_audited_is_withdrawn_again(tmp_path, monkeypatch):
     settings, keeper, recorder = keeper_for(tmp_path, monkeypatch, fail=lambda operation, arguments: arguments["event"] == "granted")
     with pytest.raises(lr.RunnerError, match="withdrawn"):
@@ -1941,10 +1974,10 @@ def test_a_grant_that_cannot_be_audited_is_withdrawn_again(tmp_path, monkeypatch
 def test_reconcile_withdraws_leftover_allow_once_grants_and_keeps_allow_always(tmp_path, monkeypatch):
     settings, keeper, recorder = keeper_for(tmp_path, monkeypatch)
     once = keeper.grant(request_view("r1", "allow_once"), "rg", "/work/w1")
-    always = keeper.grant(request_view("r2", "allow_always", "t2"), "sed", "/work/w1", command="sed -n 's/a/b/p'")
+    always = keeper.grant(request_view("r2", "allow_always", "t2"), "rg", "/work/w1")
     keeper.reconcile()
     allow = json.loads(settings.read_text())["permissions"]["allow"]
-    assert allow == [agy_rule("sed")] and [item["id"] for item in keeper.ledger.active()] == [always["id"]]
+    assert allow == [agy_rule("rg")] and [item["id"] for item in keeper.ledger.active()] == [always["id"]]
     assert once["id"] not in [item["id"] for item in keeper.ledger.active()]
 
 
@@ -2214,13 +2247,23 @@ def test_a_tool_that_would_widen_the_sandbox_is_never_requested(lab, bridge, spa
     assert agy.allow() == agy.initial["permissions"]["allow"]
 
 
+def test_an_incomplete_capture_is_posted_and_an_approval_writes_nothing(lab, bridge, space, agy):
+    message = 'Permission denied: run_command "rg foo" is not in permissions.allow" ; rm -rf x'
+    task_id = assign(space, bridge, "worker")
+    lab.start([agy_worker(lab, bridge, agy, message=message)])
+    request = pending_request(space, task_id)
+    assert request["tool"] == "rg" and "not grantable" in request["reason"]
+    space.owner.write("decide_permission", task_id=task_id, request_id=request["request_id"], option="allow_always")
+    wait_for(lambda: any("was not applied" in body and "Nothing was written" in body for body in comment_bodies(space, task_id))
+             and (task_view(space, task_id)["blocked"] or {}).get("reason_code") == "other",
+             message="the approval that writes nothing")
+    assert agy.allow() == agy.initial["permissions"]["allow"]
+
+
 @pytest.mark.parametrize("message,fragment", [
     ('Permission denied: run_command "rg --pre cat TODO" is not in permissions.allow (cwd: /etc)', "--pre"),
-    ('Permission denied: run_command "sed -e \'s/a/b/e\'" is not in permissions.allow (cwd: {cwd})', "s///e"),
     ('Permission denied: run_command "git -c core.pager=sh status" is not in permissions.allow (cwd: {cwd})', "allow-list"),
-    ('Permission denied: run_command "rg x && python3" is not in permissions.allow (cwd: {cwd})', "shell"),
-    ('Permission denied: run_command "sed \'s/a/b/\'; sh" is not in permissions.allow (cwd: {cwd})', "shell"),
-    ('Permission denied: run_command "%s" is not in permissions.allow (cwd: {cwd})' % ("rg -n " + "a" * 400 + " --pre=sh"), "truncated"),
+    ('Permission denied: run_command "%s" is not in permissions.allow (cwd: {cwd})' % ("rg -n " + "a" * 400 + " --pre=sh"), "--pre"),
     ('Permission denied: run_command "mksh -c id" is not in permissions.allow (cwd: {cwd})', "allow-list"),
 ])
 def test_commands_outside_the_argument_policy_are_never_requested(lab, bridge, space, agy, message, fragment):
@@ -2410,6 +2453,21 @@ def test_a_pending_request_expires_after_its_ttl_and_when_the_lease_is_gone(brid
     assert task_view(space, task_id)["blocked"] is None
 
 
+def test_an_expired_request_does_not_clear_a_later_waiting_input_from_the_same_worker(bridge, space):
+    task_id = assign(space, bridge, "worker", scopes=[{"kind": "none"}])
+    claimed = claim_for(bridge, "worker", task_id, lease=1)
+    ask(bridge, "worker", task_id, claimed["epoch"], ttl_seconds=1)
+    time.sleep(1.3)
+    assert permissions_of(space, task_id)[0]["status"] == "expired"
+    assert events_of(space, task_id).count("permission.expired") == 1
+    assert task_view(space, task_id)["blocked"] is None
+    Api(bridge, "worker").write("mark_blocked", task_id=task_id, reason_code="waiting_input", note="later")
+    assert task_view(space, task_id)["blocked"]["reason_code"] == "waiting_input"
+    assert permissions_of(space, task_id)[0]["status"] == "expired"
+    assert events_of(space, task_id).count("permission.expired") == 1
+    assert task_view(space, task_id)["blocked"]["reason_code"] == "waiting_input"
+
+
 def test_a_request_can_be_cancelled_by_its_worker_or_the_root_and_nobody_else(bridge, space):
     task_id = assign(space, bridge, "worker", scopes=[{"kind": "none"}])
     claimed = claim_for(bridge, "worker", task_id)
@@ -2544,6 +2602,27 @@ def test_rg_ignores_a_ripgrep_config_that_injects_pre(tmp_path, monkeypatch):
     assert ran.returncode == 0 and "hello" in ran.stdout
 
 
+def test_a_spool_fifo_and_a_dev_zero_symlink_do_not_block_the_drain(tmp_path, monkeypatch):
+    _, keeper, recorder = keeper_for(tmp_path, monkeypatch)
+    keeper.grant(request_view("r-spool"), "rg", "/work/w1")
+    spool = Path(lr.spool_dir("w1"))
+    os.mkfifo(spool / "pipe.json")
+    os.symlink("/dev/zero", spool / "zero.json")
+    done = threading.Event()
+
+    def run():
+        keeper.drain_spool()
+        done.set()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert done.wait(2), "drain_spool blocked on a fifo or a symlink"
+    thread.join(1)
+    assert not thread.is_alive()
+    assert not (spool / "pipe.json").exists() and not (spool / "zero.json").exists()
+    assert not any(call[1].get("event") == "shim_refused" for call in recorder.calls)
+
+
 def test_the_refusal_spool_is_bounded_and_untrusted(tmp_path, monkeypatch):
     _, keeper, recorder = keeper_for(tmp_path, monkeypatch)
     record = keeper.grant(request_view("r-spool", "allow_always", "t-spool"), "rg", "/work/w1")
@@ -2567,7 +2646,10 @@ def test_the_refusal_spool_is_bounded_and_untrusted(tmp_path, monkeypatch):
     plant("bad.json", "{")
     plant("list.json", "[1]")
     plant("unk.json", {"grant_id": "no-such", "request_id": "r-spool", "reason": "forged"})
-    valid = {"grant_id": record["id"], "request_id": "r-spool", "task_id": "other-task", "reason": "refused\nline"}
+    secret = "super-secret-token-value"
+    keeper._secrets = (secret,)
+    valid = {"grant_id": record["id"], "request_id": "r-spool", "task_id": "other-task",
+             "reason": "refused\nline " + secret}
     extra = lr.SPOOL_FORWARD_LIMIT + 3
     for index in range(extra):
         plant("v%02d.json" % index, valid)
@@ -2578,7 +2660,8 @@ def test_the_refusal_spool_is_bounded_and_untrusted(tmp_path, monkeypatch):
         forwarded = [call for call in recorder.calls if call[1]["event"] == "shim_refused"]
         assert len(forwarded) == 2
         assert all(call[1]["task_id"] == "t-spool" and call[1]["request_id"] == "r-spool" for call in forwarded)
-        assert all("\n" not in call[1]["reason"] for call in forwarded)
+        assert all("\n" not in call[1]["reason"] and secret not in call[1]["reason"] and lr.REDACTED in call[1]["reason"]
+                   for call in forwarded)
         assert not (spool / "dir.json").exists() and not (spool / "link.json").exists()
         assert not (spool / "big.json").exists() and not (spool / "bad.json").exists() and not (spool / "list.json").exists()
         assert not (spool / "unk.json").exists()
@@ -2656,8 +2739,8 @@ def test_one_pending_grant_that_cannot_be_settled_does_not_stop_the_others(tmp_p
     settings, keeper, _ = keeper_for(tmp_path, monkeypatch)
     work = "/work/w1"
     once = keeper.grant(request_view("r-once", "allow_once", "t-once"), "rg", work)
-    always = keeper.grant(request_view("r-always", "allow_always", "t-always"), "sed", work, command="sed -n 's/a/b/p'")
-    # A rule no live grant holds, so settling the good pending entry can remove it without touching sed's shim.
+    always = keeper.grant(request_view("r-always", "allow_always", "t-always"), "rg", work, command="rg -n TODO")
+    # A rule no live grant holds, so settling the good pending entry can remove it without touching rg's shim.
     planted = "/var/lib/baton-runner/shims/w1/planted"
     lr.edit_rule(settings, lr.CLI_PROFILES["agy"], planted, True)
     grants = keeper.ledger.load()
@@ -2672,8 +2755,7 @@ def test_one_pending_grant_that_cannot_be_settled_does_not_stop_the_others(tmp_p
     keeper.log = lambda task, what, **fields: notes.append((what, fields))
     keeper.reconcile()
     allow = json.loads(settings.read_text())["permissions"]["allow"]
-    assert planted not in allow and agy_rule("rg", work) not in allow
-    assert agy_rule("sed", work) in allow
+    assert planted not in allow and agy_rule("rg", work) in allow
     loaded = keeper.ledger.load()
     assert loaded["bad"]["status"] == "pending" and loaded["good"]["status"] == "revoked"
     assert [item["id"] for item in keeper.ledger.active()] == [always["id"]]

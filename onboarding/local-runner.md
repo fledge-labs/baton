@@ -456,18 +456,19 @@ worker 字段：
 
 ### 允许列表与参数约束
 
-授权不是“按程序名放行”。只有下面两个程序能被写入白名单，而且命令行必须落在写死的参数形态里。不在列表上的程序（shell、解释器、`mksh`、`git`、`grep`、`cat`、`python3.11`、网络客户端、`security`、脚本文件，以及任何没写在这里的名字）一律不发请求，任务按普通失败处理。匹配时只取 basename 并转小写，**不**去掉版本后缀：`python3.11` 不是 `python`，也不是允许列表里的任何一项。
+授权不是“按程序名放行”。目前只有 `rg` 能被写入白名单，而且命令行必须落在写死的参数形态里。不在列表上的程序（shell、解释器、`mksh`、`git`、`sed`、`grep`、`cat`、`python3.11`、网络客户端、`security`、脚本文件，以及任何没写在这里的名字）一律不发可批准的请求，任务按普通失败处理。匹配时只取 basename 并转小写，**不**去掉版本后缀：`python3.11` 不是 `python`，也不是允许列表里的任何一项。再加别的程序需要单独设计，不在这次里做。
 
 | 程序 | 可以授权的形态 | 一律拒绝 |
 | --- | --- | --- |
 | `rg` | 普通搜索。`--` 后面的内容当作模式，不当作选项 | `--pre`、`--pre-glob`（以及 `--pre=`、`--pre-glob=`）：它们会再执行一个程序 |
-| `sed` | 看得见的脚本，且其中没有执行命令；`w`/`W` 和 `-i` 的目标文件必须落在任务 worktree 内（按真实路径，穿过符号链接） | `e` 命令、`s///e`、`-f`/`--file`（脚本不在命令行里，无法检查）、写到 worktree 之外、解析不了的脚本 |
+
+**`sed` 现在不授权。** `-ne` 这类组合选项在 GNU sed 里会把下一个参数当成脚本，手写的解析器会把它当成空脚本。`w` 和 `-i` 的路径也要再写一套解析。这次不实现。
 
 **`git` 现在不授权。** `status`、`log`、`diff`、`show`、`ls-files`、`rev-parse`、`blame` 这些只读子命令仍会按仓库配置执行外部程序：`diff.external`、`textconv`、`core.fsmonitor`，以及 `-p` / `pager.*` 强制打开的 `core.pager`。worktree 里的 `.git` 可写，模型可以把它改指向另一个 gitdir。`git diff --output=` 也能把输出写到 worktree 之外。沙箱挡得住写出 worktree，挡不住这些钩子在沙箱里拉起解释器（网络默认开启）。以后若要加回 `git`，必须单独做，并且只能走写死的绝对路径，强制带上 `-c core.pager=cat --no-pager --no-ext-diff --no-textconv`、`-c core.fsmonitor=false`、`GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL=/dev/null`，并且不读仓库配置。本次不实现这条路径。
 
-批准前，执行器还看 CLI 输出里的**整段命令文本**（检测器捕获的原文，不是裁到 300 字符之后的那一截）。文本里若有 shell 连接符（`;`、`&`、`|`、反引号、`$`、`(`、`)`、`>`、`<`、换行），或者原文长过单行字段、会被裁掉，就直接拒绝、不发请求。`rg x && python3`、`sed 's/a/b/'; sh` 属于前一种。参数策略本身（`--pre`、`s///e`）在 shim 里对**每一次执行的完整 argv** 再查一遍，不拿裁短后的 CLI 文本当依据。
+能不能授权，只看检测器是否完整捕获了**一整行**原文。捕获在引号或括号处截断、这一行后面还有内容、拒绝信息跨了多行，或者捕获文本里有引号、反斜杠或 shell 连接符（`;`、`&`、`|`、反引号、`$`、`(`、`)`、`>`、`<`、换行），请求仍然发出给人看，但标成不可授权：批准之后什么都不写，任务按拒绝结束。`rg foo"; rm` 和第一行是 `rg`、下一行再接命令，都属于这一种。参数策略本身（`--pre`）在 shim 里对**每一次执行的完整 argv** 再查一遍，不拿裁短后的 CLI 文本当依据。
 
-这些限制由 shim 在**每一次执行**时检查，不靠 CLI 白名单的文本。写进白名单的只有 shim 的绝对路径。shim 是执行器生成的一小段标准库 Python（不用 `eval`），解释器是 `/usr/bin/python3` 的绝对路径；它放在任务 worktree 之外、worker 可写目录之外，沙箱里以只读挂载。真实程序的路径在授权时解析并写死，调用用 `execve` 和上面的环境白名单，`rg` 强制 `--no-config`。拒绝时 shim 把 JSON 写到 `~/.local/share/baton-runner/spool/<worker>/`（沙箱里这块是可写的），执行器读到后用自己的令牌调用 `record_permission(event=shim_refused)`。spool 里的内容按不可信数据处理：单次排空有文件数和字节上限，超限或坏掉的删掉并计数，非常规文件不读，转发有速率上限。`shim_refused` 可以重复报告，不改变授权是 `granted` 还是 `revoked`。调用时的工作目录必须在这条授权的 worktree 之内。
+这些限制由 shim 在**每一次执行**时检查，不靠 CLI 白名单的文本。写进白名单的只有 shim 的绝对路径。shim 是执行器生成的一小段标准库 Python（不用 `eval`），解释器是 `/usr/bin/python3` 的绝对路径；它放在任务 worktree 之外、worker 可写目录之外，沙箱里以只读挂载。真实程序的路径在授权时解析并写死，调用用 `execve` 和上面的环境白名单，`rg` 强制 `--no-config`。拒绝时 shim 把 JSON 写到 `~/.local/share/baton-runner/spool/<worker>/`（沙箱里这块是可写的），执行器读到后用自己的令牌调用 `record_permission(event=shim_refused)`。spool 里的内容按不可信数据处理：先 `lstat`，只打开普通文件，并且用 `O_NOFOLLOW|O_NONBLOCK`，有字节上限，不会在管道或符号链接上阻塞；从文件里读出的每个字段都按执行器的密钥做脱敏。单次排空有文件数上限，超限或坏掉的删掉并计数，转发有速率上限。`shim_refused` 可以重复报告，不改变授权是 `granted` 还是 `revoked`。调用时的工作目录必须在这条授权的 worktree 之内。
 
 ### 永远不会通过这条路径授权的东西
 
@@ -492,13 +493,13 @@ python3 adapters/local_runner.py --config <CONFIG_FILE> --revoke-worker <PRINCIP
 
 ### 审计
 
-每一步都有审计，且在任务线程里可见：`permission.requested`（谁、哪个 CLI、程序、目录、原因、点名的 approvers，excerpt 只存 SHA-256）、`permission.decided`（approver、选项、根或委托链）、`permission.cancelled`（worker 或根撤回）、`permission.granted`（执行器报告已写入）、`permission.revoked`、`permission.shim_refused`（shim 拒绝了一次调用，带 `reason`，不改变 grant 状态，可以有多条）。审计的 actor 分别是 worker、approver、worker、worker、worker。无法向 Baton 报告 `granted` 的授权会被撤回并让任务失败，不会留下没有审计的规则；执行器崩溃后下次启动会撤回遗留的 `allow_once` 规则并补报未报告的事件。shim 和 spool 若会落在该 worker 的 worktree 或 `extra_write_paths` 里，这个 worker 拒绝启动。
+每一步都有审计，且在任务线程里可见：`permission.requested`（谁、哪个 CLI、程序、目录、原因、点名的 approvers，excerpt 只存 SHA-256）、`permission.decided`（approver、选项、根或委托链）、`permission.cancelled`（worker 或根撤回）、`permission.granted`（执行器报告已写入）、`permission.revoked`、`permission.shim_refused`（shim 拒绝了一次调用，带 `reason`，不改变 grant 状态，可以有多条）。审计的 actor 分别是 worker、approver、worker、worker、worker。无法向 Baton 报告 `granted` 的授权会被撤回并让任务失败，不会留下没有审计的规则。`granted` 的回执若在服务端已提交后丢失，对账用同一个 `operation_id` 重放；`revoked` 只有服务端确认之后才标成已报告。执行器崩溃后下次启动会撤回遗留的 `allow_once` 规则并补报未报告的事件。请求过期写成一条 `permission.expired`（只写一次）。shim 和 spool 若会落在该 worker 的 worktree 或 `extra_write_paths` 里，这个 worker 拒绝启动。
 
 ### 限制，请明确知晓
 
 - 只在 CLI 以非零退出时检测。一个拒绝了命令但仍以 0 退出的 CLI 不会触发请求。
 - 等待审批期间该任务占用 worker 的一个并发槽（`concurrency`），并且执行器进程要一直在线并持续续租；执行器重启会丢掉这次等待（租约过期后任务回到队列，旧请求变为过期，决定会得到 `409 stale_claim`）。
-- 被拒绝的程序名和参数来自 CLI 输出，而输出可能受不可信的任务文字影响。执行器只对允许列表里的程序、且参数形态通过检查时才发请求；`directory` 一律写成任务自己的 worktree。approver 看到的就是这个程序名和这条 worktree，批准前应核对。`allow_once` 只保留到当前任务这次运行结束。`allow_always` 会留下规则，但规则指向的是写下它的那个 worktree 和写死的参数约束，不是任意参数，也不覆盖该 worker 以后其他任务的 worktree。
+- 被拒绝的程序名和参数来自 CLI 输出，而输出可能受不可信的任务文字影响。执行器只对允许列表里的程序发可批准的请求；捕获不完整或文本含引号、反斜杠、换行、shell 连接符时仍会发出，但标成不可授权，批准什么都不写。参数形态（`--pre`）在 shim 里对完整 argv 再查一遍。`directory` 一律写成任务自己的 worktree。approver 看到的就是这个程序名和这条 worktree，批准前应核对。`allow_once` 只保留到当前任务这次运行结束。`allow_always` 会留下规则，但规则指向的是写下它的那个 worktree 和写死的参数约束，不是任意参数，也不覆盖该 worker 以后其他任务的 worktree。
 - 规则模板与各 CLI 实际接受的语法是否一致未验证；写入的规则是否真被该 CLI 采纳，要靠重跑结果判断（不采纳时表现为再次被拒绝，执行器按失败处理）。
 - `mcp_stdio.py` 适配器的已知工具表没有这四个操作；approver 通过 HTTP、MCP 客户端或 `baton_cli.py call` 使用它们。
 

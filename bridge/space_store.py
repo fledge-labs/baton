@@ -59,7 +59,7 @@ CLAIM_EXPIRING_HORIZON_SECONDS = int(3600 * CLAIM_EXPIRING_FRACTION)
 BLOCK_REASONS = ("scope_conflict", "lease_held", "dependency_blocked", "waiting_input", "other")
 PERMISSION_OPTIONS = ("allow_once", "allow_always", "deny")
 PERMISSION_EVENTS = ("permission.requested", "permission.decided", "permission.granted", "permission.revoked",
-                     "permission.cancelled")
+                     "permission.cancelled", "permission.expired")
 PERMISSION_DEFAULT_TTL = 3600
 PERMISSION_MAX_TTL = 86400
 PERMISSION_GRANT_EVENTS = ("granted", "revoked")
@@ -2111,39 +2111,51 @@ class SpaceStore:
             elif row["event"] == "permission.cancelled":
                 if view["status"] == "pending":
                     view.update(status="cancelled", decided_by=row["agent"], decided_at=row["time"])
+            elif row["event"] == "permission.expired":
+                if view["status"] == "pending":
+                    view["status"] = "expired"
             elif row["event"] == "permission.granted":
                 view.update(grant="granted", granted_at=row["time"])
-            else:
+            elif row["event"] == "permission.revoked":
                 view.update(grant="revoked", revoked_at=row["time"])
         self._expire_requests(conn, task_id, views)
         return views
 
-    @staticmethod
-    def _expire_requests(conn, task_id, views):
+    def _expire_requests(self, conn, task_id, views):
         """A pending request is only live while the claim it was made under is: it expires when the epoch moves on, the
-        holder's lease is gone, or its own time-to-live passes. Derived, so nothing has to run to free the task.
+        holder's lease is gone, or its own time-to-live passes.
 
-        The same moment clears `waiting_input` when no request is still pending. Cancel of an already-expired request
-        stays `stale_claim` (there is nothing left to withdraw); the marker does not wait for that cancel, the next
-        claim, or a newer request.
+        The first time that happens, one `permission.expired` audit row is written. Later reads see that terminal
+        event and do not clear `waiting_input` again. The clear itself only matches a marker whose `blocked_at` is
+        not after the request (the marker this request set). A later `mark_blocked` by the same worker stays.
+        Cancel of an already-expired request stays `stale_claim`.
         """
         pending = [view for view in views.values() if view["status"] == "pending"]
         if not pending:
             return
-        task = conn.execute("SELECT state,epoch FROM baton.tasks WHERE id=%s", (task_id,)).fetchone()
+        task = conn.execute("SELECT * FROM baton.tasks WHERE id=%s", (task_id,)).fetchone()
         claim = conn.execute("SELECT holder,epoch FROM baton.x_claim WHERE task_id=%s AND lease_expires_at>clock_timestamp()",
                              (task_id,)).fetchone()
         now = conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
-        expired_by = []
         for view in pending:
-            if (task["state"] != "claimed" or task["epoch"] != view["epoch"] or claim is None
+            if not (task["state"] != "claimed" or task["epoch"] != view["epoch"] or claim is None
                     or (claim["holder"], claim["epoch"]) != (view["worker"], view["epoch"]) or view["expires_at"] <= now):
+                continue
+            already = conn.execute("""SELECT 1 FROM baton.x_audit WHERE task_id=%s AND event='permission.expired'
+                AND metadata->>'request_id'=%s""", (task_id, view["request_id"])).fetchone()
+            if already:
                 view["status"] = "expired"
-                expired_by.append(view["worker"])
-        if not expired_by or any(view["status"] == "pending" for view in views.values()):
-            return
-        conn.execute("""UPDATE baton.tasks SET blocked_reason=NULL,blocked_by=NULL,blocked_at=NULL
-            WHERE id=%s AND blocked_reason='waiting_input' AND blocked_by=ANY(%s)""", (task_id, expired_by))
+                continue
+            actor = Actor(view["worker"], view["worker_account"], "agent")
+            operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "baton/permission-expired/" + view["request_id"]))
+            self._task_audit(conn, actor, operation_id, "permission.expired", task, epoch=view["epoch"],
+                             request_id=view["request_id"])
+            view["status"] = "expired"
+            if any(other["status"] == "pending" for other in views.values()):
+                continue
+            conn.execute("""UPDATE baton.tasks SET blocked_reason=NULL,blocked_by=NULL,blocked_at=NULL
+                WHERE id=%s AND blocked_reason='waiting_input' AND blocked_by=%s AND blocked_at<=%s""",
+                         (task_id, view["worker"], view["requested_at"]))
 
     def _permission_request(self, conn, task_id, request_id):
         view = self._permission_views(conn, task_id).get(_uuid(request_id, "request_id"))
@@ -2185,10 +2197,12 @@ class SpaceStore:
             request_id = str(uuid.uuid4())
             permission = {"cli": cli, "tool": tool, "directory": directory, "reason": reason, "approvers": approvers,
                           "ttl_seconds": ttl_seconds, "excerpt_sha256": _sha256(excerpt) if excerpt else None}
-            self._task_audit(conn, actor, operation_id, "permission.requested", task, epoch=epoch, request_id=request_id,
-                             permission=permission)
+            # The marker is stamped before the audit row, so blocked_at is not after requested_at. Expiry clears
+            # only a marker that old; a later mark_blocked stays.
             conn.execute("UPDATE baton.tasks SET blocked_reason='waiting_input',blocked_by=%s,blocked_at=clock_timestamp() WHERE id=%s",
                          (actor.principal, task_id))
+            self._task_audit(conn, actor, operation_id, "permission.requested", task, epoch=epoch, request_id=request_id,
+                             permission=permission)
             structured = {"kind": "permission_request", "request_id": request_id, "task_id": task_id, "epoch": epoch,
                           "worker": actor.principal, "cli": cli, "tool": tool, "directory": directory, "reason": reason,
                           "approvers": approvers, "options": list(PERMISSION_OPTIONS), "excerpt": excerpt}

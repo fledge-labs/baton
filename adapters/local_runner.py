@@ -1018,15 +1018,15 @@ UNPARSED_TOOL = "(unparsed)"
 # A later change could allow git only by invoking it with the real binary's absolute path plus forced
 # `-c core.pager=cat --no-pager --no-ext-diff --no-textconv -c core.fsmonitor=false`, `GIT_CONFIG_NOSYSTEM=1`,
 # `GIT_CONFIG_GLOBAL=/dev/null`, and no repository config. That is not this change.
-GRANTABLE_TOOLS = frozenset({"rg", "sed"})
+# sed is not here either. A cluster such as `-ne` is a script to GNU sed and an empty script to a hand-written
+# parser, and `w`/`-i` paths are another parser. More tools need their own design; this change grants only rg.
+GRANTABLE_TOOLS = frozenset({"rg"})
 # Shown in the shim's header. The CLI allowlist entry is only the shim path; this text is not a CLI rule.
 POLICY_ARGS = {
     "rg": "[! --pre ! --pre-glob]",
-    "sed": "[! e-command ! s///e; w/W/-i inside worktree]",
 }
-# A command line from a shell-shaped CLI. These characters start another program, a redirect, or a substitution.
-# The check is on the raw text, before shlex, because `sed 's/a/b/'; sh` does not contain a forbidden sed option.
-SHELL_CONTROL_RE = re.compile(r"[;&|`$()><\n]")
+# Quotes, backslashes and shell control characters. Grantability is decided on the raw captured line, before shlex.
+UNTRUSTED_COMMAND_RE = re.compile(r"""['"\\;&|`$()><\n]""")
 
 
 def tool_basename(tool):
@@ -1048,8 +1048,8 @@ def _split_command(command):
 def _inside_worktree(path, worktree):
     """A path the child would use while its cwd is the worktree.
 
-    Existing components are resolved as the walk proceeds, so a symlink inside the worktree that points outside
-    does not count, including one whose final component does not exist yet. The filesystem root is never a
+    Each component is resolved before `..` is applied, so `link/../outside` follows `link` first and does not
+    collapse back into the worktree. A missing final component stays lexical. The filesystem root is never a
     worktree this check will approve a write into.
     """
     if not isinstance(path, str) or not path or "\x00" in path or path.startswith("~") or path.startswith("-"):
@@ -1057,14 +1057,19 @@ def _inside_worktree(path, worktree):
     root = os.path.realpath(worktree)
     if not root or root == os.sep:
         return False
-    candidate = os.path.normpath(path if os.path.isabs(path) else os.path.join(root, path))
-    if not candidate.startswith(os.sep):
-        return False
-    current = os.sep
-    for part in candidate.split(os.sep)[1:]:
+    if os.path.isabs(path):
+        current, parts = os.sep, path.split(os.sep)[1:]
+    else:
+        current, parts = root, path.split(os.sep)
+    for part in parts:
         if part in ("", "."):
             continue
-        nxt = os.path.join(current, part)
+        if part == "..":
+            if current != os.sep:
+                parent = os.path.dirname(current.rstrip(os.sep))
+                current = parent or os.sep
+            continue
+        nxt = os.sep + part if current == os.sep else os.path.join(current, part)
         current = os.path.realpath(nxt) if os.path.lexists(nxt) else nxt
     prefix = root.rstrip(os.sep) + os.sep
     return current == root or current.startswith(prefix)
@@ -1285,20 +1290,17 @@ def _sed_problem(argv, worktree):
     return None
 
 
-_GRANT_POLICIES = {"rg": _rg_problem, "sed": _sed_problem}
+_GRANT_POLICIES = {"rg": _rg_problem}
 
 
 def _command_text_problem(command):
-    """Why this CLI command text cannot be granted, before any parse.
+    """Why this raw command text cannot be granted, before any parse.
 
-    Shell control characters are refused on the raw text: shlex would drop `&&` or keep `;` inside a sed script and
-    the option check would then pass. A command longer than the single-line field is refused outright. The argument
-    policy itself runs on the full argv inside the shim at execution, never on a clipped copy of this text.
+    A quote, backslash or shell control character means the line is not a single plain argv. The argument policy
+    itself runs on the full argv inside the shim at execution, never on a clipped copy of this text.
     """
-    if SHELL_CONTROL_RE.search(command):
-        return "the command line contains a shell control operator and is never granted"
-    if len(command) > FIELD_CHARS or len(re.sub(r"\s+", " ", command).strip()) > FIELD_CHARS:
-        return "the command line was truncated, so it is never granted"
+    if UNTRUSTED_COMMAND_RE.search(command):
+        return "the command line contains a quote, backslash or shell control operator and is never granted"
     return None
 
 
@@ -1406,8 +1408,7 @@ def resolve_real_binary(name):
     return real
 
 
-_SHIM_FUNCTIONS = (tool_basename, _inside_worktree, _rg_problem, _sed_regex_end, _sed_address, _sed_line_path,
-                   _sed_script_problem, _sed_problem, argv_problem)
+_SHIM_FUNCTIONS = (tool_basename, _inside_worktree, _rg_problem, argv_problem)
 
 # Appended to every generated shim. Standard library only; no eval; the real program is exec'd by the baked absolute path.
 SHIM_MAIN = """
@@ -1578,6 +1579,7 @@ class Denial:
     kind: str = "command"
     excerpt: str = None
     detector: str = None
+    capture_problem: str = None
 
 
 @dataclass(frozen=True)
@@ -1633,6 +1635,28 @@ def excerpt_around(text, position, secrets):
     return truncate(redact(clean_text(window), secrets).strip(), EXCERPT_CHARS) or None
 
 
+def capture_problem(text, match, command):
+    """Why this detector match is not one complete grantable line, or None.
+
+    Grantability uses only a raw line the detector consumed through the end of that line, with nothing after it.
+    A capture that stops at a quote or parenthesis leaves the rest of the line (or the next line) unchecked, so
+    `rg foo` followed by `"; rm` is posted for visibility and is not grantable. The same is true when the captured
+    command itself contains a quote, a backslash or a shell control operator.
+    """
+    if "\n" in text[match.start():match.end()]:
+        return "the refusal spans more than one line, so it is not grantable"
+    line_end = text.find("\n", match.end())
+    if line_end < 0:
+        line_end = len(text)
+    if text[match.end():line_end].strip():
+        return "the refusal line continues past the captured command, so it is not grantable"
+    if text[line_end:].strip():
+        return "the refusal spans more than one line, so it is not grantable"
+    if command and UNTRUSTED_COMMAND_RE.search(command):
+        return "the command line contains a quote, backslash or shell control operator and is not grantable"
+    return None
+
+
 def detect_denial(cli_name, text, secrets=()):
     """Parse a CLI's refusal out of its output: the earliest detector match, else a bounded raw excerpt, else None."""
     best = None
@@ -1650,12 +1674,13 @@ def detect_denial(cli_name, text, secrets=()):
     command = found.get("command") or found.get("tool") or ""
     tool = program_name(command) if detector.kind == "command" else found.get("tool")
     # `command` is the one-line field sent to Baton. `command_full` is the raw capture the grant check must use:
-    # clipping first would hide a `--pre`, an `s///e` or a shell operator past FIELD_CHARS.
+    # clipping first would hide a `--pre` past FIELD_CHARS. `capture_problem` is set when that capture is not the
+    # whole refusal line, so an approval of it writes nothing.
     denial = Denial(cli_name, tool=tool, command=one_line(command, FIELD_CHARS, secrets) or None,
                     command_full=command or None, kind=detector.kind,
                     directory=one_line(found["directory"], 4000, secrets) if found.get("directory") else None,
                     reason=one_line(found.get("reason") or detector.reason or GENERIC_REASON, FIELD_CHARS, secrets),
-                    detector=detector.name)
+                    detector=detector.name, capture_problem=capture_problem(text, match, command))
     if tool is None:
         denial.excerpt = excerpt_around(text, match.start(), secrets)
     return denial
@@ -2035,15 +2060,30 @@ def _spool_kind(path):
 
 
 def _spool_payload(path):
-    """('ok', object) or (discard reason, None). Reads at most SPOOL_MAX_BYTES and does not raise."""
+    """('ok', object) or (discard reason, None). Reads at most SPOOL_MAX_BYTES and does not raise.
+
+    lstat decides the type. The open uses O_NOFOLLOW and O_NONBLOCK, then fstat, so a symlink, a fifo or a
+    device swapped in after the lstat cannot block this thread or follow a link to /dev/zero.
+    """
     try:
         info = os.lstat(path)
         if not stat.S_ISREG(info.st_mode):
             return "nonregular", None
         if info.st_size > SPOOL_MAX_BYTES:
             return "oversized", None
-        with open(path, "rb") as handle:
-            raw = handle.read(SPOOL_MAX_BYTES + 1)
+        flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return "nonregular", None
+            if st.st_size > SPOOL_MAX_BYTES:
+                return "oversized", None
+            raw = os.read(fd, SPOOL_MAX_BYTES + 1)
+        finally:
+            os.close(fd)
     except OSError:
         return "malformed", None
     if len(raw) > SPOOL_MAX_BYTES:
@@ -2061,20 +2101,43 @@ class GrantKeeper:
     """Applies, reports and withdraws one worker's grants. `baton` may be None (token unreadable): withdrawal still works
     and the report is retried later."""
 
-    def __init__(self, worker, ledger, baton, log):
+    def __init__(self, worker, ledger, baton, log, secrets=()):
         self.worker, self.ledger, self.baton, self.log = worker, ledger, baton, log
+        self._secrets = secrets
         self._spool_forwarded = []
         self._spool_noted = 0.0
 
+    def _secret_values(self):
+        values = self._secrets() if callable(self._secrets) else self._secrets
+        return tuple(value for value in (values or ()) if value)
+
+    def _bind_operation(self, record, kind):
+        """The operation id of a granted or revoked report, saved before the call so a lost response can be replayed."""
+        key = kind + "_operation_id"
+        current = record.get(key)
+        if isinstance(current, str) and current:
+            return current
+        operation = str(uuid.uuid4())
+        record[key] = operation
+        with contextlib.suppress(RunnerError, OSError):
+            self.ledger.mark(record["id"], **{key: operation})
+        return operation
+
     def _report(self, record, kind, reason=None):
         """True when Baton accepted the report. A Baton or network error is returned so a spool drain can tell a
-        permanent rejection from a retry. Granted and revoked reports also mark the ledger; a shim refusal does not."""
+        permanent rejection from a retry. Granted and revoked reports also mark the ledger; a shim refusal does not.
+
+        `revoked_reported` is set only after the server acknowledges the revoke. A granted report whose response was
+        lost keeps the same operation id and is retried by reconcile instead of being treated as already revoked.
+        """
         if self.baton is None:
             return False
         arguments = {"task_id": record["task_id"], "request_id": record["request_id"], "event": kind}
         if reason:
             arguments["reason"] = reason
-        if record.get("operation_id"):
+        if kind in ("granted", "revoked"):
+            arguments["operation_id"] = self._bind_operation(record, kind)
+        elif record.get("operation_id"):
             arguments["operation_id"] = record["operation_id"]
         try:
             self.baton.write("record_permission", arguments)
@@ -2082,6 +2145,7 @@ class GrantKeeper:
             self.log(record["task_id"], "grant-unreported", event=kind, error=error_code(error))
             return error
         if kind in ("granted", "revoked"):
+            record[kind + "_reported"] = True
             try:
                 self.ledger.mark(record["id"], **{kind + "_reported": True})
             except (RunnerError, OSError):
@@ -2116,9 +2180,6 @@ class GrantKeeper:
             return None
         if record.get("granted_reported"):
             self._report(record, "revoked")
-        else:
-            with contextlib.suppress(RunnerError, OSError):
-                self.ledger.mark(grant_id, revoked_reported=True)
         self.log(record["task_id"], "grant-revoked", tool=record["tool"], grant=grant_id)
         return True
 
@@ -2141,6 +2202,10 @@ class GrantKeeper:
         try:
             for record in self.ledger.unreported():
                 if record["status"] == "revoked":
+                    # The granted call may have committed even though its response was lost. Replay that operation
+                    # before reporting the revoke, and leave both flags unset until the server answers.
+                    if not record.get("granted_reported") and self._report(record, "granted") is not True:
+                        continue
                     self._report(record, "revoked")
                 elif self._report(record, "granted") is not True:
                     self.revoke(record["id"])
@@ -2199,15 +2264,22 @@ class GrantKeeper:
                     os.unlink(path)
                 continue
             payload = outcome[1]
-            grant_id = payload.get("grant_id") if isinstance(payload, dict) else None
-            known = grants.get(grant_id) if isinstance(grant_id, str) else None
-            if not isinstance(known, dict) or known.get("request_id") != payload.get("request_id"):
+            secrets = self._secret_values()
+
+            def field(value, limit):
+                if not isinstance(value, str) or not value:
+                    return None
+                return one_line(value, limit, secrets)
+
+            grant_id = field(payload.get("grant_id"), 80)
+            request_id = field(payload.get("request_id"), 80)
+            known = grants.get(grant_id) if grant_id else None
+            if not isinstance(known, dict) or field(known.get("request_id"), 80) != request_id:
                 discarded["unknown"] += 1
                 with contextlib.suppress(OSError):
                     os.unlink(path)
                 continue
-            reason = payload.get("reason")
-            reason = one_line(reason if isinstance(reason, str) and reason else "refused", 300)
+            reason = field(payload.get("reason"), 300) or "refused"
             reported = self._report(
                 {"id": known["id"], "task_id": known["task_id"], "request_id": known["request_id"],
                  "operation_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "baton/shim-refusal/" + name))},
@@ -2253,8 +2325,8 @@ class WorkerRunner:
         self.queue = queue.Queue()
         self.inflight, self.inflight_lock = set(), threading.Lock()
         self.deferrals, self.threads, self.timers = {}, [], []
-        self.keeper = (GrantKeeper(worker, GrantLedger(self.config.state_dir, worker.principal), baton, self.log)
-                       if worker.permissions else None)
+        self.keeper = (GrantKeeper(worker, GrantLedger(self.config.state_dir, worker.principal), baton, self.log,
+                                   secrets=lambda: self.secrets) if worker.permissions else None)
 
     @property
     def principal(self):
@@ -2555,7 +2627,9 @@ class WorkerRunner:
         permissions = self.worker.permissions
         reason = one_line(denial.reason or GENERIC_REASON, FIELD_CHARS, self.secrets)
         tool_text = one_line(denial.tool or UNPARSED_TOOL, 200, self.secrets)
-        if denial.command:
+        if denial.capture_problem:
+            reason = clip(reason + "; not grantable: " + denial.capture_problem, FIELD_CHARS)
+        elif denial.command:
             reason = clip(reason + "; command: " + denial.command, FIELD_CHARS)
         arguments = {"task_id": task_id, "epoch": epoch, "cli": permissions.cli, "tool": tool_text,
                      "reason": reason, "approvers": permissions.approvers, "ttl_seconds": min(86400, permissions.wait_seconds + 60),
@@ -2617,7 +2691,8 @@ class WorkerRunner:
                 if rounds >= permissions.max_requests:
                     return outcome, "gave up after %d permission requests" % rounds, None
                 problem = self.grant_problem(denial, plan)
-                if problem:
+                # An incomplete capture is still posted so a person can see it. An approval writes nothing.
+                if problem and not denial.capture_problem:
                     return outcome, "permission needed but not requested: " + problem, None
                 rounds += 1
                 request = self.post_request(task_id, epoch, denial, plan.worktree)
@@ -2635,6 +2710,8 @@ class WorkerRunner:
                          by=decided.get("decided_by"))
                 if decided["status"] == "deny":
                     return outcome, None, decided
+                if denial.capture_problem or problem:
+                    return outcome, None, {**decided, "not_applied": denial.capture_problem or problem}
                 if denial.tool is None:
                     raise RunnerError("permission approved, but the refused tool could not be identified; add it to the "
                                       "CLI's allowlist by hand")
@@ -2665,8 +2742,13 @@ class WorkerRunner:
     def permission_denied(self, task_id, page_id, epoch, request):
         self.log(task_id, "permission-denied", request=request["request_id"])
         tool = plain(request.get("tool"))
-        self.comment(task_id, page_id, "Permission denied by %s for `%s` (request %s). The task is blocked and the runner will "
-                                       "not retry it." % (plain(request.get("decided_by")), tool, request["request_id"]))
+        if request.get("not_applied"):
+            self.comment(task_id, page_id, "Permission %s for `%s` (request %s) was not applied: %s. Nothing was written."
+                                           % (plain(request.get("status")), tool, request["request_id"],
+                                              plain(request["not_applied"])))
+        else:
+            self.comment(task_id, page_id, "Permission denied by %s for `%s` (request %s). The task is blocked and the runner will "
+                                           "not retry it." % (plain(request.get("decided_by")), tool, request["request_id"]))
         note = "permission_denied: %s (request %s)" % (tool, request["request_id"])
         if self.release_lease(task_id, epoch):
             try:
