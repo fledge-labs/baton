@@ -7,27 +7,31 @@ Run it on the machine that runs Docker, from the directory your Compose files ar
     python3 scripts/deploy.py -f deploy/compose.yaml -p baton \\
         --smoke-token-file ~/.config/baton/smoke.token --backup-dir ~/baton-backups
 
-Steps, each with a hard timeout:
-  1. preflight: the migration SQL must be backward compatible (expand-only); services that the Compose files no
-     longer declare (orphans) must be acknowledged with --allow-remove-orphans;
-  2. record the image of every container of the project, running or not; tag each restorable local image
-     `baton-deploy-rollback:<id>` so it cannot be garbage-collected;
-  3. back up the database with pg_dump (custom format, mode 0600) into --backup-dir;
+Steps, each with a hard timeout (the recovery path too):
+  1. preflight: read the migration SQL (a missing file is an error) and run a textual early warning over it;
+     services that the Compose files no longer declare (orphans) must be acknowledged with --allow-remove-orphans;
+  2. record the image of every container of the project, running or not, and tag each local image per service as
+     `baton-deploy-rollback:<service>-<id>` so it cannot be garbage-collected;
+  3. if a database volume exists, make sure the database container is up (even when every application container
+     is stopped or gone), then (a) precheck the migration: apply it to a throwaway copy of the live schema and diff
+     the catalogs; any breaking change, or any step that fails, aborts (fail closed); and (b) back up the database
+     with pg_dump (custom format, mode 0600) into --backup-dir; a failed dump aborts;
   4. build (optionally with --build-network host);
   5. `docker compose up -d --wait --force-recreate --remove-orphans` (this also runs the migration);
   6. smoke-test the public entry point: GET /board is 200, an unauthenticated POST /mcp is 401, and one real MCP
      initialize + tools/list + fetch_inbox succeeds with the smoke token.
 If `up` or a smoke check fails or times out, the previous images are re-tagged and `up` runs again (rollback). The
 rollback only reports success when every service is verified to run its previous image again and the smoke checks
-pass; otherwise a best-effort recovery `up` is attempted and the report lists what to restore by hand. A JSON
-report goes to stdout; progress goes to stderr.
+pass; otherwise a best-effort recovery `up` (still waiting, still time-limited) is attempted and the report lists
+what to restore by hand. A JSON report goes to stdout; progress goes to stderr.
 
 What a rollback does not do: it restores images, not the database and not the Compose topology. The migration has
 already been applied when the smoke test runs, so the previous image must work against the new schema: migrations
 are expand-only (add nullable or defaulted columns and tables; never drop, rename, retype or tighten in the same
-release), which the preflight enforces. The backup is for a manual restore if that discipline was broken. Images
-pinned by digest come from the Compose files; to roll those back, deploy the previous revision of the files.
-Removed orphans are not recreated. The smoke token is read from a file, sent only as a bearer header and never printed.
+release), which the throwaway-database precheck enforces. The backup is for a manual restore if that discipline was
+broken. Images pinned by digest come from the Compose files; to roll those back, deploy the previous revision of the
+files. Removed orphans are not recreated. If every container was removed there is no previous image to restore.
+The smoke token is read from a file, sent only as a bearer header and never printed.
 
 Exit codes: 0 deployed; 1 failed, with the previous deployment running (restored by the rollback, or untouched
 because preflight, backup or build failed); 2 usage or configuration error; 3 failed and the previous deployment is
@@ -38,6 +42,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import signal
 import ssl
 import subprocess
@@ -58,6 +63,7 @@ MCP_PROTOCOL = '2025-06-18'
 HOLD_REPOSITORY = 'baton-deploy-rollback'
 OUTPUT_TAIL = 2000
 DATABASE_SERVICE = 'database'
+DATA_VOLUME = 'postgres-data'
 DUMP_SCRIPT = ('PGPASSWORD="$(cat /run/secrets/database-admin/postgres.password)" '
                'exec pg_dump -U baton_bootstrap -d baton -Fc')
 DUMP_MAGIC = b'PGDMP'
@@ -65,17 +71,64 @@ SCHEMA_FILE = Path(__file__).resolve().parents[1] / 'bridge/space_schema.sql'
 UP_GRACE = 120
 TIMEOUT_RETURNCODE = 124
 
-# Statements that an already-running previous image cannot tolerate after the migration has run.
+# Early warning only: textual patterns for statements a previous image cannot survive. The authoritative check is
+# the throwaway-database catalog diff (precheck_migration); this just fails fast on the obvious cases.
+IDENT = r'[\w".$]+'
 INCOMPATIBLE_SQL = (
-    ('drops a table, schema, column, view, type, sequence or function',
-     r'\bDROP\s+(?:TABLE|SCHEMA|COLUMN|VIEW|MATERIALIZED\s+VIEW|TYPE|SEQUENCE|FUNCTION)\b'),
+    ('contains a DROP other than constraint, trigger, index, policy, default, rule or statistics',
+     r'\bDROP\b(?!\s+(?:CONSTRAINT|TRIGGER|INDEX|POLICY|DEFAULT|RULE|STATISTICS)\b)'),
     ('truncates a table', r'(?:^|;)\s*TRUNCATE\b'),
     ('deletes rows', r'\bDELETE\s+FROM\b'),
     ('renames an object', r'\bRENAME\b'),
-    ('changes a column type', r'\bALTER\s+COLUMN\s+\S+\s+(?:SET\s+DATA\s+)?TYPE\b'),
-    ('makes an existing column NOT NULL', r'\bALTER\s+COLUMN\s+\S+\s+SET\s+NOT\s+NULL\b'),
+    ('changes a column type', r'\bALTER\s+(?:COLUMN\s+)?' + IDENT + r'\s+(?:SET\s+DATA\s+)?TYPE\b'),
+    ('makes an existing column NOT NULL', r'\bSET\s+NOT\s+NULL\b'),
 )
-ADD_COLUMN = re.compile(r'\bADD\s+COLUMN\b([^;]*)', re.IGNORECASE)
+ADD_CLAUSE = re.compile(r'\bADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?'
+                        r'(?!CONSTRAINT\b|PRIMARY\b|UNIQUE\b|CHECK\b|FOREIGN\b|LIKE\b|EXCLUDE\b)([^;]*?)'
+                        r'(?=,\s*(?:ADD|ALTER|DROP)\b|;|$)', re.IGNORECASE | re.DOTALL)
+NOISE = re.compile(r"--[^\n]*|/\*.*?\*/|'(?:[^']|'')*'", re.DOTALL)
+PRECHECK_PREFIX = 'baton_precheck_'
+PSQL = ('PGPASSWORD="$(cat /run/secrets/database-admin/postgres.password)" '
+        'exec psql -X -q -v ON_ERROR_STOP=1 -U baton_bootstrap -d %s')
+PSQL_ROWS = PSQL + ' -At'
+CLONE_SCRIPT = ('PGPASSWORD="$(cat /run/secrets/database-admin/postgres.password)"; export PGPASSWORD; '
+                'pg_dump -U baton_bootstrap -d baton --schema-only --file=/tmp/%(name)s.sql && '
+                'psql -X -q -v ON_ERROR_STOP=1 -U baton_bootstrap -d %(name)s -f /tmp/%(name)s.sql; '
+                'status=$?; rm -f /tmp/%(name)s.sql; exit $status')
+SYSTEM_SCHEMAS = "n.nspname !~ '^(pg_|information_schema$)'"
+CATALOG_SQL = """SELECT json_build_object(
+ 'columns', (SELECT coalesce(json_agg(json_build_object('t', n.nspname||'.'||c.relname, 'c', a.attname,
+     'type', format_type(a.atttypid, a.atttypmod), 'notnull', a.attnotnull,
+     'default', pg_get_expr(d.adbin, d.adrelid), 'hasdef', (d.adbin IS NOT NULL OR a.attidentity <> '' OR a.attgenerated <> ''))), '[]'::json)
+   FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+   LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+   WHERE a.attnum > 0 AND NOT a.attisdropped AND c.relkind IN ('r','p','v','m','f') AND %(system)s),
+ 'relations', (SELECT coalesce(json_agg(n.nspname||'.'||c.relname||':'||c.relkind::text), '[]'::json)
+   FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE c.relkind IN ('r','p','v','m','S','f') AND %(system)s),
+ 'constraints', (SELECT coalesce(json_agg(json_build_object('t', n.nspname||'.'||c.relname, 'name', k.conname,
+     'def', pg_get_constraintdef(k.oid),
+     'cols', (SELECT coalesce(json_agg(a.attname), '[]'::json) FROM pg_attribute a
+              WHERE a.attrelid = k.conrelid AND a.attnum = ANY(k.conkey)))), '[]'::json)
+   FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE %(system)s),
+ 'indexes', (SELECT coalesce(json_agg(json_build_object('t', n.nspname||'.'||c.relname, 'name', ic.relname,
+     'def', pg_get_indexdef(i.indexrelid), 'unique', i.indisunique,
+     'cols', (SELECT coalesce(json_agg(a.attname), '[]'::json) FROM pg_attribute a
+              WHERE a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)))), '[]'::json)
+   FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid JOIN pg_class c ON c.oid = i.indrelid
+   JOIN pg_namespace n ON n.oid = c.relnamespace WHERE %(system)s),
+ 'triggers', (SELECT coalesce(json_agg(json_build_object('t', n.nspname||'.'||c.relname, 'name', g.tgname,
+     'def', pg_get_triggerdef(g.oid))), '[]'::json)
+   FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE NOT g.tgisinternal AND %(system)s),
+ 'functions', (SELECT coalesce(json_agg(json_build_object('sig', p.oid::regprocedure::text, 'def', pg_get_functiondef(p.oid))), '[]'::json)
+   FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.prokind IN ('f','p') AND %(system)s),
+ 'types', (SELECT coalesce(json_agg(json_build_object('name', n.nspname||'.'||t.typname,
+     'def', t.typtype::text||':'||coalesce((SELECT string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid = t.oid), ''))), '[]'::json)
+   FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typtype IN ('e','d') AND %(system)s)
+);
+""" % {'system': SYSTEM_SCHEMAS}
+SNAPSHOT_KEYS = ('columns', 'relations', 'constraints', 'indexes', 'triggers', 'functions', 'types')
 
 
 class UsageError(Exception):
@@ -103,24 +156,44 @@ def kill_group(proc):
         proc.kill()
 
 
-class SubprocessRunner:
-    """Runs a command with a hard timeout; on expiry the whole process group is killed."""
+REAP_SECONDS = 5
 
-    def __call__(self, argv, timeout=None, stdout_path=None):
+
+class SubprocessRunner:
+    """Runs a command with a hard timeout; on expiry the whole process group is killed.
+
+    Even the wait after the kill is bounded: a descendant that escaped the group and still holds the pipes
+    cannot keep the deploy waiting.
+    """
+
+    def __call__(self, argv, timeout=None, stdout_path=None, stdin_text=None):
         sink = None
         try:
             if stdout_path:
                 sink = os.fdopen(os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'wb')
             try:
-                proc = subprocess.Popen(argv, stdout=sink or subprocess.PIPE, stderr=subprocess.PIPE,
+                proc = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+                                        stdout=sink or subprocess.PIPE, stderr=subprocess.PIPE,
                                         text=not sink, start_new_session=True)
             except FileNotFoundError:
                 return Result(127, '', 'command not found: ' + argv[0])
+            data = stdin_text
+            if data is not None and sink:
+                data = data.encode()
             try:
-                out, err = proc.communicate(timeout=timeout)
+                out, err = proc.communicate(input=data, timeout=timeout)
             except subprocess.TimeoutExpired:
                 kill_group(proc)
-                proc.communicate()
+                try:
+                    proc.communicate(timeout=REAP_SECONDS)
+                except subprocess.TimeoutExpired:
+                    for stream in (proc.stdin, proc.stdout, proc.stderr):
+                        if stream:
+                            stream.close()
+                    try:
+                        proc.wait(timeout=REAP_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        pass
                 return Result(TIMEOUT_RETURNCODE, '', 'timed out after %ss' % timeout, timed_out=True)
             if sink:
                 err = err.decode('utf-8', errors='replace')
@@ -134,14 +207,15 @@ class Config:
     def __init__(self, compose_files, project=None, env_file=None, project_directory=None, profiles=(), build=True,
                  build_network=None, wait_timeout=300, build_timeout=1800, command_timeout=120, backup_timeout=900,
                  backup_dir=None, no_backup=False, allow_remove_orphans=False, allow_incompatible_migration=False,
-                 schema_file=SCHEMA_FILE, base_url='http://127.0.0.1:8080', ca_file=None, smoke_token_file=None,
+                 schema_file=None, precheck_timeout=300, base_url='http://127.0.0.1:8080', ca_file=None, smoke_token_file=None,
                  smoke_timeout=60, request_timeout=20, dry_run=False):
         self.compose_files, self.project, self.env_file = compose_files, project, env_file
         self.project_directory, self.profiles, self.build = project_directory, list(profiles), build
         self.build_network, self.wait_timeout, self.build_timeout = build_network, wait_timeout, build_timeout
         self.command_timeout, self.backup_timeout, self.backup_dir = command_timeout, backup_timeout, backup_dir
         self.no_backup, self.allow_remove_orphans = no_backup, allow_remove_orphans
-        self.allow_incompatible_migration, self.schema_file = allow_incompatible_migration, schema_file
+        self.allow_incompatible_migration, self.schema_file = allow_incompatible_migration, schema_file or SCHEMA_FILE
+        self.precheck_timeout = precheck_timeout
         self.base_url, self.ca_file, self.smoke_token_file = base_url, ca_file, smoke_token_file
         self.smoke_timeout, self.request_timeout, self.dry_run = smoke_timeout, request_timeout, dry_run
 
@@ -171,7 +245,7 @@ class Docker:
         self.runner, self.config, self.log = runner, config, log or (lambda message: None)
         self.commands = []
 
-    def run(self, argv, mutating=False, timeout=None, stdout_path=None):
+    def run(self, argv, mutating=False, timeout=None, stdout_path=None, stdin_text=None):
         timeout = timeout or self.config.command_timeout
         entry = {'argv': list(argv), 'mutating': mutating, 'executed': True, 'timeout': timeout}
         self.commands.append(entry)
@@ -179,7 +253,11 @@ class Docker:
             entry['executed'] = False
             return Result(0)
         self.log('$ ' + ' '.join(argv))
-        kwargs = {'stdout_path': stdout_path} if stdout_path else {}
+        kwargs = {}
+        if stdout_path:
+            kwargs['stdout_path'] = stdout_path
+        if stdin_text is not None:
+            kwargs['stdin_text'] = stdin_text
         result = self.runner(argv, timeout=timeout, **kwargs)
         entry['returncode'] = result.returncode
         if result.timed_out:
@@ -403,23 +481,192 @@ def run_smoke(http, token, timeout, clock=time.monotonic, sleep=time.sleep, inte
 
 
 def unsafe_migration_statements(sql):
-    """Return descriptions of statements in the migration SQL that a previous image could not survive."""
-    text = re.sub(r'/\*.*?\*/', ' ', re.sub(r'--[^\n]*', ' ', sql), flags=re.DOTALL)
+    """Early warning: textual descriptions of statements that a previous image could not survive.
+
+    Comments and string literals are blanked in a single pass, so a comment marker inside one cannot hide a
+    statement. This is not a proof of compatibility; precheck_migration() is the authoritative check.
+    """
+    text = NOISE.sub(' ', sql)
     found = [label for label, pattern in INCOMPATIBLE_SQL if re.search(pattern, text, re.IGNORECASE)]
-    for clause in ADD_COLUMN.findall(text):
+    for clause in ADD_CLAUSE.findall(text):
         if re.search(r'\bNOT\s+NULL\b', clause, re.IGNORECASE) and not re.search(r'\bDEFAULT\b', clause, re.IGNORECASE):
             found.append('adds a NOT NULL column without a default')
             break
     return found
 
 
-def check_migration(config):
+def read_migration(config):
+    """The SQL the image being deployed will apply; a missing or unreadable file is an error, never a pass."""
     try:
         sql = Path(config.schema_file).read_text(encoding='utf-8')
-    except OSError:
-        return {'checked': False, 'reason': 'migration SQL not found', 'unsafe': []}
-    unsafe = unsafe_migration_statements(sql)
-    return {'checked': True, 'file': str(config.schema_file), 'unsafe': unsafe}
+    except (OSError, ValueError):
+        raise UsageError('migration SQL not found or unreadable: %s (pass --schema-file)' % config.schema_file) from None
+    if not sql.strip():
+        raise UsageError('migration SQL is empty: %s' % config.schema_file)
+    return sql
+
+
+def check_migration(config):
+    sql = read_migration(config)
+    return {'checked': True, 'file': str(config.schema_file), 'unsafe': unsafe_migration_statements(sql)}, sql
+
+
+def schema_breaking_changes(before, after):
+    """Differences between two catalog snapshots that a previous application image may not survive.
+
+    Dropped or changed objects, narrowed columns, and constraints, unique indexes or triggers that tighten
+    something that already existed are all flagged. Only genuinely additive changes pass.
+    """
+    changes = []
+
+    def keyed(snapshot, section, key):
+        return {key(item): item for item in snapshot[section]}
+
+    relations_after = {relation.rsplit(':', 1)[0] for relation in after['relations']}
+    old_tables = {item['t'] for item in before['columns']}
+    old_columns = {(item['t'], item['c']) for item in before['columns']}
+    for relation in sorted(set(before['relations']) - set(after['relations'])):
+        changes.append('drops %s' % relation)
+    old = keyed(before, 'columns', lambda i: (i['t'], i['c']))
+    new = keyed(after, 'columns', lambda i: (i['t'], i['c']))
+    for (table, column), item in sorted(old.items()):
+        now = new.get((table, column))
+        if now is None:
+            if table in relations_after:
+                changes.append('drops column %s.%s' % (table, column))
+            continue
+        if now['type'] != item['type']:
+            changes.append('changes the type of %s.%s from %s to %s' % (table, column, item['type'], now['type']))
+        if now['notnull'] and not item['notnull']:
+            changes.append('makes %s.%s NOT NULL' % (table, column))
+        if now['default'] != item['default']:
+            changes.append('changes the default of %s.%s' % (table, column))
+    for (table, column), item in sorted(new.items()):
+        if (table, column) not in old and table in old_tables and item['notnull'] and not item['hasdef']:
+            changes.append('adds NOT NULL column %s.%s without a default' % (table, column))
+
+    def tightens(item, existing_tables):
+        columns = item['cols']
+        return item['t'] in existing_tables and (not columns or any((item['t'], c) in old_columns for c in columns))
+
+    for section, label, key in (('constraints', 'constraint', lambda i: (i['t'], i['name'])),
+                                ('indexes', 'index', lambda i: (i['t'], i['name'])),
+                                ('triggers', 'trigger', lambda i: (i['t'], i['name']))):
+        before_items, after_items = keyed(before, section, key), keyed(after, section, key)
+        for name, item in sorted(before_items.items()):
+            if section == 'indexes' and not item['unique']:
+                continue
+            now = after_items.get(name)
+            if now is None:
+                changes.append('drops %s %s on %s' % (label, name[1], name[0]))
+            elif now['def'] != item['def'] and (section != 'indexes' or item['unique'] or now['unique']):
+                changes.append('changes %s %s on %s' % (label, name[1], name[0]))
+        for name, item in sorted(after_items.items()):
+            if name in before_items or (section == 'indexes' and not item['unique']):
+                continue
+            if section == 'triggers':
+                if item['t'] in old_tables:
+                    changes.append('adds trigger %s to the existing table %s' % (name[1], name[0]))
+            elif tightens(item, old_tables):
+                changes.append('adds %s %s that constrains existing columns of %s' % (label, name[1], name[0]))
+    old_functions, new_functions = keyed(before, 'functions', lambda i: i['sig']), keyed(after, 'functions', lambda i: i['sig'])
+    for signature, item in sorted(old_functions.items()):
+        if signature not in new_functions:
+            changes.append('drops function %s' % signature)
+        elif new_functions[signature]['def'] != item['def']:
+            changes.append('changes function %s' % signature)
+    old_types, new_types = keyed(before, 'types', lambda i: i['name']), keyed(after, 'types', lambda i: i['name'])
+    for name, item in sorted(old_types.items()):
+        if name not in new_types:
+            changes.append('drops type %s' % name)
+        elif new_types[name]['def'] != item['def']:
+            changes.append('changes type %s' % name)
+    return changes
+
+
+def parse_snapshot(text):
+    try:
+        snapshot = json.loads(text)
+        if not isinstance(snapshot, dict) or any(not isinstance(snapshot.get(key), list) for key in SNAPSHOT_KEYS):
+            raise ValueError
+        return snapshot
+    except ValueError:
+        raise UsageError('unreadable catalog snapshot') from None
+
+
+def database_exec(config, script):
+    return config.compose_base() + ['exec', '-T', DATABASE_SERVICE, 'sh', '-c', script]
+
+
+def precheck_migration(docker, config, sql):
+    """Apply the pending migration to a throwaway copy of the live schema and diff the catalogs.
+
+    Fails closed: any step that fails or cannot be read counts as a breaking change. Nothing touches the real
+    database; the throwaway database is dropped at the end.
+    """
+    name = PRECHECK_PREFIX + secrets.token_hex(6)
+    report = {'database': name, 'ok': False, 'changes': [], 'error': None}
+    timeout = config.precheck_timeout
+
+    def step(label, script, stdin_text=None):
+        result = docker.run(database_exec(config, script), mutating=True, timeout=timeout, stdin_text=stdin_text)
+        if config.dry_run:
+            return ''
+        if result.returncode != 0:
+            raise UsageError('%s %s' % (label, 'timed out' if result.timed_out else 'failed: ' + tail(result.stderr, 300)))
+        return result.stdout
+
+    try:
+        step('creating the throwaway database', PSQL % 'postgres', 'CREATE DATABASE "%s";\n' % name)
+        created = True
+    except UsageError as exc:
+        report['error'], created = str(exc), False
+    try:
+        if created:
+            step('cloning the live schema', CLONE_SCRIPT % {'name': name})
+            step('preparing the throwaway schema', PSQL % name,
+                 'CREATE SCHEMA IF NOT EXISTS baton AUTHORIZATION baton_owner;\n'
+                 'GRANT CREATE ON DATABASE "%s" TO baton_owner;\n' % name)
+            before = step('reading the schema before the migration', PSQL_ROWS % name, CATALOG_SQL)
+            step('applying the migration', PSQL % name, 'BEGIN;\nSET LOCAL ROLE baton_owner;\n%s\nCOMMIT;\n' % sql)
+            after = step('reading the schema after the migration', PSQL_ROWS % name, CATALOG_SQL)
+            if config.dry_run:
+                report.update(ok=True, planned=True)
+            else:
+                report['changes'] = schema_breaking_changes(parse_snapshot(before), parse_snapshot(after))
+                report['ok'] = not report['changes']
+    except UsageError as exc:
+        report['error'] = str(exc)
+    finally:
+        if created:
+            dropped = docker.run(database_exec(config, PSQL % 'postgres'), mutating=True, timeout=timeout,
+                                 stdin_text='DROP DATABASE IF EXISTS "%s" WITH (FORCE);\n' % name)
+            if dropped.returncode != 0:
+                report['cleanup_error'] = 'could not drop %s: %s' % (name, tail(dropped.stderr, 300))
+    return report
+
+
+def ensure_database(docker, config, project, previous):
+    """Make sure the database can be reached even when every app container is stopped.
+
+    Returns a report with state running, started, or none (no database volume: a first deployment).
+    """
+    database = previous.get(DATABASE_SERVICE)
+    if database and database['running']:
+        return {'state': 'running', 'ok': True}
+    listed = docker.run(['docker', 'volume', 'ls', '-q', '--filter', 'label=%s=%s' % (PROJECT_LABEL, project),
+                         '--filter', 'label=com.docker.compose.volume=%s' % DATA_VOLUME])
+    if listed.returncode != 0:
+        return {'state': 'unknown', 'ok': False, 'error': 'docker volume ls failed: ' + tail(listed.stderr, 300)}
+    if not listed.stdout.strip():
+        return {'state': 'none', 'ok': True, 'reason': 'no database volume: first deployment'}
+    started = docker.run(config.compose_base() + ['up', '-d', '--no-deps', '--no-recreate', '--wait', '--wait-timeout',
+                                                  str(config.wait_timeout), DATABASE_SERVICE],
+                         mutating=True, timeout=config.up_timeout)
+    if started.returncode != 0 and not config.dry_run:
+        return {'state': 'stopped', 'ok': False, 'error': 'the database volume exists but the database could not be '
+                'started: ' + ('timed out' if started.timed_out else tail(started.stderr, 300))}
+    return {'state': 'started', 'ok': True}
 
 
 def parse_inspect(text):
@@ -483,21 +730,26 @@ def verify_restored(previous, now):
     return mismatches
 
 
-def hold_tag(image_id):
-    return '%s:%s' % (HOLD_REPOSITORY, image_id.split(':')[-1][:12])
+def hold_tag(image_id, service):
+    return '%s:%s-%s' % (HOLD_REPOSITORY, re.sub(r'[^A-Za-z0-9_.-]', '_', service), image_id.split(':')[-1][:12])
 
 
 def hold_previous_images(docker, previous):
-    """Give every restorable previous image a tag of its own.
+    """Give the previous local image of every service a tag of its own.
 
     Recreating containers leaves the old image untagged, and the Docker image store may delete an unreferenced
-    image at once, which would make the rollback impossible.
+    image at once, which would make the rollback impossible. Services that share one image reference may still
+    have run different images (for example a crashed bridge next to freshly started one-shot services), so the
+    protection is per service, not per reference. Digest-pinned references stay referenced by their digest.
     """
     holds = []
-    for item in plan_rollback(previous, {})[0]:
-        tag = hold_tag(item['image_id'])
-        result = docker.run(['docker', 'tag', item['image_id'], tag], mutating=True)
-        holds.append({'tag': tag, 'image_id': item['image_id'], 'ok': result.returncode == 0})
+    for service, info in sorted(previous.items()):
+        if '@' in info['image']:
+            continue
+        tag = hold_tag(info['image_id'], service)
+        result = docker.run(['docker', 'tag', info['image_id'], tag], mutating=True)
+        holds.append({'service': service, 'image': info['image'], 'image_id': info['image_id'], 'tag': tag,
+                      'ok': result.returncode == 0})
     return holds
 
 
@@ -551,16 +803,18 @@ def project_snapshot(docker, project):
     return parse_inspect(inspected.stdout)
 
 
-def backup_database(docker, config, project, previous):
-    """pg_dump the live database before the migration can run. Returns (report, ok)."""
+def backup_database(docker, config, project, database):
+    """pg_dump the database straight from its container before the migration can run. Returns (report, ok).
+
+    `database` is the ensure_database() report: the dump happens whenever a database volume exists, including
+    when every application container is stopped or removed.
+    """
     if config.no_backup:
         return {'skipped': True, 'reason': 'disabled by --no-backup'}, True
-    if not previous:
-        return {'skipped': True, 'reason': 'first deployment: no existing containers'}, True
-    database = previous.get(DATABASE_SERVICE)
-    if not database or not database['running']:
-        return {'ok': False, 'error': 'the database service is not running, so it cannot be backed up; start it, '
-                                      'or pass --no-backup to deploy without a backup'}, False
+    if database['state'] == 'none':
+        return {'skipped': True, 'reason': database['reason']}, True
+    if not database['ok']:
+        return {'ok': False, 'error': database['error']}, False
     stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
     path = Path(config.backup_dir) / ('baton-%s-%s.dump' % (re.sub(r'[^A-Za-z0-9_.-]', '_', project), stamp))
     argv = config.compose_base() + ['exec', '-T', DATABASE_SERVICE, 'sh', '-c', DUMP_SCRIPT]
@@ -604,6 +858,11 @@ def up_command(config):
                                     '--force-recreate', '--remove-orphans']
 
 
+def recovery_up_command(config):
+    """Last-resort `up`: no forced recreate, but still waits for health, with the same bounded wait."""
+    return config.compose_base() + ['up', '-d', '--wait', '--wait-timeout', str(config.wait_timeout), '--remove-orphans']
+
+
 def current_image_ids(docker, refs):
     ids = {}
     for ref in refs:
@@ -613,15 +872,15 @@ def current_image_ids(docker, refs):
     return ids
 
 
-def manual_recovery(previous, backup):
-    steps = ['docker tag <image-id> <image-reference>   # for each image listed under rollback.retagged / held_images',
-             'docker compose <your -f and -p options> up -d --wait --force-recreate']
+def manual_recovery(previous, backup, holds):
+    steps = ['docker tag %s %s   # %s' % (hold['tag'], hold['image'], hold['service']) for hold in holds if hold['ok']]
+    steps.append('docker compose <your -f and -p options> up -d --wait --force-recreate')
     if backup and backup.get('path') and backup.get('ok'):
         steps.append('restore the database only if the schema is incompatible: pg_restore --clean --if-exists from ' + backup['path'])
     return steps
 
 
-def roll_back(docker, config, project, previous, orphans, http, token, backup, log, clock, sleep):
+def roll_back(docker, config, project, previous, orphans, http, token, backup, holds, log, clock, sleep):
     """Re-tag previous images, run `up` again, verify and smoke-test; keep trying to recover on failure."""
     core = {name: info for name, info in previous.items() if name not in orphans}
     refs = sorted({info['image'] for info in core.values()})
@@ -640,8 +899,7 @@ def roll_back(docker, config, project, previous, orphans, http, token, backup, l
     if not serving:
         message = 'docker compose up %s during rollback' % ('timed out' if up.timed_out else 'failed')
         log('rollback up failed; trying a best-effort recovery up')
-        recovery = docker.run(config.compose_base() + ['up', '-d', '--remove-orphans'], mutating=True,
-                              timeout=config.up_timeout)
+        recovery = docker.run(recovery_up_command(config), mutating=True, timeout=config.up_timeout)
         report['recovery_up'] = command_report(recovery, [token])
         serving = recovery.returncode == 0
         report['warnings' if serving else 'errors'].append(message)
@@ -660,7 +918,7 @@ def roll_back(docker, config, project, previous, orphans, http, token, backup, l
             report['errors'].append('the restored deployment fails the smoke checks')
     report['ok'] = serving and not report['errors'] and report['smoke']['ok']
     if not report['ok']:
-        report['manual_recovery'] = manual_recovery(previous, backup)
+        report['manual_recovery'] = manual_recovery(previous, backup, holds)
     return report
 
 
@@ -682,7 +940,7 @@ def deploy(config, runner, http=None, log=None, clock=time.monotonic, sleep=time
                       rollback={'attempted': False, 'reason': reason})
         return report
 
-    migration = check_migration(config)
+    migration, migration_sql = check_migration(config)
     report['migration'] = migration
     if migration['unsafe'] and not config.allow_incompatible_migration:
         return stop('aborted', 'the migration SQL is not backward compatible (%s); nothing was changed; a rollback '
@@ -708,7 +966,23 @@ def deploy(config, runner, http=None, log=None, clock=time.monotonic, sleep=time
     if not all(hold['ok'] for hold in holds):
         return stop('aborted', 'could not protect the previous images; nothing was changed')
 
-    backup, backup_ok = backup_database(docker, config, project, previous)
+    database = ensure_database(docker, config, project, previous)
+    report['database'] = database
+    if not database['ok'] and not (config.no_backup and config.allow_incompatible_migration):
+        return stop('aborted', 'the database cannot be reached, so it can be neither checked nor backed up (%s); '
+                    'nothing else was changed' % database['error'])
+    if not database['ok'] or database['state'] == 'none':
+        report['precheck'] = {'skipped': True, 'reason': database.get('reason') or 'database unavailable'}
+    else:
+        log('prechecking the migration on a throwaway database')
+        precheck = report['precheck'] = precheck_migration(docker, config, migration_sql)
+        if not precheck['ok'] and not config.allow_incompatible_migration:
+            detail = ('the precheck could not be completed (%s); treated as incompatible' % precheck['error']
+                      if precheck['error'] else 'it would break the previous image: ' + '; '.join(precheck['changes']))
+            return stop('aborted', 'the migration is not backward compatible: %s; nothing was changed. Split it into an '
+                        'expand release and a later contract release, or pass --allow-incompatible-migration' % detail)
+
+    backup, backup_ok = backup_database(docker, config, project, database)
     report['backup'] = backup
     if not backup_ok:
         return stop('aborted', 'the database backup failed; nothing was changed')
@@ -748,7 +1022,7 @@ def deploy(config, runner, http=None, log=None, clock=time.monotonic, sleep=time
         report.update(status='failed', ok=False, rollback={'attempted': False, 'reason': 'no previous deployment existed'})
     else:
         log('deployment failed; rolling back')
-        rollback = roll_back(docker, config, project, previous, orphans, http, token, backup, log, clock, sleep)
+        rollback = roll_back(docker, config, project, previous, orphans, http, token, backup, holds, log, clock, sleep)
         report['rollback'] = rollback
         report.update(status='rolled_back' if rollback['ok'] else 'rollback_failed', ok=False)
     if report['status'] != 'rollback_failed':
@@ -794,7 +1068,12 @@ def parse_args(argv):
     parser.add_argument('--allow-remove-orphans', action='store_true',
                         help='acknowledge that containers of services the Compose files no longer declare are deleted')
     parser.add_argument('--allow-incompatible-migration', action='store_true',
-                        help='deploy even though the migration SQL has statements the previous image cannot survive')
+                        help='deploy even though the migration precheck found changes the previous image cannot survive '
+                             '(or could not run)')
+    parser.add_argument('--schema-file', metavar='FILE',
+                        help='the migration SQL the image being built applies (default: bridge/space_schema.sql of this checkout)')
+    parser.add_argument('--precheck-timeout', type=positive, default=300, metavar='SECONDS',
+                        help='hard timeout for each step of the throwaway-database migration precheck')
     parser.add_argument('--base-url', default='http://127.0.0.1:8080', help='public entry point to smoke-test')
     parser.add_argument('--ca-file', help='CA bundle for an https --base-url')
     parser.add_argument('--smoke-token-file', required=True, metavar='PATH',
@@ -821,7 +1100,7 @@ def main(argv=None, runner=None, http=None, stdout=None, stderr=None, clock=time
         config = Config(args.compose_files, args.project, args.env_file, args.project_directory, args.profiles,
                         args.build, args.build_network, args.wait_timeout, args.build_timeout, args.command_timeout,
                         args.backup_timeout, args.backup_dir, args.no_backup, args.allow_remove_orphans,
-                        args.allow_incompatible_migration, SCHEMA_FILE, parse_base_url(args.base_url), args.ca_file,
+                        args.allow_incompatible_migration, args.schema_file, args.precheck_timeout, parse_base_url(args.base_url), args.ca_file,
                         args.smoke_token_file, args.smoke_timeout, args.request_timeout, args.dry_run)
         report = deploy(config, runner or SubprocessRunner(), http, log, clock, sleep)
     except UsageError as exc:

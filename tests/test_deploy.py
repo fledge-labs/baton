@@ -301,12 +301,26 @@ EDGE_ID = "sha256:" + "c" * 64
 NEW_EDGE_ID = "sha256:" + "e" * 64
 
 
+def catalog(drop_column=False):
+    columns = [{"t": "baton.tasks", "c": name, "type": "text", "notnull": False, "default": None, "hasdef": False}
+               for name in ("id", "assignee")]
+    if drop_column:
+        columns = columns[:1]
+    return {"columns": columns, "relations": ["baton.tasks:r"],
+            "constraints": [{"t": "baton.tasks", "name": "tasks_pkey", "def": "PRIMARY KEY (id)", "cols": ["id"]}],
+            "indexes": [{"t": "baton.tasks", "name": "tasks_pkey", "def": "CREATE UNIQUE INDEX tasks_pkey", "unique": True, "cols": ["id"]}],
+            "triggers": [], "functions": [], "types": []}
+
+
 class FakeDocker:
     """Scripted docker/compose: containers per service, the app image tag, and one serving image."""
 
     def __init__(self, existing=True, up_results=None, recovery_ok=True, build_ok=True, fail_tag_refs=(), hold_ok=True,
-                 dump="ok", stopped=(), orphans=(), edge_drift=False, build_timeout=False):
-        self.calls, self.timeouts = [], []
+                 dump="ok", stopped=(), orphans=(), edge_drift=False, build_timeout=False, precheck="clean",
+                 volume=None, db_start_ok=True, drop_ok=True, no_containers=False, overrides=None):
+        self.calls, self.timeouts, self.stdins = [], [], []
+        self.precheck, self.volume, self.db_start_ok, self.drop_ok = precheck, existing if volume is None else volume, db_start_ok, drop_ok
+        self.snapshots_served = 0
         self.up_results = list(up_results if up_results is not None else [0, 0])
         self.recovery_ok, self.build_ok, self.fail_tag_refs, self.hold_ok = recovery_ok, build_ok, set(fail_tag_refs), hold_ok
         self.dump, self.edge_drift, self.build_timeout = dump, edge_drift, build_timeout
@@ -322,10 +336,17 @@ class FakeDocker:
         for service in orphans:
             self.containers[service] = {"ref": "orphan:local", "id": "sha256:" + "f" * 64, "running": True}
         self.declared = ["bridge", "database", "edge", "gateway", "initialize", "migrate"]
+        if no_containers:
+            self.containers = {}
+        for service, changes in (overrides or {}).items():
+            self.containers[service].update(changes)
 
-    def __call__(self, argv, timeout=None, stdout_path=None):
+    def __call__(self, argv, timeout=None, stdout_path=None, stdin_text=None):
         self.calls.append(list(argv))
         self.timeouts.append(timeout)
+        self.stdins.append(stdin_text)
+        if argv[:3] == ["docker", "volume", "ls"]:
+            return deploy.Result(0, "demo_postgres-data\n" if self.volume else "")
         if argv[:2] == ["docker", "compose"] and "config" in argv:
             services = {name: ({"build": {}} if name in ("initialize", "bridge") else {}) for name in self.declared}
             return deploy.Result(0, json.dumps({"name": "demo", "services": services}))
@@ -336,6 +357,10 @@ class FakeDocker:
         if argv[:3] == ["docker", "image", "inspect"]:
             ref = argv[-1]
             return deploy.Result(0, self.tags[ref] + "\n") if ref in self.tags else deploy.Result(1, "", "no such image")
+        if "exec" in argv and argv[argv.index("exec") + 2] == "database" and "pg_dump" in argv[-1] and "-Fc" not in argv[-1]:
+            return self.run_clone(argv)
+        if "exec" in argv and argv[argv.index("exec") + 2] == "database" and stdin_text is not None:
+            return self.run_psql(argv, stdin_text)
         if "exec" in argv and argv[argv.index("exec") + 2] == "database":
             if self.dump == "fail":
                 return deploy.Result(1, "", "pg_dump: connection refused")
@@ -363,6 +388,11 @@ class FakeDocker:
         if argv[:2] == ["docker", "rmi"]:
             self.tags.pop(argv[2], None)
             return deploy.Result(0)
+        if argv[:2] == ["docker", "compose"] and "up" in argv and "--no-deps" in argv:
+            if not self.db_start_ok:
+                return deploy.Result(1, "", "database failed to start")
+            self.containers.setdefault("database", {"ref": DB_REF, "id": DB_ID, "running": True})["running"] = True
+            return deploy.Result(0)
         if argv[:2] == ["docker", "compose"] and "up" in argv:
             if "--force-recreate" in argv:
                 outcome = self.up_results.pop(0)
@@ -375,6 +405,27 @@ class FakeDocker:
             self.start(argv)
             return deploy.Result(0, "up output")
         raise AssertionError("unexpected command: %s" % argv)
+
+    def run_clone(self, argv):
+        if self.precheck == "fail:clone":
+            return deploy.Result(1, "", "pg_dump: error: connection refused")
+        return deploy.Result(0)
+
+    def run_psql(self, argv, sql):
+        if sql.startswith("CREATE DATABASE"):
+            return deploy.Result(1, "", "permission denied") if self.precheck == "fail:create" else deploy.Result(0)
+        if sql.startswith("CREATE SCHEMA IF NOT EXISTS"):
+            return deploy.Result(0)
+        if sql.startswith("SELECT json_build_object"):
+            self.snapshots_served += 1
+            if self.precheck == "garbage":
+                return deploy.Result(0, "this is not json")
+            return deploy.Result(0, json.dumps(catalog(drop_column=self.precheck == "breaking" and self.snapshots_served == 2)))
+        if sql.startswith("BEGIN;"):
+            return deploy.Result(1, "", "ERROR: syntax error at or near \"sql\"") if self.precheck == "fail:apply" else deploy.Result(0)
+        if sql.startswith("DROP DATABASE"):
+            return deploy.Result(0) if self.drop_ok else deploy.Result(1, "", "database is being accessed")
+        raise AssertionError("unexpected sql: %r" % sql[:60])
 
     def start(self, argv):
         self.serving = self.tags.get(APP_REF)
@@ -394,7 +445,7 @@ class FakeDocker:
     def inspect(self, name):
         container = self.containers[name]
         return {"Id": name * 20, "Image": container["id"], "State": {"Running": container["running"]},
-                "Created": "2026-01-01T00:00:0%dZ" % (len(self.calls) % 10),
+                "Created": container.get("created", "2026-01-01T00:00:00Z"),
                 "Config": {"Image": container["ref"], "Labels": {deploy.SERVICE_LABEL: name}}}
 
     def mutating(self):
@@ -402,7 +453,7 @@ class FakeDocker:
                 or c[-1:] == ["build"] or "exec" in c]
 
     def ups(self):
-        return [c for c in self.calls if c[:2] == ["docker", "compose"] and "up" in c]
+        return [c for c in self.calls if c[:2] == ["docker", "compose"] and "up" in c and "--no-deps" not in c]
 
 
 class FakeGateway:
@@ -432,6 +483,13 @@ class FakeGateway:
             return deploy.Response(202, {}, b"")
         return deploy.Response(200, {"content-type": "application/json"},
                                json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": results[message["method"]]}).encode())
+
+
+def hold(service, image_id=OLD_APP):
+    return deploy.hold_tag(image_id, service)
+
+
+APP_SERVICES = ("bridge", "initialize", "migrate")
 
 
 @pytest.fixture
@@ -476,13 +534,15 @@ def test_successful_deploy_records_backs_up_builds_ups_smokes_and_never_prints_t
 def test_every_docker_command_has_a_hard_timeout_and_up_gets_the_wait_timeout_plus_grace(files):
     docker = FakeDocker()
     run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--wait-timeout", "90", "--build-timeout", "700",
-        "--command-timeout", "30", "--backup-timeout", "400")
+        "--command-timeout", "30", "--backup-timeout", "400", "--precheck-timeout", "250")
     assert all(timeout for timeout in docker.timeouts)
     by_kind = {}
     for argv, timeout in zip(docker.calls, docker.timeouts):
-        kind = "up" if argv[-1] == "--remove-orphans" else "build" if argv[-1] == "build" else "dump" if "exec" in argv else "other"
+        kind = ("up" if argv[-1] == "--remove-orphans" else "build" if argv[-1] == "build"
+                else "dump" if "exec" in argv and "-Fc" in argv[-1] else "precheck" if "exec" in argv else "other")
         by_kind.setdefault(kind, set()).add(timeout)
-    assert by_kind == {"up": {90 + deploy.UP_GRACE}, "build": {700}, "dump": {400}, "other": {30}}
+    assert by_kind == {"up": {90 + deploy.UP_GRACE}, "build": {700}, "dump": {400},
+                       "precheck": {250}, "other": {30}}
     up = docker.ups()[0]
     assert up[up.index("--wait-timeout") + 1] == "90"
 
@@ -502,7 +562,10 @@ def test_rollback_up_that_hangs_gets_a_recovery_up_and_a_timed_out_rollback_is_r
     assert rollback["up"]["timed_out"] and rollback["recovery_up"]["ok"]
     assert rollback["warnings"] == ["docker compose up timed out during rollback"] and rollback["ok"]
     assert code == 1 and report["status"] == "rolled_back"
-    assert len(docker.ups()) == 3 and "--force-recreate" not in docker.ups()[-1] and "--wait" not in docker.ups()[-1]
+    recovery = docker.ups()[-1]
+    assert len(docker.ups()) == 3 and "--force-recreate" not in recovery
+    assert recovery[recovery.index("--wait"):] == ["--wait", "--wait-timeout", "300", "--remove-orphans"], "recovery still waits, bounded"
+    assert docker.timeouts[docker.calls.index(recovery)] == 300 + deploy.UP_GRACE
 
 
 def test_build_that_hangs_stops_before_up(files):
@@ -531,12 +594,12 @@ def test_smoke_failure_restores_the_previous_image_verifies_it_and_exits_nonzero
 def test_the_previous_image_is_pinned_by_a_holding_tag_before_the_build(files):
     docker = FakeDocker()
     run(files, docker, FakeGateway(docker, good_image=NEW_APP))
-    hold = deploy.hold_tag(OLD_APP)
-    assert hold == "baton-deploy-rollback:" + "a" * 12
-    tag_at = docker.calls.index(["docker", "tag", OLD_APP, hold])
     build_at = next(i for i, c in enumerate(docker.calls) if c[-1:] == ["build"])
-    assert tag_at < build_at
-    assert ["docker", "rmi", hold] in docker.calls
+    for service in APP_SERVICES:
+        assert hold(service) == "baton-deploy-rollback:%s-%s" % (service, "a" * 12)
+        assert docker.calls.index(["docker", "tag", OLD_APP, hold(service)]) < build_at
+        assert ["docker", "rmi", hold(service)] in docker.calls
+    assert not [c for c in docker.calls if c[:2] == ["docker", "tag"] and c[2] == DB_ID], "digest-pinned images are not tagged"
 
 
 def test_unhealthy_up_rolls_back_without_smoking_the_failed_release(files):
@@ -577,7 +640,8 @@ def test_rollback_with_a_failed_retag_still_retags_the_rest_runs_up_and_reports_
     assert code == 3 and report["status"] == "rollback_failed"
     assert any("could not re-tag" in e for e in rollback["errors"])
     assert len(docker.ups()) == 2, "up still runs after a failed retag"
-    assert rollback["manual_recovery"] and deploy.hold_tag(OLD_APP) in docker.tags
+    assert rollback["manual_recovery"] and all(hold(service) in docker.tags for service in APP_SERVICES)
+    assert "docker tag %s %s   # bridge" % (hold("bridge"), APP_REF) in rollback["manual_recovery"]
     assert [m["service"] for m in rollback["mismatches"]] == ["bridge", "initialize", "migrate"]
 
 
@@ -589,7 +653,26 @@ def test_rollback_up_failure_triggers_a_best_effort_recovery_and_failure_is_repo
     assert rollback["recovery_up"]["ok"] is False and "docker compose up failed during rollback" in rollback["errors"]
     assert rollback["manual_recovery"]
     assert len(docker.ups()) == 3 and "--force-recreate" not in docker.ups()[-1]
-    assert deploy.hold_tag(OLD_APP) in docker.tags, "holding tags survive a failed rollback"
+    assert hold("bridge") in docker.tags, "holding tags survive a failed rollback"
+
+
+CRASHED_APP = "sha256:" + "1" * 64
+
+
+def test_services_sharing_an_image_reference_each_get_their_own_protective_tag(files):
+    docker = FakeDocker(stopped=("bridge", "database", "edge"), overrides={
+        "bridge": {"id": CRASHED_APP, "running": False, "created": "2026-01-01T00:00:00Z"},
+        "initialize": {"created": "2026-02-01T00:00:00Z"}, "migrate": {"created": "2026-02-01T00:00:00Z"}})
+    code, report, _ = run(files, docker, FakeGateway(docker, good_image=OLD_APP), "--no-backup")
+    held = {(h["service"], h["image_id"]) for h in report["held_images"]}
+    assert held == {("bridge", CRASHED_APP), ("initialize", OLD_APP), ("migrate", OLD_APP)}, "the crashed bridge's own image is held"
+    build_at = next(i for i, c in enumerate(docker.calls) if c[-1:] == ["build"])
+    assert docker.calls.index(["docker", "tag", CRASHED_APP, hold("bridge", CRASHED_APP)]) < build_at
+    rollback = report["rollback"]
+    assert code == 3 and report["status"] == "rollback_failed", "one shared tag cannot restore two different images"
+    assert [(m["service"], m["expected"]) for m in rollback["mismatches"]] == [("bridge", CRASHED_APP)]
+    assert hold("bridge", CRASHED_APP) in docker.tags, "the crashed service's image survives for a manual restore"
+    assert "docker tag %s %s   # bridge" % (hold("bridge", CRASHED_APP), APP_REF) in rollback["manual_recovery"]
 
 
 def test_a_rollback_that_leaves_a_service_on_a_new_image_is_not_reported_as_rolled_back(files):
@@ -636,7 +719,7 @@ def test_build_failure_stops_before_up_and_redacts_output(files):
     assert code == 1 and report["status"] == "build_failed"
     assert not docker.ups()
     assert "[redacted]" in report["build"]["output_tail"] and TOKEN not in text
-    assert ["docker", "rmi", deploy.hold_tag(OLD_APP)] in docker.calls
+    assert ["docker", "rmi", hold("bridge")] in docker.calls
 
 
 def test_holding_failure_aborts_before_the_build(files):
@@ -653,7 +736,7 @@ def test_database_is_backed_up_before_the_build_and_the_migration(files, tmp_pat
     path = Path(backup["path"])
     assert code == 0 and backup["ok"] and path.parent == files[0].parent / "backups" and path.name.startswith("baton-demo-")
     assert path.read_bytes().startswith(b"PGDMP")
-    dump = next(i for i, c in enumerate(docker.calls) if "exec" in c)
+    dump = next(i for i, c in enumerate(docker.calls) if "exec" in c and "-Fc" in c[-1])
     assert dump < next(i for i, c in enumerate(docker.calls) if c[-1:] == ["build"])
     assert dump < next(i for i, c in enumerate(docker.calls) if c in docker.ups())
     argv = docker.calls[dump]
@@ -677,16 +760,58 @@ def test_a_failed_or_invalid_backup_aborts_before_anything_changes(files, dump):
     assert report["rollback"]["reason"] == "the database backup failed; nothing was changed"
     assert not docker.ups() and not [c for c in docker.calls if c[-1:] == ["build"]]
     assert not list((files[0].parent / "backups").glob("*.dump")), "a bad dump is not left behind"
-    assert ["docker", "rmi", deploy.hold_tag(OLD_APP)] in docker.calls
+    assert ["docker", "rmi", hold("bridge")] in docker.calls
 
 
-def test_backup_cannot_be_taken_when_the_database_is_stopped_unless_explicitly_waived(files):
-    docker = FakeDocker(stopped=("database",))
+def dump_calls(docker):
+    return [c for c in docker.calls if "exec" in c and "-Fc" in c[-1]]
+
+
+def test_a_stopped_database_is_started_then_checked_and_dumped_even_when_every_container_is_stopped(files):
+    docker = FakeDocker(stopped=("bridge", "database", "edge"), up_results=[0])
+    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP))
+    assert code == 0 and report["database"] == {"state": "started", "ok": True}
+    start = next(c for c in docker.calls if "--no-deps" in c)
+    assert start[-1] == "database" and "--no-recreate" in start and "--wait" in start, "starts the existing container, never recreates it"
+    assert docker.timeouts[docker.calls.index(start)] == 300 + deploy.UP_GRACE
+    assert report["precheck"]["ok"] and report["backup"]["ok"] and len(dump_calls(docker)) == 1
+    assert docker.calls.index(start) < docker.calls.index(dump_calls(docker)[0])
+
+
+def test_a_database_volume_without_any_container_is_still_started_checked_and_dumped(files):
+    docker = FakeDocker(no_containers=True, volume=True, up_results=[0])
+    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP))
+    assert report["previous_images"] == {} and report["database"]["state"] == "started"
+    assert report["precheck"]["ok"] and report["backup"]["ok"] and len(dump_calls(docker)) == 1
+    assert code == 0
+
+
+def test_a_database_that_cannot_be_started_aborts_before_anything_changes_unless_both_checks_are_waived(files):
+    docker = FakeDocker(stopped=("database",), db_start_ok=False)
     code, report, _ = run(files, docker, FakeGateway(docker))
-    assert code == 1 and report["status"] == "aborted" and "not running" in report["backup"]["error"]
-    docker = FakeDocker(stopped=("database",))
+    assert code == 1 and report["status"] == "aborted" and "could not be started" in report["database"]["error"]
+    assert not docker.ups() and not dump_calls(docker) and not [c for c in docker.calls if c[-1:] == ["build"]]
+    docker = FakeDocker(stopped=("database",), db_start_ok=False)
+    code, report, _ = run(files, docker, FakeGateway(docker), "--no-backup")
+    assert code == 1 and report["status"] == "aborted", "--no-backup alone does not waive the migration precheck"
+    docker = FakeDocker(stopped=("database",), db_start_ok=False)
+    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--no-backup", "--allow-incompatible-migration")
+    assert code == 0 and report["precheck"] == {"skipped": True, "reason": "database unavailable"}
+
+
+def test_no_backup_skips_the_dump_but_not_the_migration_precheck(files):
+    docker = FakeDocker()
     code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--no-backup")
     assert code == 0 and report["backup"] == {"skipped": True, "reason": "disabled by --no-backup"}
+    assert report["precheck"]["ok"] and not dump_calls(docker)
+
+
+def test_first_deployment_without_a_database_volume_has_nothing_to_check_or_dump(files):
+    docker = FakeDocker(existing=False, up_results=[0])
+    code, report, _ = run(files, docker, FakeGateway(docker, good_image=None))
+    assert report["database"] == {"state": "none", "ok": True, "reason": "no database volume: first deployment"}
+    assert report["precheck"]["skipped"] and report["backup"]["skipped"] and not dump_calls(docker)
+    assert not [c for c in docker.calls if "exec" in c]
 
 
 def test_backup_dir_is_required_unless_no_backup_is_given(files, capsys):
@@ -725,17 +850,250 @@ def test_the_shipped_migration_sql_is_expand_only():
     assert deploy.SCHEMA_FILE == schema
 
 
-def test_an_incompatible_migration_aborts_the_deploy_before_anything_changes_unless_acknowledged(files, tmp_path, monkeypatch):
+def migration_file(tmp_path, monkeypatch, sql):
     schema = tmp_path / "schema.sql"
-    schema.write_text("ALTER TABLE baton.t DROP COLUMN c;\n")
+    schema.write_text(sql)
     monkeypatch.setattr(deploy, "SCHEMA_FILE", schema)
+    return schema
+
+
+def test_an_obviously_destructive_migration_fails_fast_before_any_docker_command(files, tmp_path, monkeypatch):
+    migration_file(tmp_path, monkeypatch, "ALTER TABLE baton.t DROP COLUMN c;\n")
     docker = FakeDocker()
     code, report, _ = run(files, docker, FakeGateway(docker))
     assert code == 1 and report["status"] == "aborted" and not docker.calls
-    assert "not backward compatible" in report["rollback"]["reason"] and "drops a table" in report["rollback"]["reason"]
+    assert "not backward compatible" in report["rollback"]["reason"] and "DROP" in report["rollback"]["reason"]
     docker = FakeDocker()
     code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--allow-incompatible-migration")
     assert code == 0 and report["migration"]["unsafe"]
+
+
+@pytest.mark.parametrize("extra", [[], ["--allow-incompatible-migration"]])
+def test_a_missing_or_empty_migration_file_is_an_error_never_a_pass(files, tmp_path, monkeypatch, extra):
+    monkeypatch.setattr(deploy, "SCHEMA_FILE", tmp_path / "does-not-exist.sql")
+    docker = FakeDocker()
+    code, report, text = run(files, docker, FakeGateway(docker), *extra)
+    assert code == 2 and "migration SQL not found" in report["error"] and not docker.calls
+    (tmp_path / "empty.sql").write_text("  \n")
+    code, report, _ = run(files, docker, FakeGateway(docker), "--schema-file", str(tmp_path / "empty.sql"), *extra)
+    assert code == 2 and "empty" in report["error"] and not docker.calls
+
+
+def test_the_migration_is_applied_to_a_throwaway_database_never_to_the_live_one_and_it_is_dropped(files):
+    docker = FakeDocker()
+    code, report, text = run(files, docker, FakeGateway(docker, good_image=NEW_APP))
+    precheck = report["precheck"]
+    name = precheck["database"]
+    assert code == 0 and precheck["ok"] and precheck["changes"] == [] and name.startswith(deploy.PRECHECK_PREFIX)
+    steps = [(c[-1], s) for c, s in zip(docker.calls, docker.stdins) if "exec" in c and "-Fc" not in c[-1]]
+    assert [s.split("\n")[0] if s else "clone" for _, s in steps] == [
+        'CREATE DATABASE "%s";' % name, "clone", "CREATE SCHEMA IF NOT EXISTS baton AUTHORIZATION baton_owner;",
+        "SELECT json_build_object(", "BEGIN;", "SELECT json_build_object(", 'DROP DATABASE IF EXISTS "%s" WITH (FORCE);' % name]
+    for script, sql in steps:
+        if sql and sql.startswith(("BEGIN;", "SELECT")):
+            assert "-d %s" % name in script and "-d baton " not in script + " ", "only the throwaway database is touched"
+    apply_sql = next(s for _, s in steps if s and s.startswith("BEGIN;"))
+    assert "SET LOCAL ROLE baton_owner" in apply_sql and "CREATE TABLE IF NOT EXISTS baton.spaces" in apply_sql, "the pending SQL"
+    clone = next(script for script, sql in steps if sql is None)
+    assert "--schema-only" in clone and "-d baton" in clone
+    assert all("postgres.password" in script and "PGPASSWORD" in script for script, _ in steps)
+    assert TOKEN not in text
+
+
+def test_precheck_runs_before_the_backup_the_build_and_the_migration(files):
+    docker = FakeDocker()
+    run(files, docker, FakeGateway(docker, good_image=NEW_APP))
+    drop = max(i for i, s in enumerate(docker.stdins) if s and s.startswith("DROP DATABASE"))
+    assert drop < docker.calls.index(dump_calls(docker)[0]) < next(i for i, c in enumerate(docker.calls) if c[-1:] == ["build"])
+
+
+def test_a_breaking_schema_diff_aborts_before_anything_changes_and_the_throwaway_is_still_dropped(files):
+    docker = FakeDocker(precheck="breaking")
+    code, report, _ = run(files, docker, FakeGateway(docker))
+    assert code == 1 and report["status"] == "aborted" and report["precheck"]["changes"] == ["drops column baton.tasks.assignee"]
+    assert "drops column baton.tasks.assignee" in report["rollback"]["reason"]
+    assert any(s and s.startswith("DROP DATABASE") for s in docker.stdins), "cleanup runs even when the check fails"
+    assert not docker.ups() and not dump_calls(docker) and not [c for c in docker.calls if c[-1:] == ["build"]]
+    docker = FakeDocker(precheck="breaking")
+    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--allow-incompatible-migration")
+    assert code == 0 and report["precheck"]["changes"] and report["backup"]["ok"], "acknowledged, still recorded and backed up"
+
+
+@pytest.mark.parametrize("failure", ["fail:create", "fail:clone", "fail:apply", "garbage"])
+def test_a_precheck_that_cannot_complete_fails_closed(files, failure):
+    docker = FakeDocker(precheck=failure)
+    code, report, _ = run(files, docker, FakeGateway(docker))
+    assert code == 1 and report["status"] == "aborted" and not report["precheck"]["ok"] and report["precheck"]["error"]
+    assert "could not be completed" in report["rollback"]["reason"] and "treated as incompatible" in report["rollback"]["reason"]
+    assert not docker.ups() and not dump_calls(docker)
+    created = failure != "fail:create"
+    assert any(s and s.startswith("DROP DATABASE") for s in docker.stdins) == created
+    docker = FakeDocker(precheck=failure)
+    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--allow-incompatible-migration")
+    assert code == 0 and not report["precheck"]["ok"]
+
+
+def test_a_throwaway_database_that_cannot_be_dropped_is_reported(files):
+    docker = FakeDocker(drop_ok=False)
+    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP))
+    assert code == 0 and report["precheck"]["cleanup_error"].startswith("could not drop " + report["precheck"]["database"])
+
+
+def test_precheck_reads_the_migration_that_the_image_will_apply(files, tmp_path):
+    schema = tmp_path / "pending.sql"
+    schema.write_text("ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS extra text;\n")
+    docker = FakeDocker()
+    run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--schema-file", str(schema))
+    assert any(s and s.startswith("BEGIN;") and "ADD COLUMN IF NOT EXISTS extra text" in s for s in docker.stdins)
+
+
+def test_dry_run_plans_the_precheck_without_executing_it(files):
+    docker = FakeDocker()
+    code, report, _ = run(files, docker, None, "--dry-run")
+    assert code == 0 and report["precheck"]["planned"] and not [s for s in docker.stdins if s]
+    assert not [c for c in docker.calls if "exec" in c]
+    assert sum(1 for c in report["commands"] if "exec" in c["argv"] and not c["executed"]) >= 7
+
+
+@pytest.mark.parametrize("statement", [
+    "ALTER TABLE baton.t DROP c;", "ALTER TABLE baton.t DROP IF EXISTS c;", "ALTER TABLE baton.t ALTER c SET NOT NULL;",
+    "ALTER TABLE baton.t ALTER c TYPE bigint;", 'ALTER TABLE baton.t ALTER "c" SET DATA TYPE text;',
+    "ALTER TABLE baton.t ADD c text NOT NULL;", "ALTER TABLE baton.t ADD COLUMN a int, ADD COLUMN b int NOT NULL;",
+    "/* -- */ DROP TABLE baton.t;", "-- note\n/* x */ ALTER TABLE baton.t DROP/**/COLUMN c;",
+    "ALTER TABLE baton.t DROP COLUMN c; -- ok", "SELECT '--'; DROP TABLE baton.t;", "SELECT 'it''s'; DROP TABLE baton.t;",
+])
+def test_the_textual_early_warning_catches_the_forms_that_slipped_through_before(statement):
+    assert deploy.unsafe_migration_statements(statement)
+
+
+def base_snapshot():
+    return json.loads(json.dumps(catalog()))
+
+
+def altered(**edits):
+    snapshot = base_snapshot()
+    for section, change in edits.items():
+        change(snapshot[section]) if callable(change) else snapshot.__setitem__(section, change)
+    return snapshot
+
+
+def column(name, **fields):
+    return dict({"t": "baton.tasks", "c": name, "type": "text", "notnull": False, "default": None, "hasdef": False}, **fields)
+
+
+@pytest.mark.parametrize("after,expected", [
+    (altered(columns=lambda c: c.pop()), "drops column baton.tasks.assignee"),
+    (altered(relations=[], columns=[]), "drops baton.tasks:r"),
+    (altered(columns=lambda c: c[1].update(type="integer")), "changes the type of baton.tasks.assignee from text to integer"),
+    (altered(columns=lambda c: c[1].update(notnull=True)), "makes baton.tasks.assignee NOT NULL"),
+    (altered(columns=lambda c: c.append(column("new", notnull=True))), "adds NOT NULL column baton.tasks.new without a default"),
+    (altered(columns=lambda c: c[1].update(default="'x'::text")), "changes the default of baton.tasks.assignee"),
+    (altered(constraints=[]), "drops constraint tasks_pkey on baton.tasks"),
+    (altered(constraints=lambda c: c[0].update(**{"def": "PRIMARY KEY (id, assignee)"})), "changes constraint tasks_pkey on baton.tasks"),
+    (altered(constraints=lambda c: c.append({"t": "baton.tasks", "name": "chk", "def": "CHECK (assignee <> '')", "cols": ["assignee"]})),
+     "adds constraint chk that constrains existing columns of baton.tasks"),
+    (altered(constraints=lambda c: c.append({"t": "baton.tasks", "name": "chk0", "def": "CHECK (true)", "cols": []})),
+     "adds constraint chk0 that constrains existing columns of baton.tasks"),
+    (altered(indexes=[]), "drops index tasks_pkey on baton.tasks"),
+    (altered(indexes=lambda i: i.append({"t": "baton.tasks", "name": "u", "def": "CREATE UNIQUE INDEX u", "unique": True, "cols": ["assignee"]})),
+     "adds index u that constrains existing columns of baton.tasks"),
+    (altered(triggers=lambda t: t.append({"t": "baton.tasks", "name": "g", "def": "CREATE TRIGGER g"})),
+     "adds trigger g to the existing table baton.tasks"),
+    (altered(types=lambda t: t.append({"name": "baton.k", "def": "e:a"})), None),
+])
+def test_schema_diff_flags_everything_a_previous_image_could_not_survive(after, expected):
+    changes = deploy.schema_breaking_changes(base_snapshot(), after)
+    if expected is None:
+        assert changes == []
+    else:
+        assert expected in changes, changes
+
+
+def test_schema_diff_covers_dropped_or_changed_triggers_functions_and_types():
+    before = altered(triggers=[{"t": "baton.tasks", "name": "g", "def": "A"}], functions=[{"sig": "baton.f()", "def": "one"}],
+                     types=[{"name": "baton.k", "def": "e:a"}])
+    after = altered(triggers=[{"t": "baton.tasks", "name": "g", "def": "B"}], functions=[{"sig": "baton.f()", "def": "two"}],
+                    types=[{"name": "baton.k", "def": "e:a,b"}])
+    assert deploy.schema_breaking_changes(before, after) == [
+        "changes trigger g on baton.tasks", "changes function baton.f()", "changes type baton.k"]
+    gone = altered()
+    assert deploy.schema_breaking_changes(before, gone) == ["drops trigger g on baton.tasks", "drops function baton.f()",
+                                                            "drops type baton.k"]
+
+
+def test_schema_diff_accepts_purely_additive_changes():
+    after = altered(
+        columns=lambda c: c.extend([column("note"), column("flag", type="boolean", notnull=True, hasdef=True, default="false")]),
+        relations=lambda r: r.append("baton.notes:r"),
+        constraints=lambda c: c.append({"t": "baton.tasks", "name": "chk_note", "def": "CHECK (note <> '')", "cols": ["note"]}),
+        indexes=lambda i: i.append({"t": "baton.tasks", "name": "plain", "def": "CREATE INDEX plain", "unique": False, "cols": ["id"]}),
+        functions=[{"sig": "baton.g()", "def": "x"}])
+    assert deploy.schema_breaking_changes(base_snapshot(), after) == []
+
+
+@pytest.fixture
+def admin_connection():
+    import os
+
+    import psycopg
+
+    path = os.environ.get("BATON_TEST_DATABASE_ADMIN_CONFIG")
+    if not path:
+        pytest.skip("PostgreSQL integration NOT_RUN: set BATON_TEST_DATABASE_ADMIN_CONFIG")
+    config = json.loads(Path(path).read_text())
+    return psycopg, config
+
+
+def test_catalog_sql_and_diff_on_a_real_postgres_accept_the_shipped_schema_and_catch_evasive_drops(admin_connection):
+    psycopg, config = admin_connection
+    name = deploy.PRECHECK_PREFIX + "test_" + uuid.uuid4().hex[:8]
+    schema = (ROOT / "bridge/space_schema.sql").read_text(encoding="utf-8")
+
+    def connect(database, autocommit=False):
+        return psycopg.connect(**dict(config, dbname=database), autocommit=autocommit)
+
+    with connect(config["dbname"], autocommit=True) as admin:
+        admin.execute('CREATE DATABASE "%s"' % name)
+    try:
+        with connect(name, autocommit=True) as conn:
+            conn.execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='baton_owner') THEN "
+                         "CREATE ROLE baton_owner NOLOGIN; END IF; END $$")
+            conn.execute("CREATE SCHEMA IF NOT EXISTS baton AUTHORIZATION baton_owner")
+            conn.execute('GRANT CREATE ON DATABASE "%s" TO baton_owner' % name)
+
+            def apply(sql):
+                conn.execute("BEGIN")
+                conn.execute("SET LOCAL ROLE baton_owner")
+                conn.execute(sql)
+                conn.execute("COMMIT")
+
+            def snapshot():
+                return deploy.parse_snapshot(json.dumps(conn.execute(deploy.CATALOG_SQL).fetchone()[0]))
+
+            apply(schema)
+            first = snapshot()
+            assert {"baton.tasks:r", "baton.x_audit:r"} <= set(first["relations"])
+            assert first["constraints"] and first["indexes"] and first["triggers"] and first["functions"]
+            apply(schema)
+            assert deploy.schema_breaking_changes(first, snapshot()) == [], "the shipped migration is idempotent on its own schema"
+            for statement, expected in [
+                ("ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS df18_extra text", None),
+                ("DO $$ BEGIN EXECUTE 'ALTER TABLE baton.tasks '||'DROP COLUMN df18_extra'; END $$",
+                 "drops column baton.tasks.df18_extra"),
+                ("DO $$ BEGIN EXECUTE 'ALTER TABLE baton.tasks ALTER priority SET DATA TYPE varchar(5)'; END $$",
+                 "changes the type of baton.tasks.priority from text to character varying(5)"),
+                ("DO $$ BEGIN EXECUTE 'ALTER TABLE baton.tasks ALTER blocked_by SET NOT NULL'; END $$",
+                 "makes baton.tasks.blocked_by NOT NULL"),
+                ("ALTER TABLE baton.tasks ADD COLUMN df18_required text NOT NULL DEFAULT 'x'", None),
+                ("DO $$ BEGIN EXECUTE 'ALTER TABLE baton.tasks DROP COLUMN assignee'; END $$", "drops column baton.tasks.assignee"),
+            ]:
+                before = snapshot()
+                apply(statement)
+                changes = deploy.schema_breaking_changes(before, snapshot())
+                assert (expected in changes) if expected else changes == [], (statement, changes)
+    finally:
+        with connect(config["dbname"], autocommit=True) as admin:
+            admin.execute('DROP DATABASE IF EXISTS "%s" WITH (FORCE)' % name)
 
 
 def test_orphans_must_be_acknowledged_and_are_excluded_from_rollback_verification(files):
@@ -873,6 +1231,27 @@ def test_subprocess_runner_kills_a_hung_command_and_its_children_at_the_timeout(
     assert not marker.exists(), "the whole process group was killed"
 
 
+def test_subprocess_runner_does_not_wait_forever_for_a_descendant_that_escaped_the_process_group(tmp_path):
+    escaped = tmp_path / "escaped.py"
+    escaped.write_text("import os, time\nos.setsid()\ntime.sleep(25)\n")
+    parent = tmp_path / "parent.py"
+    parent.write_text("import subprocess, sys, time\nsubprocess.Popen([sys.executable, %r])\ntime.sleep(60)\n" % str(escaped))
+    started = time.monotonic()
+    result = deploy.SubprocessRunner()([sys.executable, str(parent)], timeout=1)
+    assert result.timed_out and result.returncode == deploy.TIMEOUT_RETURNCODE
+    assert time.monotonic() - started < 1 + 2 * deploy.REAP_SECONDS + 5, "the wait after the kill is bounded too"
+
+
+def test_subprocess_runner_feeds_stdin_text_to_the_command(tmp_path):
+    result = deploy.SubprocessRunner()([sys.executable, "-c", "import sys; print(sys.stdin.read().upper())"], timeout=20,
+                                       stdin_text="select 1;")
+    assert result.returncode == 0 and result.stdout.strip() == "SELECT 1;"
+    target = tmp_path / "o"
+    result = deploy.SubprocessRunner()([sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.read())"], timeout=20,
+                                       stdin_text="abc", stdout_path=str(target))
+    assert result.returncode == 0 and target.read_text() == "abc"
+
+
 def test_subprocess_runner_streams_stdout_to_a_private_file_and_reports_missing_commands(tmp_path):
     target = tmp_path / "out.bin"
     result = deploy.SubprocessRunner()([sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'PGDMP\\x00\\xff'); sys.stderr.write('warn')"],
@@ -885,7 +1264,8 @@ def test_subprocess_runner_streams_stdout_to_a_private_file_and_reports_missing_
 def test_rollback_limits_are_documented_next_to_the_commands():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     section = readme.split("### 重新部署、冒烟与回滚")[1].split("### 升级旧实例")[0]
-    for needle in ("expand", "pg_dump", "--backup-dir", "迁移", "不恢复数据库", "--allow-remove-orphans", "超时", "孤立"):
+    for needle in ("expand", "pg_dump", "--backup-dir", "迁移", "不恢复数据库", "--allow-remove-orphans", "超时", "孤立",
+                   "临时数据库", "已停止", "数据卷", "--schema-file", "保留标签"):
         assert needle in section, needle
     assert "expand-only" in deploy.__doc__ and "backup" in deploy.__doc__ and "orphans" in deploy.__doc__
 
