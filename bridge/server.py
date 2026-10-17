@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 
 from bridge import common
 from bridge.common import AuthMiddleware, audit, redact, safe_id, transport_origins, uuid_id
+from bridge.failures import failure_from_a2a
 from bridge.space_store import Actor, SpaceStore, StoreError
 
 PROTOCOL = common.SPACE_PROTOCOL
@@ -376,6 +377,15 @@ async def dispatch(task):
             raise DispatchUncertain("Dispatch requires reconciliation")
         result = result["result"]
         a2a_id = uuid_id(result["id"])
+        if result.get("status", {}).get("state") == "failed":
+            # Only the worker's versioned code/stage is accepted; its text is never stored.
+            failure = failure_from_a2a(result["status"])
+            failed = await store_call("fail_auto", SERVICE, operation_id(task_id, epoch, "fail"),
+                                      task_id, epoch, failure.code, a2a_id)
+            audit("task.failed", task_id=task_id, agent=task["owner"], a2a_task_id=a2a_id, epoch=epoch,
+                  error_code=failure.code, stage=failure.stage)
+            audit("thread.failed", task_id=task_id, thread_id=task_id, agent=task["owner"])
+            return failed
         artifacts = result.get("artifacts", [])
         output = "\n".join(part.get("text", "") for artifact in artifacts for part in artifact.get("parts", []) if part.get("kind") == "text")
         backend = next((artifact.get("metadata", {}).get("backend") for artifact in artifacts

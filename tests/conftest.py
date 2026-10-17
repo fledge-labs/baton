@@ -5,6 +5,7 @@ import importlib
 import hashlib
 import json
 import os
+import sys
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -119,3 +120,55 @@ def pg_store(modules, tmp_path, monkeypatch):
         modules[1]._STORE = None
         with psycopg.connect(**admin_config, autocommit=True) as connection:
             connection.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database)))
+
+
+FAKE_CODEX = '''#!{python}
+import json, os, sys, time
+from pathlib import Path
+
+home = Path(os.environ["CODEX_HOME"])
+if sys.argv[1:] == ["--version"]:
+    print("codex-cli 0.154.0")
+    sys.exit(0)
+scenario = json.loads((home / "scenario.json").read_text())
+(home / "invocation.json").write_text(json.dumps({{"argv": sys.argv[1:], "cwd": os.getcwd()}}))
+with (home / "calls.log").open("a") as calls:
+    calls.write("x")
+final = sys.argv[sys.argv.index("--output-last-message") + 1]
+sys.stdin.read()
+for step in scenario["steps"]:
+    time.sleep(step.get("delay", 0))
+    if "event" in step:
+        print(json.dumps(step["event"]), flush=True)
+    if "raw" in step:
+        print(step["raw"], flush=True)
+    if "stderr" in step:
+        print(step["stderr"], file=sys.stderr, flush=True)
+    for path, text in step.get("files", {{}}).items():
+        Path(path).write_text(text)
+    if "symlink" in step:
+        os.symlink(step["symlink"], "result.txt")
+    if step.get("hang"):
+        time.sleep(3600)
+if scenario["result"] is not None:
+    Path(final).write_text(scenario["result"])
+sys.exit(scenario["exit"])
+'''
+
+
+@pytest.fixture
+def fake_codex(modules, tmp_path, monkeypatch):
+    """A synthetic `codex` on PATH that emits scripted --json events; no model, network or credentials."""
+    common = modules[0]
+    directory = tmp_path / "bin"
+    directory.mkdir()
+    program = directory / "codex"
+    program.write_text(FAKE_CODEX.format(python=sys.executable))
+    program.chmod(0o755)
+    monkeypatch.setenv("PATH", str(directory) + os.pathsep + os.environ["PATH"])
+
+    def script(steps=(), result="BATON_CANARY_OK", exit=0):
+        (common.CODEX_HOME / "scenario.json").write_text(json.dumps(
+            {"steps": list(steps), "result": result, "exit": exit}))
+    script()
+    return script

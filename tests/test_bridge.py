@@ -63,7 +63,7 @@ def test_schema_mcp_parameters_and_actor_injection_are_safe(api, modules, capsys
     schema = client.get("/v1/space/schema", headers={"Authorization": "Bearer " + tokens["owner"]}).json()
     operations = schema["operations"]
     assert {"create_space", "comment", "mention", "assign_task", "plan", "ready", "claim", "renew", "handoff", "gate", "list_audit"} <= operations.keys()
-    assert not {"claim_next", "finish_auto", "recover_auto", "check_schema"} & operations.keys()
+    assert not {"claim_next", "finish_auto", "fail_auto", "recover_auto", "check_schema"} & operations.keys()
     assert operations["handoff"]["request"]["properties"]["target_principal"]["type"] == "string"
     assert "target" not in operations["handoff"]["request"]["properties"]
     graph_entry = operations["plan"]["request"]["$defs"]["GraphEntry"]

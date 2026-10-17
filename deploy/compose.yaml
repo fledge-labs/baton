@@ -121,10 +121,11 @@ services:
     depends_on:
       initialize: {condition: service_completed_successfully}
     healthcheck:
-      test: [CMD, python, -c, "import socket; socket.create_connection(('localhost',9001),2).close()"]
-      interval: 5s
-      timeout: 3s
-      retries: 15
+      test: [CMD, python, -m, bridge.worker_health, check]
+      interval: 30s
+      timeout: 5s
+      start_period: 90s
+      retries: 3
   database:
     <<: *service
     image: postgres:17.11-bookworm@sha256:3645570cccdfa447589da9f57dd740faa29b30938e861289a5574b6ca6b03826
