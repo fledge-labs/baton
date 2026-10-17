@@ -8,4 +8,11 @@ services:
       - ${TLS_CERT_FILE:?set an external certificate path}:/tls/fullchain.pem:ro
       - ${TLS_KEY_FILE:?set an external private key path}:/tls/privkey.pem:ro
     healthcheck:
-      test: [CMD, nginx, -t]
+      # Listening on 8443, completing a TLS handshake with the configured certificate, and the edge -> gateway
+      # route answering 401 to an unauthenticated MCP POST. The certificate chain is not verified here
+      # (loopback probe); clients verify it.
+      test:
+        - CMD-SHELL
+        - >-
+          wget -q --no-check-certificate --spider https://127.0.0.1:8443/board &&
+          wget -S --no-check-certificate -O /dev/null --post-data '' https://127.0.0.1:8443/mcp 2>&1 | grep -q 'HTTP/1\.[01] 401'

@@ -721,7 +721,7 @@ async def lifespan(app):
                     await task
 
 
-app = FastAPI(lifespan=lifespan)
+api = FastAPI(lifespan=lifespan)
 
 
 def versioned(body):
@@ -784,7 +784,7 @@ class ProtocolVersion:
         await self.app(scope, receive, send_with_version)
 
 
-@app.exception_handler(BridgeError)
+@api.exception_handler(BridgeError)
 async def bridge_error(request, exc):
     status, message = ERRORS[exc.code]
     error = {"code": exc.code, "message": message, **({"details": exc.details} if exc.details else {})}
@@ -796,18 +796,18 @@ async def bridge_error(request, exc):
     return JSONResponse(status_code=status, content=body)
 
 
-@app.exception_handler(RequestValidationError)
+@api.exception_handler(RequestValidationError)
 async def validation_error(request, exc):
     return await bridge_error(request, BridgeError("invalid", validation_details(exc.errors())))
 
 
-@app.get("/healthz")
+@api.get("/healthz")
 async def health():
     await store_call("check_schema", SERVICE)
     return {"status": "ok", "service": "baton-bridge", "x_protocol": PROTOCOL}
 
 
-@app.post("/v1/space/{operation}")
+@api.post("/v1/space/{operation}")
 async def space_operation(operation: str, request: Request):
     try:
         payload = await request.json()
@@ -817,7 +817,7 @@ async def space_operation(operation: str, request: Request):
     return versioned({"result": result})
 
 
-@app.get("/v1/space/schema")
+@api.get("/v1/space/schema")
 async def space_schema():
     return versioned({"operations": {
         name: {"mutation": mutation, "request": MODELS[name].model_json_schema()}
@@ -825,17 +825,17 @@ async def space_schema():
     }, "aliases": ALIASES})
 
 
-@app.post(a2a_public.RPC_PATH)
+@api.post(a2a_public.RPC_PATH)
 async def a2a_rpc(request: Request):
     return await a2a_public.handle_rpc(request, store=get_store(), call=store_call, actor=request_actor(request), waker=WAKEUP)
 
 
-@app.get(a2a_public.DIRECTORY_PATH)
+@api.get(a2a_public.DIRECTORY_PATH)
 async def a2a_directory(request: Request):
     return await a2a_public.directory_response(a2a_public.Context(get_store(), store_call, request_actor(request), waker=WAKEUP))
 
 
-@app.get("/board/data")
+@api.get("/board/data")
 async def board_data(request: Request):
     tasks = await invoke("list_tasks", {}, request)
     inbox = await invoke("fetch_inbox", {}, request)
@@ -843,8 +843,25 @@ async def board_data(request: Request):
             "inbox": inbox.get("messages", [])}
 
 
-app.mount("/", mcp.streamable_http_app())
-app = a2a_public.PublicDiscovery(ProtocolVersion(AuthMiddleware(DeprecationHeaders(app), role="client")))
+api.mount("/", mcp.streamable_http_app())
+_authenticated_app = AuthMiddleware(DeprecationHeaders(api), role="client")
+LOOPBACK_CLIENTS = frozenset({"127.0.0.1", "::1"})
+
+
+async def _loopback_health(scope, receive, send):
+    """Container healthcheck: only GET /healthz from loopback inside the container skips bearer auth.
+
+    The gateway and every other client connect from another address, so /healthz stays authenticated for them.
+    Public discovery stays outside this gate, on the outer wrapper.
+    """
+    client = scope.get("client") or ()
+    if (scope["type"] == "http" and scope["method"] == "GET" and scope["path"] == "/healthz"
+            and client[:1] and client[0] in LOOPBACK_CLIENTS):
+        return await api(scope, receive, send)
+    return await _authenticated_app(scope, receive, send)
+
+
+app = a2a_public.PublicDiscovery(ProtocolVersion(_loopback_health))
 
 
 if __name__ == "__main__":
