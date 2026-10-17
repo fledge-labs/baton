@@ -50,19 +50,21 @@ Python 3.9+ standard library only.
 """
 import argparse
 import fcntl
+import http.client
 import json
 import os
 import re
 import secrets
 import signal
+import socket
 import ssl
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
-from urllib import error, request
 from urllib.parse import urlsplit
 
 EXIT_OK, EXIT_ROLLED_BACK, EXIT_USAGE, EXIT_UNRECOVERED = 0, 1, 2, 3
@@ -377,36 +379,91 @@ def parse_base_url(url):
     return url.rstrip('/')
 
 
-class NoRedirect(request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None
-
-
 class HttpClient:
-    """Minimal HTTP caller: no proxies, no redirects, bounded timeout, certificate verification on https."""
+    """Minimal HTTP caller: no proxies, no redirects, certificate verification on https.
+
+    ``timeout`` bounds one blocking socket operation. ``set_deadline`` bounds the whole call, including a body
+    that keeps arriving in small pieces: a timer closes the socket when the deadline is reached, so the read
+    cannot run on past it.
+    """
 
     def __init__(self, base_url, ca_file=None, timeout=20):
-        self.base_url, self.timeout = base_url, timeout
-        handlers = [request.ProxyHandler({}), NoRedirect()]
-        if base_url.startswith('https://'):
+        self.base_url, self.ca_file, self.timeout = base_url, ca_file, timeout
+        self.deadline, self.clock = None, time.monotonic
+        parts = urlsplit(base_url)
+        self._secure = parts.scheme == 'https'
+        self._host, self._port = parts.hostname, parts.port or (443 if self._secure else 80)
+        if self._secure:
             try:
-                context = ssl.create_default_context(cafile=ca_file or None)
+                self._ssl = ssl.create_default_context(cafile=ca_file or None)
             except (OSError, ssl.SSLError):
                 raise UsageError('cannot load --ca-file') from None
-            handlers.append(request.HTTPSHandler(context=context))
-        self.opener = request.build_opener(*handlers)
+
+    def set_deadline(self, deadline, clock):
+        """Absolute monotonic deadline for every call, or None to keep only the per-read timeout."""
+        self.deadline, self.clock = deadline, clock
+
+    def _budget(self):
+        if self.deadline is None:
+            return self.timeout
+        return min(self.timeout, self.deadline - self.clock())
 
     def __call__(self, method, path, headers=None, body=None):
-        req = request.Request(self.base_url + path, data=body, method=method, headers=headers or {})
+        budget = self._budget()
+        if budget <= 0:
+            raise SmokeError('timed out')
+        connection = (http.client.HTTPSConnection(self._host, self._port, timeout=budget, context=self._ssl)
+                      if self._secure else http.client.HTTPConnection(self._host, self._port, timeout=budget))
+        fired = []
+
+        def abort():
+            # close() alone does not unblock a read that is still collecting a chunked body.
+            fired.append(True)
+            sock = connection.sock
+            if sock is None:
+                return
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+        timer = None
         try:
-            with self.opener.open(req, timeout=self.timeout) as response:
-                return Response(response.status, dict((k.lower(), v) for k, v in response.headers.items()), response.read())
-        except error.HTTPError as exc:
-            body = exc.read()
-            return Response(exc.code, dict((k.lower(), v) for k, v in exc.headers.items()), body)
-        except (error.URLError, OSError, ValueError) as exc:
-            reason = getattr(exc, 'reason', exc)
-            raise SmokeError('request failed: ' + type(reason).__name__) from None
+            connection.connect()
+            if self.deadline is not None:
+                delay = self.deadline - self.clock()
+                if delay <= 0:
+                    raise SmokeError('timed out')
+                timer = threading.Timer(delay, abort)
+                timer.daemon = True
+                timer.start()
+            connection.request(method, path, body=body, headers=headers or {})
+            remote = connection.getresponse()
+            chunks = []
+            while True:
+                if self.deadline is not None and self.clock() >= self.deadline:
+                    raise SmokeError('timed out')
+                block = remote.read(65536)
+                if not block:
+                    break
+                chunks.append(block)
+            payload = b''.join(chunks)
+            header_map = dict((key.lower(), value) for key, value in remote.getheaders())
+            return Response(remote.status, header_map, payload)
+        except SmokeError:
+            raise
+        except Exception as exc:
+            if fired or (self.deadline is not None and self.clock() >= self.deadline):
+                raise SmokeError('timed out') from None
+            raise SmokeError('request failed: ' + type(exc).__name__) from None
+        finally:
+            if timer is not None:
+                timer.cancel()
+            connection.close()
 
 
 def rpc_result(response, request_id):
@@ -530,21 +587,119 @@ def run_smoke_once(http, token):
 
 
 def run_smoke(http, token, timeout, clock=time.monotonic, sleep=time.sleep, interval=2):
-    """Repeat the whole smoke run until it passes or the window closes; the last attempt is the verdict."""
-    deadline = clock() + timeout
-    while True:
-        results = run_smoke_once(http, token)
-        if all(item['ok'] for item in results) or clock() >= deadline:
-            return {'ok': all(item['ok'] for item in results), 'checks': results}
-        sleep(interval)
+    """Repeat the smoke run until it passes or the deadline passes. The last attempt is the verdict.
 
+    The deadline is handed to the HTTP client as well. It is not only checked between rounds: a single
+    response that trickles forever is cut off when the deadline is reached.
+    """
+    deadline = clock() + timeout
+    set_deadline = getattr(http, 'set_deadline', None)
+    # A zero window still runs one attempt (bounded by the per-request timeout). A positive window is absolute:
+    # the client cuts the socket off when it is reached, including in the middle of a body.
+    if set_deadline and timeout > 0:
+        set_deadline(deadline, clock)
+    try:
+        while True:
+            results = run_smoke_once(http, token)
+            if all(item['ok'] for item in results) or clock() >= deadline:
+                return {'ok': all(item['ok'] for item in results), 'checks': results}
+            remaining = deadline - clock()
+            sleep(interval if interval < remaining else remaining)
+    finally:
+        if set_deadline:
+            set_deadline(None, clock)
+
+
+
+def _dollar_delimiter(sql, index):
+    """The ``$tag$`` starting at index, or None when this dollar sign is not a quote delimiter."""
+    if index >= len(sql) or sql[index] != '$':
+        return None
+    cursor = index + 1
+    if cursor < len(sql) and sql[cursor] == '$':
+        return '$$'
+    while cursor < len(sql) and (sql[cursor].isalnum() or sql[cursor] == '_'):
+        cursor += 1
+    if cursor > index + 1 and cursor < len(sql) and sql[cursor] == '$':
+        return sql[index:cursor + 1]
+    return None
+
+
+def _skip_quoted(sql, index, escape):
+    """Index just after a single-quoted string that starts at index. Unclosed quotes consume the rest."""
+    index += 1
+    length = len(sql)
+    while index < length:
+        if escape and sql[index] == '\\':
+            index += 2
+            continue
+        if sql[index] == "'":
+            if index + 1 < length and sql[index + 1] == "'":
+                index += 2
+                continue
+            return index + 1
+        index += 1
+    return length
+
+
+def psql_meta_command(sql):
+    """True when psql would treat an unquoted backslash as a meta-command such as ``\\c`` or ``\\!``.
+
+    Comments, quoted strings, identifiers and dollar quotes are skipped the way psql's lexer skips them.
+    A backslash inside one of those is data. migrate.py sends SQL through psycopg, which never runs these
+    commands; the precheck must not either.
+    """
+    index, length = 0, len(sql)
+    while index < length:
+        char = sql[index]
+        if char == '-' and index + 1 < length and sql[index + 1] == '-':
+            newline = sql.find('\n', index)
+            index = length if newline < 0 else newline + 1
+            continue
+        if char == '/' and index + 1 < length and sql[index + 1] == '*':
+            end = sql.find('*/', index + 2)
+            index = length if end < 0 else end + 2
+            continue
+        if char == '$':
+            delimiter = _dollar_delimiter(sql, index)
+            if delimiter:
+                end = sql.find(delimiter, index + len(delimiter))
+                index = length if end < 0 else end + len(delimiter)
+                continue
+        if char == '"':
+            index += 1
+            while index < length:
+                if sql[index] == '"':
+                    if index + 1 < length and sql[index + 1] == '"':
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                index += 1
+            continue
+        if char in 'eEuU' and (index == 0 or not (sql[index - 1].isalnum() or sql[index - 1] == '_')):
+            if char in 'eE' and index + 1 < length and sql[index + 1] == "'":
+                index = _skip_quoted(sql, index + 1, escape=True)
+                continue
+            if char in 'uU' and index + 2 < length and sql[index + 1] == '&' and sql[index + 2] == "'":
+                index = _skip_quoted(sql, index + 2, escape=False)
+                continue
+        if char == "'":
+            index = _skip_quoted(sql, index, escape=False)
+            continue
+        if char == '\\':
+            return True
+        index += 1
+    return False
 
 
 def unsafe_migration_statements(sql):
     """Early warning: textual descriptions of statements that a previous image could not survive.
 
     Comments and string literals are blanked in a single pass, so a comment marker inside one cannot hide a
-    statement. This is not a proof of compatibility; precheck_migration() is the authoritative check.
+    statement. A psql meta-command is reported from the raw script, because blanking strings must not hide
+    ``\\c`` that sits outside them and must not invent one that sits inside them. This is not a proof of
+    compatibility; precheck_migration() is the authoritative check.
     """
     text = NOISE.sub(' ', sql)
     found = [label for label, pattern in INCOMPATIBLE_SQL if re.search(pattern, text, re.IGNORECASE)]
@@ -552,6 +707,8 @@ def unsafe_migration_statements(sql):
         if re.search(r'\bNOT\s+NULL\b', clause, re.IGNORECASE) and not re.search(r'\bDEFAULT\b', clause, re.IGNORECASE):
             found.append('adds a NOT NULL column without a default')
             break
+    if psql_meta_command(sql):
+        found.append('contains a psql meta-command')
     return found
 
 
@@ -620,9 +777,14 @@ def schema_breaking_changes(before, after):
                                 ('triggers', 'trigger', lambda i: (i['t'], i['name']))):
         before_items, after_items = keyed(before, section, key), keyed(after, section, key)
         for name, item in sorted(before_items.items()):
-            if section == 'indexes' and not item['unique']:
-                continue
             now = after_items.get(name)
+            # A non-unique index is not a constraint, so dropping or rebuilding it is compatible. Replacing it
+            # with a unique index of the same name is not: the name is already in before_items, so the "new
+            # index" loop below would skip it, and the old image's writes can start failing.
+            if section == 'indexes' and not item['unique']:
+                if now is not None and now['unique']:
+                    changes.append('replaces non-unique index %s on %s with a unique index' % (name[1], name[0]))
+                continue
             if now is None:
                 changes.append('drops %s %s on %s' % (label, name[1], name[0]))
             elif now['def'] != item['def'] and (section != 'indexes' or item['unique'] or now['unique']):
@@ -746,11 +908,24 @@ def database_exec(config, script):
     return config.compose_base() + ['exec', '-T', DATABASE_SERVICE, 'sh', '-c', script]
 
 
+def restricted_migration(sql):
+    """SQL for the throwaway psql, with meta-commands disabled before any of the migration is read.
+
+    ``\\restrict`` (PostgreSQL 17.6+, the pinned image is 17.11) rejects every meta-command except
+    ``\\unrestrict`` with this key. The key is random, so the script cannot leave restricted mode and then
+    ``\\c`` to the real database or ``\\!`` a shell. migrate.py applies the same file through psycopg, which
+    does not interpret those commands. The wrapper stays in place even when ``--allow-incompatible-migration``
+    skips the textual warning.
+    """
+    key = secrets.token_hex(16)
+    return 'BEGIN;\nSET LOCAL ROLE baton_owner;\n\\restrict %s\n%s\nCOMMIT;\n' % (key, sql)
+
+
 def precheck_migration(docker, config, sql):
     """Apply the pending migration to a throwaway copy of the live schema and diff the catalogs.
 
-    Fails closed: any step that fails or cannot be read counts as a breaking change. Nothing touches the real
-    database; the throwaway database is dropped at the end.
+    Fails closed: any step that fails or cannot be read counts as a breaking change. The migration is applied
+    only to the throwaway database, with psql meta-commands disabled, and that database is dropped at the end.
     """
     name = PRECHECK_PREFIX + secrets.token_hex(6)
     report = {'database': name, 'ok': False, 'changes': [], 'error': None}
@@ -776,7 +951,7 @@ def precheck_migration(docker, config, sql):
                  'CREATE SCHEMA IF NOT EXISTS baton AUTHORIZATION baton_owner;\n'
                  'GRANT CREATE ON DATABASE "%s" TO baton_owner;\n' % name)
             before = step('reading the schema before the migration', PSQL_ROWS % name, CATALOG_SQL)
-            step('applying the migration', PSQL % name, 'BEGIN;\nSET LOCAL ROLE baton_owner;\n%s\nCOMMIT;\n' % sql)
+            step('applying the migration', PSQL % name, restricted_migration(sql))
             after = step('reading the schema after the migration', PSQL_ROWS % name, CATALOG_SQL)
             if config.dry_run:
                 report.update(ok=True, planned=True)

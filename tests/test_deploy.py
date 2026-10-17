@@ -1069,6 +1069,10 @@ def test_the_migration_is_applied_to_a_throwaway_database_never_to_the_live_one_
             assert "-d %s" % name in script and "-d baton " not in script + " ", "only the throwaway database is touched"
     apply_sql = next(s for _, s in steps if s and s.startswith("BEGIN;"))
     assert "SET LOCAL ROLE baton_owner" in apply_sql and "CREATE TABLE IF NOT EXISTS baton.spaces" in apply_sql, "the pending SQL"
+    restrict = re.search(r"\\restrict ([0-9a-f]{32})\n", apply_sql)
+    assert restrict, apply_sql
+    assert apply_sql.index("\\restrict ") < apply_sql.index("CREATE TABLE IF NOT EXISTS baton.spaces")
+    assert "\\unrestrict" not in apply_sql and apply_sql.count("\\restrict ") == 1
     clone = next(script for script, sql in steps if sql is None)
     assert "--schema-only" in clone and "-d baton" in clone
     assert all("postgres.password" in script and "PGPASSWORD" in script for script, _ in steps)
@@ -1112,6 +1116,37 @@ def test_a_throwaway_database_that_cannot_be_dropped_is_reported(files):
     docker = FakeDocker(drop_ok=False)
     code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP))
     assert code == 0 and report["precheck"]["cleanup_error"].startswith("could not drop " + report["precheck"]["database"])
+
+
+@pytest.mark.parametrize("statement", [
+    "\\c baton\n", "\\! id\n", "SELECT 1;\n\\c baton\n", "SELECT 1; \\g\n", "\\copy baton.t TO stdout\n",
+    "COMMIT;\n\\connect baton\nDROP TABLE baton.t;\n",
+])
+def test_psql_meta_commands_are_rejected_before_any_docker_command(files, tmp_path, monkeypatch, statement):
+    migration_file(tmp_path, monkeypatch, statement)
+    docker = FakeDocker()
+    code, report, _ = run(files, docker, FakeGateway(docker))
+    assert code == 1 and report["status"] == "aborted" and not docker.calls
+    assert "psql meta-command" in report["rollback"]["reason"]
+
+
+@pytest.mark.parametrize("statement", [
+    "SELECT '\\c baton';\n", "SELECT E'\\c baton';\n", "-- \\c baton\nSELECT 1;\n",
+    "/* \\! id */\nSELECT 1;\n", "SELECT $$ \\c baton $$;\n", 'SELECT "\\c";\n',
+])
+def test_a_backslash_inside_a_literal_or_comment_is_not_a_psql_meta_command(statement):
+    assert deploy.psql_meta_command(statement) is False
+    assert "psql meta-command" not in deploy.unsafe_migration_statements(statement)
+
+
+def test_allowing_an_incompatible_migration_still_disables_psql_meta_commands(files, tmp_path, monkeypatch):
+    migration_file(tmp_path, monkeypatch, "\\c baton\nSELECT 1;\n")
+    docker = FakeDocker()
+    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--allow-incompatible-migration")
+    assert code == 0 and report["migration"]["unsafe"]
+    applied = next(s for s in docker.stdins if s and s.startswith("BEGIN;"))
+    assert applied.index("\\restrict ") < applied.index("\\c baton")
+    assert re.search(r"\\restrict [0-9a-f]{32}\n", applied)
 
 
 def test_precheck_reads_the_migration_that_the_image_will_apply(files, tmp_path):
@@ -1213,6 +1248,19 @@ def test_schema_diff_covers_dropped_or_changed_triggers_functions_and_types():
                                                             "drops type baton.k"]
 
 
+def test_schema_diff_flags_a_non_unique_index_rebuilt_as_unique_under_the_same_name():
+    plain = {"t": "baton.tasks", "name": "tasks_assignee",
+             "def": "CREATE INDEX tasks_assignee ON baton.tasks USING btree (assignee)",
+             "unique": False, "cols": ["assignee"]}
+    unique = dict(plain, unique=True,
+                  **{"def": "CREATE UNIQUE INDEX tasks_assignee ON baton.tasks USING btree (assignee)"})
+    before = altered(indexes=lambda rows: rows.append(dict(plain)))
+    after = altered(indexes=lambda rows: rows.append(dict(unique)))
+    assert deploy.schema_breaking_changes(before, after) == [
+        "replaces non-unique index tasks_assignee on baton.tasks with a unique index"]
+    assert deploy.schema_breaking_changes(before, base_snapshot()) == [], "dropping a non-unique index is compatible"
+
+
 def test_schema_diff_flags_policy_edits_and_fails_closed_without_privilege_sections():
     before = altered(policies=[{"t": "baton.tasks", "name": "p", "permissive": True, "cmd": "*", "roles": "",
                                 "qual": "true", "with_check": None}])
@@ -1307,6 +1355,9 @@ def test_catalog_sql_and_diff_on_a_real_postgres_accept_the_shipped_schema_and_c
                 ("CREATE POLICY df18_p ON baton.tasks USING (true)", "adds policy df18_p to the existing table baton.tasks"),
                 ("DROP POLICY df18_p ON baton.tasks", "drops policy df18_p on baton.tasks"),
                 ("DO $$ BEGIN EXECUTE 'GRANT SELECT ON TABLE baton.tasks TO PUBLIC'; END $$", "changes privileges on baton.tasks"),
+                ("CREATE INDEX df18_plain ON baton.tasks (priority)", None),
+                ("DROP INDEX baton.df18_plain; CREATE UNIQUE INDEX df18_plain ON baton.tasks (priority)",
+                 "replaces non-unique index df18_plain on baton.tasks with a unique index"),
             ]:
                 before = snapshot()
                 apply(statement)
@@ -1604,7 +1655,8 @@ def test_rollback_limits_are_documented_next_to_the_commands():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     section = readme.split("### 重新部署、冒烟与回滚")[1].split("### 升级旧实例")[0]
     for needle in ("expand", "pg_dump", "--backup-dir", "迁移", "不恢复数据库", "--allow-remove-orphans", "超时", "孤立",
-                   "临时数据库", "已停止", "数据卷", "--schema-file", "保留标签", "符号链接", "互斥", "行级安全", "GRANT"):
+                   "临时数据库", "已停止", "数据卷", "--schema-file", "保留标签", "符号链接", "互斥", "行级安全", "GRANT",
+                   "元命令", "唯一索引", "截止时间"):
         assert needle in section, needle
     assert "expand-only" in deploy.__doc__ and "backup" in deploy.__doc__ and "orphans" in deploy.__doc__
 
@@ -1755,6 +1807,49 @@ class StubStack(BaseHTTPRequestHandler):
                   "tools/call": {"content": [{"type": "text", "text": "{}"}], "isError": False}}[body["method"]]
         event = "data: " + json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": result}) + "\n\n"
         self.reply(200, event.encode(), "text/event-stream")
+
+
+class Trickle(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _trickle(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        try:
+            for _ in range(40):
+                self.wfile.write(b"1\r\nx\r\n")
+                self.wfile.flush()
+                time.sleep(0.2)
+            self.wfile.write(b"0\r\n\r\n")
+        except Exception:
+            return
+
+    def do_GET(self):
+        self._trickle()
+
+    def do_POST(self):
+        self._trickle()
+
+    def log_message(self, fmt, *args):
+        return
+
+
+def test_a_trickling_response_cannot_outrun_the_smoke_deadline():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        client = deploy.HttpClient("http://127.0.0.1:%d" % server.server_address[1], timeout=30)
+        started = time.monotonic()
+        result = deploy.run_smoke(client, TOKEN, 0.6)
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert not result["ok"]
+    assert any(item["detail"] == "timed out" for item in result["checks"])
+    assert elapsed < 3, elapsed
 
 
 def test_http_client_runs_the_whole_smoke_against_a_real_local_server():
