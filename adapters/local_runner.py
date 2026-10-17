@@ -29,6 +29,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -241,10 +242,11 @@ def parse_permissions(raw, what, principal):
     if principal in approvers:
         raise ConfigError(what + ".approvers may not name the worker itself")
     template = raw.get("rule_template")
-    if template is not None and (not isinstance(template, str) or template.count("{tool}") != 1 or template.count("{directory}") > 1
+    if template is not None and (not isinstance(template, str) or any(template.count(mark) != 1 for mark in ("{tool}", "{args}", "{directory}"))
                                  or len(template) > 200
                                  or re.search(r"[\x00-\x1f\x7f]", template)):
-        raise ConfigError(what + ".rule_template must be one line of at most 200 characters with {tool} exactly once")
+        raise ConfigError(what + ".rule_template must be one line of at most 200 characters with {tool}, {args} and "
+                          "{directory} each exactly once")
     return PermissionConfig(
         cli=name, config_file=_path(raw, "config_file", what), approvers=list(dict.fromkeys(approvers)),
         wait_seconds=_int(raw, "wait_seconds", what, 1800, 1, 86400),
@@ -1003,33 +1005,329 @@ EXCERPT_CHARS = 1500
 FIELD_CHARS = 300
 TOOL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}")
 UNPARSED_TOOL = "(unparsed)"
-# Programs whose allowlisting would be a sandbox widening in disguise (network clients, shells and interpreters that run
-# anything, privilege changes, the Keychain tool, sandbox tooling): never offered, whatever the CLI asked for.
-UNGRANTABLE_TOOLS = frozenset("""
-    sh bash zsh dash ksh csh tcsh fish ash python pypy perl ruby node nodejs php lua luajit tclsh wish pwsh powershell
-    osascript deno bun ts-node tsx java jshell groovy scala kotlin swift julia rscript runhaskell ghc
-    awk gawk mawk nawk busybox toybox env xargs eval exec find nice nohup timeout time watch strace ltrace gdb lldb
-    script setsid flock parallel expect ex vi vim view nvim emacs less more man ed tar make cmake ninja gmake rake bundle
-    gem npm npx yarn pnpm pip pipx uv uvx cargo go gradle mvn sudo su doas nc ncat netcat socat telnet curl wget ssh scp
-    sftp rsync ftp security launchctl sandbox-exec bwrap chroot nsenter unshare docker podman mount open
-""".split())
-SCRIPT_SUFFIXES = frozenset((".sh", ".bash", ".zsh", ".py", ".pl", ".rb", ".js", ".mjs", ".php", ".lua", ".ps1", ".exe", ".bat",
-                             ".cmd", ".jar", ".command"))
-VERSION_SUFFIX = re.compile(r"(?:[-_.]?\d+)+$")
+# Only these programs can ever be written into a CLI allowlist, and only under the argument policy next to each name.
+# Everything else (shells, interpreters, mksh, network clients, package managers, a versioned python3.11, a script) is
+# never granted: there is no deny-list to forget an entry on.
+GRANTABLE_TOOLS = frozenset({"rg", "sed", "git"})
+# Text embedded in the CLI rule so the entry states the same limits the runner enforced. A template that cannot carry
+# both this text ({args}) and the worktree ({directory}) cannot be granted through.
+POLICY_ARGS = {
+    "rg": "[! --pre ! --pre-glob]",
+    "sed": "[! e-command ! s///e; w/W/-i inside worktree]",
+    "git": "[status|log|diff|show|ls-files|rev-parse|blame ! -c ! --config ! --upload-pack ! --exec ! -C ! alias]",
+}
+GIT_READONLY = frozenset({"status", "log", "diff", "show", "ls-files", "rev-parse", "blame"})
+GIT_SAFE_GLOBAL = frozenset({
+    "-p", "--paginate", "-P", "--no-pager", "--no-replace-objects",
+    "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs",
+})
 
 
-def normalized_tool(tool):
-    """Lower-cased basename without a version suffix: python3.11 -> python, perl5.36 -> perl, node20 -> node."""
-    name = os.path.basename(str(tool)).lower()
-    stripped = VERSION_SUFFIX.sub("", name)
-    return stripped or name
+def tool_basename(tool):
+    return os.path.basename(str(tool)).lower()
 
 
 def is_ungrantable(tool):
-    """Interpreters, shells, generic executors, network clients and script files can run anything, so never allowlisted."""
-    name = os.path.basename(str(tool)).lower()
-    return (normalized_tool(tool) in UNGRANTABLE_TOOLS or name in UNGRANTABLE_TOOLS
-            or os.path.splitext(name)[1] in SCRIPT_SUFFIXES)
+    """True when the program is not on the allow-list. Argument shape is checked separately, against the command line."""
+    return tool_basename(tool) not in GRANTABLE_TOOLS
+
+
+def _split_command(command):
+    try:
+        return shlex.split(command, posix=True)
+    except ValueError:
+        return None
+
+
+def _inside_worktree(path, worktree):
+    """A path the child would use while its cwd is the worktree.
+
+    Existing components are resolved as the walk proceeds, so a symlink inside the worktree that points outside
+    does not count, including one whose final component does not exist yet. The filesystem root is never a
+    worktree this check will approve a write into.
+    """
+    if not isinstance(path, str) or not path or "\x00" in path or path.startswith("~") or path.startswith("-"):
+        return False
+    root = os.path.realpath(worktree)
+    if not root or root == os.sep:
+        return False
+    candidate = os.path.normpath(path if os.path.isabs(path) else os.path.join(root, path))
+    if not candidate.startswith(os.sep):
+        return False
+    current = os.sep
+    for part in candidate.split(os.sep)[1:]:
+        if part in ("", "."):
+            continue
+        nxt = os.path.join(current, part)
+        current = os.path.realpath(nxt) if os.path.lexists(nxt) else nxt
+    prefix = root.rstrip(os.sep) + os.sep
+    return current == root or current.startswith(prefix)
+
+
+def _rg_problem(argv, worktree):
+    stop = argv.index("--") if "--" in argv else len(argv)
+    for arg in argv[1:stop]:
+        if arg in ("--pre", "--pre-glob") or arg.startswith("--pre=") or arg.startswith("--pre-glob="):
+            return "rg --pre and --pre-glob run another program and are never granted"
+    return None
+
+
+def _sed_regex_end(script, i):
+    """script[i] is the delimiter. Returns the index after the closing delimiter, or None."""
+    delim, i = script[i], i + 1
+    while i < len(script):
+        if script[i] == "\\":
+            i += 2
+            continue
+        if script[i] == delim:
+            return i + 1
+        i += 1
+    return None
+
+
+def _sed_address(script, i):
+    if i >= len(script):
+        return i, False
+    if script[i].isdigit():
+        while i < len(script) and script[i].isdigit():
+            i += 1
+        return i, True
+    if script[i] == "$":
+        return i + 1, True
+    if script[i] == "\\":
+        if i + 1 >= len(script):
+            return i, False
+        end = _sed_regex_end(script, i + 1)
+        return (i, False) if end is None else (end, True)
+    if script[i] == "/":
+        end = _sed_regex_end(script, i)
+        return (i, False) if end is None else (end, True)
+    return i, False
+
+
+def _sed_line_path(script, i):
+    """The filename of a w/W/r/R command: the rest of the line, one leading blank skipped."""
+    if i < len(script) and script[i] == " ":
+        i += 1
+    end = script.find("\n", i)
+    end = len(script) if end < 0 else end
+    return script[i:end].strip(), end
+
+
+def _sed_script_problem(script, worktree):
+    """None when every command is one this runner can grant. Anything it cannot parse is refused."""
+    i, n = 0, len(script)
+    while i < n:
+        while i < n and script[i] in " \t\n;":
+            i += 1
+        if i >= n:
+            break
+        if script[i] == "#":
+            newline = script.find("\n", i)
+            i = n if newline < 0 else newline + 1
+            continue
+        start, saw = i, False
+        while True:
+            i, ok = _sed_address(script, i)
+            if not ok:
+                if saw:
+                    return "the sed script is not a form this runner can grant"
+                i = start
+                break
+            saw = True
+            if i < n and script[i] == ",":
+                i += 1
+                continue
+            break
+        if i < n and script[i] == "!":
+            i += 1
+        if i >= n:
+            return "the sed script is not a form this runner can grant"
+        command = script[i]
+        i += 1
+        if command == "e":
+            return "sed's e command runs another program and is never granted"
+        if command in "dDpPnNgGhHxlzF={}":
+            continue
+        if command in ":btT":
+            while i < n and script[i] in " \t":
+                i += 1
+            while i < n and (script[i].isalnum() or script[i] == "_"):
+                i += 1
+            continue
+        if command in "qQ":
+            while i < n and script[i].isdigit():
+                i += 1
+            continue
+        if command in "rR":
+            _, i = _sed_line_path(script, i)
+            continue
+        if command in "wW":
+            filename, i = _sed_line_path(script, i)
+            if not _inside_worktree(filename, worktree):
+                return "sed w/W would write outside the task worktree and is never granted"
+            continue
+        if command == "y":
+            if i >= n:
+                return "the sed script is not a form this runner can grant"
+            end = _sed_regex_end(script, i)
+            end = None if end is None else _sed_regex_end(script, end - 1)
+            if end is None:
+                return "the sed script is not a form this runner can grant"
+            i = end
+            continue
+        if command != "s":
+            return "the sed script is not a form this runner can grant"
+        if i >= n:
+            return "the sed script is not a form this runner can grant"
+        end = _sed_regex_end(script, i)
+        end = None if end is None else _sed_regex_end(script, end - 1)
+        if end is None:
+            return "the sed script is not a form this runner can grant"
+        i = end
+        while i < n and script[i] not in "\n;":
+            flag = script[i]
+            if flag == "e":
+                return "sed s///e runs another program and is never granted"
+            if flag in "wW":
+                filename, i = _sed_line_path(script, i + 1)
+                if not _inside_worktree(filename, worktree):
+                    return "sed w/W would write outside the task worktree and is never granted"
+                break
+            if flag.isdigit() or flag in "gpiImM":
+                i += 1
+                continue
+            return "the sed script is not a form this runner can grant"
+    return None
+
+
+def _sed_problem(argv, worktree):
+    scripts, inplace, i = [], False, 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            i += 1
+            break
+        if arg == "-" or not arg.startswith("-"):
+            break
+        if arg in ("-n", "--quiet", "--silent", "-E", "-r", "--regexp-extended", "-s", "--separate", "-u",
+                   "--unbuffered", "-z", "--null-data", "--posix", "--sandbox", "-b", "--binary", "--follow-symlinks"):
+            i += 1
+            continue
+        if arg in ("-f", "--file") or arg.startswith("--file=") or (arg.startswith("-f") and arg != "-f"):
+            return "sed -f reads a script this runner cannot check and is never granted"
+        if arg in ("-e", "--expression"):
+            if i + 1 >= len(argv):
+                return "the sed command line is not a form this runner can grant"
+            scripts.append(argv[i + 1])
+            i += 2
+            continue
+        if arg.startswith("--expression="):
+            scripts.append(arg.split("=", 1)[1])
+            i += 1
+            continue
+        if arg.startswith("-e") and len(arg) > 2:
+            scripts.append(arg[2:])
+            i += 1
+            continue
+        if arg in ("-i", "--in-place") or arg.startswith("--in-place=") or (arg.startswith("-i") and arg != "-i"):
+            inplace = True
+            i += 1
+            continue
+        if arg in ("-l", "--line-length"):
+            i += 2
+            continue
+        if arg.startswith("--line-length=") or (arg.startswith("-l") and arg != "-l"):
+            i += 1
+            continue
+        if arg.startswith("--"):
+            return "sed option %s is not a form this runner can grant" % arg
+        # A cluster of flag letters (-nE, -Es). -e, -f, -i and -l take the rest of the cluster.
+        cluster, consumed = arg[1:], False
+        for index, letter in enumerate(cluster):
+            if letter in "nErsuzb":
+                continue
+            if letter == "e":
+                scripts.append(cluster[index + 1:])
+                consumed = True
+                break
+            if letter == "f":
+                return "sed -f reads a script this runner cannot check and is never granted"
+            if letter == "i":
+                inplace = True
+                consumed = True
+                break
+            if letter == "l":
+                consumed = True
+                break
+            return "sed option -%s is not a form this runner can grant" % letter
+        if not consumed and not cluster:
+            return "the sed command line is not a form this runner can grant"
+        i += 1
+    if i < len(argv) and not scripts and argv[i] != "--":
+        scripts.append(argv[i])
+        i += 1
+    if not scripts:
+        return "sed without a visible script is never granted"
+    for script in scripts:
+        problem = _sed_script_problem(script, worktree)
+        if problem:
+            return problem
+    files = [arg for arg in argv[i:] if arg != "--"]
+    if inplace and (not files or not all(_inside_worktree(path, worktree) for path in files)):
+        return "sed -i would edit a file outside the task worktree and is never granted"
+    return None
+
+
+def _git_forbidden(arg, _subcommand):
+    """Dangerous git arguments. Every -c is refused, including combined-diff: the rule written into the CLI says ! -c,
+    and `git -c name=value` runs through config. -C is refused the same way (it is also how git changes directory)."""
+    if arg.startswith(("-c", "-C", "--upload-pack", "--exec", "--config", "--git-dir", "--work-tree", "--ext-diff",
+                       "--textconv", "--extcmd")):
+        return True
+    if "alias." in arg:
+        return True
+    return False
+
+
+def _git_problem(argv, worktree):
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--" or not arg.startswith("-"):
+            break
+        if arg not in GIT_SAFE_GLOBAL:
+            return "git option %s can run a command, change directory or set config, and is never granted" % arg
+        index += 1
+    if index >= len(argv) or argv[index].startswith("-"):
+        return "git was given no read-only subcommand and is never granted"
+    subcommand = argv[index]
+    if subcommand not in GIT_READONLY:
+        return "git %s is not one of the read-only subcommands this runner can grant (an alias would be, too)" % subcommand
+    for arg in argv[index + 1:]:
+        if _git_forbidden(arg, subcommand):
+            return "git option %s can run a command, change directory or set config, and is never granted" % arg
+    return None
+
+
+_GRANT_POLICIES = {"rg": _rg_problem, "sed": _sed_problem, "git": _git_problem}
+
+
+def argument_problem(tool, command, worktree):
+    """None when this exact command line is within the tool's fixed policy and every path it writes stays in worktree."""
+    name = tool_basename(tool)
+    if name not in _GRANT_POLICIES:
+        return "%s is not on the allow-list and is never granted" % (name or tool)
+    if not isinstance(command, str) or not command.strip():
+        return "%s was refused without a command line, so its arguments cannot be checked" % name
+    argv = _split_command(command)
+    if not argv:
+        return "the command line could not be parsed, so it is never granted"
+    if tool_basename(argv[0]) != name:
+        return "the command line does not start with %s, so it is never granted" % name
+    if not isinstance(worktree, str) or not os.path.isabs(worktree):
+        return "the task worktree is not an absolute path, so nothing is granted"
+    return _GRANT_POLICIES[name](argv, worktree)
 
 
 @dataclass(frozen=True)
@@ -1088,21 +1386,27 @@ class Denial:
 
 @dataclass(frozen=True)
 class Profile:
-    """Where and how a CLI's own allowlist is written. `rule` renders one entry from the program name ({tool})."""
+    """Where and how a CLI's own allowlist is written.
+
+    `rule` must carry {tool}, {args} (the fixed argument policy) and {directory} (the task worktree). A syntax that
+    cannot say both is not grantable: the runner will not write a rule that is wider than the check it just made.
+    """
     kind: str
     keys: tuple
     rule: str
 
 
 # Only agy's `permissions.allow` array is documented in this repository (onboarding/agy.md); every other path and every rule
-# syntax here is an unverified assumption that the operator must check, or override with permissions.rule_template.
+# syntax here is an unverified assumption that the operator must check, or override with permissions.rule_template. The
+# default for each CLI names the program, the argument policy and the worktree. A template that drops {args} or
+# {directory} makes that CLI not grantable.
 CLI_PROFILES = {
-    "agy": Profile("json_list", ("permissions", "allow"), "run_command({tool})"),
-    "codex": Profile("lines", (), 'prefix_rule(pattern=["{tool}"], decision="allow")'),
-    "grok": Profile("json_list", ("permissions", "allow"), "Bash({tool}:*)"),
-    "cline": Profile("json_list", ("allow",), "{tool} *"),
-    "opencode": Profile("json_map", ("permission", "bash"), "{tool} *"),
-    "dsh": Profile("json_list", ("permissions", "allow"), "shell({tool})"),
+    "agy": Profile("json_list", ("permissions", "allow"), "run_command({tool} {args} in {directory})"),
+    "codex": Profile("lines", (), 'prefix_rule(pattern=["{tool}", "{args}"], decision="allow", cwd="{directory}")'),
+    "grok": Profile("json_list", ("permissions", "allow"), "Bash({tool}:{args} in {directory})"),
+    "cline": Profile("json_list", ("allow",), "{tool} {args} {directory}"),
+    "opencode": Profile("json_map", ("permission", "bash"), "{tool} {args} {directory}"),
+    "dsh": Profile("json_list", ("permissions", "allow"), "shell({tool} {args} in {directory})"),
 }
 
 
@@ -1159,9 +1463,26 @@ def detect_denial(cli_name, text, secrets=()):
 DIRECTORY_RE = re.compile(r"[A-Za-z0-9_./@+:-][A-Za-z0-9_./@+: -]{0,498}")
 
 
-def render_rule(permissions, tool, directory=None):
-    template = permissions.rule_template or CLI_PROFILES[permissions.cli].rule
-    return template.replace("{tool}", tool).replace("{directory}", directory or "")
+def rule_template_of(permissions):
+    return permissions.rule_template or CLI_PROFILES[permissions.cli].rule
+
+
+def rule_encodes_constraints(permissions):
+    """The CLI rule can state the argument policy and the worktree. Otherwise the tool is not grantable for this CLI."""
+    template = rule_template_of(permissions)
+    return all(template.count(mark) == 1 for mark in ("{tool}", "{args}", "{directory}"))
+
+
+def render_rule(permissions, tool, directory):
+    template = rule_template_of(permissions)
+    if not rule_encodes_constraints(permissions):
+        raise RunnerError("the CLI rule cannot express the argument limits and the worktree")
+    name = tool_basename(tool)
+    if name not in POLICY_ARGS:
+        raise RunnerError("%s is not on the allow-list" % name)
+    if not directory or not DIRECTORY_RE.fullmatch(directory):
+        raise RunnerError("the worktree cannot be written into the rule")
+    return (template.replace("{tool}", name).replace("{args}", POLICY_ARGS[name]).replace("{directory}", directory))
 
 
 def replace_file(path, text):
@@ -1316,20 +1637,30 @@ class GrantLedger:
             if edit_rule(record["config_file"], profile, record["rule"], False, dry_run=True):
                 raise RunnerError("the rule is still present in the CLI configuration")
 
-    def add(self, worker, request, tool, directory=None):
-        """Record, then write, then activate one rule; returns the entry. Undo it with remove() if it cannot be reported."""
+    def add(self, worker, request, tool, directory, command):
+        """Record, then write, then activate one rule; returns the entry. Undo it with remove() if it cannot be reported.
+
+        `directory` is the runner's own task worktree, never a path taken from CLI output. The rule names that directory
+        and the tool's fixed argument policy; a template that cannot say both is refused.
+        """
         permissions = worker.permissions
         profile = CLI_PROFILES[permissions.cli]
-        if "{directory}" in (permissions.rule_template or "") and not (directory and DIRECTORY_RE.fullmatch(directory)):
-            raise RunnerError("the refused directory cannot be written into the rule")
-        rule = render_rule(permissions, tool, directory)
+        name = tool_basename(tool)
+        if is_ungrantable(name):
+            raise RunnerError("%s is not on the allow-list and is never granted" % name)
+        problem = argument_problem(name, command, directory)
+        if problem:
+            raise RunnerError(problem)
+        if not rule_encodes_constraints(permissions):
+            raise RunnerError("the CLI rule cannot express the argument limits and the worktree")
+        rule = render_rule(permissions, name, directory)
         path = os.path.realpath(permissions.config_file)
         if not self.confined(worker, path):
             raise RunnerError("the CLI configuration is not inside the worker's own directories")
         with self.locked():
             grants = self.load()
             record = {"id": uuid.uuid4().hex, "request_id": request["request_id"], "task_id": request["task_id"],
-                      "tool": tool, "directory": directory, "rule": rule, "option": request["status"], "cli": permissions.cli,
+                      "tool": name, "directory": directory, "rule": rule, "option": request["status"], "cli": permissions.cli,
                       "config_file": path, "status": "pending", "granted_reported": False, "revoked_reported": False,
                       "created": time.time()}
             holders = self.holders(grants, record)
@@ -1366,16 +1697,24 @@ class GrantLedger:
             return dict(record)
 
     def settle_pending(self, worker):
-        """After a crash between the ledger write and the activation: withdraw any rule such an entry may have written."""
+        """After a crash between the ledger write and the activation: withdraw any rule such an entry may have written.
+
+        Each entry is settled on its own. One that cannot be undone stays pending and is reported back; the rest still run.
+        """
+        failed = []
         with self.locked():
             grants = self.load()
             for record in list(grants.values()):
                 if record.get("status") != "pending":
                     continue
-                self._undo(grants, record, self.confined(worker, record["config_file"]))
-                record["status"] = "revoked"
-                record["revoked_reported"] = True
-                self.save(grants)
+                try:
+                    self._undo(grants, record, self.confined(worker, record["config_file"]))
+                    record["status"] = "revoked"
+                    record["revoked_reported"] = True
+                    self.save(grants)
+                except (RunnerError, OSError) as error:
+                    failed.append((record.get("id"), str(error) if isinstance(error, RunnerError) else "the CLI configuration is not writable"))
+        return failed
 
     def mark(self, grant_id, **values):
         with self.locked():
@@ -1448,10 +1787,14 @@ class GrantKeeper:
             self.log(record["task_id"], "grant-ledger-unwritten", event=kind)
         return True
 
-    def grant(self, request, tool, directory=None):
-        """Write the approved rule into the CLI's allowlist and audit it; a grant that cannot be audited is withdrawn."""
+    def grant(self, request, tool, directory, command=None):
+        """Write the approved rule into the CLI's allowlist and audit it; a grant that cannot be audited is withdrawn.
+
+        `directory` is the task worktree. `command` is the command line that was checked against the argument policy;
+        a bare program name is used when the caller already knows that is the whole command.
+        """
         try:
-            record = self.ledger.add(self.worker, request, tool, directory)
+            record = self.ledger.add(self.worker, request, tool, directory, command if command is not None else tool_basename(tool))
         except (RunnerError, OSError) as error:
             raise RunnerError("could not apply the approved permission: " + (str(error) if isinstance(error, RunnerError)
                                                                                else "the CLI configuration is not writable")) from None
@@ -1480,19 +1823,28 @@ class GrantKeeper:
 
     def reconcile(self):
         """After a crash: undo entries that never became active, withdraw leftover allow-once grants, finish unreported
-        audits, and withdraw what cannot be audited."""
+        audits, and withdraw what cannot be audited. One entry that cannot be settled does not stop the others."""
         try:
-            self.ledger.settle_pending(self.worker)
+            failed = self.ledger.settle_pending(self.worker)
+        except (RunnerError, OSError):
+            self.log(None, "grant-reconcile-failed", grant="ledger")
+            failed = []
+        for grant_id, reason in failed:
+            self.log(None, "grant-reconcile-failed", grant=grant_id, reason=one_line(str(reason), 200))
+        try:
             for record in self.ledger.active():
                 if record["option"] == "allow_once":
                     self.revoke(record["id"])
+        except (RunnerError, OSError):
+            self.log(None, "grant-reconcile-failed", grant="allow_once")
+        try:
             for record in self.ledger.unreported():
                 if record["status"] == "revoked":
                     self._report(record, "revoked")
                 elif not self._report(record, "granted"):
                     self.revoke(record["id"])
         except (RunnerError, OSError):
-            self.log(None, "grant-reconcile-failed")
+            self.log(None, "grant-reconcile-failed", grant="unreported")
 
 
 def call_interruptible(stop, work):
@@ -1796,35 +2148,38 @@ class WorkerRunner:
         return detect_denial(self.worker.permissions.cli, text, self.secrets)
 
     def grant_problem(self, denial, plan):
-        """Why a refusal cannot be answered with an allowlist entry, or None. Unparsed refusals are still posted, for visibility."""
+        """Why a refusal cannot be answered with an allowlist entry, or None. Unparsed refusals are still posted, for visibility.
+
+        The directory is always this task's worktree (`plan.worktree`). A path in the CLI's output is not consulted: the
+        program under test can print whatever directory it likes, including this worktree's own path.
+        """
         if denial.tool is None:
             return None
         if denial.kind != "command":
             return "the CLI wants %s permission, which is outside the command allowlist and is never granted here" % plain(denial.tool)
         if is_ungrantable(denial.tool):
-            return "%s cannot be allowlisted through Baton (it can run arbitrary programs or widen the sandbox)" % denial.tool
-        # Fail closed: a refusal that does not say where it happened cannot be shown to be inside this worker's directories.
-        if not denial.directory or not os.path.isabs(denial.directory):
-            return "the CLI did not report an absolute directory for the refusal, so it cannot be tied to this worker's directories"
-        roots = [plan.worktree, plan.tmpdir, plan.own_root, *plan.home_read, *plan.extra_write]
-        if not _under(_real(denial.directory), roots):
-            return "the refused directory is outside this worker's own directories"
-        if "{directory}" in (self.worker.permissions.rule_template or "") and not DIRECTORY_RE.fullmatch(denial.directory):
-            return "the refused directory cannot be written into the rule"
-        if any(record["tool"] == denial.tool and record["status"] == "active" for record in self.keeper.ledger.active()):
-            return "the CLI still refused %s although it is already allowlisted" % denial.tool
+            return "%s cannot be allowlisted through Baton (it is not on the allow-list)" % denial.tool
+        problem = argument_problem(denial.tool, denial.command, plan.worktree)
+        if problem:
+            return problem
+        if not rule_encodes_constraints(self.worker.permissions):
+            return "this CLI's rule cannot express the argument limits and the worktree, so nothing is granted"
+        if not DIRECTORY_RE.fullmatch(plan.worktree):
+            return "the worktree path cannot be written into the rule"
+        if any(record["tool"] == tool_basename(denial.tool) and record.get("directory") == plan.worktree
+               and record["status"] == "active" for record in self.keeper.ledger.active()):
+            return "the CLI still refused %s although it is already allowlisted for this worktree" % denial.tool
         return None
 
-    def post_request(self, task_id, epoch, denial):
+    def post_request(self, task_id, epoch, denial, worktree):
         permissions = self.worker.permissions
         reason = one_line(denial.reason or GENERIC_REASON, FIELD_CHARS, self.secrets)
         tool_text = one_line(denial.tool or UNPARSED_TOOL, 200, self.secrets)
         if denial.command:
             reason = clip(reason + "; command: " + denial.command, FIELD_CHARS)
         arguments = {"task_id": task_id, "epoch": epoch, "cli": permissions.cli, "tool": tool_text,
-                     "reason": reason, "approvers": permissions.approvers, "ttl_seconds": min(86400, permissions.wait_seconds + 60)}
-        if denial.directory:
-            arguments["directory"] = clip(denial.directory, 500)
+                     "reason": reason, "approvers": permissions.approvers, "ttl_seconds": min(86400, permissions.wait_seconds + 60),
+                     "directory": clip(worktree, 500)}
         if denial.excerpt:
             arguments["excerpt"] = redact(denial.excerpt, self.secrets)
         try:
@@ -1885,7 +2240,7 @@ class WorkerRunner:
                 if problem:
                     return outcome, "permission needed but not requested: " + problem, None
                 rounds += 1
-                request = self.post_request(task_id, epoch, denial)
+                request = self.post_request(task_id, epoch, denial, plan.worktree)
                 self.log(task_id, "permission-requested", request=request["request_id"], tool=denial.tool or "unparsed")
                 try:
                     kind, decided = self.await_decision(task_id, request["request_id"], lease_lost)
@@ -1903,7 +2258,7 @@ class WorkerRunner:
                 if denial.tool is None:
                     raise RunnerError("permission approved, but the refused tool could not be identified; add it to the "
                                       "CLI's allowlist by hand")
-                record = self.keeper.grant(decided, denial.tool, denial.directory)
+                record = self.keeper.grant(decided, denial.tool, plan.worktree, denial.command)
                 if decided["status"] == "allow_once":
                     once.append(record["id"])
                 self.baton.write("renew", {"task_id": task_id, "epoch": epoch, "lease_seconds": lease})
@@ -2177,6 +2532,9 @@ class Runner:
                 continue
             if worker.implicit_auto_approve and worker.sandbox.backend == "none":
                 self.refuse(worker, "implicit auto-approve needs a sandbox backend")
+                continue
+            if worker.permissions is not None and worker.sandbox.backend == "none":
+                self.refuse(worker, "permissions need a sandbox backend")
                 continue
             if worker.env_from_keychain:
                 if self.platform != "darwin":

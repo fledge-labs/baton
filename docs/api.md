@@ -362,7 +362,7 @@ print(view["blocked"])  # {"reason_code": "scope_conflict", "by": "...", "at": "
 
 ## 权限请求
 
-本地执行器（`adapters/local_runner.py`）运行的 agent CLI 在 headless 模式下被自己的白名单拒绝（例如 agy 拒绝白名单外的 `rg`）时，不再“拒绝并退出”：执行器发一个**权限请求**，任务进入可见的 `input required: permission` 状态，等 approver 决定，批准后在**同一 epoch、同一租约、同一 worktree** 内恢复。这是 Baton 的 x_ 扩展（规格 X26），模型参考 A2A 的 `INPUT_REQUIRED` 与 MCP elicitation；它不执行、不核验任何本地配置修改，只保存请求、决定和审计。
+本地执行器（`adapters/local_runner.py`）运行的 agent CLI 在 headless 模式下被自己的白名单拒绝（例如 agy 拒绝白名单外的 `rg`）时，不再“拒绝并退出”：执行器发一个**权限请求**，任务进入可见的 `input required: permission` 状态，等 approver 决定，批准后在**同一 epoch、同一租约、同一 worktree** 内恢复。这是 Baton 的 x_ 扩展（规格 X28），模型参考 A2A 的 `INPUT_REQUIRED` 与 MCP elicitation；它不执行、不核验任何本地配置修改，只保存请求、决定和审计。
 
 **为什么不是 `mark_blocked`。** `mark_blocked` 对持有有效租约的持有人返回 `409 stale_claim`，只能先放掉租约再标记，恢复就得重新 `claim` 并提高 epoch。所以用一个小的请求对象：不新增表，请求与决定都是追加审计事件，`list_permissions` 把它们折叠成视图；追加审计只有服务端能写，评论者（包括 worker 自己）伪造不了“已批准”。
 
@@ -371,7 +371,7 @@ print(view["blocked"])  # {"reason_code": "scope_conflict", "by": "...", "at": "
 - **过期与撤回。** 待决请求绑定它被提出时的 epoch 和持有人，只在那个 claim 还有效时才算数。以下任一情况它会**自动变为 `expired`**（视图派生，不需要任何后台任务）：任务的 epoch 变了（handoff、租约过期后被重新领取）、任务不再是 `claimed` 或持有人的租约已失效、或超过 `ttl_seconds`。`expired` 的请求不再阻止新请求，也不能再被决定（`409 stale_claim`），所以换手或租约丢失之后任务不会因一个死请求而无法再申请权限。`cancel_permission(task_id, request_id)` 主动撤回待决请求：只有请求的 worker（principal 与 account 都匹配）或 Space 根可以调用（其他人 `403 forbidden`），请求不再待决时 `409 stale_claim`，成功写审计 `permission.cancelled` 并清除 `waiting_input` 标记；同 `operation_id` 重放返回同一视图。执行器在等待超时、被停止或丢失租约时会自动撤回自己的请求。因过期而失效的请求，任务视图上的 `waiting_input` 标记会保留到任务下一次被领取（或被新请求覆盖、被撤回）为止。
 - **`record_permission`。** 只有请求的 worker（principal 与 account 都匹配）能调用：`granted` 要求请求已被批准为 `allow_once` 或 `allow_always` 且尚未报告过 `granted`，`revoked` 要求已 `granted`，否则 `409 stale_claim`。写审计 `permission.granted` / `permission.revoked`。它不要求租约有效，所以任务结束后的撤销也能报告。
 - **`list_permissions`。** 返回 `[{"request_id","task_id","epoch","worker","worker_account","cli","tool","directory","reason","approvers","ttl_seconds","expires_at","excerpt_sha256","options","status","requested_at","decided_by","decided_at","authority","grant","granted_at","revoked_at"}]`。`status` 为 `pending`、`allow_once`、`allow_always`、`deny`、`expired`、`cancelled`；视图另含 `expires_at`、`ttl_seconds`；`grant` 为 `null`、`granted`、`revoked`；`authority` 为 `root` 或 `delegated by <grantor> via <delegation id>`。需要任务的 view 权限。
-- **范围边界。** 这条路径只描述 worker 自己 CLI 的命令/工具白名单。没有任何字段能改变本地沙箱（`home_read`、网络、Keychain、可写路径）。拒绝时执行器释放租约后 `mark_blocked(reason_code="other", note="permission_denied: <tool> (request <id>)")`：`tasks.blocked_reason` 的 CHECK 约束只允许 `mark_blocked` 列出的五个原因码，本功能不改 schema，所以 `permission_denied` 写在 `note` 里，不是第六个原因码。
+- **范围边界。** 这条路径只描述 worker 自己 CLI 的命令/工具白名单。没有任何字段能改变本地沙箱（`home_read`、网络、Keychain、可写路径）。执行器只在真实沙箱（`sandbox-exec` 或 `bwrap`）下启用它，请求里的目录一律是任务自己的 worktree，并且只放行带固定参数约束的 `rg`、`sed`、`git`（见 `onboarding/local-runner.md`）。拒绝时执行器释放租约后 `mark_blocked(reason_code="other", note="permission_denied: <tool> (request <id>)")`：`tasks.blocked_reason` 的 CHECK 约束只允许 `mark_blocked` 列出的五个原因码，本功能不改 schema，所以 `permission_denied` 写在 `note` 里，不是第六个原因码。
 - **接口。** HTTP `POST /v1/space/{operation}`，MCP 工具同名。`adapters/mcp_stdio.py` 的已知工具表没有加入这四个操作（它不是这条路径的客户端，执行器直接调用 HTTP）；通过 MCP 的 approver 用 `list_permissions` 查看、用 `decide_permission` 决定。客户端配置、检测器和撤销命令见 `onboarding/local-runner.md`。
 
 ```python
