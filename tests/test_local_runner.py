@@ -2602,6 +2602,80 @@ def test_rg_ignores_a_ripgrep_config_that_injects_pre(tmp_path, monkeypatch):
     assert ran.returncode == 0 and "hello" in ran.stdout
 
 
+def test_a_fifo_swapped_in_after_lstat_and_a_device_symlink_are_not_read(tmp_path, monkeypatch):
+    _, keeper, recorder = keeper_for(tmp_path, monkeypatch)
+    keeper.grant(request_view("r-race"), "rg", "/work/w1")
+    spool = Path(lr.spool_dir("w1"))
+    os.mkfifo(spool / "race.json")
+    os.symlink("/dev/zero", spool / "zero.json")
+    real_lstat, real_open = os.lstat, os.open
+    opened = []
+
+    def stale(path):
+        info = real_lstat(path)
+        if os.path.basename(path) in ("race.json", "zero.json"):
+            return os.stat_result((stat.S_IFREG | 0o644,) + info[1:])
+        return info
+
+    def spy(path, flags, *args, **kwargs):
+        opened.append((os.path.basename(path), flags))
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", stale)
+    monkeypatch.setattr(os, "open", spy)
+    started = time.monotonic()
+    keeper.drain_spool()
+    assert time.monotonic() - started < 2, "drain blocked after lstat on a fifo or a device symlink"
+    want = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    seen = {name: flags for name, flags in opened}
+    for name in ("race.json", "zero.json"):
+        flags = seen[name]
+        assert flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK and (flags & os.O_ACCMODE) == os.O_RDONLY
+        assert flags & want == want
+    assert not (spool / "race.json").exists() and not (spool / "zero.json").exists()
+    assert not any(call[1].get("event") == "shim_refused" for call in recorder.calls)
+
+
+def test_allow_once_is_revoked_before_a_spool_drain_that_fails_or_hangs(tmp_path, monkeypatch):
+    settings, keeper, _ = keeper_for(tmp_path, monkeypatch)
+    record = keeper.grant(request_view("r-once", "allow_once"), "rg", "/work/w1")
+    runner = lr.WorkerRunner.__new__(lr.WorkerRunner)
+    runner.keeper = keeper
+    runner.log = lambda *args, **kwargs: None
+    events = []
+    real_revoke = keeper.revoke
+
+    def revoke(grant_id):
+        events.append("revoke")
+        return real_revoke(grant_id)
+
+    def fail():
+        events.append("drain")
+        raise lr.RunnerError("spool drain failed")
+
+    keeper.revoke = revoke
+    keeper.drain_spool = fail
+    runner.end_task_grants(record["task_id"], [record["id"]])
+    assert events == ["revoke", "drain"]
+    assert json.loads(settings.read_text())["permissions"]["allow"] == []
+    assert keeper.ledger.active() == []
+
+    again = keeper.grant(request_view("r-hang", "allow_once", "t-hang"), "rg", "/work/w1")
+    monkeypatch.setattr(lr, "SPOOL_DRAIN_SECONDS", 0.2)
+
+    def hang():
+        events.append("hang")
+        time.sleep(30)
+
+    keeper.drain_spool = hang
+    started = time.monotonic()
+    runner.end_task_grants(again["task_id"], [again["id"]])
+    assert time.monotonic() - started < 2
+    assert events[-2:] == ["revoke", "hang"]
+    assert json.loads(settings.read_text())["permissions"]["allow"] == []
+    assert keeper.ledger.active() == []
+
+
 def test_a_spool_fifo_and_a_dev_zero_symlink_do_not_block_the_drain(tmp_path, monkeypatch):
     _, keeper, recorder = keeper_for(tmp_path, monkeypatch)
     keeper.grant(request_view("r-spool"), "rg", "/work/w1")

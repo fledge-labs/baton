@@ -2039,11 +2039,13 @@ def error_code(error):
     return type(error).__name__
 
 
-# The refusal spool is worker-writable. A drain never reads more than this, and never forwards faster than the window.
+# The refusal spool is worker-writable. A drain never reads more than this, never forwards faster than the window,
+# and never runs longer than SPOOL_DRAIN_SECONDS. Past that, leftover files wait for a later drain.
 SPOOL_DRAIN_FILES = 32
 SPOOL_MAX_BYTES = 4096
 SPOOL_FORWARD_LIMIT = 8
 SPOOL_FORWARD_WINDOW = 60.0
+SPOOL_DRAIN_SECONDS = 2.0
 
 
 def _spool_kind(path):
@@ -2062,19 +2064,19 @@ def _spool_kind(path):
 def _spool_payload(path):
     """('ok', object) or (discard reason, None). Reads at most SPOOL_MAX_BYTES and does not raise.
 
-    lstat decides the type. The open uses O_NOFOLLOW and O_NONBLOCK, then fstat, so a symlink, a fifo or a
-    device swapped in after the lstat cannot block this thread or follow a link to /dev/zero.
+    The type check is fstat of the descriptor this open returned, not a prior lstat. A fifo or a symlink swapped
+    in after a directory listing cannot block this thread or be followed to a device: the open is non-blocking and
+    does not follow links, and anything that is not a regular file is closed without a read.
     """
     try:
-        info = os.lstat(path)
-        if not stat.S_ISREG(info.st_mode):
-            return "nonregular", None
-        if info.st_size > SPOOL_MAX_BYTES:
-            return "oversized", None
-        flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    except AttributeError:
+        return "malformed", None
+    try:
         fd = os.open(path, flags)
+    except OSError:
+        return "malformed", None
+    try:
         try:
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode):
@@ -2082,10 +2084,10 @@ def _spool_payload(path):
             if st.st_size > SPOOL_MAX_BYTES:
                 return "oversized", None
             raw = os.read(fd, SPOOL_MAX_BYTES + 1)
-        finally:
-            os.close(fd)
-    except OSError:
-        return "malformed", None
+        except OSError:
+            return "malformed", None
+    finally:
+        os.close(fd)
     if len(raw) > SPOOL_MAX_BYTES:
         return "oversized", None
     try:
@@ -2216,12 +2218,15 @@ class GrantKeeper:
         """Forward a bounded number of shim refusals. The shim writes a file; this process holds the token.
 
         The spool is writable by the worker, so every record is untrusted. One drain looks at a fixed number of
-        regular files, each capped in size. Oversized, malformed and unknown files are deleted and counted.
-        Directories and other non-regular names are removed when that can be done without an error, and are never
-        read. Forwarding is rate-limited; files left by the limit wait for a later drain instead of flooding audit.
+        names for at most SPOOL_DRAIN_SECONDS. Each candidate is opened with O_RDONLY|O_NOFOLLOW|O_NONBLOCK and kept
+        only when fstat says it is a regular file within the byte cap. Oversized, malformed and unknown files are
+        deleted and counted. Directories and other non-regular names are removed when that can be done without an
+        error, and are never read. lstat is only used to decide that cleanup; it is not the open. Forwarding is
+        rate-limited; files left by the limit or the deadline wait for a later drain instead of flooding audit.
         """
         if self.baton is None:
             return
+        deadline = time.monotonic() + SPOOL_DRAIN_SECONDS
         spool = spool_dir(self.worker.principal)
         if not os.path.isdir(spool):
             return
@@ -2232,6 +2237,8 @@ class GrantKeeper:
         discarded = {"nonregular": 0, "oversized": 0, "malformed": 0, "unknown": 0, "overflow": 0}
         files = []
         for name in names:
+            if time.monotonic() >= deadline:
+                break
             path = os.path.join(spool, name)
             kind = _spool_kind(path)
             if kind == "file" and len(name) <= 200:
@@ -2254,7 +2261,7 @@ class GrantKeeper:
         with self.ledger.locked():
             grants = self.ledger.load()
         for name in files:
-            if len(self._spool_forwarded) >= SPOOL_FORWARD_LIMIT:
+            if len(self._spool_forwarded) >= SPOOL_FORWARD_LIMIT or time.monotonic() >= deadline:
                 break
             path = os.path.join(spool, name)
             outcome = _spool_payload(path)
@@ -2582,13 +2589,8 @@ class WorkerRunner:
         finally:
             renewing.set()
             renewer.join(10)
-            if self.keeper is not None:
-                with contextlib.suppress(RunnerError, OSError):
-                    self.keeper.drain_spool()
-            self.drop_once_grants(task_id, once)
-            if self.keeper is not None:
-                with contextlib.suppress(RunnerError, OSError):
-                    self.keeper.drain_spool()
+            # Revoke first. A stuck or malicious spool must not keep an allow_once grant alive.
+            self.end_task_grants(task_id, once)
             shutil.rmtree(str(tmpdir), ignore_errors=True)
         try:
             if denied is not None:
@@ -2738,6 +2740,31 @@ class WorkerRunner:
         for grant_id in grant_ids:
             if self.keeper.revoke(grant_id) is False:
                 self.log(task_id, "grant-left-active", grant=grant_id)
+
+    def end_task_grants(self, task_id, once):
+        """Withdraw allow_once, then drain the spool. The drain cannot postpone or skip the withdrawal.
+
+        The drain runs on a daemon thread and is abandoned after SPOOL_DRAIN_SECONDS. A raise inside it is logged.
+        The watcher keeps draining during the run; this only covers records still there when the task ends.
+        """
+        self.drop_once_grants(task_id, once)
+        if self.keeper is None:
+            return
+        box = {}
+
+        def run():
+            try:
+                self.keeper.drain_spool()
+            except (RunnerError, OSError, cli.BatonError, cli.NetworkError) as error:
+                box["error"] = error
+
+        thread = threading.Thread(target=run, name="spool-drain-" + str(task_id), daemon=True)
+        thread.start()
+        thread.join(SPOOL_DRAIN_SECONDS)
+        if thread.is_alive():
+            self.log(task_id, "spool-drain-timeout")
+        elif "error" in box:
+            self.log(task_id, "spool-drain-failed", error=error_code(box["error"]))
 
     def permission_denied(self, task_id, page_id, epoch, request):
         self.log(task_id, "permission-denied", request=request["request_id"])
