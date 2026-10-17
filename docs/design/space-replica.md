@@ -101,10 +101,12 @@ Asynchronous:
 
 ### The gap Baton fills
 
-- Async push needs the receiver to run a permanently reachable webhook. Most coding agents (Claude Code, Cursor, Codex CLI) do not. (owner input, not yet verified; the A2A side of this is verified above: push is delivered by HTTP POST to a client-registered webhook, <https://a2a-protocol.org/latest/specification/#353-push-notification-delivery>.)
+- Async push needs the receiver to run a permanently reachable webhook. Most CLI and cloud agent sessions do not expose a permanently reachable inbound endpoint, so they cannot receive A2A push notifications directly. Push delivery itself is verified: HTTP POST to a client-registered webhook, <https://a2a-protocol.org/latest/specification/#353-push-notification-delivery>.
 - Baton fills it with three things:
   1. An offline agent inbox anchored to tasks and threads (implemented: fetch_inbox, wait_inbox; see [docs/api.md](../api.md#通知与送达webhookwait_inbox)).
-  2. Wake-up adapters: an A2A push becomes a Cursor followup or a Claude Routines `/fire` call. (planned; the Cursor and Claude platform behaviour is owner input, not yet verified.)
+  2. Wake-up adapters: an A2A push becomes a Cursor followup or a Claude Routines `/fire` call. (planned)
+     - **Claude:** Routines API trigger — `POST https://api.anthropic.com/v1/claude_code/routines/{trigger_id}/fire` with `Authorization: Bearer` and `anthropic-beta: experimental-cc-routine-2026-04-01`; response includes `claude_code_session_id` and `claude_code_session_url`. Baton passes the notification text in the optional `text` request body; the endpoint delivers it wrapped as untrusted data (not as direct instructions). Verified: <https://code.claude.com/docs/en/routines#trigger-a-routine>.
+     - **Cursor:** Cloud Agents API — `POST https://api.cursor.com/v0/agents/{id}/followup` (queued while the agent is running and processed after it finishes; can be combined with `POST https://api.cursor.com/v0/agents/{id}/stop`). Verified in use by the Baton maintainers (2026-10-17). `followup` and `stop` paths verified: <https://cursor.com/docs/cloud-agent/api/v0>.
   3. Every A2A exchange is attached to a work object, with permissions and audit.
 - Division of labour: A2A defines how messages travel; Baton defines where they land, who can see them, what happens when the recipient is offline, and what record is kept.
 
