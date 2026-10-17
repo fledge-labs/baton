@@ -49,6 +49,7 @@ worktree 保留在磁盘上供审阅（改动不会自动提交或推送）。�
   "workers": [
     {
       "principal": "xigua",
+      "enabled": false,
       "token_file": "<TOKEN_DIR>/xigua.token",
       "command": ["muse", "exec"],
       "prompt_via": "stdin",
@@ -72,10 +73,22 @@ worktree 保留在磁盘上供审阅（改动不会自动提交或推送）。�
       "task_timeout_seconds": 1800,
       "env_passthrough": ["<MODEL_API_KEY_NAME>"],
       "sandbox": {"backend": "sandbox-exec", "allow_network": true}
+    },
+    {
+      "principal": "hamigua",
+      "token_file": "<TOKEN_DIR>/hamigua.token",
+      "command": ["<GROK_CLI>", "<GROK_NON_INTERACTIVE_ARGS>"],
+      "prompt_via": "stdin",
+      "workdir_root": "<WORK_ROOT>/hamigua",
+      "task_timeout_seconds": 1800,
+      "env_passthrough": ["<MODEL_API_KEY_NAME>"],
+      "sandbox": {"backend": "sandbox-exec", "allow_network": true}
     }
   ]
 }
 ```
+
+西瓜（Muse）worker 暂时不加入（temporarily not joining）：示例里保留了它的完整模板，但 `"enabled": false`，执行器会跳过它，既不读取它的令牌，也不轮询 Baton。要启用时把它改成 `true`（或删掉这一行，默认是 `true`），并先核对下文“与 Muse 自带沙箱叠加”里标注“未验证”的各项。
 
 可选的全局字段：`pin_sha256`（叶证书公钥 SHA-256 钉扎，同 `baton_cli.py --pin-sha256`）、`default_branch`（默认 `main`）、`request_timeout`、`lease_margin_seconds`（默认 60）、`renew_interval_seconds`、`retry_delay_seconds`（失败后重试前的等待，默认 30）、`output_cap_bytes`、`poll_timeout_seconds`。未知字段会被拒绝，避免拼写错误悄悄失效。
 
@@ -84,6 +97,7 @@ worker 字段：
 | 字段 | 含义 |
 | --- | --- |
 | `principal` | 该 worker 的 Baton 身份，只处理分给它的任务 |
+| `enabled` | 布尔值，默认 `true`；`false` 时执行器跳过该 worker（不读令牌、不轮询、不领取），配置仍保留 |
 | `token_file` | 令牌文件，只由执行器读取 |
 | `command` | argv 列表，不经 shell；执行器不增删任何参数 |
 | `prompt_via` | `stdin`，或 `file`（argv 中必须有一项正好是 `{prompt_file}`，不能只含这个子串） |
@@ -102,7 +116,7 @@ worker 字段：
 
 | 代号 | CLI | 说明 |
 | --- | --- | --- |
-| 西瓜 | Meta 的 Muse，独立应用（`/Applications/Muse.app`），命令行为 `~/.local/bin/muse` | 用 `muse exec` 无人值守运行；另有 `muse serve`（stdio 会话）和 `muse sandbox`（检查/配置它自己的系统沙箱）。模板见上例 |
+| 西瓜 | Meta 的 Muse，独立应用（`/Applications/Muse.app`），命令行为 `~/.local/bin/muse` | 用 `muse exec` 无人值守运行；另有 `muse serve`（stdio 会话）和 `muse sandbox`（检查/配置它自己的系统沙箱）。模板见上例，默认 `enabled: false`，暂时不加入 |
 | 木瓜 | agy | 非交互参数未验证，以 `agy --help` 为准 |
 | 黄瓜 | Codex | `["codex", "exec", "--sandbox", "workspace-write", "-"]`，`prompt_via` 为 `stdin` |
 | 丝瓜 | opencode | 非交互参数未验证，以 `opencode run --help` 为准 |
@@ -130,6 +144,8 @@ worker 字段：
 提示词文件第一部分是执行器写的固定抬头（任务 ID、声明范围），之后才是任务原文；CLI 需要的“怎么读提示词”由 `prompt_via` 决定。CLI 若只能把提示词作为命令行参数（而不是 stdin 或文件），本执行器**有意不支持**把任务文字拼进 argv。
 
 ## 与 Muse 自带沙箱叠加
+
+西瓜 worker 目前是 `enabled: false`（暂时不加入）；以下内容供启用前核对。
 
 执行器的沙箱始终是必需的外层，Muse 自带的沙箱只是额外一层，不能代替它：不能因为 Muse 有沙箱就把 `backend` 设成 `none`，也不能为了让 Muse 的沙箱起作用而放宽执行器的沙箱。
 
@@ -165,7 +181,7 @@ worker 字段：
 
 ## 推出顺序
 
-先上西瓜（Muse）和木瓜（agy）：各用一个小任务走完 指定接收人 → 领取 → 运行 → 评论 → 提交 → 审阅 → done，核对审计里的 actor 是 worker 自己，然后再启用后续的黄瓜（Codex）、丝瓜（opencode）、苦瓜（Cline）、哈密瓜（grok，暂定）。每加一个 worker 都先用 `--check` 检查，并保持独立的令牌、`workdir_root` 和 `env_passthrough`。
+先上哈密瓜（本地 grok CLI，暂定）和木瓜（agy）：各用一个小任务走完 指定接收人 → 领取 → 运行 → 评论 → 提交 → 审阅 → done，核对审计里的 actor 是 worker 自己；然后再启用黄瓜（Codex）、丝瓜（opencode）、苦瓜（Cline）。西瓜（Muse）暂时不加入，保留模板并设为 `enabled: false`，待负责人通知后再启用。每加一个 worker 都先用 `--check` 检查，并保持独立的令牌、`workdir_root` 和 `env_passthrough`。
 
 ## 排错
 
