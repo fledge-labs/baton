@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """adapters/local_runner.py against the real bridge app (PostgreSQL), a fake agent CLI and, on Linux, real bwrap."""
 
+import copy
 import importlib.util
 import json
 import os
@@ -54,6 +55,22 @@ def tick(kind):
             handle.write("%s %s %f\\n" % (kind, os.getpid(), time.time()))
 
 tick("start")
+marker_seen = None
+if scenario.get("mark"):
+    marker_seen = os.path.exists(scenario["mark"])
+    with open(scenario["mark"], "a") as handle:
+        handle.write("x")
+gate = scenario.get("gate")
+if gate:
+    try:
+        allowed = json.loads(Path(gate["config"]).read_text()).get("permissions", {{}}).get("allow", [])
+    except OSError:
+        allowed = []
+    if gate["rule"] not in allowed:
+        sys.stderr.write(gate["message"].replace("{{cwd}}", os.getcwd()) + "\\n")
+        sys.stderr.flush()
+        sys.exit(gate.get("exit", 1))
+report["marker_seen"] = marker_seen
 counter = scenario.get("counter")
 attempt = 1
 if counter:
@@ -840,6 +857,19 @@ def test_the_documented_example_config_parses_and_keeps_the_agreed_workers(monke
         assert not worker.allow_keychain, "the Keychain stays denied in every example"
 
 
+def test_the_documented_permissions_example_parses_for_an_agy_worker(tmp_path, monkeypatch):
+    import re
+    text = (ROOT / "onboarding" / "local-runner.md").read_text(encoding="utf-8")
+    block = json.loads(next(item for item in re.findall(r"```json\n(.*?)```", text, re.S) if '"permissions"' in item))
+    data = home_config(tmp_path, monkeypatch, [{}])
+    worker = {**data["workers"][0], **{key: block[key] for key in ("home_read", "permissions")}, "home": "real"}
+    data["workers"] = [worker]
+    parsed = lr.parse_config(data).workers[0]
+    assert parsed.permissions.cli == "agy" and parsed.permissions.approvers == ["nangua"]
+    assert parsed.permissions.config_file.endswith("/.gemini/antigravity-cli/settings.json")
+    assert "approvers" in lr.PERMISSIONS_KEYS and set(block["permissions"]) <= lr.PERMISSIONS_KEYS
+
+
 STUB_SECURITY = '''#!{python}
 import json, sys
 from pathlib import Path
@@ -1441,3 +1471,601 @@ def test_pinned_key_is_enforced_for_every_worker_call(lab, bridge, space):
     wait_state(space, task_id, "awaiting_gate")
     with pytest.raises(lr.ConfigError):
         lr.parse_config({**lab.config([lab.worker()]), "pin_sha256": "not-a-pin"})
+
+
+# --- permission requests: detectors, allowlist writers and the grant ledger -------------------------
+
+# Every sample below is SYNTHETIC: hand-written to look like each CLI's headless refusal. None was captured from the
+# real program, so the detector patterns are a best guess that a real capture may have to adjust. The generic fallback
+# (a bounded, redacted excerpt) is what covers a message no pattern recognizes.
+SYNTHETIC_SAMPLES = [
+    ("agy", 'step 3/9 run_command "rg -n TODO src/"\n'
+            'Permission denied: run_command "rg -n TODO src/" is not in permissions.allow (cwd: /work/mugua/t1)\n'
+            'Headless mode cannot ask for approval.\n',
+     {"tool": "rg", "directory": "/work/mugua/t1", "reason": "is not in permissions.allow", "command": "rg -n TODO src/"}),
+    ("codex", 'exec\nrg -n "TODO" src in /work/huanggua/t2\n'
+              'command requires approval and approval_policy is "never": rejected\n',
+     {"tool": "rg", "directory": "/work/huanggua/t2", "reason": 'command requires approval and approval_policy is "never": rejected',
+      "command": 'rg -n "TODO" src'}),
+    ("grok", 'Error: tool "bash" denied in non-interactive mode: command `/usr/bin/rg -n TODO` is not allowed by permissions '
+             '(cwd=/work/haimigua/t3)\n',
+     {"tool": "rg", "directory": "/work/haimigua/t3", "reason": "is not allowed by permissions", "command": "/usr/bin/rg -n TODO"}),
+    ("cline", 'Command "rg -n TODO" was blocked: no allow rule in CLINE_COMMAND_PERMISSIONS matches (workdir: /work/kugua/t4)\n',
+     {"tool": "rg", "directory": "/work/kugua/t4", "reason": "no allow rule in CLINE_COMMAND_PERMISSIONS matches",
+      "command": "rg -n TODO"}),
+    ("opencode", '! permission requested: bash (rg -n TODO src/*); auto-rejecting\n',
+     {"tool": "rg", "directory": None, "reason": "auto-rejecting", "command": "rg -n TODO src/*"}),
+    ("dsh", 'dsh: shell command "rg" denied (policy=ask, headless: no prompt available); cwd=/work/xianggua/t5\n',
+     {"tool": "rg", "directory": "/work/xianggua/t5", "reason": "policy=ask, headless: no prompt available", "command": "rg"}),
+]
+
+
+def test_every_documented_cli_has_a_detector_and_an_allowlist_profile():
+    assert set(lr.DETECTORS) == set(lr.CLI_PROFILES) == {"agy", "codex", "grok", "cline", "opencode", "dsh"}
+    assert {cli_name for cli_name, _, _ in SYNTHETIC_SAMPLES} == set(lr.DETECTORS)
+
+
+@pytest.mark.parametrize("cli_name,output,expected", SYNTHETIC_SAMPLES, ids=[item[0] for item in SYNTHETIC_SAMPLES])
+def test_detectors_parse_tool_directory_and_reason_from_realistic_refusals(cli_name, output, expected):
+    noisy = "starting task\n" + output + "exit\n"
+    denial = lr.detect_denial(cli_name, noisy)
+    assert denial is not None and denial.cli == cli_name and denial.kind == "command"
+    for key, value in expected.items():
+        assert getattr(denial, key) == value, key
+    assert denial.excerpt is None, "a clean parse carries no raw excerpt"
+    for other in lr.DETECTORS:
+        if other != cli_name:
+            parsed = lr.detect_denial(other, output)
+            assert parsed is None or parsed.tool is None, "a detector must not claim another CLI's message"
+
+
+def test_a_non_command_permission_is_parsed_but_is_not_a_command_denial():
+    denial = lr.detect_denial("opencode", "! permission requested: external_directory (/srv/data/secrets/*); auto-rejecting\n")
+    assert denial.kind == "other" and denial.tool == "external_directory"
+
+
+@pytest.mark.parametrize("output", [
+    "bash: ./build.sh: Permission denied\n", "error: EACCES: permission denied, open '/etc/shadow'\n",
+    "Traceback (most recent call last):\nValueError: bad\n", "", "all done\n"])
+def test_ordinary_failures_and_os_permission_errors_are_not_permission_walls(output):
+    for cli_name in lr.DETECTORS:
+        assert lr.detect_denial(cli_name, output) is None
+
+
+def test_an_unrecognized_refusal_attaches_a_bounded_redacted_excerpt_and_no_tool():
+    secret = "tok-0123456789abcdef"
+    filler = "x" * 4000
+    output = ("line before\n" + filler + "\nAction blocked: this step requires approval in headless mode (credential " + secret
+              + ")\nline after\n" + filler + "\n")
+    denial = lr.detect_denial("agy", output, [secret])
+    assert denial.tool is None and denial.excerpt and len(denial.excerpt) <= lr.EXCERPT_CHARS
+    assert "requires approval" in denial.excerpt and secret not in denial.excerpt and lr.REDACTED in denial.excerpt
+    assert denial.reason == lr.GENERIC_REASON
+
+
+@pytest.mark.parametrize("command,tool", [
+    ("rg -n x", "rg"), ("/usr/local/bin/rg -n x", "rg"), ('"rg" x', "rg"), ("FOO=1 rg x", None), ("", None),
+    ("$(rg) x", None), ("./run.sh", "run.sh")])
+def test_the_program_name_is_a_plain_word_or_nothing(command, tool):
+    assert lr.program_name(command) == tool
+
+
+def test_a_command_the_parser_cannot_name_falls_back_to_the_excerpt():
+    output = 'Permission denied: run_command "FOO=1 rg -n x" is not in permissions.allow (cwd: /w)\n'
+    denial = lr.detect_denial("agy", output)
+    assert denial.tool is None and "FOO=1 rg" in denial.excerpt and denial.directory == "/w"
+
+
+@pytest.mark.parametrize("tool", ["curl", "wget", "ssh", "bash", "python3", "sudo", "security", "env", "xargs", "nc"])
+def test_shells_interpreters_network_clients_and_the_keychain_tool_are_never_grantable(tool):
+    assert tool in lr.UNGRANTABLE_TOOLS
+
+
+def permission_worker_config(tmp_path, monkeypatch, cli_name="agy", **permissions):
+    home = tmp_path / "home"
+    data = home_config(tmp_path, monkeypatch, [{"home_read": ["~/.gemini/antigravity-cli"],
+                                                "permissions": {"cli": cli_name, "approvers": ["boss"],
+                                                                "config_file": "~/.gemini/antigravity-cli/settings.json",
+                                                                **permissions}}])
+    return home, data
+
+
+def test_permissions_config_is_accepted_inside_the_workers_own_home_read(tmp_path, monkeypatch):
+    home, data = permission_worker_config(tmp_path, monkeypatch, poll_seconds=0.5, wait_seconds=60, max_requests=2)
+    permissions = lr.parse_config(data).workers[0].permissions
+    assert permissions.cli == "agy" and permissions.approvers == ["boss"] and permissions.max_requests == 2
+    assert permissions.config_file == str(home / ".gemini/antigravity-cli/settings.json")
+
+
+@pytest.mark.parametrize("override", [
+    {"cli": "unknown"}, {"cli": None}, {"approvers": []}, {"approvers": ["w1"]}, {"approvers": ["bad name"]},
+    {"approvers": "boss"}, {"config_file": "relative/settings.json"}, {"wait_seconds": 0}, {"max_requests": 11},
+    {"rule_template": "no placeholder"}, {"rule_template": "{tool} {tool}"}, {"rule_template": "a\n{tool}"},
+    {"surprise": 1}])
+def test_permissions_config_rejects_bad_values(tmp_path, monkeypatch, override):
+    _, data = permission_worker_config(tmp_path, monkeypatch)
+    data["workers"][0]["permissions"].update(override)
+    with pytest.raises(lr.ConfigError):
+        lr.parse_config(data)
+
+
+@pytest.mark.parametrize("config_file,why", [
+    ("~/.gemini/other/settings.json", "outside the worker's home_read"), ("~/settings.json", "directly in HOME"),
+    ("~/.ssh/config", "a protected directory"), ("/etc/settings.json", "outside HOME"),
+    ("~/.gemini/antigravity-cli/../other/settings.json", "dot-dot escape")])
+def test_the_allowlist_file_must_lie_inside_the_workers_home_read_so_the_sandbox_is_never_widened(
+        tmp_path, monkeypatch, config_file, why):
+    _, data = permission_worker_config(tmp_path, monkeypatch, config_file=config_file)
+    with pytest.raises(lr.ConfigError):
+        lr.parse_config(data)
+
+
+def test_the_allowlist_file_may_not_be_writable_by_the_cli_or_shared_between_workers(tmp_path, monkeypatch):
+    _, data = permission_worker_config(tmp_path, monkeypatch)
+    data["workers"][0]["sandbox"]["extra_write_paths"] = ["~/.gemini/antigravity-cli"]
+    (tmp_path / "home/.gemini/antigravity-cli").mkdir(parents=True)
+    with pytest.raises(lr.ConfigError, match="extra_write_paths"):
+        lr.parse_config(data)
+    data = home_config(tmp_path, monkeypatch, [
+        {"home_read": ["~/.shared"], "permissions": {"cli": "agy", "approvers": ["boss"], "config_file": "~/.shared/s.json"}},
+        {"home_read": ["~/.shared"], "permissions": {"cli": "agy", "approvers": ["boss"], "config_file": "~/.shared/s.json"}}])
+    with pytest.raises(lr.ConfigError, match="shared with another worker"):
+        lr.parse_config(data)
+    data["workers"][1]["permissions"]["config_file"] = "~/.shared/other.json"
+    assert len(lr.parse_config(data).workers) == 2
+
+
+def test_the_allowlist_file_is_checked_by_real_path_so_a_symlink_cannot_point_it_elsewhere(tmp_path, monkeypatch):
+    home, data = permission_worker_config(tmp_path, monkeypatch)
+    (home / ".gemini/antigravity-cli").mkdir(parents=True)
+    (home / ".aws").mkdir()
+    (home / ".gemini/antigravity-cli/settings.json").symlink_to(home / ".aws/credentials")
+    with pytest.raises(lr.ConfigError):
+        lr.parse_config(data)
+
+
+PROFILE_CASES = {
+    "agy": ("settings.json", {"permissions": {"allow": ["mcp(baton/get_task)"], "deny": ["run_command(rm)"]}, "theme": "dark"},
+            lambda data: data["permissions"]["allow"], "run_command(rg)"),
+    "grok": ("settings.json", {"permissions": {"allow": []}}, lambda data: data["permissions"]["allow"], "Bash(rg:*)"),
+    "cline": ("perm.json", {"allow": ["git *"], "deny": ["rm *"]}, lambda data: data["allow"], "rg *"),
+    "dsh": ("dsh.json", {}, lambda data: data["permissions"]["allow"], "shell(rg)"),
+    "opencode": ("opencode.json", {"theme": "x", "permission": {"bash": {"git *": "allow"}}},
+                 lambda data: list(data["permission"]["bash"]), "rg *"),
+}
+
+
+@pytest.mark.parametrize("cli_name", sorted(PROFILE_CASES))
+def test_json_allowlist_writers_add_and_remove_one_rule_and_keep_everything_else(tmp_path, cli_name):
+    name, initial, listing, rule = PROFILE_CASES[cli_name]
+    path = tmp_path / name
+    path.write_text(json.dumps(initial))
+    path.chmod(0o640)
+    profile = lr.CLI_PROFILES[cli_name]
+    assert lr.edit_rule(path, profile, rule, True) is True
+    assert rule in listing(json.loads(path.read_text()))
+    assert lr.edit_rule(path, profile, rule, True) is False, "adding twice changes nothing"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640, "the file's mode is kept"
+    assert lr.edit_rule(path, profile, rule, False) is True
+    assert json.loads(path.read_text()) == (initial or {"permissions": {"allow": []}})
+    assert lr.edit_rule(path, profile, rule, False) is False, "removing an absent rule changes nothing"
+
+
+def test_json_writer_leaves_untouched_keys_and_values_intact(tmp_path):
+    path = tmp_path / "settings.json"
+    initial = {"permissions": {"allow": ["a", "b"], "deny": ["c"], "ask": ["d"]}, "other": {"k": [1, 2, 3]}}
+    path.write_text(json.dumps(initial))
+    profile = lr.CLI_PROFILES["agy"]
+    lr.edit_rule(path, profile, "run_command(rg)", True)
+    data = json.loads(path.read_text())
+    assert data["permissions"]["allow"] == ["a", "b", "run_command(rg)"]
+    assert data["permissions"]["deny"] == ["c"] and data["permissions"]["ask"] == ["d"] and data["other"] == initial["other"]
+    lr.edit_rule(path, profile, "run_command(rg)", False)
+    assert json.loads(path.read_text()) == initial
+
+
+def test_a_missing_allowlist_file_is_created_private_and_removed_cleanly(tmp_path):
+    path = tmp_path / "new" / "settings.json"
+    profile = lr.CLI_PROFILES["agy"]
+    assert lr.edit_rule(path, profile, "run_command(rg)", True)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert lr.edit_rule(path, profile, "run_command(rg)", False)
+    assert json.loads(path.read_text()) == {"permissions": {"allow": []}}
+
+
+def test_the_text_writer_appends_and_removes_exact_lines_only(tmp_path):
+    path = tmp_path / "default.rules"
+    path.write_text('prefix_rule(pattern=["git"], decision="allow")\n')
+    profile, rule = lr.CLI_PROFILES["codex"], 'prefix_rule(pattern=["rg"], decision="allow")'
+    assert lr.render_rule(type("P", (), {"cli": "codex", "rule_template": None}), "rg") == rule
+    assert lr.edit_rule(path, profile, rule, True) and lr.edit_rule(path, profile, rule, True) is False
+    assert path.read_text() == 'prefix_rule(pattern=["git"], decision="allow")\n' + rule + "\n"
+    assert lr.edit_rule(path, profile, rule, False)
+    assert path.read_text() == 'prefix_rule(pattern=["git"], decision="allow")\n'
+
+
+@pytest.mark.parametrize("content", ["{not json", "[1, 2]", '{"permissions": {"allow": "rg"}}', '{"permissions": 3}'])
+def test_the_writer_refuses_a_file_it_does_not_understand_and_leaves_it_alone(tmp_path, content):
+    path = tmp_path / "settings.json"
+    path.write_text(content)
+    with pytest.raises(lr.RunnerError):
+        lr.edit_rule(path, lr.CLI_PROFILES["agy"], "run_command(rg)", True)
+    assert path.read_text() == content
+
+
+def test_the_rule_template_can_be_overridden_per_worker():
+    permissions = lr.PermissionConfig("agy", "/x", ["boss"], rule_template="Bash({tool} *)")
+    assert lr.render_rule(permissions, "rg") == "Bash(rg *)"
+
+
+class RecordingBaton:
+    def __init__(self, fail=None):
+        self.calls, self.fail = [], fail
+
+    def write(self, operation, arguments):
+        if self.fail and self.fail(operation, arguments):
+            raise baton.BatonError("storage_unavailable", 503)
+        self.calls.append((operation, dict(arguments)))
+        return {}
+
+
+def keeper_for(tmp_path, monkeypatch, fail=None, cli_name="agy"):
+    home, data = permission_worker_config(tmp_path, monkeypatch, cli_name=cli_name)
+    worker = lr.parse_config(data).workers[0]
+    (home / ".gemini/antigravity-cli").mkdir(parents=True, exist_ok=True)
+    state = tmp_path / "ledger-state"
+    state.mkdir(exist_ok=True)
+    recorder = RecordingBaton(fail)
+    notes = []
+    keeper = lr.GrantKeeper(worker, lr.GrantLedger(state, worker.principal), recorder, lambda task, what, **fields: notes.append(what))
+    return home / ".gemini/antigravity-cli/settings.json", keeper, recorder
+
+
+def request_view(identity="r1", status="allow_always", task="t1"):
+    return {"request_id": identity, "task_id": task, "status": status}
+
+
+def test_a_grant_is_written_audited_and_withdrawn_through_the_ledger(tmp_path, monkeypatch):
+    settings, keeper, recorder = keeper_for(tmp_path, monkeypatch)
+    settings.write_text(json.dumps({"permissions": {"allow": ["mine"]}}))
+    record = keeper.grant(request_view(), "rg")
+    assert json.loads(settings.read_text())["permissions"]["allow"] == ["mine", "run_command(rg)"]
+    assert recorder.calls == [("record_permission", {"task_id": "t1", "request_id": "r1", "event": "granted"})]
+    assert keeper.revoke(record["id"]) is True and keeper.revoke(record["id"]) is None
+    assert json.loads(settings.read_text())["permissions"]["allow"] == ["mine"]
+    assert recorder.calls[-1][1]["event"] == "revoked"
+    assert keeper.ledger.active() == []
+
+
+def test_an_entry_the_operator_already_had_is_never_removed_by_a_revoke(tmp_path, monkeypatch):
+    settings, keeper, _ = keeper_for(tmp_path, monkeypatch)
+    settings.write_text(json.dumps({"permissions": {"allow": ["run_command(rg)"]}}))
+    first = keeper.grant(request_view("r1"), "rg")
+    second = keeper.grant(request_view("r2", "allow_once"), "rg")
+    assert first["preexisting"] and second["preexisting"]
+    assert keeper.revoke(second["id"]) and keeper.revoke(first["id"])
+    assert json.loads(settings.read_text())["permissions"]["allow"] == ["run_command(rg)"]
+
+
+def test_overlapping_grants_of_the_same_rule_keep_it_until_the_last_is_withdrawn(tmp_path, monkeypatch):
+    settings, keeper, _ = keeper_for(tmp_path, monkeypatch)
+    first = keeper.grant(request_view("r1", "allow_once", "t1"), "rg")
+    second = keeper.grant(request_view("r2", "allow_always", "t2"), "rg")
+    assert not first["preexisting"] and not second["preexisting"]
+    keeper.revoke(first["id"])
+    assert "run_command(rg)" in json.loads(settings.read_text())["permissions"]["allow"], "the other grant still needs it"
+    keeper.revoke(second["id"])
+    assert json.loads(settings.read_text())["permissions"]["allow"] == []
+
+
+def test_a_grant_that_cannot_be_audited_is_withdrawn_again(tmp_path, monkeypatch):
+    settings, keeper, recorder = keeper_for(tmp_path, monkeypatch, fail=lambda operation, arguments: arguments["event"] == "granted")
+    with pytest.raises(lr.RunnerError, match="withdrawn"):
+        keeper.grant(request_view(), "rg")
+    assert json.loads(settings.read_text())["permissions"]["allow"] == []
+    assert keeper.ledger.active() == []
+
+
+def test_reconcile_withdraws_leftover_allow_once_grants_and_keeps_allow_always(tmp_path, monkeypatch):
+    settings, keeper, recorder = keeper_for(tmp_path, monkeypatch)
+    once = keeper.grant(request_view("r1", "allow_once"), "rg")
+    always = keeper.grant(request_view("r2", "allow_always", "t2"), "cat")
+    keeper.reconcile()
+    allow = json.loads(settings.read_text())["permissions"]["allow"]
+    assert allow == ["run_command(cat)"] and [item["id"] for item in keeper.ledger.active()] == [always["id"]]
+    assert once["id"] not in [item["id"] for item in keeper.ledger.active()]
+
+
+def test_a_revoke_that_cannot_reach_baton_is_reported_later(tmp_path, monkeypatch):
+    settings, keeper, recorder = keeper_for(tmp_path, monkeypatch)
+    record = keeper.grant(request_view(), "rg")
+    recorder.fail = lambda operation, arguments: True
+    assert keeper.revoke(record["id"]) is True
+    assert json.loads(settings.read_text())["permissions"]["allow"] == [], "the rule is gone even when the report is not"
+    assert [item["status"] for item in keeper.ledger.unreported()] == ["revoked"]
+    recorder.fail = None
+    keeper.reconcile()
+    assert keeper.ledger.unreported() == [] and recorder.calls[-1][1]["event"] == "revoked"
+
+
+def test_a_ledger_in_the_state_directory_is_private(tmp_path, monkeypatch):
+    _, keeper, _ = keeper_for(tmp_path, monkeypatch)
+    keeper.grant(request_view(), "rg")
+    assert stat.S_IMODE(keeper.ledger.path.stat().st_mode) == 0o600 and stat.S_IMODE(keeper.ledger.lock_path.stat().st_mode) == 0o600
+
+
+def test_the_runner_never_decides_a_permission_request_itself():
+    source = RUNNER.read_text()
+    assert "decide_permission" not in source
+    assert source.count('"request_permission"') == 1 and source.count('"record_permission"') == 1
+
+
+# --- permission requests against the real bridge -----------------------------------------------------
+
+AGY_RG = 'Permission denied: run_command "rg -n TODO src/" is not in permissions.allow (cwd: {cwd})'
+
+
+@pytest.fixture
+def agy(tmp_path, monkeypatch):
+    home = tmp_path / "agyhome"
+    (home / ".gemini/antigravity-cli").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    settings = home / ".gemini/antigravity-cli/settings.json"
+    initial = {"permissions": {"allow": ["mcp(baton/get_task)"], "deny": ["run_command(rm)"]}, "theme": "dark"}
+    settings.write_text(json.dumps(initial, indent=2))
+    return type("Agy", (), {"home": home, "settings": settings, "initial": initial,
+                            "allow": lambda self: json.loads(settings.read_text())["permissions"]["allow"]})()
+
+
+def agy_worker(lab, bridge, agy, label="worker", message=AGY_RG, rule="run_command(rg)", **permissions):
+    scenario = lab.scenario(gate={"config": str(agy.settings), "rule": rule, "message": message}, mark="ran.txt")
+    settings = {"cli": "agy", "config_file": str(agy.settings), "approvers": [bridge.identities["owner"]["agent"]],
+                "poll_seconds": 0.2, "wait_seconds": 60}
+    settings.update(permissions)
+    return lab.worker(label, scenario=scenario, home_read=[str(agy.home / ".gemini/antigravity-cli")], permissions=settings)
+
+
+def permissions_of(space, task_id):
+    return space.owner.read("list_permissions", task_id=task_id)
+
+
+def pending_request(space, task_id):
+    return wait_for(lambda: next((item for item in permissions_of(space, task_id) if item["status"] == "pending"), None),
+                    message="a pending permission request")
+
+
+def api_error(call):
+    with pytest.raises(baton.BatonError) as caught:
+        call()
+    return caught.value.code, caught.value.status
+
+
+def runs(lab, task_id, label="worker"):
+    return len((lab.tmp / "roots" / label / task_id / "ran.txt").read_text())
+
+
+def events_of(space, task_id):
+    return [row["event"] for row in space.owner.read("list_audit", task_id=task_id)]
+
+
+def test_approved_permission_resumes_the_same_task_in_the_same_epoch_and_worktree_to_done(
+        lab, bridge, space, agy, tmp_path, capsys):
+    worker_name = bridge.identities["worker"]["agent"]
+    owner_name = bridge.identities["owner"]["agent"]
+    task_id = assign(space, bridge, "worker", prompt="Search the sources with rg")
+    lab.start([agy_worker(lab, bridge, agy)])
+    config_before = copy.deepcopy(lab.runners[0].workers[0].worker)
+
+    request = pending_request(space, task_id)
+    assert (request["worker"], request["cli"], request["tool"], request["epoch"]) == (worker_name, "agy", "rg", 1)
+    assert request["directory"].endswith(task_id) and "is not in permissions.allow" in request["reason"]
+    assert request["approvers"] == [owner_name] and request["options"] == ["allow_once", "allow_always", "deny"]
+    assert request["excerpt_sha256"] is None, "a clean parse attaches no raw excerpt"
+
+    view = task_view(space, task_id)
+    assert view["state"] == "claimed" and view["holder"] == worker_name and view["lease_valid"] and view["epoch"] == 1
+    assert view["blocked"]["reason_code"] == "waiting_input" and view["blocked"]["by"] == worker_name
+    thread = [item for item in thread_comments(space, task_id) if item["subject"].startswith("[input required: permission]")]
+    assert len(thread) == 1 and thread[0]["author_principal"] == worker_name
+    structured = json.loads(thread[0]["body"].split("\n", 1)[1])
+    assert structured["kind"] == "permission_request" and structured["request_id"] == request["request_id"]
+    assert structured["options"] == ["allow_once", "allow_always", "deny"] and structured["tool"] == "rg"
+    inbox = space.owner.read("fetch_inbox")["messages"]
+    assert any(item["subject"].startswith("[input required: permission]")
+               and any(mention["requested_by"] == worker_name and mention["action_requested"] for mention in item["requests"])
+               for item in inbox), "the approver is mentioned with an action request"
+
+    expires = view["lease_expires_at"]
+    wait_for(lambda: task_view(space, task_id)["lease_expires_at"] != expires, 15, "the lease to be renewed while waiting")
+    assert agy.allow() == agy.initial["permissions"]["allow"], "nothing is granted before the approver decides"
+
+    decided = space.owner.write("decide_permission", task_id=task_id, request_id=request["request_id"], option="allow_always")
+    assert decided["status"] == "allow_always" and decided["decided_by"] == owner_name and decided["authority"] == "root"
+
+    view = wait_state(space, task_id, "awaiting_gate")
+    assert view["epoch"] == 1 and view["result_epoch"] == 1 and view["result_author"] == worker_name
+    assert view["blocked"] is None and "exit code: 0" in view["result"]
+    assert agy.allow() == ["mcp(baton/get_task)", "run_command(rg)"]
+    settings = json.loads(agy.settings.read_text())
+    assert settings["permissions"]["deny"] == ["run_command(rm)"] and settings["theme"] == "dark"
+    report = lab.report("worker", task_id)
+    assert report["marker_seen"] is True and runs(lab, task_id) == 2, "re-run in the very same worktree"
+    assert lab.runners[0].workers[0].worker == config_before, "no sandbox, network or keychain setting was touched"
+
+    events = events_of(space, task_id)
+    assert events.count("task.claimed") == 1 and events.count("task.blocked") == 0
+    ordered = [event for event in events if event in {"task.claimed", "permission.requested", "permission.decided",
+                                                      "permission.granted", "task.result_submitted"}]
+    assert ordered == ["task.claimed", "permission.requested", "permission.decided", "permission.granted",
+                       "task.result_submitted"]
+    audit = {row["event"]: row for row in space.owner.read("list_audit", task_id=task_id) if row["event"].startswith("permission.")}
+    assert audit["permission.requested"]["agent"] == worker_name and audit["permission.granted"]["agent"] == worker_name
+    assert audit["permission.decided"]["agent"] == owner_name and audit["permission.decided"]["metadata"]["root"] is True
+    assert audit["permission.decided"]["metadata"]["decision"] == "allow_always"
+    assert any("Permission allow_always granted for `rg`" in body for body in comment_bodies(space, task_id))
+    assert space.owner.write("gate", task_id=task_id, expected_epoch=1, decision="pass")["state"] == "done"
+
+    runner_config = str(tmp_path / "config" / "runner.json")
+    assert lr.main(["--config", runner_config, "--list-grants"]) == 0
+    out = capsys.readouterr().out
+    listed = [item for item in (json.loads(line) for line in out.splitlines() if line.startswith("{")) if "rule" in item]
+    assert [(item["worker"], item["tool"], item["option"], item["status"]) for item in listed] == [
+        (worker_name, "rg", "allow_always", "active")]
+
+    assert lr.main(["--config", runner_config, "--revoke-grant", listed[0]["id"]]) == 0
+    assert agy.allow() == agy.initial["permissions"]["allow"] and json.loads(agy.settings.read_text())["theme"] == "dark"
+    assert events_of(space, task_id).count("permission.revoked") == 1
+    assert permissions_of(space, task_id)[0]["grant"] == "revoked"
+    assert lr.main(["--config", runner_config, "--revoke-grant", listed[0]["id"]]) == lr.EXIT_USAGE, "already withdrawn"
+
+
+def test_allow_once_is_removed_after_the_run_and_does_not_persist_to_the_next_task(lab, bridge, space, agy):
+    worker_name = bridge.identities["worker"]["agent"]
+    first = assign(space, bridge, "worker", prompt="First search")
+    lab.start([agy_worker(lab, bridge, agy)])
+    request = pending_request(space, first)
+    space.owner.write("decide_permission", task_id=first, request_id=request["request_id"], option="allow_once")
+    wait_state(space, first, "awaiting_gate")
+    assert agy.allow() == agy.initial["permissions"]["allow"], "the once-only rule is gone after the run"
+    events = events_of(space, first)
+    assert [event for event in events if event.startswith("permission.")] == [
+        "permission.requested", "permission.decided", "permission.granted", "permission.revoked"]
+    assert events.index("permission.revoked") < events.index("task.result_submitted")
+    record = permissions_of(space, first)[0]
+    assert record["status"] == "allow_once" and record["grant"] == "revoked"
+    ledger = lr.GrantLedger(lab.tmp / "state", worker_name)
+    assert ledger.active() == [] and [item["status"] for item in ledger.load().values()] == ["revoked"]
+
+    second = assign(space, bridge, "worker", prompt="Second search")
+    again = pending_request(space, second)
+    assert again["request_id"] != request["request_id"], "a new task asks again"
+    assert agy.allow() == agy.initial["permissions"]["allow"]
+
+
+def test_denied_permission_blocks_the_task_without_a_retry_or_any_grant(lab, bridge, space, agy):
+    worker_name = bridge.identities["worker"]["agent"]
+    task_id = assign(space, bridge, "worker")
+    lab.start([agy_worker(lab, bridge, agy)])
+    request = pending_request(space, task_id)
+    space.owner.write("decide_permission", task_id=task_id, request_id=request["request_id"], option="deny",
+                      reason="rg is not needed here")
+    view = wait_for(lambda: (lambda v: v if v["blocked"] and v["blocked"]["reason_code"] == "other" else None)(task_view(space, task_id)),
+                    message="the permission_denied block")
+    assert view["blocked"]["by"] == worker_name and view["result"] is None
+    bodies = comment_bodies(space, task_id)
+    assert any(body.startswith("[blocked] other: permission_denied: rg (request %s)" % request["request_id"]) for body in bodies)
+    assert any("Permission denied by" in body and "will not retry" in body for body in bodies)
+    wait_for(lambda: json.loads((lab.tmp / "state" / (worker_name + ".tasks.json")).read_text())["tasks"][task_id]["state"]
+             == "handed_back", message="the task is handed back, not retried")
+    time.sleep(2)
+    assert agy.allow() == agy.initial["permissions"]["allow"], "a denied request grants nothing"
+    events = events_of(space, task_id)
+    assert events.count("task.claimed") == 1 and "permission.granted" not in events and runs(lab, task_id) == 1
+    assert permissions_of(space, task_id)[0]["status"] == "deny" and permissions_of(space, task_id)[0]["grant"] is None
+    assert api_error(lambda: Api(bridge, "worker").write("record_permission", task_id=task_id, request_id=request["request_id"],
+                                                         event="granted")) == ("stale_claim", 409), "no grant can be recorded for a denial"
+
+
+def test_only_an_approver_can_decide_and_the_worker_never_approves_its_own_request(lab, bridge, space, agy, pg_store, approver):
+    task_id = assign(space, bridge, "worker")
+    lab.start([agy_worker(lab, bridge, agy)])
+    request = pending_request(space, task_id)
+    arguments = {"task_id": task_id, "request_id": request["request_id"], "option": "allow_always"}
+
+    assert api_error(lambda: Api(bridge, "worker").write("decide_permission", **arguments)) == ("forbidden", 403), "the worker itself"
+    assert api_error(lambda: Api(bridge, "reviewer").write("decide_permission", **arguments)) == ("delegation_required", 403)
+    assert api_error(lambda: Api(bridge, "worker2").write("decide_permission", **arguments)) == ("delegation_required", 403)
+    assert api_error(lambda: space.owner.write("decide_permission", **{**arguments, "option": "forever"}))[1] == 422
+    assert api_error(lambda: space.owner.write("decide_permission", **{**arguments, "request_id": str(uuid.uuid4())})) == ("not_found", 404)
+    assert permissions_of(space, task_id)[0]["status"] == "pending" and agy.allow() == agy.initial["permissions"]["allow"]
+    assert "permission.decided" not in events_of(space, task_id)
+
+    approver(pg_store, bridge.identities["reviewer"], by=bridge.identities["owner"])
+    decided = Api(bridge, "reviewer").write("decide_permission", **{**arguments, "option": "allow_once"})
+    reviewer_name = bridge.identities["reviewer"]["agent"]
+    assert decided["decided_by"] == reviewer_name and decided["authority"].startswith("delegated by " + bridge.identities["owner"]["agent"])
+    wait_state(space, task_id, "awaiting_gate")
+    audit = next(row for row in space.owner.read("list_audit", task_id=task_id) if row["event"] == "permission.decided")
+    assert audit["agent"] == reviewer_name and audit["metadata"]["root"] is False and audit["metadata"]["delegation_id"]
+    assert api_error(lambda: space.owner.write("decide_permission", **arguments)) == ("stale_claim", 409), "decided once"
+
+
+def test_a_decision_is_idempotent_per_operation_id_and_a_different_decision_under_it_conflicts(lab, bridge, space, agy):
+    task_id = assign(space, bridge, "worker")
+    lab.start([agy_worker(lab, bridge, agy)])
+    request = pending_request(space, task_id)
+    arguments = {"task_id": task_id, "request_id": request["request_id"], "option": "allow_once", "operation_id": str(uuid.uuid4())}
+    first = space.owner.client.call("decide_permission", arguments)
+    again = space.owner.client.call("decide_permission", arguments)
+    assert first["status"] == again["status"] == "allow_once" and again["replay"] is True
+    assert api_error(lambda: space.owner.client.call("decide_permission", {**arguments, "option": "deny"})) == ("operation_conflict", 409)
+    wait_state(space, task_id, "awaiting_gate")
+    assert events_of(space, task_id).count("permission.decided") == 1
+
+
+def test_a_stranger_cannot_see_or_decide_a_request_and_only_the_worker_records_grants(lab, bridge, space, agy):
+    task_id = assign(space, bridge, "worker")
+    lab.start([agy_worker(lab, bridge, agy)])
+    request = pending_request(space, task_id)
+    assert api_error(lambda: Api(bridge, "owner").write("record_permission", task_id=task_id, request_id=request["request_id"],
+                                                        event="granted")) == ("forbidden", 403)
+    assert api_error(lambda: Api(bridge, "worker").write("record_permission", task_id=task_id, request_id=request["request_id"],
+                                                         event="granted")) == ("stale_claim", 409), "not approved yet"
+    assert api_error(lambda: Api(bridge, "worker").write("record_permission", task_id=task_id, request_id=request["request_id"],
+                                                         event="weird"))[1] == 422
+    ask = {"task_id": task_id, "epoch": 1, "cli": "agy", "tool": "cat"}
+    assert api_error(lambda: Api(bridge, "worker").write("request_permission", **ask)) == ("operation_conflict", 409), "one pending"
+    assert api_error(lambda: Api(bridge, "owner").write("request_permission", **ask)) == ("stale_claim", 409), "only the holder asks"
+    space.owner.write("decide_permission", task_id=task_id, request_id=request["request_id"], option="deny")
+
+
+def test_a_tool_that_would_widen_the_sandbox_is_never_requested(lab, bridge, space, agy):
+    message = 'Permission denied: run_command "curl https://example.com" is not in permissions.allow (cwd: {cwd})'
+    task_id = assign(space, bridge, "worker")
+    lab.start([agy_worker(lab, bridge, agy, message=message, rule="run_command(curl)")], max_failures_per_task=1)
+    wait_for(lambda: any("cannot be allowlisted through Baton" in body for body in comment_bodies(space, task_id)),
+             message="the failure explains why nothing was requested")
+    assert permissions_of(space, task_id) == [] and "permission.requested" not in events_of(space, task_id)
+    assert agy.allow() == agy.initial["permissions"]["allow"]
+
+
+def test_a_refusal_outside_the_workers_own_directories_is_never_requested(lab, bridge, space, agy):
+    message = 'Permission denied: run_command "rg -n key /etc" is not in permissions.allow (cwd: /etc)'
+    task_id = assign(space, bridge, "worker")
+    lab.start([agy_worker(lab, bridge, agy, message=message)], max_failures_per_task=1)
+    wait_for(lambda: any("outside this worker's own directories" in body for body in comment_bodies(space, task_id)),
+             message="the failure explains the directory")
+    assert permissions_of(space, task_id) == []
+
+
+def test_an_unparsed_refusal_is_posted_with_a_redacted_excerpt_and_cannot_be_auto_granted(lab, bridge, space, agy):
+    token = bridge.tokens["worker"].read_text().strip()
+    message = "step 4: Action blocked, this step requires approval in headless mode (credential %s) {cwd}" % token
+    task_id = assign(space, bridge, "worker")
+    lab.start([agy_worker(lab, bridge, agy, message=message)], max_failures_per_task=1)
+    request = pending_request(space, task_id)
+    assert request["tool"] == lr.UNPARSED_TOOL and request["excerpt_sha256"]
+    thread = next(item for item in thread_comments(space, task_id) if item["subject"].startswith("[input required"))
+    structured = json.loads(thread["body"].split("\n", 1)[1])
+    assert "requires approval in headless mode" in structured["excerpt"] and len(structured["excerpt"]) <= lr.EXCERPT_CHARS
+    assert token not in thread["body"] and lr.REDACTED in structured["excerpt"]
+    space.owner.write("decide_permission", task_id=task_id, request_id=request["request_id"], option="allow_always")
+    wait_for(lambda: any("could not be identified" in body for body in comment_bodies(space, task_id)), message="manual follow-up")
+    assert agy.allow() == agy.initial["permissions"]["allow"]
+    assert all(token not in body for body in comment_bodies(space, task_id))
+
+
+def test_an_unanswered_request_fails_the_task_after_the_wait_and_changes_nothing(lab, bridge, space, agy):
+    task_id = assign(space, bridge, "worker")
+    lab.start([agy_worker(lab, bridge, agy, wait_seconds=1)], max_failures_per_task=1)
+    wait_for(lambda: any("was not answered within 1s" in body for body in comment_bodies(space, task_id)), 30, "the wait to give up")
+    assert agy.allow() == agy.initial["permissions"]["allow"]
+    assert [item["status"] for item in permissions_of(space, task_id)] == ["pending"]
+
+
+def test_a_worker_without_a_permissions_block_still_fails_as_before(lab, bridge, space, agy):
+    scenario = lab.scenario(gate={"config": str(agy.settings), "rule": "run_command(rg)", "message": AGY_RG}, mark="ran.txt")
+    task_id = assign(space, bridge, "worker")
+    lab.start([lab.worker(scenario=scenario)], max_failures_per_task=1)
+    wait_for(lambda: any("exit code 1" in body for body in comment_bodies(space, task_id)), message="the plain failure")
+    assert permissions_of(space, task_id) == []

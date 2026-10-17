@@ -17,6 +17,8 @@
 5. 限量捕获 stdout/stderr，把摘要（截断，并对执行器持有的每一个令牌值做字面脱敏）发为任务线程评论，再 `submit_result`，证据列表含退出码、耗时和 `git status` 得到的改动文件。之后由审阅人照常 `gate`。
 6. 失败、超时或非零退出：缩短租约、`mark_blocked(reason_code="other", note=简短原因)` 并记一次失败；同一任务失败达到 `max_failures_per_task`（默认 2）次后不再自动重试，评论“已交还给分配人”并停止。Baton 对仍持有有效租约的任务不接受 `mark_blocked`，所以执行器先把租约续到 1 秒、等它失效，再写阻塞标记。
 
+7. 例外：worker 配了 `permissions`，且 CLI 因自己的白名单拒绝了某个命令时，不走上面的失败路径，而是发权限请求并等待批准，见“权限请求闭环”。
+
 worktree 保留在磁盘上供审阅（改动不会自动提交或推送）。重试同一任务时会先清掉旧 worktree。定期清理 `workdir_root` 下不再需要的目录（`git worktree remove` 或删除目录后 `git worktree prune`）。
 
 ## 上限
@@ -276,6 +278,7 @@ worker 字段：
 | `home_read` | 路径列表，必须在 `HOME` 之内：该 CLI 自己真正需要读取的配置/登录态目录。沙箱默认拒绝读写整个 `HOME`，只放行这里列出的路径（只读）、任务 worktree 和临时目录；见“沙箱：HOME 默认拒绝”。默认空 |
 | `allow_keychain` | 布尔值，默认 `false`。默认每个有沙箱的 worker 都被拒绝读取 macOS Keychain；设为 `true` 会关闭这项防护，并在日志里打印醒目警告 |
 | `sandbox.extra_write_paths` | 沙箱内额外可写的已存在目录（例如 CLI 把登录态或会话写在 `HOME` 下） |
+| `permissions` | 可选对象，开启权限请求闭环：`cli`、`config_file`、`approvers` 及可选的 `wait_seconds`、`poll_seconds`、`max_requests`、`rule_template`，见“权限请求闭环” |
 
 用 `python3 adapters/local_runner.py --config <CONFIG_FILE> --check` 检查配置和每个 worker，再不带 `--check` 启动。`SIGINT`/`SIGTERM` 会终止正在运行的子进程并退出。
 
@@ -390,6 +393,93 @@ worker 字段：
 - `backend: "none"`：没有任何隔离。
 - macOS 的 `sandbox-exec` 规则（HOME 拒绝、再放行、元数据放行、Keychain 拒绝）由测试检查生成的配置文本，**没有在 macOS 上真实执行**；上线前请在目标机器上用一个读取 `~/.aws` 之类无害文件的任务验证。
 
+## 权限请求闭环
+
+没有这一节的配置时，headless CLI 碰到权限墙（例如 agy 拒绝白名单外的 `rg`）会拒绝并退出，任务以 `exit code N` 失败，没人知道缺什么。给 worker 加上 `permissions` 块后，执行器把这个失败变成一次可见的、需要人批准的请求（规格 X26，接口见 [API](../docs/api.md#权限请求)）。
+
+流程（同一任务、同一 epoch、同一租约、同一 worktree）：
+
+1. CLI 以非零退出结束（不含超时、被停止、租约丢失）。执行器在它的 stdout/stderr 里按该 CLI 的检测器表解析拒绝信息：被拒绝的程序（`tool`）、目录、原因。解析不出字段，但输出里有明确的审批措辞（`requires approval`、`not in the allow list`、`denied by policy`、`no prompt available` 等）时，仍发请求，`tool` 记为 `(unparsed)`，并附带一段**有界、已脱敏**的原始输出片段（至多 1500 字符，对令牌、`env_passthrough` 值、Keychain 值做字面脱敏）。普通的操作系统 `Permission denied` 不算。
+2. 执行器发 `request_permission`：任务保持 `claimed`，视图出现 `blocked.reason_code=waiting_input`（`input required: permission`），线程出现一条以 `[input required: permission]` 开头的评论（一行说明加一段结构化 JSON），并提及 `permissions.approvers`，选项是 `allow_once`、`allow_always`、`deny`。执行器每 `poll_seconds`（默认 5）读一次 `list_permissions`，等待期间续租线程继续续租，最多等 `wait_seconds`（默认 1800）；超时按普通失败处理（计一次失败，同一请求保持待决）。
+3. 决定必须由 approver 通过 Baton 做出：Space 根，或持有覆盖该任务的审批人委托的主体（与 gate 的规则相同）。执行器自己的 worker 身份永远不能决定自己的请求，执行器代码里也没有任何决定调用；`approvers` 配置里不能写 worker 自己。别的人（没有委托的 reviewer、别的 agent）得到 `403`。
+4. `allow_once` / `allow_always`：执行器在**该 CLI 自己的白名单文件**（`permissions.config_file`）里加一条规则，向 Baton 报告 `granted`，续租，在评论里说明，然后在**同一个 worktree** 里重新运行 CLI（上一次运行留下的改动还在）。每次重跑都有完整的 `task_timeout_seconds`；一个任务至多发 `max_requests`（默认 3）个请求。`allow_once` 的规则在整个任务运行结束后（成功或失败，提交结果之前）移除并报告 `revoked`；之后的任务会重新请求。`allow_always` 的规则一直保留，直到用下面的撤销命令移除。
+5. `deny`：执行器评论说明，释放租约并 `mark_blocked(reason_code="other", note="permission_denied: <tool> (request <id>)")`，不再自动重试，也不记入失败次数。`permission_denied` 写在 `note` 里而不是原因码，因为 `blocked_reason` 的数据库约束只允许五个固定原因码，本功能不改 schema。
+
+配置（只示意 `permissions` 块；其余字段同上文 worker 配置）：
+
+```json
+{
+  "principal": "mugua",
+  "home": "real",
+  "home_read": ["~/.gemini/antigravity-cli"],
+  "permissions": {
+    "cli": "agy",
+    "config_file": "~/.gemini/antigravity-cli/settings.json",
+    "approvers": ["nangua"],
+    "wait_seconds": 1800,
+    "poll_seconds": 5,
+    "max_requests": 3
+  }
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `cli` | `agy`、`codex`、`grok`、`cline`、`opencode`、`dsh` 之一：选择检测器和白名单写入格式 |
+| `config_file` | 该 CLI 白名单文件的绝对路径（`~` 会展开）。必须落在**这个 worker 自己的 `home_read` 之内**（按真实路径比较，符号链接绕不过去），不能同时落在 `extra_write_paths` 里（否则 CLI 自己能改写白名单），也不能和别的 worker 共用同一个文件。这样授权只影响该 worker，且沙箱不会为此放宽：沙箱里这个文件仍是只读的，只有执行器进程（在沙箱外）写它 |
+| `approvers` | 1 到 10 个 principal，请求里会提及他们；不能包含 worker 自己。它决定提醒谁，不决定谁有权批准 |
+| `wait_seconds` / `poll_seconds` / `max_requests` | 等待上限（默认 1800 秒）、轮询间隔（默认 5 秒）、每个任务的请求数上限（默认 3） |
+| `rule_template` | 可选：覆盖默认规则模板，必须是一行且含恰好一个 `{tool}`，例如 `Bash({tool} *)` |
+
+`home: "real"` 才有意义：授权写入的是操作者真实 `HOME` 下的 CLI 配置文件。用 `home: "task"`（临时 HOME）的 worker，CLI 读不到这个文件。
+
+### 各 CLI 的检测器与白名单格式
+
+**这些都是未验证的。** 本仓库没有真实运行任何一个 CLI：测试里的每一条输出样例都是**合成的**（按各 CLI 拒绝信息的大致样子手写），不是从真实程序捕获的；检测器的正则因此只是“当前最好的猜测”，真实输出可能不同。解析不到的拒绝信息会走“未解析 + 原始片段”的兜底，人看得到，但不能自动授权（批准后执行器会明说“无法识别被拒绝的工具”，需要手工加白名单后重新分派）。下表“白名单文件”和“规则”也都需要操作者对照该 CLI 的官方文档确认，仅 agy 的 `permissions.allow` 数组路径在本仓库的 [agy 接入页](agy.md)里有出处，其规则写法同样未验证；不对时用 `rule_template` 覆盖，或者不要启用该 worker 的 `permissions`。
+
+| `cli` | 白名单位置（写入方式） | 默认规则（`{tool}` 是程序名） | 检测的拒绝信息（合成样例的形状） |
+| --- | --- | --- | --- |
+| `agy` | JSON，`permissions.allow` 数组 | `run_command({tool})` | `Permission denied: run_command "<命令>" is not in permissions.allow (cwd: <目录>)` |
+| `codex` | 文本，每行一条规则（追加/删除整行） | `prefix_rule(pattern=["{tool}"], decision="allow")` | `exec` / `<命令> in <目录>` / `…requires approval…` 三行 |
+| `grok` | JSON，`permissions.allow` 数组 | `Bash({tool}:*)` | `tool "bash" denied in non-interactive mode: command <命令，反引号包裹> is not allowed by permissions (cwd=<目录>)` |
+| `cline` | JSON，顶层 `allow` 数组 | `{tool} *` | `Command "<命令>" was blocked: no allow rule in CLINE_COMMAND_PERMISSIONS matches (workdir: <目录>)` |
+| `opencode` | JSON，`permission.bash` 映射（规则 → `"allow"`） | `{tool} *` | `permission requested: bash (<命令>); auto-rejecting`；`external_directory` 等非命令权限能解析但不授权 |
+| `dsh` | JSON，`permissions.allow` 数组 | `shell({tool})` | `dsh: shell command "<命令>" denied (policy=…, headless: no prompt available); cwd=<目录>` |
+
+写入只改这一条规则：JSON 文件原样保留其余内容（用标准库解析并以缩进 2 重写，所以原文件里的注释和排版不会保留；解析不了的文件、结构不符的文件直接拒绝，不改写），保留文件权限，原子替换。操作者本来就有的同名规则永远不会被撤销命令删除；同一规则被多个未撤销的授权共用时，要最后一个撤销才会删。
+
+### 永远不会通过这条路径授权的东西
+
+- **任何沙箱设置。** 请求只会变成 CLI 白名单里的一条命令规则。`home_read`、`sandbox.*`（含网络）、`allow_keychain`、`extra_write_paths` 和配置里的其他项执行器都不会改（测试断言授权前后 worker 配置完全相同）。
+- **会放宽沙箱的程序：** shell 和解释器（`sh`、`bash`、`zsh`、`python*`、`node`、`perl`、`ruby`、`env`、`xargs`、`eval` 等）、网络客户端（`curl`、`wget`、`ssh`、`scp`、`nc`、`rsync` 等）、提权（`sudo`、`su`、`doas`）、Keychain 工具（`security`）、沙箱和容器工具（`bwrap`、`sandbox-exec`、`docker` 等）。这类拒绝不发请求，任务按普通失败处理，失败评论说明原因。
+- **非命令权限**（例如读写某个目录的权限）和**被拒绝目录落在这个 worker 自己的目录之外**（worktree、临时目录、`workdir_root`、`home_read`、`extra_write_paths`）的请求：同样不发请求，按普通失败处理。
+- 同一个程序已经授权过、CLI 却仍然拒绝：不再请求，按失败处理（避免循环）。
+
+### 查看与撤销授权
+
+执行器为每个 worker 在 `state_dir/<principal>.grants.json`（权限 600）记录自己加的每条规则；`<principal>.grants.lock` 让执行器和撤销命令（可能是另一个进程）互斥。撤销命令只作用于指定的 worker 自己的白名单文件，不会碰别的 worker：
+
+```sh
+# SPDX-License-Identifier: Apache-2.0
+python3 adapters/local_runner.py --config <CONFIG_FILE> --list-grants
+python3 adapters/local_runner.py --config <CONFIG_FILE> --revoke-grant <GRANT_ID>
+python3 adapters/local_runner.py --config <CONFIG_FILE> --revoke-worker <PRINCIPAL>
+```
+
+`--list-grants` 每行输出一个 JSON（`worker`、`id`、`tool`、`rule`、`option`、`status`、`task_id`、`request_id`、`created`）。撤销会从白名单文件里删除规则（除非那条规则本来就是操作者的），把授权标为 `revoked`，并用该 worker 自己的令牌向 Baton 报告 `revoked`；Baton 暂时连不上时规则照样先删，报告记在账本里，执行器下次启动（或再次运行撤销命令）时补报。退出码：0 成功，1 有授权撤销失败，2 找不到该 id 或 worker。
+
+### 审计
+
+每一步都有审计，且在任务线程里可见：`permission.requested`（谁、哪个 CLI、程序、目录、原因、点名的 approvers，excerpt 只存 SHA-256）、`permission.decided`（approver、选项、根或委托链）、`permission.granted`（执行器报告已写入）、`permission.revoked`。审计的 actor 分别是 worker、approver、worker、worker。无法向 Baton 报告 `granted` 的授权会被撤回并让任务失败，不会留下没有审计的规则；执行器崩溃后下次启动会撤回遗留的 `allow_once` 规则并补报未报告的事件。
+
+### 限制，请明确知晓
+
+- 只在 CLI 以非零退出时检测。一个拒绝了命令但仍以 0 退出的 CLI 不会触发请求。
+- 等待审批期间该任务占用 worker 的一个并发槽（`concurrency`），并且执行器进程要一直在线并持续续租；执行器重启会丢掉这次等待（租约过期后任务回到队列，旧请求变为过期，决定会得到 `409 stale_claim`）。
+- 被拒绝的程序名来自 CLI 输出，而输出可能受不可信的任务文字影响，所以：只接受简单程序名，有上面的拒绝清单，approver 在请求里看到的是同一个名字，批准前应核对。批准一个程序等于允许该 CLI 在这个 worker 的**所有后续任务**里按规则模板运行它（`allow_always`），或在当前任务的这一次运行里使用它（`allow_once`）。
+- 规则模板与各 CLI 实际接受的语法是否一致未验证；写入的规则是否真被该 CLI 采纳，要靠重跑结果判断（不采纳时表现为再次被拒绝，执行器按失败处理）。
+- `mcp_stdio.py` 适配器的已知工具表没有这四个操作；approver 通过 HTTP、MCP 客户端或 `baton_cli.py call` 使用它们。
+
 ## 安全模型
 
 任务文字是不可信数据：它只写进提示词文件，永远不会被拼进 argv、shell 或环境变量；唯一的替换是把整项 `{prompt_file}` 换成文件路径，或把整项 `{prompt_instruction}` 换成只含该路径的固定指令句。
@@ -423,4 +513,5 @@ worker 字段：
 - `refused`：日志里会写原因（令牌不可读、沙箱后端不可用、绕过开关缺少沙箱、`extra_write_paths` 不是目录）。
 - `claim-failed`/`deferred`：另一个任务的租约占用了范围，或依赖未满足；执行器会在 `retry_delay_seconds` 后重试，最多 10 次，随后评论交还。
 - `hourly-cap-reached`：已到滚动一小时上限，会等到有空位。
-- 状态文件在 `state_dir`：`<principal>.seq`（已处理的通知序号）、`<principal>.tasks.json`（任务状态与失败次数）、`hourly.json`。被交还的任务重新指派后会收到新的 `task.assigned`，失败计数随之清零。
+- `permission-requested` / `permission-decided` / `grant-applied` / `grant-revoked` / `grant-unreported` / `grant-left-active`：权限请求闭环的日志行（只含任务 ID、请求 ID、程序名、授权 ID，不含任何密钥）；`grant-left-active` 表示一条规则没能删掉，用 `--list-grants` 和 `--revoke-grant` 处理。
+- 状态文件在 `state_dir`：`<principal>.seq`（已处理的通知序号）、`<principal>.tasks.json`（任务状态与失败次数）、`<principal>.grants.json`（权限授权账本）、`hourly.json`。被交还的任务重新指派后会收到新的 `task.assigned`，失败计数随之清零。

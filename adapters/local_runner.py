@@ -13,10 +13,17 @@ worker command in a sandbox without a shell and reports the result with the work
 Task text is untrusted data. It is written to a prompt file and never interpolated into argv, a shell or the
 environment. Tokens are read only by this process; the child gets a scrubbed environment.
 
+A worker whose CLI refuses a command because its own allowlist lacks it can ask for input instead of failing: the runner
+parses the refusal, posts a permission request in the task thread and waits, holding the same claim and epoch. On approval
+by a Baton approver it adds one rule to that CLI's allowlist (never to the sandbox) and re-runs in the same worktree.
+`--list-grants`, `--revoke-grant` and `--revoke-worker` list and withdraw those rules.
+
 Exit codes: 0 ok, 1 runtime error, 2 usage or configuration error.
 """
 
 import argparse
+import contextlib
+import fcntl
 import importlib.util
 import json
 import os
@@ -88,8 +95,9 @@ CONFIG_KEYS = frozenset({
 WORKER_KEYS = frozenset({
     "principal", "token_file", "command", "prompt_via", "workdir_root", "concurrency", "task_timeout_seconds",
     "sandbox", "env_passthrough", "home", "enabled", "implicit_auto_approve",
-    "env_from_keychain", "home_read", "allow_keychain",
+    "env_from_keychain", "home_read", "allow_keychain", "permissions",
 })
+PERMISSIONS_KEYS = frozenset({"cli", "config_file", "approvers", "wait_seconds", "poll_seconds", "max_requests", "rule_template"})
 SANDBOX_KEYS = frozenset({"backend", "allow_network", "extra_write_paths"})
 
 
@@ -132,6 +140,18 @@ class SandboxConfig:
 
 
 @dataclass
+class PermissionConfig:
+    """How one worker asks for, and receives, an allowlist entry in its own CLI's configuration."""
+    cli: str
+    config_file: str
+    approvers: list
+    wait_seconds: int = 1800
+    poll_seconds: float = 5.0
+    max_requests: int = 3
+    rule_template: str = None
+
+
+@dataclass
 class WorkerConfig:
     principal: str
     token_file: str
@@ -148,6 +168,7 @@ class WorkerConfig:
     env_from_keychain: dict = field(default_factory=dict)
     home_read: list = field(default_factory=list)
     allow_keychain: bool = False
+    permissions: PermissionConfig = None
 
 
 @dataclass
@@ -206,6 +227,28 @@ def _path(section, key, what, required=True):
 
 def _nested(first, second):
     return first == second or first.startswith(second.rstrip("/") + "/") or second.startswith(first.rstrip("/") + "/")
+
+
+def parse_permissions(raw, what, principal):
+    _check_keys(raw, PERMISSIONS_KEYS, what)
+    name = raw.get("cli")
+    if name not in CLI_PROFILES:
+        raise ConfigError(what + ".cli must be one of " + ", ".join(sorted(CLI_PROFILES)))
+    approvers = raw.get("approvers")
+    if (not isinstance(approvers, list) or not approvers or len(approvers) > 10
+            or not all(isinstance(item, str) and cli.AGENT_RE.fullmatch(item) for item in approvers)):
+        raise ConfigError(what + ".approvers must be a list of 1 to 10 principal identifiers")
+    if principal in approvers:
+        raise ConfigError(what + ".approvers may not name the worker itself")
+    template = raw.get("rule_template")
+    if template is not None and (not isinstance(template, str) or template.count("{tool}") != 1 or len(template) > 200
+                                 or re.search(r"[\x00-\x1f\x7f]", template)):
+        raise ConfigError(what + ".rule_template must be one line of at most 200 characters with {tool} exactly once")
+    return PermissionConfig(
+        cli=name, config_file=_path(raw, "config_file", what), approvers=list(dict.fromkeys(approvers)),
+        wait_seconds=_int(raw, "wait_seconds", what, 1800, 1, 86400),
+        poll_seconds=_number(raw, "poll_seconds", what, 5, 0.05, 300), max_requests=_int(raw, "max_requests", what, 3, 1, 10),
+        rule_template=template)
 
 
 def parse_worker(raw, index):
@@ -280,13 +323,14 @@ def parse_worker(raw, index):
     enabled = raw.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ConfigError(what + ".enabled must be true or false")
+    permissions = parse_permissions(raw["permissions"], what + ".permissions", principal) if "permissions" in raw else None
     return WorkerConfig(
         principal=principal, token_file=_path(raw, "token_file", what), command=list(command), prompt_via=prompt_via,
         workdir_root=_path(raw, "workdir_root", what), concurrency=_int(raw, "concurrency", what, 1, 1, 16),
         task_timeout_seconds=_int(raw, "task_timeout_seconds", what, None, 1, MAX_LEASE_SECONDS - 1),
         sandbox=SandboxConfig(backend, allow_network, extra_paths), env_passthrough=list(passthrough), home=home,
         enabled=enabled, implicit_auto_approve=implicit,
-        env_from_keychain=dict(keychain), home_read=home_read, allow_keychain=allow_keychain)
+        env_from_keychain=dict(keychain), home_read=home_read, allow_keychain=allow_keychain, permissions=permissions)
 
 
 def _inside(path, directory):
@@ -337,6 +381,21 @@ def validate_home_access(workers, state_dir, config_path):
                     if _nested(entry, foreign):
                         raise ConfigError("workers[%d] reaches into the home paths of workers[%d]; each worker may "
                                           "only expose its own CLI's directories" % (index, other_index))
+    seen = set()
+    for index, worker in enumerate(workers):
+        if worker.permissions is None:
+            continue
+        what = "workers[%d].permissions.config_file" % index
+        real = os.path.realpath(worker.permissions.config_file)
+        if real in seen:
+            raise ConfigError(what + " is shared with another worker; a grant must only reach its own worker")
+        seen.add(real)
+        if not any(real == os.path.realpath(entry) or _inside(real, os.path.realpath(entry)) for entry in worker.home_read):
+            raise ConfigError(what + " must lie inside this worker's own home_read: the CLI's allowlist is the only thing "
+                              "a grant may change, and the sandbox is never widened to reach it")
+        if any(real == os.path.realpath(entry) or _inside(real, os.path.realpath(entry))
+               for entry in worker.sandbox.extra_write_paths):
+            raise ConfigError(what + " may not lie inside extra_write_paths: the CLI could then rewrite its own allowlist")
 
 
 def parse_config(data, path=None):
@@ -935,6 +994,309 @@ class HourlyCap:
                 self._save()
 
 
+# --- permission requests -------------------------------------------------------------------------------
+
+PERMISSION_OPTIONS = ("allow_once", "allow_always", "deny")
+GENERIC_REASON = "the CLI refused an action in headless mode"
+EXCERPT_CHARS = 1500
+FIELD_CHARS = 300
+TOOL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}")
+UNPARSED_TOOL = "(unparsed)"
+# Programs whose allowlisting would be a sandbox widening in disguise (network clients, shells and interpreters that run
+# anything, privilege changes, the Keychain tool, sandbox tooling): never offered, whatever the CLI asked for.
+UNGRANTABLE_TOOLS = frozenset("""
+    sh bash zsh dash ksh csh tcsh fish python python2 python3 node nodejs deno bun ruby perl php lua osascript pwsh env
+    xargs eval exec sudo su doas nc ncat netcat socat telnet curl wget ssh scp sftp rsync ftp security launchctl
+    sandbox-exec bwrap chroot nsenter unshare docker podman mount open
+""".split())
+
+
+@dataclass(frozen=True)
+class Detector:
+    """One refusal message of one CLI. Named groups: command or tool, and optionally directory and reason."""
+    name: str
+    pattern: "re.Pattern"
+    kind: str = "command"
+    reason: str = None
+
+
+def _detector(name, pattern, kind="command", reason=None):
+    return Detector(name, re.compile(pattern, re.MULTILINE), kind, reason)
+
+
+# Output formats are the runner's best understanding of each CLI, not captured from the real programs: every sample in
+# tests/test_local_runner.py is synthetic. A message that does not match still raises a request, with a raw excerpt.
+DETECTORS = {
+    "agy": [_detector("run_command not in permissions.allow",
+                      r'Permission denied: run_command "(?P<command>[^"\n]+)" (?P<reason>is not in permissions\.allow)'
+                      r'(?: \(cwd: (?P<directory>[^)\n]+)\))?')],
+    "codex": [_detector("exec rejected by approval policy",
+                        r'^exec\n(?P<command>[^\n]+?) in (?P<directory>/[^\n]+)\n(?P<reason>[^\n]*'
+                        r'(?:requires approval|rejected|blocked by policy)[^\n]*)$')],
+    "grok": [_detector("bash denied in non-interactive mode",
+                       r'tool "bash" denied in non-interactive mode: command `(?P<command>[^`\n]+)` '
+                       r'(?P<reason>is not allowed by permissions)(?: \(cwd=(?P<directory>[^)\n]+)\))?')],
+    "cline": [_detector("command blocked by CLINE_COMMAND_PERMISSIONS",
+                        r'Command "(?P<command>[^"\n]+)" was blocked: (?P<reason>no allow rule in CLINE_COMMAND_PERMISSIONS '
+                        r'matches)(?: \(workdir: (?P<directory>[^)\n]+)\))?')],
+    "opencode": [_detector("bash permission auto-rejected",
+                           r'permission requested: bash \((?P<command>[^)\n]+)\); (?P<reason>auto-rejecting)'),
+                 _detector("non-command permission auto-rejected",
+                           r'permission requested: (?P<tool>external_directory|read|edit|write|webfetch|task) '
+                           r'\((?P<detail>[^)\n]+)\); (?P<reason>auto-rejecting)', kind="other")],
+    "dsh": [_detector("shell command denied without a prompt",
+                      r'dsh: shell command "(?P<command>[^"\n]+)" denied \((?P<reason>policy=[a-z]+, headless: no prompt '
+                      r'available)\)(?:; cwd=(?P<directory>\S+))?')],
+}
+# A refusal in a shape no detector knows. Deliberately narrow: ordinary EACCES "Permission denied" is not a policy wall.
+GENERIC_MARKER = re.compile(r"(?i)(requires? (?:user )?approval|not in the allow(?:ed)? list|denied by (?:policy|permission)"
+                            r"|permission requested[^\n]*auto-reject|no prompt available)")
+
+
+@dataclass
+class Denial:
+    cli: str
+    tool: str = None
+    command: str = None
+    directory: str = None
+    reason: str = None
+    kind: str = "command"
+    excerpt: str = None
+    detector: str = None
+
+
+@dataclass(frozen=True)
+class Profile:
+    """Where and how a CLI's own allowlist is written. `rule` renders one entry from the program name ({tool})."""
+    kind: str
+    keys: tuple
+    rule: str
+
+
+# Only agy's `permissions.allow` array is documented in this repository (onboarding/agy.md); every other path and every rule
+# syntax here is an unverified assumption that the operator must check, or override with permissions.rule_template.
+CLI_PROFILES = {
+    "agy": Profile("json_list", ("permissions", "allow"), "run_command({tool})"),
+    "codex": Profile("lines", (), 'prefix_rule(pattern=["{tool}"], decision="allow")'),
+    "grok": Profile("json_list", ("permissions", "allow"), "Bash({tool}:*)"),
+    "cline": Profile("json_list", ("allow",), "{tool} *"),
+    "opencode": Profile("json_map", ("permission", "bash"), "{tool} *"),
+    "dsh": Profile("json_list", ("permissions", "allow"), "shell({tool})"),
+}
+
+
+def one_line(text, limit, secrets=()):
+    text = redact(clean_text(str(text)), secrets)
+    return truncate(re.sub(r"\s+", " ", text).strip(), limit)
+
+
+def program_name(command):
+    """The program of a command line, or None when the first word is not a plain program name (assignments, paths, shells)."""
+    words = command.split()
+    if not words or "=" in words[0]:
+        return None
+    name = os.path.basename(words[0].strip("\"'"))
+    return name if TOOL_RE.fullmatch(name) else None
+
+
+def excerpt_around(text, position, secrets):
+    """A bounded window of the raw output centred on the refusal, redacted. Never more than EXCERPT_CHARS."""
+    window = text[max(0, position - EXCERPT_CHARS // 3):position + EXCERPT_CHARS // 2]
+    return truncate(redact(clean_text(window), secrets).strip(), EXCERPT_CHARS) or None
+
+
+def detect_denial(cli_name, text, secrets=()):
+    """Parse a CLI's refusal out of its output: the earliest detector match, else a bounded raw excerpt, else None."""
+    best = None
+    for detector in DETECTORS.get(cli_name, ()):
+        match = detector.pattern.search(text)
+        if match and (best is None or match.start() < best[1].start()):
+            best = (detector, match)
+    if best is None:
+        marker = GENERIC_MARKER.search(text)
+        if marker is None:
+            return None
+        return Denial(cli_name, reason=GENERIC_REASON, excerpt=excerpt_around(text, marker.start(), secrets))
+    detector, match = best
+    found = match.groupdict()
+    command = found.get("command") or found.get("tool") or ""
+    tool = program_name(command) if detector.kind == "command" else found.get("tool")
+    denial = Denial(cli_name, tool=tool, command=one_line(command, FIELD_CHARS, secrets) or None, kind=detector.kind,
+                    directory=one_line(found["directory"], FIELD_CHARS, secrets) if found.get("directory") else None,
+                    reason=one_line(found.get("reason") or detector.reason or GENERIC_REASON, FIELD_CHARS, secrets),
+                    detector=detector.name)
+    if tool is None:
+        denial.excerpt = excerpt_around(text, match.start(), secrets)
+    return denial
+
+
+def render_rule(permissions, tool):
+    template = permissions.rule_template or CLI_PROFILES[permissions.cli].rule
+    return template.replace("{tool}", tool)
+
+
+def replace_file(path, text):
+    """Atomic replace that keeps the existing file's mode (a new file is 0600)."""
+    path = Path(path)
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        mode = 0o600
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name("." + path.name + "." + uuid.uuid4().hex[:8] + ".tmp")
+    fd = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        os.write(fd, text.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.chmod(str(temporary), mode)
+    os.replace(str(temporary), str(path))
+
+
+def edit_rule(path, profile, rule, add):
+    """Add or remove one allowlist entry in the CLI's configuration, leaving everything else as it was.
+
+    Returns whether the file changed. A file this cannot parse or a structure it does not expect is refused, not rewritten.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8") if Path(path).exists() else ""
+    except (OSError, UnicodeDecodeError):
+        raise RunnerError("cannot read the CLI configuration") from None
+    if profile.kind == "lines":
+        lines = text.splitlines()
+        if (rule in lines) == add:
+            return False
+        lines = lines + [rule] if add else [line for line in lines if line != rule]
+        replace_file(path, "\n".join(lines) + "\n" if lines else "")
+        return True
+    try:
+        data = json.loads(text) if text.strip() else {}
+    except ValueError:
+        raise RunnerError("the CLI configuration is not plain JSON; edit it by hand") from None
+    if not isinstance(data, dict):
+        raise RunnerError("the CLI configuration has an unexpected structure")
+    node = data
+    for key in profile.keys[:-1]:
+        child = node.get(key)
+        if child is None and add:
+            child = node[key] = {}
+        if child is None:
+            return False
+        if not isinstance(child, dict):
+            raise RunnerError("the CLI configuration has an unexpected structure")
+        node = child
+    leaf, wanted = profile.keys[-1], list if profile.kind == "json_list" else dict
+    container = node.get(leaf)
+    if container is None and add:
+        container = node[leaf] = wanted()
+    if container is None:
+        return False
+    if not isinstance(container, wanted):
+        raise RunnerError("the CLI configuration has an unexpected structure")
+    present = rule in container
+    if present == add:
+        return False
+    if profile.kind == "json_list":
+        container.append(rule) if add else container.remove(rule)
+    elif add:
+        container[rule] = "allow"
+    else:
+        del container[rule]
+    replace_file(path, json.dumps(data, indent=2) + "\n")
+    return True
+
+
+class GrantLedger:
+    """Per-worker record of every rule the runner added, so each can be listed and withdrawn exactly.
+
+    One lock file serializes the runner and the revoke command, which may be separate processes, around both the ledger and
+    the CLI configuration they edit.
+    """
+
+    def __init__(self, state_dir, principal):
+        self.path = Path(state_dir) / (principal + ".grants.json")
+        self.lock_path = Path(state_dir) / (principal + ".grants.lock")
+        self.thread_lock = threading.Lock()
+
+    @contextlib.contextmanager
+    def locked(self):
+        with self.thread_lock:
+            fd = os.open(str(self.lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                os.close(fd)
+
+    def load(self):
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            raise RunnerError("cannot read the grant ledger") from None
+        grants = data.get("grants") if isinstance(data, dict) else None
+        return {key: value for key, value in (grants or {}).items() if isinstance(value, dict)}
+
+    def save(self, grants):
+        write_private(self.path, json.dumps({"grants": grants}, sort_keys=True) + "\n")
+
+    @staticmethod
+    def holders(grants, record):
+        return [other for key, other in grants.items() if other is not record and other.get("status") == "active"
+                and (other["config_file"], other["rule"]) == (record["config_file"], record["rule"])]
+
+    def add(self, worker, request, tool):
+        """Write the rule and its ledger entry; returns the entry. Must be undone with remove() when it cannot be reported."""
+        permissions = worker.permissions
+        rule = render_rule(permissions, tool)
+        path = os.path.realpath(permissions.config_file)
+        with self.locked():
+            grants = self.load()
+            record = {"id": uuid.uuid4().hex, "request_id": request["request_id"], "task_id": request["task_id"],
+                      "tool": tool, "rule": rule, "option": request["status"], "config_file": path, "status": "active",
+                      "granted_reported": False, "revoked_reported": False, "created": time.time()}
+            holders = self.holders(grants, record)
+            added = edit_rule(path, CLI_PROFILES[permissions.cli], rule, True)
+            # An entry that was there before the runner touched the file is the operator's: it is never removed.
+            record["preexisting"] = (not added) and (not holders or any(h.get("preexisting") for h in holders))
+            grants[record["id"]] = record
+            self.save(grants)
+            return dict(record)
+
+    def remove(self, worker, grant_id):
+        """Withdraw one active grant; returns its entry, or None when there is nothing active to withdraw."""
+        profile = CLI_PROFILES[worker.permissions.cli]
+        with self.locked():
+            grants = self.load()
+            record = grants.get(grant_id)
+            if record is None or record.get("status") != "active":
+                return None
+            if not record["preexisting"] and not self.holders(grants, record):
+                edit_rule(record["config_file"], profile, record["rule"], False)
+            record["status"] = "revoked"
+            self.save(grants)
+            return dict(record)
+
+    def mark(self, grant_id, **values):
+        with self.locked():
+            grants = self.load()
+            if grant_id in grants:
+                grants[grant_id].update(values)
+                self.save(grants)
+
+    def active(self):
+        with self.locked():
+            return [dict(record) for record in self.load().values() if record.get("status") == "active"]
+
+    def unreported(self):
+        with self.locked():
+            return [dict(record) for record in self.load().values()
+                    if (record.get("status") == "revoked" and not record.get("revoked_reported"))
+                    or (record.get("status") == "active" and not record.get("granted_reported"))]
+
+
 # --- Baton access ----------------------------------------------------------------------------------
 
 class Baton:
@@ -965,6 +1327,65 @@ def error_code(error):
     if isinstance(error, cli.NetworkError):
         return error.category
     return type(error).__name__
+
+
+class GrantKeeper:
+    """Applies, reports and withdraws one worker's grants. `baton` may be None (token unreadable): withdrawal still works
+    and the report is retried later."""
+
+    def __init__(self, worker, ledger, baton, log):
+        self.worker, self.ledger, self.baton, self.log = worker, ledger, baton, log
+
+    def _report(self, record, kind):
+        if self.baton is None:
+            return False
+        try:
+            self.baton.write("record_permission", {"task_id": record["task_id"], "request_id": record["request_id"], "event": kind})
+        except (cli.BatonError, cli.NetworkError) as error:
+            self.log(record["task_id"], "grant-unreported", event=kind, error=error_code(error))
+            return False
+        self.ledger.mark(record["id"], **{kind + "_reported": True})
+        return True
+
+    def grant(self, request, tool):
+        """Write the approved rule into the CLI's allowlist and audit it; a grant that cannot be audited is withdrawn."""
+        try:
+            record = self.ledger.add(self.worker, request, tool)
+        except (RunnerError, OSError) as error:
+            raise RunnerError("could not apply the approved permission: " + (str(error) if isinstance(error, RunnerError)
+                                                                               else "the CLI configuration is not writable")) from None
+        if not self._report(record, "granted"):
+            self.revoke(record["id"])
+            raise RunnerError("the approved permission could not be recorded in Baton and was withdrawn")
+        self.log(record["task_id"], "grant-applied", tool=tool, option=record["option"], grant=record["id"])
+        return record
+
+    def revoke(self, grant_id):
+        """True when withdrawn, None when there was nothing active under that id, False when the rule could not be removed."""
+        try:
+            record = self.ledger.remove(self.worker, grant_id)
+        except (RunnerError, OSError):
+            self.log(None, "grant-revoke-failed", grant=grant_id)
+            return False
+        if record is None:
+            return None
+        if record.get("granted_reported"):
+            self._report(record, "revoked")
+        else:
+            self.ledger.mark(grant_id, revoked_reported=True)
+        self.log(record["task_id"], "grant-revoked", tool=record["tool"], grant=grant_id)
+        return True
+
+    def reconcile(self):
+        """After a crash: withdraw leftover allow-once grants, finish unreported audits, withdraw what cannot be audited."""
+        for record in self.ledger.active():
+            if record["option"] == "allow_once":
+                self.revoke(record["id"])
+        for record in self.ledger.unreported():
+            if record["status"] == "revoked":
+                self._report(record, "revoked")
+            elif not self._report(record, "granted"):
+                self.revoke(record["id"])
 
 
 def call_interruptible(stop, work):
@@ -998,6 +1419,8 @@ class WorkerRunner:
         self.queue = queue.Queue()
         self.inflight, self.inflight_lock = set(), threading.Lock()
         self.deferrals, self.threads, self.timers = {}, [], []
+        self.keeper = (GrantKeeper(worker, GrantLedger(self.config.state_dir, worker.principal), baton, self.log)
+                       if worker.permissions else None)
 
     @property
     def principal(self):
@@ -1037,6 +1460,11 @@ class WorkerRunner:
     # polling
 
     def poll_loop(self):
+        if self.keeper is not None:
+            try:
+                self.keeper.reconcile()
+            except (RunnerError, OSError):
+                self.log(None, "grant-reconcile-failed")
         try:
             seq = self.state.load_seq()
             self.state.save_seq(seq)
@@ -1204,38 +1632,191 @@ class WorkerRunner:
         renewer.start()
         workdir = Path(worker.workdir_root) / task_id
         tmpdir = Path(worker.workdir_root) / ".tmp" / task_id
-        outcome, files, failure = None, None, None
-        keychain = {}
+        outcome, files, failure, denied = None, None, None, None
+        once = []
         try:
             try:
                 prompt = claimed.get("prompt") or view.get("prompt")
                 if not isinstance(prompt, str) or not prompt.strip():
                     raise RunnerError("task has no prompt")
-                if worker.env_from_keychain:
-                    keychain = read_keychain(self.runner.security_bin, worker.env_from_keychain)
-                    self.task_local.secrets = list(keychain.values())
                 commit, admin = create_worktree(config, str(workdir), claimed.get("base_commit"), claimed.get("scopes"))
                 prompt_file = self.prepare_temp(tmpdir, task_id, prompt, claimed.get("scopes"))
                 argv = self.build_argv(_real(str(prompt_file)))
                 plan = self.sandbox_plan(workdir, tmpdir, admin)
-                env = self.child_env(tmpdir, keychain)
-                try:
-                    outcome = run_child(wrap_command(plan, argv), str(workdir), env, self.stdin_bytes(prompt_file),
-                                        worker.task_timeout_seconds, config.output_cap_bytes, self.stop, lease_lost)
-                finally:
-                    env.clear()
-                    keychain.clear()
+
+                def launch():
+                    keychain = {}
+                    try:
+                        if worker.env_from_keychain:
+                            keychain = read_keychain(self.runner.security_bin, worker.env_from_keychain)
+                            self.task_local.secrets = list(keychain.values())
+                        env = self.child_env(tmpdir, keychain)
+                        try:
+                            return run_child(wrap_command(plan, argv), str(workdir), env, self.stdin_bytes(prompt_file),
+                                             worker.task_timeout_seconds, config.output_cap_bytes, self.stop, lease_lost)
+                        finally:
+                            env.clear()
+                    finally:
+                        keychain.clear()
+
+                outcome = launch()
+                outcome, failure, denied = self.permission_loop(task_id, page_id, epoch, lease, outcome, launch, lease_lost,
+                                                                once, plan)
                 files = changed_files(admin, str(workdir))
             except RunnerError as error:
                 failure = str(error)
         finally:
             renewing.set()
             renewer.join(10)
+            self.drop_once_grants(task_id, once)
             shutil.rmtree(str(tmpdir), ignore_errors=True)
         try:
-            self.finish_task(task_id, page_id, epoch, outcome, files, failure)
+            if denied is not None:
+                self.permission_denied(task_id, page_id, epoch, denied)
+            else:
+                self.finish_task(task_id, page_id, epoch, outcome, files, failure)
         finally:
             self.task_local.secrets = ()
+
+    # permission requests
+
+    def denial_of(self, outcome):
+        """The CLI's permission refusal in a failed run's output, or None (also for runs ended by timeout, stop or lease loss)."""
+        if (outcome is None or outcome.exit_code in (0, None) or outcome.timed_out or outcome.stopped or outcome.lease_lost
+                or outcome.start_error):
+            return None
+        text = outcome.stderr.text(self.secrets) + "\n" + outcome.stdout.text(self.secrets)
+        return detect_denial(self.worker.permissions.cli, text, self.secrets)
+
+    def grant_problem(self, denial, plan):
+        """Why a refusal cannot be answered with an allowlist entry, or None. Unparsed refusals are still posted, for visibility."""
+        if denial.tool is None:
+            return None
+        if denial.kind != "command":
+            return "the CLI wants %s permission, which is outside the command allowlist and is never granted here" % plain(denial.tool)
+        if denial.tool in UNGRANTABLE_TOOLS:
+            return "%s cannot be allowlisted through Baton (it would widen the sandbox)" % denial.tool
+        if denial.directory and os.path.isabs(denial.directory):
+            roots = [plan.worktree, plan.tmpdir, plan.own_root, *plan.home_read, *plan.extra_write]
+            if not _under(_real(denial.directory), roots):
+                return "the refused directory is outside this worker's own directories"
+        if any(record["tool"] == denial.tool and record["status"] == "active" for record in self.keeper.ledger.active()):
+            return "the CLI still refused %s although it is already allowlisted" % denial.tool
+        return None
+
+    def post_request(self, task_id, epoch, denial):
+        permissions = self.worker.permissions
+        reason = one_line(denial.reason or GENERIC_REASON, FIELD_CHARS, self.secrets)
+        if denial.command:
+            reason = truncate(reason + "; command: " + denial.command, FIELD_CHARS)
+        arguments = {"task_id": task_id, "epoch": epoch, "cli": permissions.cli, "tool": denial.tool or UNPARSED_TOOL,
+                     "reason": reason, "approvers": permissions.approvers}
+        if denial.directory:
+            arguments["directory"] = truncate(denial.directory, 500)
+        if denial.excerpt:
+            arguments["excerpt"] = redact(denial.excerpt, self.secrets)
+        try:
+            request = self.baton.write("request_permission", arguments)
+        except (cli.BatonError, cli.NetworkError) as error:
+            raise RunnerError("permission request failed (%s)" % error_code(error)) from None
+        if not isinstance(request, dict) or not UUID_RE.fullmatch(str(request.get("request_id"))):
+            raise RunnerError("permission request failed (bad response)")
+        return request
+
+    def await_decision(self, task_id, request_id, lease_lost):
+        """Poll until an approver decides; the renew thread keeps the claim alive meanwhile. Returns (kind, request)."""
+        permissions = self.worker.permissions
+        deadline = time.monotonic() + permissions.wait_seconds
+        while True:
+            if lease_lost.is_set():
+                return "lease_lost", None
+            try:
+                requests = self.baton.read("list_permissions", {"task_id": task_id})
+            except (cli.BatonError, cli.NetworkError) as error:
+                if not cli.transient(error):
+                    raise RunnerError("permission request could not be read (%s)" % error_code(error)) from None
+                requests = []
+            request = next((item for item in requests if isinstance(item, dict) and item.get("request_id") == request_id), None) \
+                if isinstance(requests, list) else None
+            if request is not None and request.get("status") != "pending":
+                if request.get("status") not in PERMISSION_OPTIONS or request.get("decided_by") == self.principal:
+                    raise RunnerError("permission decision was not accepted: it did not come from an approver")
+                return "decided", request
+            if time.monotonic() >= deadline:
+                raise RunnerError("permission request was not answered within %ds" % permissions.wait_seconds)
+            if self.stop.wait(permissions.poll_seconds):
+                return "stopped", None
+
+    def permission_loop(self, task_id, page_id, epoch, lease, outcome, launch, lease_lost, once, plan):
+        """After a refused run, ask for the permission and re-run in the same worktree on approval.
+
+        Returns (outcome, failure, denied request). The claim, epoch and worktree are the task's own throughout.
+        """
+        permissions, rounds = self.worker.permissions, 0
+        try:
+            while permissions is not None:
+                denial = self.denial_of(outcome)
+                if denial is None:
+                    break
+                if rounds >= permissions.max_requests:
+                    return outcome, "gave up after %d permission requests" % rounds, None
+                problem = self.grant_problem(denial, plan)
+                if problem:
+                    return outcome, "permission needed but not requested: " + problem, None
+                rounds += 1
+                request = self.post_request(task_id, epoch, denial)
+                self.log(task_id, "permission-requested", request=request["request_id"], tool=denial.tool or "unparsed")
+                kind, decided = self.await_decision(task_id, request["request_id"], lease_lost)
+                if kind == "stopped":
+                    outcome.stopped = True
+                    return outcome, None, None
+                if kind == "lease_lost":
+                    outcome.lease_lost = True
+                    return outcome, None, None
+                self.log(task_id, "permission-decided", request=request["request_id"], decision=decided["status"],
+                         by=decided.get("decided_by"))
+                if decided["status"] == "deny":
+                    return outcome, None, decided
+                if denial.tool is None:
+                    raise RunnerError("permission approved, but the refused tool could not be identified; add it to the "
+                                      "CLI's allowlist by hand")
+                record = self.keeper.grant(decided, denial.tool)
+                if decided["status"] == "allow_once":
+                    once.append(record["id"])
+                self.baton.write("renew", {"task_id": task_id, "epoch": epoch, "lease_seconds": lease})
+                self.comment(task_id, page_id, "Permission %s granted for `%s` (request %s); resuming this task in the same "
+                                               "worktree and epoch %d." % (decided["status"], denial.tool, request["request_id"], epoch))
+                outcome = launch()
+            return outcome, None, None
+        except cli.BatonError as error:
+            if error.status == 409:
+                outcome.lease_lost = True
+                return outcome, None, None
+            return outcome, "baton call failed (%s)" % error_code(error), None
+        except cli.NetworkError as error:
+            return outcome, "baton call failed (%s)" % error_code(error), None
+        except RunnerError as error:
+            return outcome, str(error), None
+
+    def drop_once_grants(self, task_id, grant_ids):
+        for grant_id in grant_ids:
+            if self.keeper.revoke(grant_id) is False:
+                self.log(task_id, "grant-left-active", grant=grant_id)
+
+    def permission_denied(self, task_id, page_id, epoch, request):
+        self.log(task_id, "permission-denied", request=request["request_id"])
+        tool = plain(request.get("tool"))
+        self.comment(task_id, page_id, "Permission denied by %s for `%s` (request %s). The task is blocked and the runner will "
+                                       "not retry it." % (plain(request.get("decided_by")), tool, request["request_id"]))
+        note = "permission_denied: %s (request %s)" % (tool, request["request_id"])
+        if self.release_lease(task_id, epoch):
+            try:
+                self.baton.write("mark_blocked", {"task_id": task_id, "reason_code": "other", "note": note})
+            except (cli.BatonError, cli.NetworkError) as error:
+                self.log(task_id, "mark-blocked-failed", error=error_code(error))
+        else:
+            self.log(task_id, "mark-blocked-skipped")
+        self.state.update(task_id, state="handed_back")
 
     def finish_task(self, task_id, page_id, epoch, outcome, files, failure):
         if outcome is not None and outcome.stopped:
@@ -1526,13 +2107,68 @@ def build_parser():
                                      formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False)
     parser.add_argument("--config", required=True, metavar="PATH", help="JSON config file; its mode must be 0600")
     parser.add_argument("--check", action="store_true", help="validate the config and each worker, then exit")
+    parser.add_argument("--list-grants", action="store_true",
+                        help="print the permission grants the runner added to each worker's CLI allowlist, then exit")
+    parser.add_argument("--revoke-grant", metavar="ID", help="withdraw one grant by id (see --list-grants), then exit")
+    parser.add_argument("--revoke-worker", metavar="PRINCIPAL",
+                        help="withdraw every active grant of this one worker, then exit")
     return parser
 
 
+def grant_keepers(config):
+    """One GrantKeeper per worker that has a permissions block; Baton access only where the token is readable."""
+    endpoint = cli.parse_endpoint(config.url)
+    context = cli.tls_context(config.ca_file) if endpoint.scheme == "https" else None
+    pin = cli.parse_pin(config.pin_sha256) if config.pin_sha256 else None
+    keepers = {}
+    for worker in config.workers:
+        if worker.permissions is None:
+            continue
+        baton = None
+        try:
+            client = cli.Client(endpoint, cli.read_token(worker.token_file), context, pin, config.request_timeout)
+            baton = Baton(client, threading.Event())
+        except cli.UsageError:
+            pass
+        keepers[worker.principal] = GrantKeeper(
+            worker, GrantLedger(config.state_dir, worker.principal), baton,
+            lambda task_id, what, _name=worker.principal, **fields: event(_name, task_id, what, **fields))
+    return keepers
+
+
+def grants_command(config, args):
+    keepers = grant_keepers(config)
+    if args.list_grants:
+        for principal, keeper in sorted(keepers.items()):
+            with keeper.ledger.locked():
+                records = keeper.ledger.load()
+            for record in sorted(records.values(), key=lambda item: item.get("created", 0)):
+                print(json.dumps({"worker": principal, **{key: record.get(key) for key in (
+                    "id", "tool", "rule", "option", "status", "task_id", "request_id", "created")}}, sort_keys=True))
+        return EXIT_OK
+    if args.revoke_worker:
+        keeper = keepers.get(args.revoke_worker)
+        if keeper is None:
+            log("error: no worker with that principal has a permissions block")
+            return EXIT_USAGE
+        results = [keeper.revoke(record["id"]) for record in keeper.ledger.active()]
+        return EXIT_ERROR if any(result is False for result in results) else EXIT_OK
+    for keeper in keepers.values():
+        if any(record["id"] == args.revoke_grant for record in keeper.ledger.active()):
+            return EXIT_OK if keeper.revoke(args.revoke_grant) else EXIT_ERROR
+    log("error: no active grant with that id")
+    return EXIT_USAGE
+
+
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if sum(bool(value) for value in (args.check, args.list_grants, args.revoke_grant, args.revoke_worker)) > 1:
+        parser.error("--check, --list-grants, --revoke-grant and --revoke-worker cannot be combined")
     try:
         config = load_config(args.config)
+        if args.list_grants or args.revoke_grant or args.revoke_worker:
+            return grants_command(config, args)
         runner = Runner(config)
         if args.check:
             workers = runner.prepare()
