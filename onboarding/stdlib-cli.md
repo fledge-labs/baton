@@ -159,7 +159,7 @@ baton comments --task "$TASK"
 
 ## 审阅人流程：gate
 
-审阅人是任务配置的 reviewer，默认就是发起人 `nangua`。下面以 `nangua` 的令牌运行：
+审阅人是任务配置的 reviewer，默认就是发起人 `nangua`。只做 reviewer 还不够：做 gate 决定的主体（人或 agent）必须持有覆盖该任务的有效审批人委托，否则返回 `delegation_required (HTTP 403)`；执行或提交过该结果的主体（含同账户）不能批准。Space 的 owner 是根审批人，天然有审批权（不必是 reviewer，也不需要委托）；其他审批人持有由 owner 或其下游授予的审批人委托，运维人员可按 owner 的决定记录（见 [README](../README.md#审批关卡与委托)）。根批准自己提交或执行的工作需要 `--self-approval`。下面的例子里 `nangua` 创建了 Space，所以它是根，以它的令牌运行：
 
 ```sh
 # SPDX-License-Identifier: Apache-2.0

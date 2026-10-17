@@ -61,8 +61,8 @@ with urlopen(request) as response:
 - `get_proposal(proposal_id: str)` — 读取。
 - `list_proposals(block_id: str)` — 读取。
 - `list_attribution(block_id: str)` — 读取。
-- `create_task_block(operation_id: str, page_id: str, prompt: str, reviewers: list[str], scopes: list[dict] | None = None, base_commit: str | None = None, context: Any = None, evidence: Any = None, assignee_principal: str | None = None, depends_on: list[str] | None = None, work_face: dict | None = None, require_work_face: bool = False, task_kind: str = "construction")` — 写入。
-- `submit_task(operation_id: str, idempotency_key: str, prompt: str, page_id: str | None = None, scopes: list[dict] | None = None, assignee_principal: str | None = None, depends_on: list[str] | None = None, work_face: dict | None = None, require_work_face: bool = False, task_kind: str = "construction")` — 写入。
+- `create_task_block(operation_id: str, page_id: str, prompt: str, reviewers: list[str], scopes: list[dict] | None = None, base_commit: str | None = None, context: Any = None, evidence: Any = None, assignee_principal: str | None = None, depends_on: list[str] | None = None, work_face: dict | None = None, require_work_face: bool = False, task_kind: str = "construction", approvals_required: int | None = None)` — 写入；`approvals_required` 为 1 或 2，见“审批关卡”。
+- `submit_task(operation_id: str, idempotency_key: str, prompt: str, page_id: str | None = None, scopes: list[dict] | None = None, assignee_principal: str | None = None, depends_on: list[str] | None = None, work_face: dict | None = None, require_work_face: bool = False, task_kind: str = "construction", approvals_required: int | None = None)` — 写入；`approvals_required` 为 1 或 2，见“审批关卡”。
 - `assign_task(operation_id: str, task_id: str, target_principal: str)` — 写入。
 - `plan(operation_id: str, graph: list[dict])` — 写入。
 - `set_work_face(operation_id: str, task_id: str, work_face: dict, base_commit: str | None = None)` — 写入。
@@ -79,7 +79,10 @@ with urlopen(request) as response:
 - `renew(operation_id: str, task_id: str, epoch: int, lease_seconds: int = 300)` — 写入。
 - `submit_result(operation_id: str, task_id: str, epoch: int, result: str, evidence: Any = None)` — 写入。
 - `handoff(operation_id: str, task_id: str, epoch: int, target_principal: str, base_commit: str | None = None, context: Any = None, evidence: Any = None, lease_seconds: int = 300)` — 写入。
-- `gate(operation_id: str, task_id: str, expected_epoch: int, decision: str, evidence: Any = None)` — 写入。
+- `gate(operation_id: str, task_id: str, expected_epoch: int, decision: str, evidence: Any = None, self_approval: bool = False)` — 写入；`self_approval=true` 只对 Space owner（根）批准自己提交或执行的工作有效，见下文。
+- `delegation_create(operation_id: str, delegate_principal: str, scope: str = "approve", space_id: str | None = None, expires_at: str | None = None, may_delegate: bool = False, reason: str)` — 写入；Space owner 创建根委托，持有 `may_delegate` 委托的主体创建子委托，授权人就是调用者。
+- `delegation_revoke(operation_id: str, delegation_id: str)` — 写入；仅授权人本人。
+- `delegation_list()` — 读取；返回调用者作为授权人或被委托方的委托。
 - `get_claim(task_id: str)` — 读取。
 - `list_claims()` — 读取。
 - `get_scopes(task_id: str)` — 读取。
@@ -103,13 +106,29 @@ with urlopen(request) as response:
 
 `create_task_block` 创建手工任务，绝不自动派发。领取和交接返回 task view，其中 epoch 是单调 fence，lease_expires_at 来自数据库时钟。renew、submit_result 和 handoff 必须带当前 epoch；续租重放不延长第二次，过期旧 fence 即使重放旧操作也失败。base_commit 是任务创建后的不可变基线（包括 null）；handoff 只能省略它或重复原值。未提供的 context/evidence 保留，thread_id 不变。
 
-手工 submit_result 只进入 awaiting_gate。gate 必须携带对应候选的 expected_epoch 和 pass/fail；只有配置 reviewer、具备当前 edit 权限且不是结果作者或持有人账户，才可通过。只有 gate 通过才会 done。
+手工 submit_result 只进入 awaiting_gate。gate 必须携带对应候选的 expected_epoch 和 pass/fail；只有 Space owner（根），或配置 reviewer、具备当前 edit 权限、持有审批人委托且不是结果作者或执行者的主体，才可通过；需要双人确认时还要两个不同审批人都通过。只有 gate 通过才会 done。
+
+**审批关卡。** 只有持有审批人委托的主体（人或 agent）才能批准，任何人不能批准自己提交或执行的工作。Space 的 owner（创建时记录的精确身份：`owner_principal` + `owner_account` + `owner_kind`，不分 kind）是**根审批人**，天然拥有审批权，不需要委托，也不必在 reviewers 里；同账户的其他 principal、人类账户下的 agent、同名但 kind 不同的主体都不是根。没有 `owner_principal` 的 Space 没有根，直到运维人员用 `set-space-owner` 设置。其他主体做 gate 必须同时满足：（1）是任务配置的 reviewer，并有当前页面 edit 权限，否则 `403 forbidden`；（2）持有覆盖该任务的有效审批人委托（范围 `approve`，`space_id` 为空或等于任务所在 Space，被委托方 principal、account、kind 匹配，整条委托链未过期、未撤销，且链的根授权人正是任务所在 Space 的根身份），否则 `403 delegation_required`；（3）不是结果作者，也不是在被审批 epoch 持有过 claim 的 principal 或 account（含 handoff 的原持有人）或执行 worker，否则 `403 forbidden`。只创建了请求、没有提交或执行结果的任务 owner 可以批准。**根可以批准自己提交或执行的工作，但必须带 `self_approval=true`**，否则 `403 forbidden`；非根带该标志仍被拒绝。服务自动写入的 `worker_success` gate 不受影响。`gate.reviewed` 审计和 `x_gate` 记录带 `self_approval`、`root`，非根的批准还带 `delegation_id` 与 `grantor`，审计另含完整委托链 `chain` 以及已计入的 `approvals` 和 `approvals_required`；同一 `operation_id` 的重试会重新检查整条链，委托失效后同样返回 `delegation_required`。
+
+**双人确认。** 任务可以要求两个批准：运维人员为某个范围配置策略（`python -m bridge.delegations policy-set`，见 README），或创建任务时在 `create_task_block`（或带 assignee 的 `submit_task`）传 `approvals_required`（1 或 2；非法值返回 `422 invalid`，自动任务不允许）；任务的值可以提高策略要求，只有创建者是 Space owner 时才能降低。要求 2 个批准时，任务只有在两个不同的审批人（不同 principal 和 account）对同一个 `result_epoch` 都 pass 之后才变成 done，第一个 pass 后仍是 `awaiting_gate`，同一审批人再次 pass 返回 `403 forbidden`。策略的 `root_required` 要求根必须是其中之一，根 pass 之前任务不会 done。任何有权方的 fail（包括根的 fail）都把任务退回 `queued`，旧 epoch 的 pass 不再计数。task view 带有效的 `approvals_required`、已通过的 `approvals_passed` 和 `root_required`。
 
 Task view 包含 `blocked`（`null`，或 `{"reason_code","by","at"}`，见“阻塞标记”）、id/task_id/thread_id、work_face/require_work_face/task_kind/work_face_missing、priority/respond_by/responded_at/escalated_at/overdue、page_id/block_id、owner/owner_account、execution_mode、state/status、epoch、holder/holder_account、lease_expires_at/lease_valid、scopes、base_commit、context、evidence、result/result_epoch、a2a_id/backend、gate_mode/reviewers 和错误元数据。canonical state 为 queued/claimed/awaiting_gate/done/failed/interrupted；兼容 status 将 claimed→working、done→completed。手工任务在当前 page view 权限下返回 prompt，方便接收人读取指令；自动任务的旧兼容状态视图仍省略 prompt。所有状态视图都不返回 idempotency key 或凭据。
 
 自动派发前先持久化 dispatch_started，并且每次结果写入检查 holder、当前 epoch 和未过期租约。网络结果不确定时进入 interrupted；自动恢复不会再次执行可能已派发的任务，旧 worker 不能覆盖新持有人。worker 明确报告失败时，任务进入 failed，`error` 只保存封闭词汇中的错误码（如 `CODEX_TIMEOUT`、`CODEX_AUTH_UNAUTHORIZED`；无法接受的诊断为 `A2A_FAILED_UNCLASSIFIED`），并在任务线程追加固定文本的 `[failed]` 评论；worker 的原始错误文本不会进入任务、线程或审计。
 
 在写入 dispatch_started 前，bridge 重新读取 registry，要求提交者仍是 active client，且 principal、connected account 和 kind 与任务保存的身份一致。撤销或改变映射后，排队任务以 cancelled 停止，不向 A2A 发出请求；这一检查不承诺取消此前已经发出的执行。页面及依赖权限仍由 store 以任务保存的原提交者身份重新校验，内部 service 身份不扩大执行授权。
+
+## 审批人委托（delegation）
+
+审批人是靠委托授予的角色，委托只从根向下流动。**根委托**的授权人是 Space 的 owner（不分 kind）；持有该 Space 中有效 `may_delegate=true` 委托的主体可以授予**子委托**。被委托方永远不能超过授权人：Space 相同或更窄，`expires_at` 不晚于父委托（父委托有过期时间时子委托也必须有），祖先被撤销或过期时子委托失效，链最多 3 层。
+
+`delegation_create`：`delegate_principal` 必须是注册表中已连接的主体（人或 agent），不能是调用者自己、service，也不能是调用者链上已有的人（包括上方的根；按 principal 判断），否则会形成环，返回 `422 invalid`；`scope` 目前只有 `approve`；`space_id` 为空表示根拥有的所有 Space；`expires_at` 是带 UTC 偏移、位于未来的 ISO 8601 时刻，省略表示不过期；`may_delegate` 默认 false；`reason` 必填，最多 500 字符（例如 `DECISIONS 291`）。授权人就是调用者：正是所指 Space 的根身份（不指定时为任一 Space 的根身份）的调用者创建根委托；其他调用者须持有覆盖所请求 Space 与过期时间、`may_delegate` 为真且链未满的有效审批人委托，它就是新委托的 `parent_id`。没有任何 `may_delegate` 委托返回 `403 forbidden`，请求超出父委托范围或链已满返回 `422 invalid`。返回的委托含 `id`、`grantor`、`grantor_kind`、`delegate`、`scope`、`space_id`、`may_delegate`、`parent_id`、`reason`、`created_via`（`api`）、`created_by`、`expires_at`、`revoked_at`、`revoked_by`、`chain`（从该委托到根的 ID）和表示整条链是否有效的 `active`。
+
+委托与审批相关参数（`scope`、`reason`、`expires_at`、`may_delegate`、`delegate_principal`、`delegation_id`、`approvals_required`、`self_approval`）校验失败时返回 `422 invalid`，`error.details` 给出字段名与期望类型，不回显输入值；`delegation_required` 是 `403`，与 `forbidden` 一样没有 details。
+
+`delegation_revoke` 只允许授权人本人撤销，撤销父委托会使其下所有子委托失效；已撤销的委托再次撤销返回同一条记录，不重复审计。`delegation_list` 返回调用者作为授权人或被委托方的委托，包含已撤销和已过期的，用 `active` 区分。创建和撤销写入 `x_audit`（`delegation.created`、`delegation.revoked`），元数据只含 `delegation_id`、`scope`、`created_via`、`chain`，不含 reason。
+
+owner 尚无人类身份时，用运维命令在 bridge 容器内记录 owner 的根委托：`python -m bridge.delegations create|revoke|list`（见 README）。它记录 owner 的决定由指定运维人员执行，行里 `created_via='operator'`、`created_by` 为运维人员名称，审计的 `requested_by` 是授权人、`performed_by` 是 `operator:<名称>`；授权人必须正是所指 Space 记录的根身份，并受同样的范围、过期和环规则约束；`set-space-owner` 为没有根的 Space 记录根身份。按 DECISIONS 287、291，owner 是根，南瓜持有 owner 的审批人委托。
 
 ## x_graph 依赖图
 
@@ -306,6 +325,7 @@ MCP 与适配器：`submit_task` 工具和 `create_task_block` 带上述三个�
 
 - `401 unauthorized`：缺少、重复、无效或已撤销的认证。
 - `403 forbidden`：对象对调用者可见，但当前权限不允许该操作（例如只有 view 权限却要评论、不是指定接收人却要领取）。
+- `403 delegation_required`：gate 的调用者（人或 agent）不是根审批人，也没有覆盖该任务的有效审批人委托；错误体的 `error.details` 与其他错误相同，不回显输入值。
 - `404 not_found`：资源不存在，或调用者对它没有 view 权限（包括已被撤权）；两种情况的响应完全相同，不泄漏存在性（规格 X7）。`get_task`、`list_comments`、`get_page`、`comment` 等读写一律如此。对他人目标（assignee、handoff 目标）缺权限的检查仍报告 `403`，因为调用者看得到该对象。
 - `409 operation_conflict / scope_conflict / stale_claim / revision_conflict / gate_required / dependency_blocked / graph_cycle / work_face_incomplete`：幂等、作用域、租约、版本、gate、依赖图或施工面清单不满足当前条件。
 - `422 invalid`：未知操作、额外字段、无效类型或无效业务参数。响应的 `error.details` 在可定位时给出字段级提示，见下。

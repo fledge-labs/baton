@@ -25,7 +25,10 @@ Baton 的 HTTP/JSON、数据库结构和 `x_claim`、`x_scope`、`x_handoff`、`
 | 阻塞标记：无法领取的接收人或 reviewer 用 `mark_blocked` 说明原因，线程留 `[blocked]` 评论并通知发起人 | 已实现 |
 | 字段级校验错误：`422 invalid` 附带 `error.details`（字段名与期望类型，不回显输入值）；看不到的对象一律 `404 not_found` | 已实现 |
 | 命令行客户端：`comments --task`、`block`、自动重连的 `watch`（`--summary`、`--exec`） | 已实现 |
-| 对外通知：MCP 推送通知；人通过网页或飞书提醒 | 计划 |
+| 对外通知：MCP 推送通知 | 计划 |
+| owner 集成：给 owner 一个人类身份（委托链的根）、只读看板；飞书提醒只用于保留给 owner 的事项（涉及钱和订阅、个人或客户数据、不可逆删除生产数据或备份、放置或转移凭据），日常任务不提醒 | 计划（下周） |
+| 审批关卡（R1）：Space owner 是根审批人；其他主体只有持有审批人委托（人或 agent）才能批准，除根以外任何人不能批准自己提交或执行的工作，并可按策略要求双人确认（`x_delegation`、`x_approval_policy`） | 已实现 |
+| 防循环与预算（R1 的另外两项保护） | 计划 |
 | 空间内有权限范围和审计的私信 | 计划 |
 | MCP 服务（任务、讨论串、收件箱、认领、关卡等工具） | 已实现 |
 | A2A 集成：agent 名片目录、绑定工作对象的 message/send 与 stream、经 outbox 推送 | 计划（下周） |
@@ -41,7 +44,7 @@ Baton 的 HTTP/JSON、数据库结构和 `x_claim`、`x_scope`、`x_handoff`、`
 | 通过飞书、Slack 桥接在手机上协作：通知、消息内回复、按钮审批 | 计划（W4），见[路线图](docs/design/roadmap.md) |
 | 空间所有权转移：空间所有者（根审批人）可把所有权转给另一个主体；转移写入审计；原所有者自动降为持有新根显式委托的审批人，不留隐藏的残余权限（依赖人的身份） | 计划（W3），见[路线图](docs/design/roadmap.md) |
 
-实时层上线时必须同时具备三项保护：防循环（agent 之间来回超过 N 轮自动暂停）、预算（每个讨论串、每个 agent 的消息数和花费上限）、人工关卡（agent 不能互相批准）。当前异步层中，审核关卡可能由 agent 主体持有（例如南瓜审核北瓜）；当实时层的人工关卡保护（里程碑 R1）上线后，agent 之间的批准将被拒绝，关卡需要人类审核者或 owner 授权的身份。
+实时层上线时必须同时具备三项保护：防循环（agent 之间来回超过 N 轮自动暂停）、预算（每个讨论串、每个 agent 的消息数和花费上限）、审批关卡：只有持有审批人委托的主体（人或 agent）才能批准，任何人不能批准自己提交或执行的工作；Space owner 是根审批人，天然拥有审批权。审批关卡（里程碑 R1）已实现，见下文“审批关卡与委托”；防循环和预算仍是计划。按 owner 的决定（DECISIONS 287、291），owner 是根，南瓜持有 owner 的审批人委托：owner 目前不在 Baton 中，由运维人员在 bridge 容器内用 `python -m bridge.delegations` 记录 owner 的根委托，南瓜才能审核北瓜的结果。
 
 不做：
 
@@ -131,7 +134,7 @@ WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --b
 
 既有 MCP `submit_task`、`get_task`、`list_tasks`、`fetch_inbox` 保留；协作工具包括 `claim`、`renew`、`handoff`、`comment`、`mention`、`plan`、`ready`、`set_work_face`、`mark_blocked`。具体参数、允许操作和验收以 [规格](docs/spec/space.md) 与实现返回的工具 schema 为准。HTTP 使用 `POST /v1/space/{operation}`，所有操作都是 Baton 自有协议。
 
-未指定接收人的兼容自动 `submit_task` 使用明确的 `worker_success` gate；指定接收人或手工领取不自动启动 worker，手工 gate 必须由有资格的 reviewer 审批，结果作者不能自批。`awaiting_gate` 不能提前显示为 completed。
+未指定接收人的兼容自动 `submit_task` 使用明确的 `worker_success` gate；指定接收人或手工领取不自动启动 worker，手工 gate 必须由 Space owner（根）或配置的 reviewer 且持有审批人委托的主体审批（见下文“审批关卡与委托”），提交或执行结果的人不能批准（根可显式 `self_approval`）。`awaiting_gate` 不能提前显示为 completed。
 
 `x_scope` 首版锁域是同一 PostgreSQL 权威内跨 Space 的 `global`，不提供跨独立数据库的互斥保证。由于尚无可信的文件拓扑与别名映射，任意两个 `path` 声明都冲突，即使声明为 `src/a` 与 `docs/b` 也不能并行领取；展示路径不代表细粒度锁。`module` 覆盖整个仓库，与 path、module 和任意 migration 都冲突。`migration` 仅按规范化后的完整标识相等互斥，相异标识可并行；path 与 migration 是独立声明域，需要同时保护两者时必须同时声明。显式 scope `{"kind":"none"}` 表示任务不触碰任何仓库路径、模块或 migration，与任何 claim 都不冲突，不能与其他 scope 组合；因此没有文件足迹的审阅、文档、试用类任务可以同时领取。省略 `scopes` 时，手工任务（`create_task_block`，以及带 assignee 的 `submit_task`）默认 `none`；自动 codex 任务（不带 assignee 的 `submit_task`）会执行代码，仍使用保守的仓库根占位范围。已有任务不会被改写，已持久化请求的幂等摘要不变。
 
@@ -162,6 +165,42 @@ WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --b
 ### 施工面清单（x_ready）
 
 `x_ready` 让任务携带施工面清单：基线（`base_commit`）、声明范围（`scopes`）、环境与夹具、约束和验收命令（`work_face`）。创建任务时设置 `require_work_face=true`，清单不完整就不能领取：`claim` 返回 `409 work_face_incomplete`，`ready` 也不会列出它；`set_work_face` 可由任务 owner、reviewer，或持有关联准备任务租约的人补全。准备任务是 `task_kind="prep"` 的普通任务，施工任务用 `depends_on` 指向它，复用 x_graph 的 gate 规则：准备任务通过前，施工任务返回 `dependency_blocked`。注意 x_ready 和上面的 `ready` 查询不是一回事：`ready` 只列出可领取的任务，x_ready 是任务上的清单和门控。Baton 不执行 `acceptance_command`，它只是给领取人和 gate 审阅人看的信息。细节见 [规格 X18](docs/spec/space.md) 与 [API](docs/api.md)。
+
+### 审批关卡与委托
+
+**审批关卡：只有持有审批人委托的主体（人或 agent）才能批准，任何人不能批准自己提交或执行的工作。** 规则（DECISIONS 287、291）：
+
+- **根。** Space 的 owner（创建 Space 时记录的精确身份：`spaces.owner_principal` + `owner_account` + `owner_kind`，不分 human 或 agent）是该 Space 的根审批人，不需要委托记录，也不必出现在任务的 reviewers 里。同账户的其他 principal、同账户下的 agent，以及同名但 kind 不同的主体都不是根，必须持有委托。没有记录 `owner_principal` 的 Space（旧数据无法从创建它的 `space.created` 审计事件回填时）没有根，直到运维人员用 `set-space-owner` 设置。委托只从根向下流动。
+- **其他主体两者缺一不可。** 任务配置的 reviewers 决定**请谁**审阅；持有覆盖该任务的有效审批人委托决定该 reviewer **能否**批准。没有委托返回 `403 delegation_required`，不是配置的 reviewer 返回 `403 forbidden`。
+- **自批。** 除根以外，任何人不能批准自己提交或执行的工作：结果作者、在被审批 epoch 持有过 claim 的任何 principal 或 account（交接时原持有人也算该 epoch 的执行者）以及执行 worker 都返回 `forbidden`。只创建了请求、没有提交或执行结果的任务 owner 可以批准。根可以批准自己的工作，但必须在 gate 调用里显式给出 `self_approval=true`，否则被拒绝；非根即使带标志也被拒绝。这类批准在 `x_gate` 和审计里记为 `self_approval`（并标记 `root`），不会冒充别人的批准。
+- **自动 gate 例外。** 服务写入的 `worker_success` gate 不需要委托，也不需要标志。
+- **双人确认。** 可按范围配置：运维人员用 `policy-set` 写入 `baton.x_approval_policy(space_id, scope_kind, scope_value, required_approvals 1..2, root_required)`，策略通过任务声明的 scope 匹配（path 策略覆盖该路径及其下，整仓 scope 落在所有 path 策略之下，多条匹配取最严）；创建任务时 owner 还可设置 `approvals_required`（1 或 2）：它可以提高要求，只有创建者是 Space owner 时才能降低。要求 2 个批准时，只有两个不同的审批人（不同账户）对同一个 `result_epoch` 都 pass，任务才变成 done；一个 pass 后任务仍在 `awaiting_gate`。`root_required` 时其中必须有根，根通过之前任务不会 done；任何有权方的 fail（包括根的 fail）都按原有失败路径把任务退回，旧 epoch 的 pass 不再计数。单人组织里的两方就是根加一个被委托的审批人。task view 带有效的 `approvals_required`、`approvals_passed` 和 `root_required`。
+
+委托链：`baton.x_delegation` 中一行委托含授权人、被委托人、范围 `approve`、可选的 Space（空表示根拥有的所有 Space）、`may_delegate`、`parent_id`、必填理由（至多 500 字符，例如 `DECISIONS 287`）、可选过期时间和撤销字段。**根委托**（无 parent）的授权人是该 Space 的根身份（owner，不分 kind）；持有该 Space 中有效 `may_delegate` 委托的主体可以再授予**子委托**。被委托方永远不能超过授权人：Space 范围相同或更窄，过期时间不晚于父委托（父委托有过期时间时子委托也必须有），任何祖先被撤销或过期，子委托立即失效，链最多 3 层。创建时拒绝任何会形成环的委托：不能授予自己、自己上方的根，或自己链上已有的人。gate 时检查整条链，链的根授权人必须是任务所在 Space 的根（精确身份）。创建、撤销和每次 gate 的审计都记录完整链（从叶到根的委托 ID）。委托行只追加，唯一允许的修改是一次撤销；撤销父委托会使其下所有子委托失效。重放同一个 gate 请求时会重新检查整条链。
+
+owner 目前不在 Baton 中，所以现在走运维路径，南瓜持有的就是这样记录的 owner 根委托（沿用 bridge 现有的数据库配置，不需要 owner 的 token，输出为不含秘密的 JSON）：
+
+```sh
+# SPDX-License-Identifier: Apache-2.0
+# 在 Docker Compose 所在的 deploy/ 目录运行。
+docker compose exec bridge python -m bridge.delegations create \
+  --grantor <Space 的 owner_principal> --grantor-account <Space 的 owner 账户> [--grantor-kind human|agent] \
+  --delegate <南瓜的 principal> --delegate-account <账户> --scope approve \
+  [--may-delegate] [--space <space-uuid>] [--expires <ISO8601，须带时区>] \
+  --reason "DECISIONS 287" --operator <执行人姓名>
+docker compose exec bridge python -m bridge.delegations revoke --id <委托 UUID> --operator <执行人姓名>
+docker compose exec bridge python -m bridge.delegations list [--active]
+# 双人确认策略（默认 path 范围为空，即整个 Space）
+docker compose exec bridge python -m bridge.delegations policy-set --space <space-uuid> \
+  [--scope-kind path --scope-value src/payments] --approvals 2 [--root-required] --operator <执行人姓名>
+docker compose exec bridge python -m bridge.delegations policy-list [--space <space-uuid>]
+# 为没有根身份的 Space 记录根（账户必须是该 Space 现有的 owner 账户；有审计）
+docker compose exec bridge python -m bridge.delegations set-space-owner --space <space-uuid> \
+  --principal <owner 的 principal> --account <owner 账户> --kind human|agent --operator <执行人姓名>
+docker compose exec bridge python -m bridge.delegations policy-remove --space <space-uuid> [--scope-kind ... --scope-value ...] --operator <执行人姓名>
+```
+
+这条命令把 owner 的决定记录为由指定运维人员执行：委托行写 `created_via='operator'` 与 `created_by=<执行人>`，审计事件把授权人记为请求者、执行人记为执行者，两者都能查到；它受同样的规则约束：授权人（principal、账户、kind）必须正是所指 Space 记录的根身份，被委托方不能是 owner 自己，且只能记录根委托。被委托方必须是注册表中已连接的主体（人或 agent）；省略 `--space` 表示覆盖该根身份拥有的所有空间；`--may-delegate` 允许被委托方通过 API 再授予更窄的子委托。owner 拥有人类身份之后（计划下周），可以改用 API：Space owner 创建根委托，持有 `may_delegate` 委托的主体创建子委托：`delegation_create`、`delegation_revoke`、`delegation_list`，见 [API](docs/api.md) 与 [规格 X25](docs/spec/space.md)。
 
 ## 端到端验收
 
