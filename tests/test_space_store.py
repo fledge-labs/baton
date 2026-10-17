@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import psycopg
 import pytest
 
-from bridge.space_store import Actor, SERVICE_ACTOR, SpaceStore, StoreError, LOCK_ID, normalize_scopes
+from bridge.space_store import Actor, SERVICE_ACTOR, SpaceStore, StoreError, LOCK_ID, normalize_scopes, normalize_work_face
 
 
 def operation():
@@ -840,3 +840,330 @@ def test_auto_rechecks_saved_requester_authority_without_impersonating_audit_act
     assert not any(row["event"] == "task.dispatched" for row in rows)
     service_rows = [row for row in rows if row["event"] in {"worker.claimed", "task.interrupted"}]
     assert all(row["performed_by"] == SERVICE_ACTOR.principal and row["requested_by"] == pg.editor.principal for row in service_rows)
+
+
+def face(**changes):
+    return {"environment": ["python 3.12"], "fixtures": ["seed.sql"], "constraints": ["no network"],
+            "migration": None, "acceptance_command": "pytest -q", **changes}
+
+
+def disjoint(pg, suffix):
+    """Migration scopes conflict only on equal identifiers, so tasks can be held concurrently."""
+    return [{"kind": "migration", "value": pg.prefix + "-" + suffix}]
+
+
+def ready_ids(pg, actor):
+    return {row["id"] for row in pg.store.ready(actor, pg.page["id"])}
+
+
+def test_incomplete_work_face_blocks_claim_and_ready_until_owner_completes(pg, tmp_path):
+    s = pg.store
+    marker = tmp_path / "executed"
+    task = manual(pg, "wf-gate", scopes=disjoint(pg, "gate"), assignee=pg.editor, require_work_face=True)
+    assert task["require_work_face"] is True and task["task_kind"] == "construction" and task["work_face"] is None
+    assert task["work_face_missing"] == ["base_commit", "work_face"]
+    expect("work_face_incomplete", lambda: s.claim(pg.editor, operation(), task["id"]))
+    assert task["id"] not in ready_ids(pg, pg.editor)
+    completed = s.set_work_face(pg.owner, operation(), task["id"], face(acceptance_command=f"touch {marker}"), base_commit="base-1")
+    assert completed["work_face_missing"] == [] and completed["base_commit"] == "base-1"
+    assert completed["work_face"]["acceptance_command"] == f"touch {marker}" and completed["state"] == "queued"
+    assert task["id"] in ready_ids(pg, pg.editor)
+    claimed = s.claim(pg.editor, operation(), task["id"])
+    assert claimed["state"] == "claimed" and claimed["work_face"] == completed["work_face"]
+    s.submit_result(pg.editor, operation(), task["id"], claimed["epoch"], "Candidate")
+    assert s.gate(pg.reviewer, operation(), task["id"], claimed["epoch"], "pass")["state"] == "done"
+    assert not marker.exists()
+
+
+def test_work_face_missing_names_each_absent_part_and_scopes_cannot_be_repaired(pg):
+    s = pg.store
+    only_face = manual(pg, "missing-base", scopes=disjoint(pg, "m1"), require_work_face=True, work_face=face())
+    assert only_face["work_face_missing"] == ["base_commit"]
+    only_base = manual(pg, "missing-face", scopes=disjoint(pg, "m2"), require_work_face=True, base_commit="base-1")
+    assert only_base["work_face_missing"] == ["work_face"]
+    no_scopes = manual(pg, "missing-scopes", scopes=[], require_work_face=True, base_commit="base-1", work_face=face())
+    assert no_scopes["work_face_missing"] == ["scopes"]
+    nothing = manual(pg, "missing-all", scopes=[], require_work_face=True)
+    assert nothing["work_face_missing"] == ["base_commit", "scopes", "work_face"]
+    still = s.set_work_face(pg.owner, operation(), nothing["id"], face(), base_commit="base-1")
+    assert still["work_face_missing"] == ["scopes"]
+    expect("work_face_incomplete", lambda: s.claim(pg.owner, operation(), still["id"]))
+    assert not {only_face["id"], only_base["id"], no_scopes["id"], nothing["id"]} & ready_ids(pg, pg.owner)
+    assert s.set_work_face(pg.owner, operation(), only_face["id"], face(), base_commit="base-1")["work_face_missing"] == []
+
+
+def test_auto_queue_skips_incomplete_work_face_and_take_claim_enforces_it(pg):
+    s = pg.store
+    incomplete = s.submit_task(pg.owner, operation(), "wf-auto-incomplete", "Auto work needing a work face", page_id=pg.page["id"],
+                               scopes=disjoint(pg, "auto1"), require_work_face=True)
+    plain = s.submit_task(pg.owner, operation(), "wf-auto-plain", "Auto work without a checklist", page_id=pg.page["id"],
+                          scopes=disjoint(pg, "auto2"))
+    assert incomplete["work_face_missing"] == ["base_commit", "work_face"]
+    with s._transaction(write=True) as conn:
+        raw = s._row(conn, "tasks", incomplete["id"])
+        with pytest.raises(StoreError) as caught:
+            s._take_claim(conn, SERVICE_ACTOR, operation(), raw, 60)
+        assert caught.value.code == "work_face_incomplete"
+    first = s.claim_next(SERVICE_ACTOR, operation())
+    assert first["task_id"] == plain["id"]
+    s.set_work_face(pg.owner, operation(), incomplete["id"], face(), base_commit="auto-base")
+    claim_op = operation()
+    second = s.claim_next(SERVICE_ACTOR, claim_op)
+    assert second["task_id"] == incomplete["id"] and second["work_face"] == face()
+    with s._transaction(write=True) as conn:
+        conn.execute("UPDATE baton.tasks SET work_face=NULL WHERE id=%s", (incomplete["id"],))
+    expect("work_face_incomplete", lambda: s.claim_next(SERVICE_ACTOR, claim_op))
+
+
+def test_claim_replay_rechecks_work_face(pg):
+    s = pg.store
+    task = manual(pg, "wf-replay", scopes=disjoint(pg, "replay"), assignee=pg.editor, require_work_face=True,
+                  base_commit="base-1", work_face=face())
+    claim_op = operation()
+    assert s.claim(pg.editor, claim_op, task["id"])["state"] == "claimed"
+    assert s.claim(pg.editor, claim_op, task["id"])["replay"]
+    with s._transaction(write=True) as conn:
+        conn.execute("UPDATE baton.tasks SET work_face=NULL WHERE id=%s", (task["id"],))
+    expect("work_face_incomplete", lambda: s.claim(pg.editor, claim_op, task["id"]))
+
+
+def test_prep_task_gates_construction_through_graph_and_holder_sets_work_face(pg):
+    s = pg.store
+    prep = manual(pg, "prep", scopes=disjoint(pg, "prep"), assignee=pg.editor, task_kind="prep")
+    build = manual(pg, "build", scopes=disjoint(pg, "build"), assignee=pg.editor, depends_on=[prep["id"]], require_work_face=True)
+    later = manual(pg, "later", scopes=disjoint(pg, "later"), assignee=pg.editor, depends_on=[prep["id"]], require_work_face=True)
+    assert prep["task_kind"] == "prep" and prep["require_work_face"] is False and build["depends_on"] == [prep["id"]]
+    expect("forbidden", lambda: s.set_work_face(pg.editor, operation(), build["id"], face(), "prep-base"))
+    prep_claim = s.claim(pg.editor, operation(), prep["id"])
+    done = s.set_work_face(pg.editor, operation(), build["id"], face(), base_commit="prep-base")
+    assert done["work_face_missing"] == [] and done["base_commit"] == "prep-base" and done["work_face"] == face()
+    expect("dependency_blocked", lambda: s.claim(pg.editor, operation(), build["id"]))
+    s.submit_result(pg.editor, operation(), prep["id"], prep_claim["epoch"], "Site prepared")
+    expect("forbidden", lambda: s.set_work_face(pg.editor, operation(), later["id"], face(), "late-base"))
+    expect("dependency_blocked", lambda: s.claim(pg.editor, operation(), build["id"]))
+    assert build["id"] not in ready_ids(pg, pg.editor)
+    s.gate(pg.reviewer, operation(), prep["id"], prep_claim["epoch"], "pass")
+    assert build["id"] in ready_ids(pg, pg.editor) and later["id"] not in ready_ids(pg, pg.editor)
+    expect("work_face_incomplete", lambda: s.claim(pg.editor, operation(), later["id"]))
+    claimed = s.claim(pg.editor, operation(), build["id"])
+    assert claimed["state"] == "claimed" and claimed["work_face"] == face()
+
+
+def test_set_work_face_requires_edit_and_owner_reviewer_or_live_prep_holder(pg):
+    s = pg.store
+    task = manual(pg, "wf-auth", scopes=disjoint(pg, "auth"), require_work_face=True)
+    def attempt(actor):
+        return lambda: s.set_work_face(actor, operation(), task["id"], face())
+    expect("forbidden", attempt(pg.reader))
+    s.share(pg.owner, operation(), "space", pg.space["id"], "person", pg.reader.account, "view")
+    expect("forbidden", attempt(pg.reader))
+    s.share(pg.owner, operation(), "space", pg.space["id"], "person", pg.reviewer.account, "view")
+    expect("forbidden", attempt(pg.reviewer))
+    s.share(pg.owner, operation(), "space", pg.space["id"], "person", pg.reviewer.account, "edit")
+    owner_twin = Actor(pg.prefix + "-owner-twin", pg.owner.account, "human")
+    reviewer_twin = Actor(pg.prefix + "-reviewer-twin", pg.reviewer.account, "human")
+    assert s.effective_role(owner_twin, "page", pg.page["id"])["role"] == "edit"
+    expect("forbidden", attempt(owner_twin))
+    expect("forbidden", attempt(reviewer_twin))
+    expect("forbidden", attempt(pg.editor))
+    expect("forbidden", lambda: s.set_work_face(SERVICE_ACTOR, operation(), task["id"], face()))
+
+    other = manual(pg, "wf-other", scopes=disjoint(pg, "other"), assignee=pg.editor)
+    s.claim(pg.editor, operation(), other["id"])
+    expect("forbidden", attempt(pg.editor))
+    s.plan(pg.owner, operation(), [{"task_id": task["id"], "depends_on": [other["id"]]}])
+    expect("forbidden", attempt(pg.editor))
+    expire(pg, other["id"])
+
+    unrelated = manual(pg, "wf-unrelated-prep", scopes=disjoint(pg, "unrelated"), assignee=pg.editor, task_kind="prep")
+    s.claim(pg.editor, operation(), unrelated["id"])
+    expect("forbidden", attempt(pg.editor))
+    prep = manual(pg, "wf-related-prep", scopes=disjoint(pg, "related"), assignee=pg.editor, task_kind="prep")
+    s.plan(pg.owner, operation(), [{"task_id": task["id"], "depends_on": [prep["id"]]}])
+    s.claim(pg.editor, operation(), prep["id"])
+    expire(pg, prep["id"])
+    expect("forbidden", attempt(pg.editor))
+    assert not [row for row in s.list_audit(pg.owner, task_id=task["id"]) if row["event"] == "task.work_face_set"]
+
+    s.claim(pg.editor, operation(), prep["id"])
+    assert s.set_work_face(pg.editor, operation(), task["id"], face())["work_face"] == face()
+    assert s.set_work_face(pg.reviewer, operation(), task["id"], face(constraints=["reviewer edit"]))["work_face"]["constraints"] == ["reviewer edit"]
+    assert s.set_work_face(pg.owner, operation(), task["id"], face(constraints=["owner edit"]))["work_face"]["constraints"] == ["owner edit"]
+    events = [row for row in s.list_audit(pg.owner, task_id=task["id"]) if row["event"] == "task.work_face_set"]
+    assert [row["performed_by"] for row in events] == [pg.editor.principal, pg.reviewer.principal, pg.owner.principal]
+
+
+def test_work_face_is_frozen_once_started_and_base_commit_is_set_once(pg):
+    s = pg.store
+    task = manual(pg, "wf-frozen", scopes=disjoint(pg, "frozen"), assignee=pg.editor, require_work_face=True)
+    s.set_work_face(pg.owner, operation(), task["id"], face(), base_commit="base-1")
+    expect("operation_conflict", lambda: s.set_work_face(pg.owner, operation(), task["id"], face(constraints=["changed"]), base_commit="base-2"))
+    unchanged = s.get_task(pg.owner, task["id"])
+    assert unchanged["base_commit"] == "base-1" and unchanged["work_face"] == face()
+    updated = s.set_work_face(pg.owner, operation(), task["id"], face(constraints=["changed"]), base_commit="base-1")
+    assert updated["base_commit"] == "base-1" and updated["work_face"]["constraints"] == ["changed"]
+    assert s.set_work_face(pg.owner, operation(), task["id"], face(), base_commit=None)["base_commit"] == "base-1"
+
+    created = manual(pg, "wf-created-base", scopes=disjoint(pg, "created"), require_work_face=True, base_commit="created-base")
+    expect("operation_conflict", lambda: s.set_work_face(pg.owner, operation(), created["id"], face(), base_commit="other-base"))
+    assert s.set_work_face(pg.owner, operation(), created["id"], face(), base_commit="created-base")["work_face_missing"] == []
+
+    claim = s.claim(pg.editor, operation(), task["id"])
+    expect("stale_claim", lambda: s.set_work_face(pg.owner, operation(), task["id"], face(), base_commit="base-1"))
+    s.submit_result(pg.editor, operation(), task["id"], claim["epoch"], "Candidate")
+    expect("stale_claim", lambda: s.set_work_face(pg.owner, operation(), task["id"], face()))
+    assert s.gate(pg.reviewer, operation(), task["id"], claim["epoch"], "fail")["state"] == "queued"
+    expect("stale_claim", lambda: s.set_work_face(pg.owner, operation(), task["id"], face()))
+    assert s.get_task(pg.owner, task["id"])["work_face"] == face()
+
+
+def test_set_work_face_idempotency_and_creation_digests(pg):
+    s = pg.store
+    task = manual(pg, "wf-idempotent", scopes=disjoint(pg, "idem"), require_work_face=True)
+    op = operation()
+    first = s.set_work_face(pg.owner, op, task["id"], face(), base_commit="idem-base")
+    replay = s.set_work_face(pg.owner, op, task["id"], face(environment=["  python 3.12  "]), base_commit="idem-base")
+    assert first["replay"] is False and replay["replay"] is True and replay["work_face"] == first["work_face"]
+    expect("operation_conflict", lambda: s.set_work_face(pg.owner, op, task["id"], face(fixtures=["other.sql"]), base_commit="idem-base"))
+    expect("operation_conflict", lambda: s.set_work_face(pg.owner, op, task["id"], face(), base_commit="other-base"))
+    expect("operation_conflict", lambda: s.set_work_face(pg.owner, op, task["id"], face()))
+    assert len([row for row in s.list_audit(pg.owner, task_id=task["id"]) if row["event"] == "task.work_face_set"]) == 1
+    s.share(pg.owner, operation(), "space", pg.space["id"], "person", pg.owner.account, None)
+    assert s.set_work_face(pg.owner, op, task["id"], face(), base_commit="idem-base")["replay"]
+
+    scopes, reviewers = disjoint(pg, "digest"), [pg.reviewer.principal]
+    def create(op, **kwargs):
+        return s.create_task_block(pg.owner, op, pg.page["id"], "Digest task", scopes, reviewers, **kwargs)
+    op = operation()
+    created = create(op, work_face=face(), require_work_face=True, task_kind="prep")
+    assert create(op, work_face=face(), require_work_face=True, task_kind="prep")["replay"]
+    for changed in ({"work_face": None, "require_work_face": True, "task_kind": "prep"},
+                    {"work_face": face(migration="0042"), "require_work_face": True, "task_kind": "prep"},
+                    {"work_face": face(), "require_work_face": False, "task_kind": "prep"},
+                    {"work_face": face(), "require_work_face": True, "task_kind": "construction"}):
+        expect("operation_conflict", lambda: create(op, **changed))
+    assert created["task_kind"] == "prep" and created["require_work_face"] is True
+
+    submit = lambda op, key, **kwargs: s.submit_task(pg.owner, op, key, "Digest submit", page_id=pg.page["id"], scopes=disjoint(pg, "digest2"), **kwargs)
+    op = operation()
+    submitted = submit(op, "wf-digest", work_face=face(), require_work_face=True, task_kind="prep")
+    assert submit(op, "wf-digest", work_face=face(), require_work_face=True, task_kind="prep")["replay"]
+    assert submit(operation(), "wf-digest", work_face=face(), require_work_face=True, task_kind="prep")["id"] == submitted["id"]
+    for changed in ({"require_work_face": True, "task_kind": "prep"}, {"work_face": face(), "task_kind": "prep"},
+                    {"work_face": face(), "require_work_face": True}):
+        expect("operation_conflict", lambda: submit(op, "wf-digest", **changed))
+        expect("operation_conflict", lambda: submit(operation(), "wf-digest", **changed))
+
+
+INVALID_FACES = {
+    "extra key": {**face(), "owner": "someone"},
+    "missing environment": {key: value for key, value in face().items() if key != "environment"},
+    "missing fixtures": {key: value for key, value in face().items() if key != "fixtures"},
+    "missing constraints": {key: value for key, value in face().items() if key != "constraints"},
+    "missing migration": {key: value for key, value in face().items() if key != "migration"},
+    "missing command": {key: value for key, value in face().items() if key != "acceptance_command"},
+    "empty object": {},
+    "list is a string": face(environment="python"),
+    "list is null": face(constraints=None),
+    "item is integer": face(fixtures=[1]),
+    "item is null": face(fixtures=[None]),
+    "item is boolean": face(constraints=[True]),
+    "item is nested list": face(environment=[["python"]]),
+    "item is empty": face(environment=[""]),
+    "item is blank": face(environment=["  \t "]),
+    "item is too long": face(fixtures=["x" * 501]),
+    "too many items": face(constraints=["rule"] * 21),
+    "item has NUL": face(environment=["a\x00b"]),
+    "migration is integer": face(migration=42),
+    "migration is empty": face(migration=""),
+    "migration is blank": face(migration="   "),
+    "migration is too long": face(migration="m" * 201),
+    "command is null": face(acceptance_command=None),
+    "command is integer": face(acceptance_command=7),
+    "command is empty": face(acceptance_command=""),
+    "command is blank": face(acceptance_command=" \n "),
+    "command is too long": face(acceptance_command="c" * 2001),
+    "command has NUL": face(acceptance_command="pytest\x00"),
+}
+
+
+@pytest.mark.parametrize("work_face", INVALID_FACES.values(), ids=INVALID_FACES.keys())
+def test_work_face_validation_rejects_malformed_input_before_storage(work_face):
+    store = SpaceStore("/synthetic/nonexistent-config.json")
+    actor = Actor("synthetic-principal", "synthetic-account", "human")
+    expect("invalid", lambda: normalize_work_face(work_face))
+    expect("invalid", lambda: store.set_work_face(actor, operation(), operation(), work_face))
+    expect("invalid", lambda: store.create_task_block(actor, operation(), operation(), "Prompt", [], ["reviewer"], work_face=work_face))
+    expect("invalid", lambda: store.submit_task(actor, operation(), "synthetic-key", "Prompt", work_face=work_face))
+
+
+@pytest.mark.parametrize("work_face", [None, [], "text", 7, [face()]], ids=["null", "list", "text", "integer", "list of faces"])
+def test_set_work_face_requires_an_object(work_face):
+    store = SpaceStore("/synthetic/nonexistent-config.json")
+    actor = Actor("synthetic-principal", "synthetic-account", "human")
+    expect("invalid", lambda: store.set_work_face(actor, operation(), operation(), work_face))
+    expect("invalid", lambda: store.set_work_face(actor, operation(), operation(), face(), base_commit="  "))
+
+
+def test_work_face_limits_are_inclusive_and_values_are_trimmed():
+    limit = face(environment=["e" * 500] * 20, fixtures=[" f "], constraints=[], migration="m" * 200, acceptance_command="  " + "c" * 2000 + "\n")
+    assert normalize_work_face(limit) == {"environment": ["e" * 500] * 20, "fixtures": ["f"], "constraints": [],
+                                          "migration": "m" * 200, "acceptance_command": "c" * 2000}
+    assert normalize_work_face(face(migration="  0042  "))["migration"] == "0042"
+    assert normalize_work_face(face(acceptance_command="make\ncheck"))["acceptance_command"] == "make\ncheck"
+
+
+def test_invalid_creation_inputs_leave_no_task(pg):
+    s = pg.store
+    before = len(s.list_tasks(pg.owner))
+    expect("invalid", lambda: manual(pg, "bad-face", work_face=face(extra=1)))
+    expect("invalid", lambda: manual(pg, "bad-flag", require_work_face="true"))
+    expect("invalid", lambda: manual(pg, "bad-flag-int", require_work_face=1))
+    expect("invalid", lambda: manual(pg, "bad-kind", task_kind="ops"))
+    expect("invalid", lambda: manual(pg, "null-kind", task_kind=None))
+    expect("invalid", lambda: s.submit_task(pg.owner, operation(), "bad-submit-kind", "Prompt", page_id=pg.page["id"], task_kind="Prep"))
+    assert len(s.list_tasks(pg.owner)) == before
+
+
+def test_work_face_audit_has_key_names_and_digest_only(pg):
+    s = pg.store
+    marker = "synthetic-secret-acceptance-body"
+    checklist = face(acceptance_command="run " + marker, fixtures=[marker + "-fixture"], migration="0042")
+    task = manual(pg, "wf-audit", scopes=disjoint(pg, "audit"), require_work_face=True)
+    op = operation()
+    s.set_work_face(pg.owner, op, task["id"], checklist, base_commit="audit-base")
+    s.set_work_face(pg.owner, op, task["id"], checklist, base_commit="audit-base")
+    rows = [row for row in s.list_audit(pg.owner, task_id=task["id"]) if row["event"] == "task.work_face_set"]
+    assert len(rows) == 1
+    canonical = json.dumps(checklist, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    assert rows[0]["metadata"] == {"work_face_keys": sorted(checklist), "work_face_sha256": hashlib.sha256(canonical.encode()).hexdigest(),
+                                   "thread_id": task["id"]}
+    assert rows[0]["performed_by"] == pg.owner.principal and rows[0]["task_id"] == task["id"]
+    assert marker not in json.dumps(s.list_audit(pg.owner, task_id=task["id"]), default=str)
+    assert marker not in json.dumps(s.list_audit(pg.owner, space_id=pg.space["id"]), default=str)
+
+
+def test_tasks_without_work_face_requirement_behave_as_before(pg):
+    s = pg.store
+    plain = manual(pg, "plain", scopes=disjoint(pg, "plain1"), assignee=pg.editor)
+    decorated = manual(pg, "plain-face", scopes=disjoint(pg, "plain2"), assignee=pg.editor, work_face=face())
+    for task in (plain, decorated):
+        assert task["require_work_face"] is False and task["task_kind"] == "construction" and task["work_face_missing"] == []
+        assert task["base_commit"] is None
+    assert plain["work_face"] is None and decorated["work_face"] == face()
+    assert {plain["id"], decorated["id"]} <= ready_ids(pg, pg.editor)
+    assert s.claim(pg.editor, operation(), plain["id"])["state"] == "claimed"
+    assert s.claim(pg.editor, operation(), decorated["id"])["state"] == "claimed"
+    auto = s.submit_task(pg.owner, operation(), "plain-auto", "Plain automatic work", page_id=pg.page["id"], scopes=disjoint(pg, "plain3"))
+    assert auto["work_face_missing"] == [] and auto["task_kind"] == "construction"
+    assert s.claim_next(SERVICE_ACTOR, operation())["task_id"] == auto["id"]
+    with s._transaction() as conn:
+        columns = {row["column_name"]: row for row in conn.execute(
+            "SELECT column_name,column_default,is_nullable FROM information_schema.columns WHERE table_schema='baton' AND table_name='tasks'")}
+    assert columns["require_work_face"]["column_default"] == "false" and columns["require_work_face"]["is_nullable"] == "NO"
+    assert columns["task_kind"]["column_default"].startswith("'construction'") and columns["task_kind"]["is_nullable"] == "NO"
+    assert columns["work_face"]["is_nullable"] == "YES"
+    with s._transaction(write=True) as conn:
+        with pytest.raises(psycopg.errors.CheckViolation):
+            with conn.transaction():
+                conn.execute("UPDATE baton.tasks SET task_kind='other' WHERE id=%s", (plain["id"],))
