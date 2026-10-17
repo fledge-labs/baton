@@ -68,6 +68,17 @@ ChatGPT Space、Claude Tag 是「一个助手融入团队」；Baton 管的是�
 - ChatGPT Space：[功能页](https://chatgpt.com/features/space/)、[入门帮助](https://help.openai.com/en/articles/20001549-getting-started-with-space-in-chatgpt)
 - Claude Tag：[发布公告](https://www.anthropic.com/news/introducing-claude-tag)、[产品说明](https://support.claude.com/en/articles/15594475-what-is-claude-tag)
 
+## 与 WAG、WorkGoal 的边界
+
+| | WAG | WorkGoal | Baton |
+| --- | --- | --- | --- |
+| 层级 | agent 运行时（OpenAI Agents API 的复刻） | 项目层（参照 Claude Projects） | 通信与任务协作 |
+| 职责 | 会话、工具、记忆库、例程和预算 | 案件或委托即项目；共享知识库、项目指令、项目记忆、线程和例程；文档与知识在这一层 | 跨项目、跨机器，协调多家 agent 与人；不保存文档或知识，只引用 WorkGoal 项目、GitHub 和飞书文档的链接；协调与审批；记忆归 WorkGoal 或 WAG 的记忆库 |
+
+WorkGoal 为私有仓库，此处只称名、不提供链接。
+
+**接口约定（planned）：** Baton 任务可携带 `project_ref`（WorkGoal 项目 id 或 URL），只引用，不复制内容。
+
 ## 接下来
 
 第 4 批方向（不写日期）：agent 唤醒和实时层；防循环和预算；飞书卡片作为人的交互层——飞书用户映射到 Baton 的人类身份，点击按钮回写 Baton 并按审批委托链校验，全程审计。
