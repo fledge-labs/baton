@@ -16,11 +16,14 @@ Communication is anchored to work objects: every message belongs to a task, page
 | Claim and lease (x_claim), scope conflict checks (x_scope), dependency graph (x_graph) | implemented |
 | Handoff notes (x_handoff), approval and gates (x_gate), append-only audit (x_audit) | implemented |
 | Work-face checklist (x_ready) | implemented |
-| Outbound notifications: webhooks, MCP notifications; people via web board or Feishu reminder | planned (this week) |
+| Outbound notifications: transactional outbox, webhooks (HMAC-signed, at-least-once), wait_inbox long poll | implemented |
+| Outbound notifications: MCP push notifications; people via web board or Feishu reminder | planned |
 | Direct messages within a space with scoped permissions and audit | planned |
 | MCP server (tasks, threads, inbox, claim, gate tools, etc.) | implemented |
 | A2A interface and agent-card directory (discovery); A2A calls through Baton recorded on the corresponding task or page | planned (next week) |
 | Real-time layer: web WebSocket threads, A2A/MCP streaming forwarded per thread, wake-up for offline agents (Cursor followup first, then Claude Routines /fire, then A2A push notifications) | planned (from next week) |
+| Sync outcomes written back to the task or thread as minutes when a real-time conversation ends | planned (with the real-time layer, R4) |
+| Response-time agreements per priority with escalation or reassignment on timeout | in progress |
 
 Out of scope:
 
@@ -55,9 +58,9 @@ Agent Mail's inbox, threads and file reservations become comment threads plus me
 
 ### Two layers
 
-- **Async (this week):** threads, @mentions, assignments and inboxes are persisted. Delivery: agents pull with fetch_inbox; webhooks; MCP notifications; people see the web board or a Feishu reminder. Webhook and wait_inbox delivery is implemented as a transactional outbox + webhooks + wait_inbox (see [docs/api.md](../api.md#通知与送达webhookwait_inbox)). Acceptance: Baton replaces the 南瓜↔北瓜 file mailbox (南瓜 creates a task assigned to 北瓜 in Baton, 北瓜 claims it and reports under the task, 南瓜 reviews and passes the gate in the same task; the owner no longer relays; the mailbox remains only as a fallback).
+- **Async:** threads, @mentions, assignments and inboxes are persisted. Delivery: **implemented** — fetch_inbox pull, wait_inbox long poll, webhooks (transactional outbox; see [docs/api.md](../api.md#通知与送达webhookwait_inbox)); **planned** — MCP push notifications, Feishu reminder for people. Acceptance: Baton replaces the 南瓜↔北瓜 file mailbox (南瓜 creates a task assigned to 北瓜 in Baton, 北瓜 claims it and reports under the task, 南瓜 reviews and passes the gate in the same task; the owner no longer relays; the mailbox remains only as a fallback).
 - **Real-time (from next week):** web WebSocket threads for people and running agents; A2A/MCP streaming forwarded per thread; wake-up adapters that turn a message into one trigger on the recipient's platform when it is offline (Cursor followup first, then Claude Routines /fire, then A2A push notifications).
-- Real-time ships only together with three safeguards: loop guard (auto-pause after more than N agent-to-agent turns), budgets (per-thread and per-agent message count and spend caps), and a human gate (agents cannot approve each other).
+- Real-time ships only together with three safeguards: loop guard (auto-pause after more than N agent-to-agent turns), budgets (per-thread and per-agent message count and spend caps), and a human gate (agents cannot approve each other). In the current async layer a reviewer gate may be held by an agent principal (for example 南瓜 reviewing 北瓜); when the real-time layer's human-gate safeguard (milestone R1) ships, agent-to-agent approval is refused and the gate needs a human reviewer or an owner-authorized reviewer identity.
 
 ### Principles
 
