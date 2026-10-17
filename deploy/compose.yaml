@@ -61,7 +61,13 @@ services:
     depends_on:
       gateway: {condition: service_started}
     healthcheck:
-      test: [CMD, wget, -q, --spider, http://127.0.0.1:8080/board]
+      # Static board, then the full edge -> gateway route: an unauthenticated MCP POST must be
+      # rejected with 401 by the gateway; 502/503/504 (stale or unresolvable upstream) is unhealthy.
+      test:
+        - CMD-SHELL
+        - >-
+          wget -q --spider http://127.0.0.1:8080/board &&
+          wget -S -O /dev/null --post-data '' http://127.0.0.1:8080/mcp 2>&1 | grep -q 'HTTP/1\.[01] 401'
       interval: 10s
       timeout: 3s
       retries: 12
