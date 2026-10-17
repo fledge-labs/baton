@@ -22,7 +22,7 @@ Baton 提供通信、权限、审计和工作流秩序；执行属于外部 agen
 
 | 状态 | 内容 |
 | --- | --- |
-| **现已提供** | MCP/HTTP、webhook、`wait_inbox`、任务与讨论串 API、审批关卡与委托链（经 API/CLI）、只读 web 看板（运维视图，非人的主入口）；**A2A v1.0 公共接口**（签名 Agent Card、`SendMessage` / 流式等，见 [spec A39](spec/space.md) 与 `bridge/a2a_public.py`） |
+| **现已提供** | MCP/HTTP、webhook、`wait_inbox`、任务与讨论串 API、审批关卡与委托链（经 API/CLI）、轻量 web 看板（[`board/index.html`](../board/index.html)：可提交任务并查看状态，经 bearer 调 MCP 如 `submit_task`，**非**人的主交互通道）；**A2A v1.0 公共接口**（签名 Agent Card、`SendMessage` / 流式等，见 [spec A39](spec/space.md) 与 `bridge/a2a_public.py`） |
 | **计划（第 4 批 / W4 等）** | **飞书**为第一个通道实现：互动卡片（审批：通过 / 拒绝 / 要修改；状态：派出、完成、超时；**预算告警**待防循环与预算能力落地后随状态卡片一并提供），同一对象只更新同一张卡片；飞书用户映射到 Baton 人类身份，按钮回写并按委托链校验、全程审计。**Slack** 等后续接入。 |
 
 防循环与预算在 README 能力表中仍为**计划**（审批关卡已实现）；与上表「预算告警」卡片一致，均属未来工作，不在此文档中表述为已上线。
@@ -52,7 +52,7 @@ Baton 提供通信、权限、审计和工作流秩序；执行属于外部 agen
 - **作用域冲突（x_scope）** — 在共用权威内按声明路径等规则互斥占用，防止并发领取重叠工作面。见 [行为规格 X9–X10](spec/space.md#x_claimx_scope-与-x_handoff) 与 [API「任务、租约与 gate」](api.md#任务租约与-gate)。
 - **安全交接（x_handoff）** — 在事务内切换持有人并提升 fence，保留上下文与证据且不扩大未检查的作用域。见 [行为规格 X11](spec/space.md#x_claimx_scope-与-x_handoff) 与 [API「任务、租约与 gate」](api.md#任务租约与-gate)。
 - **依赖图（x_graph）** — 任务经 `depends_on` 组成 DAG，前置未通过 gate 则后继不可领取。见 [行为规格 X17](spec/space.md#x_gate任务兼容层与-x_audit) 与 [API「x_graph 依赖图」](api.md#x_graph-依赖图)。
-- **审批委托链** — 仅 Space owner（根）或持有根链上有效审批人委托的主体可批准，委托不可越权、不可成环；**非根**还须是任务配置的审阅人（reviewer）并对任务页面具**当前 edit 权限**，且除根在显式 `self_approval` 外不得批准自己提交或执行的结果（含该 epoch 的 claim 持有人）。见 [行为规格 X13](spec/space.md#x_gate任务兼容层与-x_audit)、[X25](spec/space.md#审批关卡与委托)；[API「任务、租约与 gate」](api.md#任务租约与-gate)、[「审批人委托（delegation）」](api.md#审批人委托delegation)。
+- **审批委托链** — 仅 Space owner（根）或持有根链上有效审批人委托的主体可批准，委托不可越权、不可成环；**非根**还须是任务配置的审阅人（reviewer）并对任务页面具**当前 edit 权限**，且除根在显式 `self_approval` 外，若审批人的 principal **或** account 与结果作者、或在该 `result_epoch` 持有过 claim 的持有人（含 handoff 原持有人、**同 account 下另一 principal**）匹配，一律拒绝自批。见 [行为规格 X13](spec/space.md#x_gate任务兼容层与-x_audit)、[X25](spec/space.md#审批关卡与委托)；[API「任务、租约与 gate」](api.md#任务租约与-gate)、[「审批人委托（delegation）」](api.md#审批人委托delegation)。
 - **双人确认** — 任务可要求**两个不同审批人**（不同 principal **且**不同 account）对同一 `result_epoch` 均通过后才完成。见 [行为规格 X25](spec/space.md#审批关卡与委托)、[API「双人确认」](api.md#任务租约与-gate)（「任务、租约与 gate」一节内）。
 - **全程审计（x_audit，只追加）** — 业务效果与审计在同一事务提交，应用角色不得改写或删除审计行。见 [行为规格 X16](spec/space.md#x_gate任务兼容层与-x_audit) 与 [API「错误与审计」](api.md#错误与审计)。
 - **多家 agent 加本地 runner** — 任意家的 agent 经 MCP、HTTP、A2A、webhook 接入；本地执行可用 [`adapters/local_runner.py`](../adapters/local_runner.py) 与 [API「MCP 兼容与发现」](api.md#mcp-兼容与发现)、[「适配器角色预设」](api.md#适配器角色预设)。
