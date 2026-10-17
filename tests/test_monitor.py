@@ -48,9 +48,11 @@ class Server:
 
 
 class FakeBaton:
-    """Just enough of the edge + MCP surface: /board, unauthenticated /mcp -> 401, tools/call."""
+    """Just enough of the edge + MCP surface: authenticated /healthz, unauthenticated /mcp -> 401, tools/call."""
 
     def __init__(self):
+        self.health_status = 200
+        self.health_body = (b'{"status":"ok","service":"baton-bridge","x_protocol":"baton.space.v1"}')
         self.board_status = 200
         self.unauth_status = 401
         self.mcp_status = 200
@@ -83,6 +85,13 @@ class FakeBaton:
             def do_GET(self):
                 with fake.lock:
                     fake.calls.append(("GET", self.path, self.headers.get("Authorization")))
+                if self.path == "/healthz":
+                    auth = self.headers.get("Authorization")
+                    if auth is None:
+                        return self.reply(401, b'{"error":"unauthorized"}')
+                    if auth != "Bearer " + MONITOR_TOKEN:
+                        return self.reply(401, b'{"error":"unauthorized"}')
+                    return self.reply(fake.health_status, fake.health_body)
                 if self.path == "/board":
                     return self.reply(fake.board_status, b"<html></html>", "text/html")
                 self.reply(404)
@@ -295,6 +304,8 @@ def real_probes(baton, token_file, tmp_path):
 def test_all_probes_pass_against_a_healthy_deployment(baton, token_file, tmp_path):
     for name, probe in real_probes(baton, token_file, tmp_path).items():
         probe()
+    health = [call for call in baton.calls if call[0] == "GET" and call[1] == "/healthz"]
+    assert len(health) == 1 and health[0][2] == "Bearer " + MONITOR_TOKEN
     methods = [call[3] for call in baton.calls if call[0] == "POST" and call[2]]
     assert methods == ["initialize", "notifications/initialized", "tools/call"]
     unauth = [call for call in baton.calls if call[0] == "POST" and call[2] is None]
@@ -307,7 +318,9 @@ def test_mcp_call_accepts_an_event_stream_reply(baton, token_file, tmp_path):
 
 
 @pytest.mark.parametrize("setup,check,category", [
-    (lambda b: setattr(b, "board_status", 503), "board", "http_503"),
+    (lambda b: setattr(b, "health_status", 503) or setattr(b, "health_body", b'{"status":"error"}'), "board", "http_503"),
+    (lambda b: setattr(b, "health_body", b'{"status":"error"}'), "board", "health_not_ok"),
+    (lambda b: setattr(b, "health_body", b"not-json"), "board", "invalid_response"),
     (lambda b: setattr(b, "unauth_status", 200), "mcp_unauth", "http_200_expected_401"),
     (lambda b: setattr(b, "unauth_status", 403), "mcp_unauth", "http_403_expected_401"),
     (lambda b: setattr(b, "mcp_status", 502), "mcp_call", "initialize_http_502"),
@@ -324,12 +337,22 @@ def test_each_probe_detects_its_failure(baton, token_file, tmp_path, setup, chec
             probe()
 
 
-def test_a_rejected_token_fails_only_the_authenticated_probe(baton, tmp_path):
+def test_healthz_without_credentials_is_rejected_at_the_edge(baton):
+    conn = http.client.HTTPConnection("127.0.0.1", baton.server.httpd.server_address[1], timeout=5)
+    try:
+        conn.request("GET", "/healthz")
+        assert conn.getresponse().status == 401
+    finally:
+        conn.close()
+
+
+def test_a_rejected_token_fails_only_the_authenticated_probes(baton, tmp_path):
     bad = tmp_path / "bad.token"
     bad.write_text("wrong-token\n")
     probes = real_probes(baton, bad, tmp_path)
-    probes["board"]()
     probes["mcp_unauth"]()
+    with pytest.raises(monitor.ProbeError, match="^http_401$"):
+        probes["board"]()
     with pytest.raises(monitor.ProbeError, match="initialize_http_401"):
         probes["mcp_call"]()
 
@@ -350,7 +373,8 @@ def test_latency_is_measured_and_sent(baton, token_file, tmp_path):
     state = monitor.State(tmp_path / "state.json")
     probes = real_probes(baton, token_file, tmp_path)
     mon = monitor.Monitor(probes, sink, state, host_label="h", failures=1)
-    baton.board_status = 500
+    baton.health_status = 503
+    baton.health_body = b'{"status":"error"}'
     mon.cycle(1000.0)
     alert = sink.of("alert")[0]
     assert alert["check"] == "board"
@@ -556,9 +580,11 @@ def test_end_to_end_run_alerts_recovers_and_never_logs_a_secret(baton, webhook, 
     args = args_for(baton, token_file, tmp_path, "--sink", "webhook", "--webhook-url", webhook.url,
                     "--webhook-token-file", str(webhook_token_file),
                     "--interval", "0.05", "--failures", "3", "--max-cycles", "6", "--port", "0")
-    baton.board_status = 500
+    baton.health_status = 503
+    baton.health_body = b'{"status":"error"}'
     monitor.run(args)
-    baton.board_status = 200
+    baton.health_status = 200
+    baton.health_body = b'{"status":"ok"}'
     args.max_cycles = 2
     monitor.run(args)
     assert [e["status"] for e in webhook.events()] == ["alert", "recovered"]
@@ -868,13 +894,15 @@ def test_run_serves_the_api_for_real_probes_until_stopped(baton, token_file, tmp
         while fetch("/healthz")[0] != 200 and time.time() < deadline:
             time.sleep(0.05)
         assert fetch("/api/v1/alerts") == (200, {"status": "success", "data": {"alerts": []}})
-        baton.board_status = 500
+        baton.health_status = 503
+        baton.health_body = b'{"status":"error"}'
         alerts = []
         while not alerts and time.time() < deadline:
             time.sleep(0.05)
             alerts = fetch("/api/v1/alerts")[1]["data"]["alerts"]
         assert [a["labels"]["alertname"] for a in alerts] == ["BatonBoardDown"]
-        baton.board_status = 200
+        baton.health_status = 200
+        baton.health_body = b'{"status":"ok"}'
         while alerts and time.time() < deadline:
             time.sleep(0.05)
             alerts = fetch("/api/v1/alerts")[1]["data"]["alerts"]
@@ -1389,6 +1417,8 @@ def test_cli_once_with_stdout_sink_exit_codes(baton, token_file, tmp_path):
     ok = run_cli(*base)
     assert ok.returncode == 0 and ok.stdout == ""
     baton.board_status = 500
+    baton.health_status = 503
+    baton.health_body = b'{"status":"error"}'
     bad = run_cli(*base)
     assert bad.returncode == 1
     event = json.loads(bad.stdout)
