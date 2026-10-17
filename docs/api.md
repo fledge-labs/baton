@@ -394,7 +394,7 @@ docker compose exec bridge python -m bridge.a2a_public init-keys
 
 **审计。** 每个任务相关的 A2A 调用都在 `baton.x_audit` 追加一行，`agent`、`actor_account`、`actor_kind` 是 bearer token 对应的真实调用者：`a2a.message_sent`（`outcome`: `task_created`、`comment_appended`、`replayed`；`input_sha256` 是正文哈希，不存正文）、`a2a.task_streamed`、`a2a.task_read`、`a2a.task_canceled`、`a2a.refused`（无工作对象或无权取消；无工作对象的没有 task_id）。元数据只含方法名、结果、`a2a_version`、`a2a_state` 和请求 id（`X-Request-ID` 为 UUID 时）。对调用者不可见的任务不留下审计行（不泄漏存在性）。这些行在 `list_audit` 里与其他任务事件一起可读。
 
-**部署路由。** agentgateway 的 `baton-space` 路由增加精确路径 `/a2a/rpc` 与 `/a2a/agents`（client 角色，与 `/v1/space/` 相同的 ACL），新增 `baton-a2a-public` 路由承接两个公开文档（apiKey `optional`，无授权规则）；公开路由排在路由表最前，使 `/.well-known/agent-card.json` 解析到 Baton 自己的卡片（已用 agentgateway v1.6.0 实测，测试固定了这个顺序）；`/a2a/rpc` 与 `/a2a/agents` 是精确路径。nginx 为两个公开文档单独设置 location：保留 `nosniff`（TLS 版也保留 HSTS），不再附加服务级的 `Cache-Control: no-store`，使 bridge 给出的缓存头生效；SSE 沿用已有的 `proxy_buffering off` 与 370 秒读超时。
+**部署路由。** agentgateway 的 `baton-space` 路由增加精确路径 `/a2a/rpc` 与 `/a2a/agents`（client 角色，与 `/v1/space/` 相同的 ACL），新增 `baton-a2a-public` 路由承接两个公开文档（apiKey `optional`，无授权规则）；`/a2a/rpc` 与 `/a2a/agents` 是精确路径匹配。nginx 为两个公开文档单独设置 location：保留 `nosniff`（TLS 版也保留 HSTS），不再附加服务级的 `Cache-Control: no-store`，使 bridge 给出的缓存头生效；SSE 沿用已有的 `proxy_buffering off` 与 370 秒读超时。
 
 ## MCP 兼容与发现
 

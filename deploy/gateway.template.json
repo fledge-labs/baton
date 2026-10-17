@@ -87,6 +87,38 @@
                   "host": "bridge:9000"
                 }
               ]
+            },
+            {
+              "name": "baton-a2a-public",
+              "matches": [
+                {
+                  "path": {
+                    "exact": "/.well-known/agent-card.json"
+                  }
+                },
+                {
+                  "path": {
+                    "exact": "/.well-known/jwks.json"
+                  }
+                }
+              ],
+              "policies": {
+                "apiKey": {
+                  "keys": [],
+                  "mode": "optional",
+                  "location": {
+                    "header": {
+                      "name": "authorization",
+                      "prefix": "Bearer "
+                    }
+                  }
+                }
+              },
+              "backends": [
+                {
+                  "host": "bridge:9000"
+                }
+              ]
             }
           ]
         }

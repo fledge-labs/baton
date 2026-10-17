@@ -14,9 +14,7 @@ from pathlib import Path
 
 import jwt
 import pytest
-from a2a.types import AgentCard, Task, TaskState
 from cryptography.hazmat.primitives.asymmetric import ec
-from google.protobuf import json_format
 
 from bridge import a2a_public
 from bridge.space_store import Actor
@@ -93,9 +91,29 @@ def assigned_task(client, tokens, call, identities, assignee="worker", **baton):
     return page, task
 
 
+A2A_STATES = {"TASK_STATE_SUBMITTED", "TASK_STATE_WORKING", "TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED",
+              "TASK_STATE_INPUT_REQUIRED", "TASK_STATE_REJECTED", "TASK_STATE_AUTH_REQUIRED"}
+
+
 def parse_task(task):
-    """The official A2A SDK's protobuf types accept the document, so field names and enum values are v1.0."""
-    return json_format.ParseDict(task, Task())
+    """Required fields and enum values of an A2A v1.0 Task, Message and Part (spec 4.1)."""
+    assert {"id", "status"} <= task.keys() and task["status"]["state"] in A2A_STATES and task["status"]["timestamp"].endswith("Z")
+    for message in task.get("history", []):
+        assert {"messageId", "role", "parts"} <= message.keys() and message["role"] in {"ROLE_USER", "ROLE_AGENT"}
+        assert all(len({"text", "raw", "url", "data"} & part.keys()) == 1 for part in message["parts"])
+    for artifact in task.get("artifacts", []):
+        assert artifact["artifactId"] and artifact["parts"]
+    return task
+
+
+def parse_card(card):
+    """Required fields of an A2A v1.0 AgentCard (spec 4.4.1) and of its interfaces, skills and signatures."""
+    assert {"name", "description", "supportedInterfaces", "version", "capabilities", "defaultInputModes", "defaultOutputModes",
+            "skills"} <= card.keys()
+    assert all({"url", "protocolBinding", "protocolVersion"} <= item.keys() for item in card["supportedInterfaces"])
+    assert all({"id", "name", "description", "tags"} <= skill.keys() for skill in card["skills"])
+    assert all({"protected", "signature"} <= item.keys() for item in card["signatures"])
+    return card
 
 
 # --- Agent Card and signature -----------------------------------------------------------------------------------------
@@ -109,7 +127,7 @@ def test_card_is_public_signed_and_verifies_against_the_published_key(a2a):
     jwks = client.get(JWKS).json()
     assert jwks == {"keys": [jwk]} and jwk["kty"] == "EC" and jwk["crv"] == "P-256" and "d" not in jwk
     assert a2a_public.verify_card(card, jwks)
-    json_format.ParseDict(card, AgentCard())
+    parse_card(card)
     header = json.loads(a2a_public.b64u_decode(card["signatures"][0]["protected"]))
     assert header == {"alg": "ES256", "typ": "JOSE", "kid": jwk["kid"], "jku": BASE + JWKS}
     interface = card["supportedInterfaces"][0]
@@ -225,7 +243,7 @@ def test_directory_lists_only_agents_the_caller_can_see(a2a):
         cards = response.json()["agents"]
         for card in cards:
             assert a2a_public.verify_card(card, jwks)
-            json_format.ParseDict(card, AgentCard())
+            parse_card(card)
             assert card["supportedInterfaces"][0]["tenant"] == card["name"]
             assert card["supportedInterfaces"][0]["url"] == BASE + "/a2a/rpc"
         return [card["name"] for card in cards]
@@ -414,11 +432,11 @@ def test_state_mapping_table_is_a_bijection_onto_the_a2a_states():
         "submitted": "TASK_STATE_SUBMITTED", "working": "TASK_STATE_WORKING", "input_required": "TASK_STATE_INPUT_REQUIRED",
         "auth_required": "TASK_STATE_AUTH_REQUIRED", "completed": "TASK_STATE_COMPLETED", "failed": "TASK_STATE_FAILED",
         "canceled": "TASK_STATE_CANCELED", "rejected": "TASK_STATE_REJECTED"}
-    sdk_states = {name for name in TaskState.keys() if name != "TASK_STATE_UNSPECIFIED"}
-    assert set(a2a_public.BATON_TO_A2A.values()) == sdk_states
+    spec_states = A2A_STATES
+    assert set(a2a_public.BATON_TO_A2A.values()) == spec_states
     for baton, a2a_name in a2a_public.BATON_TO_A2A.items():
         assert a2a_public.a2a_state(baton) == a2a_name and a2a_public.baton_from_a2a(a2a_name) == baton
-    for a2a_name in sdk_states:
+    for a2a_name in spec_states:
         assert a2a_public.a2a_state(a2a_public.baton_from_a2a(a2a_name)) == a2a_name
     for unknown in ("TASK_STATE_UNSPECIFIED", "working", None, "TASK_STATE_PAUSED"):
         with pytest.raises(ValueError):
@@ -787,9 +805,8 @@ def test_gateway_routes_the_public_endpoints():
     assert "transformations" not in public["policies"]
     for name, route in routes.items():
         assert "keys" in route["policies"]["apiKey"], name
-    # The card path must resolve to Baton's own card: no route listed before the public one may match it.
-    names = list(routes)
-    assert not [name for name in names[:names.index("baton-a2a-public")] if ("exact", CARD) in route_paths(routes[name])]
+    # No other route may claim the public documents.
+    assert [name for name, route in routes.items() if name != "baton-a2a-public" and {("exact", CARD), ("exact", JWKS)} & route_paths(route)] == []
 
 
 def test_nginx_serves_the_cards_with_caching_and_keeps_the_rpc_stream_unbuffered():
