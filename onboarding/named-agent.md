@@ -23,6 +23,21 @@ adapters/launch_mcp.sh beigua "$HOME/.config/baton/beigua.token" \
 
 `--allow-tools` 接受逗号分隔的已知 Baton 工具名称，区分大小写，可去除名称两端空格；它**替换**默认白名单，重复名称合并，空名称、未知名称和通配符会报错。也可把该参数直接传给 `adapters/mcp_stdio.py`。发起人或审阅人使用下文的建页、分享、派单扩展、审阅和审计工具时，也应在自己的适配器中显式加入相应名称，例如 `create_space,create_page,share,gate,x_audit`；白名单不会扩大服务端权限。
 
+**角色预设。** 不想逐个列名称时，`--allow-tools` 也接受下列预设，可与工具名混用（如 `@assignee,x_audit`），展开后合并去重：
+
+| 预设 | 展开为 |
+| --- | --- |
+| `@reader` | `get_task`、`list_tasks`、`fetch_inbox`、`wait_inbox`、`list_comments`、`get_page`、`list_pages`、`list_audit`、`ready` |
+| `@assignee` | `@reader` + `claim`、`renew`、`comment`、`submit_result`、`mark_blocked`、`handoff` |
+| `@reviewer` | `@reader` + `comment`、`gate` |
+| `@owner` | `@reviewer` + `submit_task`、`create_task_block`、`assign_task`、`plan`、`set_work_face`、`set_priority`、`share`、`create_space`、`create_page`、`delegation_create`、`delegation_revoke`、`delegation_list` |
+
+```sh
+adapters/launch_mcp.sh beigua "$HOME/.config/baton/beigua.token" --allow-tools @assignee
+```
+
+预设只展开为已知工具名；未知预设（如 `@admin`，大小写也要一致）、空名称和通配符都会报错退出。不带 `--allow-tools` 时默认白名单不变，仍是 `submit_task,get_task,list_tasks,fetch_inbox`；显式传参（含预设）**替换**默认。预设只缩小适配器暴露的工具，不扩大权限：`@reviewer` 能调用 `gate`，但能否通过仍取决于根身份或审批人委托；`@owner` 也不会让主体成为 Space 的 owner。
+
 远端发现结果中的未允许工具不会暴露给客户端，直接猜测名称调用也在本地拒绝。每次发现响应有过滤项时写一条汇总审计（仅记录数量），每次拒绝调用写一条审计，不记录工具原名或参数正文。设置 `BATON_AUDIT_FILE` 或 `--audit-file` 时审计追加到权限为 0600 的文件；未设置或文件写入失败时，审计写到 stderr，不占用 MCP 的 stdout。成功调用回执仍只在配置审计文件时记录。
 
 ## 发起人派单
@@ -42,6 +57,8 @@ adapters/launch_mcp.sh beigua "$HOME/.config/baton/beigua.token" \
 3. 在自己的 CLI 权限边界内执行。需要更多时间时调用 `renew(task_id, epoch, operation_id, lease_seconds)`；过期或 fence 失效后停止提交旧结果，不能绕过检查。
 4. 调用 `submit_result(task_id, epoch, result, evidence, operation_id)`。结果以实际持有人署名写入同一任务线程，任务进入 `awaiting_gate`。也可用 `comment(page_id, thread_id=task_id, body, operation_id)`补充说明。
 5. 发起人或配置的 reviewer 检查结果后调用 `gate(task_id, expected_epoch=result_epoch, decision="pass", evidence, operation_id)`，此后才成为 `done`，兼容视图为 `completed`。Space owner（根）可直接批准；其他配置的 reviewer 还必须持有覆盖该任务的审批人委托（`delegation_required`），持有人和提交者不能批准自己执行的结果（根可显式带 `self_approval`）。
+
+   审阅人收到的 `task.awaiting_gate` 通知（`wait_inbox`）已带 `result_epoch` 与 `result_author`，直接作为 `expected_epoch` 即可，不必先 `get_task`。审阅人发现小问题时可用 `decision="edit"` 带修改批准：同时传 `edited_result`（替换后的完整结果，须与原结果不同）和可选 `reason`；这算一次 pass，任务的 `result` 变成修改后的文本，原文保留在 gate 记录里，审计多一条 `gate.result_overridden`（只含两份结果的哈希、审批人和理由）。`gate` 的返回值带 `gate` 对象，其 `authority` 写明审批人如何取得权限：`root`、`root (self-approval)` 或 `delegated by <授权人> via <委托 id>`。
 
 每个有副作用的新动作使用一个稳定 UUID `operation_id`；网络重试复用它，不重新生成。MCP `submit_task` 兼容工具根据 principal 与业务键生成操作 ID；直接调用 HTTP 时需显式提供。
 

@@ -80,16 +80,16 @@ openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/
 | `renew` | `renew` | `--task`、`--epoch`、`--lease` |
 | `comment` | `comment` | `--page`、`--thread`、`--body` 或 `--body-file` |
 | `result` | `submit_result` | `--task`、`--epoch`，`--result` 或 `--result-file` |
-| `gate` | `gate` | `--task`、`--epoch`、`--decision pass\|fail` |
+| `gate` | `gate` | `--task`、`--epoch`（省略时取任务当前的 `result_epoch`）、`--decision pass\|fail\|edit`、`--edited-result` 或 `--edited-result-file`（仅 `edit`）、`--reason`、`--self-approval` |
 | `block` | `mark_blocked` | `--task`、`--reason scope_conflict\|lease_held\|dependency_blocked\|waiting_input\|other`，可选 `--note` 或 `--note-file` |
 | `audit` | `list_audit` | `--task` 或 `--space`、`--limit` |
 | `call` | 任意操作 | `call <operation> --json '<参数对象>'`，或 `--json-file` |
 | `watch` | 循环 `wait_inbox` | `--agent`、`--state`、`--timeout`、`--limit`、`--summary/--no-summary`、`--exec`、`--exec-timeout` |
 
 - 写操作（`submit`、`claim`、`renew`、`comment`、`result`、`gate`、`block`）自动生成 UUIDv4 `operation_id`，也可用 `--operation-id` 指定。读操作不发送 `operation_id`。`call` 不替你生成：写操作需要在 `--json` 里放 `operation_id`，或用 `--operation-id`。
-- `--prompt-file`、`--body-file`、`--result-file`、`--json-file` 传 `-` 表示读取 stdin。`--epoch` 在 `gate` 中对应 API 的 `expected_epoch`，即被审阅结果所属的 epoch。
+- `--prompt-file`、`--body-file`、`--result-file`、`--json-file` 传 `-` 表示读取 stdin。`--epoch` 在 `gate` 中对应 API 的 `expected_epoch`，即被审阅结果所属的 epoch；省略时见下文“审阅人流程”。`--edited-result-file` 同样可传 `-` 读取 stdin。
 - stdout 始终是纯 JSON，并以 UTF-8 输出原文（`ensure_ascii=False`），中文不会被转义成 `\uXXXX`。
-- `claim`、`renew`、`result`、`gate`、`block` 默认再向 stderr 打印一行摘要，如 `task <id> state=claimed epoch=3`；用 `--no-summary` 关闭，`submit`、`task`、`comment`、`call` 可用 `--summary` 打开。stdout 不受影响。`watch` 的 `--summary` 含义不同，见下文。
+- `claim`、`renew`、`result`、`gate`、`block` 默认再向 stderr 打印一行摘要，如 `task <id> state=claimed epoch=3`；用 `--no-summary` 关闭，`submit`、`task`、`comment`、`call` 可用 `--summary` 打开。stdout 不受影响。`gate` 的摘要行还带审批人与权限来源，见下文。`watch` 的 `--summary` 含义不同，见下文。
 - 省略 scope 时，带 `--assignee` 的手工任务默认声明 `none`（不占用任何 scope，多个无文件足迹的审阅、文档任务可同时领取）；不带 `--assignee` 的自动任务仍使用保守的仓库根占位范围。
 - 写操作失败后，stderr 会多打一行 `operation_id=...`。网络中断后不知道操作是否生效时，用同一个 `--operation-id` 重试，服务端保证只产生一次效果；不要重新生成。
 
@@ -178,11 +178,32 @@ RESULT_EPOCH=$(baton task "$TASK" | field result_epoch)
 baton gate --task "$TASK" --epoch "$RESULT_EPOCH" --decision pass
 # 不通过时：baton gate --task "$TASK" --epoch "$RESULT_EPOCH" --decision fail
 
+# 省略 --epoch：自动取任务当前的 result_epoch（一次 get_task），并在 stderr 说明用了哪个 epoch
+baton gate --task "$TASK" --decision pass
+# baton_cli: gate: --epoch not given; using result_epoch=1 from get_task
+
+# 带修改批准：用 --edited-result（或 --edited-result-file）给出替换后的完整结果，--reason 说明原因
+baton gate --task "$TASK" --decision edit --edited-result "修订后的完整结果" --reason "补上了遗漏的数字"
+
 # 核对全程审计：task.assigned → task.claimed → task.result_submitted → gate.reviewed
 baton audit --task "$TASK"
 ```
 
-只有 `pass` 之后任务才变成 `done`，接收人通过 `wait` 收到 `gate.decided`。`--epoch` 与当前候选不一致时返回 `stale_claim`，需要先重新读取任务。
+只有 `pass`（或 `edit`）之后任务才变成 `done`（需要双人确认时要两位审批人都通过），接收人通过 `wait` 收到 `gate.decided`。`--epoch` 与当前候选不一致时返回 `stale_claim`，需要先重新读取任务。
+
+**省略 `--epoch`。** `task.awaiting_gate` 通知本身已带 `result_epoch` 和 `result_author`（`baton watch --summary` 的通知行会显示），审批人可以直接使用。`gate --task <id>` 省略 `--epoch` 时，CLI 先调用一次 `get_task`，取任务当前的 `result_epoch` 作为 `expected_epoch`，并向 stderr 打印 `baton_cli: gate: --epoch not given; using result_epoch=<n> from get_task`。任务没有可审的结果（不在 `awaiting_gate`）时退出 2，不会发出 gate 请求。需要钉住某一代结果时仍应显式传 `--epoch`：任务在你读取之后又被退回重做，省略 `--epoch` 会审到新的结果，显式 epoch 则返回 `stale_claim`。
+
+**带修改批准（`--decision edit`）。** 必须带 `--edited-result` 或 `--edited-result-file`（`-` 读 stdin），其他决定不能带；两者缺一或多余时退出 2，不发请求。替换文本须与当前结果不同，否则返回 `invalid (HTTP 422)`。只有能 `pass` 的人（根或持有委托的 reviewer）能 `edit`，它计为一次 pass；任务 `result` 变成修改后的文本，原文保存在 gate 记录里并出现在任务视图的 `original_result`，审计多一条 `gate.result_overridden`。
+
+**审批人与权限来源。** `gate` 的 JSON 输出带 `gate` 对象，`--summary` 行（stderr）在 `task <id> state=<state> epoch=<n>` 之后追加决定、审批人和权限来源，例如：
+
+```text
+task 7d1c… state=done epoch=1 gate=pass approver=nangua authority=root
+task 7d1c… state=done epoch=1 gate=pass approver=nangua authority=root (self-approval)
+task 7d1c… state=done epoch=1 gate=edit approver=sunflower authority=delegated by nangua via 5b0e…
+```
+
+`authority` 只有这三种写法；只回显格式合法的字段。
 
 ## 常驻监听：watch
 
