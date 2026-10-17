@@ -491,6 +491,39 @@ def test_lease_is_renewed_while_the_command_runs(lab, bridge, space):
     assert audit_events(space, task_id).count("claim.renewed") >= 2
 
 
+def test_a_disabled_worker_is_never_polled_and_its_token_is_never_used(lab, bridge, space, capsys):
+    other = assign(space, bridge, "worker2")
+    mine = assign(space, bridge, "worker")
+    disabled_token = bridge.tokens["worker2"].read_text().strip()
+    runner = lab.start([lab.worker(), lab.worker("worker2", enabled=False)])
+    assert [w.principal for w in runner.workers] == [bridge.identities["worker"]["agent"]]
+    wait_state(space, mine, "awaiting_gate")
+    time.sleep(2.5)
+    assert task_view(space, other)["state"] == "queued"
+    used = {r["headers"].get("authorization") for r in bridge.requests}
+    assert "Bearer " + disabled_token not in used
+    assert not any(r["path"].endswith("/wait_inbox") and r["headers"].get("authorization") == "Bearer " + disabled_token
+                   for r in bridge.requests)
+    assert not (lab.tmp / "state" / (bridge.identities["worker2"]["agent"] + ".seq")).exists()
+    assert "disabled" in capsys.readouterr().err
+
+
+def test_enabled_defaults_to_true_must_be_boolean_and_all_disabled_workers_means_nothing_starts(tmp_path, capsys):
+    assert lr.parse_config(base_config(tmp_path)).workers[0].enabled is True
+    assert lr.parse_config(base_config(tmp_path, enabled=False)).workers[0].enabled is False
+    for bad in ("false", 0, None):
+        with pytest.raises(lr.ConfigError):
+            lr.parse_config(base_config(tmp_path, enabled=bad))
+    (tmp_path / "t1").write_text("synthetic-token\n")
+    (tmp_path / "t1").chmod(0o600)
+    subprocess.run(["git", "init", "-q", str(tmp_path / "repo")], check=True)
+    path = tmp_path / "runner.json"
+    path.write_text(json.dumps(base_config(tmp_path, enabled=False)))
+    path.chmod(0o600)
+    assert lr.main(["--config", str(path)]) == 2
+    assert "no worker could start" in capsys.readouterr().err
+
+
 def test_runner_never_claims_a_task_assigned_to_another_principal(lab, bridge, space):
     other = assign(space, bridge, "worker2")
     mine = assign(space, bridge, "worker")

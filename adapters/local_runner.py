@@ -76,7 +76,7 @@ CONFIG_KEYS = frozenset({
 })
 WORKER_KEYS = frozenset({
     "principal", "token_file", "command", "prompt_via", "workdir_root", "concurrency", "task_timeout_seconds",
-    "sandbox", "env_passthrough", "home",
+    "sandbox", "env_passthrough", "home", "enabled",
 })
 SANDBOX_KEYS = frozenset({"backend", "allow_network", "extra_write_paths"})
 
@@ -131,6 +131,7 @@ class WorkerConfig:
     concurrency: int = 1
     env_passthrough: list = field(default_factory=list)
     home: str = "task"
+    enabled: bool = True
 
 
 @dataclass
@@ -234,11 +235,15 @@ def parse_worker(raw, index):
     home = raw.get("home", "task")
     if home not in ("task", "real"):
         raise ConfigError(what + '.home must be "task" or "real"')
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ConfigError(what + ".enabled must be true or false")
     return WorkerConfig(
         principal=principal, token_file=_path(raw, "token_file", what), command=list(command), prompt_via=prompt_via,
         workdir_root=_path(raw, "workdir_root", what), concurrency=_int(raw, "concurrency", what, 1, 1, 16),
         task_timeout_seconds=_int(raw, "task_timeout_seconds", what, None, 1, MAX_LEASE_SECONDS - 1),
-        sandbox=SandboxConfig(backend, allow_network, extra_paths), env_passthrough=list(passthrough), home=home)
+        sandbox=SandboxConfig(backend, allow_network, extra_paths), env_passthrough=list(passthrough), home=home,
+        enabled=enabled)
 
 
 def parse_config(data, path=None):
@@ -1242,13 +1247,16 @@ class Runner:
         pin = cli.parse_pin(config.pin_sha256) if config.pin_sha256 else None
         tokens = {}
         for worker in config.workers:
+            if not worker.enabled:
+                event(worker.principal, None, "disabled")
+                continue
             try:
                 tokens[worker.principal] = cli.read_token(worker.token_file)
             except cli.UsageError:
                 self.refuse(worker, "token file unreadable")
         self.secrets = list(tokens.values())
         for worker in config.workers:
-            if worker.principal not in tokens:
+            if not worker.enabled or worker.principal not in tokens:
                 continue
             flags = refused_flags(worker.command)
             if flags and worker.sandbox.backend == "none":
