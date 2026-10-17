@@ -14,6 +14,8 @@
 
 接收方主机无法安装 MCP SDK（例如只有 Python 3 标准库、没有 venv）时，改用单文件命令行客户端 `adapters/baton_cli.py`，不需要下面的适配器，见 [标准库 CLI](stdlib-cli.md)。
 
+接收方想让本机 agent CLI 无人值守地领取、运行并回报这类任务时，可用本地执行器 `adapters/local_runner.py`，见 [本地执行器](local-runner.md)；它每个 worker 使用自己的令牌，审计里的执行者就是该 worker。
+
 适配器默认仅允许 `submit_task,get_task,list_tasks,fetch_inbox`。下文的领取、续租、评论和提交结果必须显式加入白名单：
 
 ```sh
