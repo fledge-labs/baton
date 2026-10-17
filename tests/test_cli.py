@@ -227,7 +227,7 @@ def plain_token(tmp_path, cli):
 @pytest.fixture
 def bridge(modules, pg_store, make_context, register_identity, pki, tmp_path, cli):
     """The real bridge app, recorded, served over HTTPS (generated CA) and plain loopback HTTP."""
-    _, server, _ = modules
+    _, server = modules
     recorder = Recorder(server.app)
     identities, files = {}, {}
     for label, kind in (("owner", "human"), ("worker", "agent"), ("reviewer", "human")):

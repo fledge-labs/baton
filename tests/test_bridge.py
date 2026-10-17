@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Public HTTP/MCP boundaries and dispatch fencing on actual PostgreSQL."""
+"""Public HTTP/MCP boundaries on actual PostgreSQL."""
 
-import asyncio
 import hashlib
 import json
 import uuid
@@ -17,7 +16,7 @@ def op():
 
 @pytest.fixture
 def api(modules, pg_store, make_context):
-    common, server, _ = modules
+    common, server = modules
     identities = {}
     tokens = {}
     records = {}
@@ -57,7 +56,7 @@ def shared_page(call, identities):
 
 def test_schema_mcp_parameters_and_actor_injection_are_safe(api, modules, capsys):
     client, call, _, tokens, _, _ = api
-    common, _, _ = modules
+    common, _ = modules
     private = "synthetic-private-body-marker"
     assert client.get("/v1/space/schema").status_code == 401
     schema = client.get("/v1/space/schema", headers={"Authorization": "Bearer " + tokens["owner"]}).json()
@@ -105,7 +104,6 @@ def test_assigned_task_only_recipient_can_claim_and_review_is_independent(api, m
                 assignee_principal=identities["worker"]["agent"])
     assert task["execution_mode"] == "manual" and task["assignee"] == identities["worker"]["agent"]
     assert task["thread_id"] == task["task_id"]
-    assert pg_store.claim_next(modules[1].SERVICE, op()) is None
     assert call("reviewer", "claim", 403, operation_id=op(), task_id=task["task_id"])["code"] == "forbidden"
     inbox = call("worker", "fetch_inbox")
     assert any(message["thread_id"] == task["task_id"] for message in inbox["messages"])
@@ -198,64 +196,6 @@ def test_storage_failure_is_metadata_only(api, modules, pg_store, monkeypatch, c
     assert private not in capsys.readouterr().out
 
 
-@pytest.mark.asyncio
-async def test_unknown_dispatch_is_durable_and_not_automatically_retried(modules, pg_store, make_context, register_identity, monkeypatch):
-    common, server, _ = modules
-    context = make_context()
-    register_identity(context.request_context.request.state.identity)
-    task = await server.submit_task("ambiguous", "Synthetic dispatch", context)
-    calls = []
-    class FailedHttp:
-        def __init__(self, **kwargs):
-            pass
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *args):
-            pass
-        async def post(self, *args, **kwargs):
-            calls.append(1)
-            raise RuntimeError("synthetic-private-upstream-error")
-    monkeypatch.setattr(server.httpx, "AsyncClient", FailedHttp)
-    assert await server.process_next()
-    view = await server.get_task(task["task_id"], make_context())
-    assert view["status"] == "interrupted"
-    assert not await server.process_next() and len(calls) == 1
-    assert "synthetic-private-upstream-error" not in (common.STATE / "audit.jsonl").read_text()
-
-
-@pytest.mark.asyncio
-async def test_expired_dispatch_cannot_commit_success_or_thread_report(modules, pg_store, make_context, register_identity, monkeypatch):
-    _, server, _ = modules
-    context = make_context()
-    register_identity(context.request_context.request.state.identity)
-    task = await server.submit_task("late-result", "Synthetic dispatch", context)
-    claim = pg_store.claim_next(server.SERVICE, op(), lease_seconds=1)
-    class Response:
-        def raise_for_status(self):
-            pass
-        def json(self):
-            return {"result": {"id": op(), "status": {"state": "completed"}, "artifacts": [{
-                "metadata": {"backend": "demo"}, "parts": [{"kind": "text", "text": "LATE_RESULT"}]}]}}
-    class SlowHttp:
-        def __init__(self, **kwargs):
-            pass
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *args):
-            pass
-        async def post(self, *args, **kwargs):
-            await asyncio.sleep(1.1)
-            return Response()
-    monkeypatch.setattr(server.httpx, "AsyncClient", SlowHttp)
-    with pytest.raises(server.DispatchUncertain):
-        await server.dispatch(claim)
-    await server.recover_auto()
-    view = await server.get_task(task["task_id"], make_context())
-    assert view["status"] == "interrupted" and view["result"] is None
-    inbox = await server.fetch_inbox(make_context())
-    assert not any(message.get("subject", "").startswith("[completed]") for message in inbox["messages"])
-
-
 def test_gateway_routes_http_api_through_client_acl():
     root = Path(__file__).parents[1]
     template = json.loads((root / "deploy/gateway.template.json").read_text())
@@ -330,149 +270,65 @@ def test_person_mentions_use_active_human_principal_not_connected_account(api):
                 target_type="person", target_id=identities["reviewer"]["agent"])["code"] == "invalid"
 
 
-def test_atomic_dependencies_block_auto_dispatch_until_current_gate_passes(api, modules, pg_store):
+def test_atomic_dependencies_keep_an_unassigned_task_unclaimable_until_the_current_gate_passes(api):
     client, call, identities, tokens, _, _ = api
     _, page = shared_page(call, identities)
     parent = call("owner", "create_task_block", operation_id=op(), page_id=page["id"], prompt="Prerequisite",
                   scopes=[{"kind": "path", "value": "src/parent"}], reviewers=[identities["owner"]["agent"]],
                   assignee_principal=identities["worker"]["agent"])
-    arguments = {"idempotency_key": "atomic-auto-dependent", "prompt": "Automatic dependent", "page_id": page["id"],
-                 "scopes": [{"kind": "path", "value": "src/automatic"}], "depends_on": [parent["task_id"]]}
+    arguments = {"idempotency_key": "atomic-open-dependent", "prompt": "Unassigned dependent", "page_id": page["id"],
+                 "scopes": [{"kind": "path", "value": "src/open"}], "depends_on": [parent["task_id"]]}
     headers = {"Authorization": "Bearer " + tokens["owner"], "Host": "bridge", "Accept": "application/json, text/event-stream"}
     response = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 30, "method": "tools/call", "params": {
         "name": "submit_task", "arguments": arguments}})
     result = response.json()["result"]
     assert not result.get("isError", False)
     child = result.get("structuredContent") or json.loads(result["content"][0]["text"])
-    assert pg_store.claim_next(modules[1].SERVICE, op()) is None
+    assert child["execution_mode"] == "manual" and child["assignee"] is None and child["depends_on"] == [parent["task_id"]]
+    assert call("replacement", "claim", 409, operation_id=op(), task_id=child["task_id"])["code"] == "dependency_blocked"
     claim = call("worker", "claim", operation_id=op(), task_id=parent["task_id"])
     candidate = call("worker", "submit_result", operation_id=op(), task_id=parent["task_id"], epoch=claim["epoch"], result="Candidate")
     assert candidate["state"] == "awaiting_gate"
-    assert pg_store.claim_next(modules[1].SERVICE, op()) is None
+    assert call("replacement", "claim", 409, operation_id=op(), task_id=child["task_id"])["code"] == "dependency_blocked"
     call("owner", "gate", operation_id=op(), task_id=parent["task_id"], expected_epoch=claim["epoch"], decision="pass")
-    dispatchable = pg_store.claim_next(modules[1].SERVICE, op())
-    assert dispatchable["task_id"] == child["task_id"]
+    assert {task["task_id"] for task in call("replacement", "ready", page_id=page["id"])} == {child["task_id"]}
+    assert call("replacement", "claim", operation_id=op(), task_id=child["task_id"])["state"] == "claimed"
     assert call("owner", "submit_task", 409, operation_id=op(), **{**arguments, "depends_on": []})["code"] == "operation_conflict"
 
 
-@pytest.fixture
-def no_a2a(modules, monkeypatch):
-    calls = []
-    class ForbiddenHttp:
-        def __init__(self, **kwargs):
-            calls.append("client_created")
-            raise AssertionError("A2A must not be reached after identity revocation")
-    monkeypatch.setattr(modules[1].httpx, "AsyncClient", ForbiddenHttp)
-    return calls
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["revoked", "account", "kind", "role", "removed"])
-async def test_queued_auto_task_rechecks_registered_owner_before_dispatch(
-        modules, pg_store, make_context, register_identity, no_a2a, change):
-    common, server, _ = modules
-    context = make_context()
-    who = context.request_context.request.state.identity
-    token = register_identity(who)
-    private = "synthetic-private-queued-instructions"
-    task = await server.submit_task("revocation-" + change, private, context)
-    registry = common.CONFIG / "identities.json"
-    records = json.loads(registry.read_text())
-    if change == "revoked":
-        records[who["agent"]]["active"] = False
-    elif change == "account":
-        records[who["agent"]]["account"] = who["account"] + "-remapped"
-    elif change == "kind":
-        records[who["agent"]]["kind"] = "human"
-    elif change == "role":
-        records[who["agent"]].update(role="dispatcher", kind="service")
-    else:
-        del records[who["agent"]]
-    registry.write_text(json.dumps(records))
-    assert await server.process_next()
-    # Inspect synthetic storage using the original saved owner, independent of
-    # the now-revoked public token. This is not a public authentication bypass.
-    actor = server.Actor(who["agent"], who["account"], who["kind"])
-    view = pg_store.get_task(actor, task["task_id"])
-    assert view["status"] in {"failed", "interrupted"} and view["error"] == "cancelled"
-    assert view["dispatch_started_at"] is None and no_a2a == []
-    assert not await server.process_next()
-    events = pg_store.list_audit(actor, task_id=task["task_id"])
-    assert any(row["metadata"].get("error_code") == "cancelled" for row in events)
-    log = (common.STATE / "audit.jsonl").read_text()
-    assert token not in log and private not in log
-    assert not any(json.loads(line)["event"] == "task.dispatched" for line in log.splitlines())
-
-
-@pytest.mark.asyncio
-async def test_dispatch_direct_entry_rechecks_identity_changed_after_claim(
-        modules, pg_store, make_context, register_identity, no_a2a):
-    common, server, _ = modules
-    context = make_context()
-    who = context.request_context.request.state.identity
-    register_identity(who)
-    task = await server.submit_task("revoked-after-claim", "Synthetic task", context)
-    claim = await server.claim_next()
-    assert claim["task_id"] == task["task_id"] and server.dispatch_owner_current(claim)
-    registry = common.CONFIG / "identities.json"
-    records = json.loads(registry.read_text())
-    records[who["agent"]]["active"] = False
-    registry.write_text(json.dumps(records))
-    assert not server.dispatch_owner_current(claim)
-    stopped = await server.dispatch(claim)
-    assert stopped["error"] == "cancelled" and stopped["dispatch_started_at"] is None
-    assert no_a2a == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("identity_change", ["revoked", "account", "kind", "role"])
-async def test_dispatch_rechecks_revocation_while_mark_dispatched_waits(
-        modules, pg_store, make_context, register_identity, no_a2a, monkeypatch, identity_change):
-    common, server, _ = modules
-    context = make_context()
-    who = context.request_context.request.state.identity
-    register_identity(who)
-    task = await server.submit_task("revoked-during-mark", "Synthetic task", context)
-    claim = await server.claim_next()
-    assert claim["task_id"] == task["task_id"] and server.dispatch_owner_current(claim)
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    original_store_call = server.store_call
-
-    async def held_store_call(method, *args, **kwargs):
-        if method == "mark_dispatched":
-            entered.set()
-            await release.wait()
-        return await original_store_call(method, *args, **kwargs)
-
-    monkeypatch.setattr(server, "store_call", held_store_call)
-    pending = asyncio.create_task(server.dispatch(claim))
-    try:
-        await asyncio.wait_for(entered.wait(), timeout=5)
-        registry = common.CONFIG / "identities.json"
-        records = json.loads(registry.read_text())
-        record = records[who["agent"]]
-        if identity_change == "revoked":
-            record["active"] = False
-        elif identity_change == "account":
-            record["account"] = "synthetic-remapped-account"
-        elif identity_change == "kind":
-            record["kind"] = "human"
-        else:
-            record["role"] = "dispatcher"
-        registry.write_text(json.dumps(records))
-        release.set()
-        stopped = await asyncio.wait_for(pending, timeout=5)
-    finally:
-        release.set()
-        if not pending.done():
-            pending.cancel()
-            await asyncio.gather(pending, return_exceptions=True)
-    assert stopped["status"] == "interrupted" and stopped["error"] == "cancelled"
-    assert stopped["dispatch_started_at"] is not None  # The real PG mark committed.
-    assert no_a2a == []
-    log = (common.STATE / "audit.jsonl").read_text()
-    assert not any(json.loads(line)["event"] == "task.dispatched" for line in log.splitlines())
+def test_unassigned_submit_task_is_a_manual_task_any_page_editor_can_claim(api, modules):
+    client, call, identities, tokens, _, _ = api
+    _, page = shared_page(call, identities)
+    owner = identities["owner"]["agent"]
+    task = call("owner", "submit_task", operation_id=op(), idempotency_key="open-journey", prompt="Synthetic open task",
+                page_id=page["id"])
+    assert task["execution_mode"] == "manual" and task["gate_mode"] == "reviewer" and task["state"] == "queued"
+    assert task["assignee"] is None and task["reviewers"] == [owner] and task["scopes"] == [{"kind": "none"}]
+    assert task["prompt"] == "Synthetic open task" and task["respond_by"] is None
+    for label in ("worker", "replacement", "reviewer"):
+        assert {item["task_id"] for item in call(label, "ready", page_id=page["id"])} == {task["task_id"]}
+    assert call("stranger", "ready") == []
+    assert call("stranger", "ready", 404, page_id=page["id"])["code"] == "not_found"
+    assert call("stranger", "claim", 404, operation_id=op(), task_id=task["task_id"])["code"] == "not_found"
+    claim = call("replacement", "claim", operation_id=op(), task_id=task["task_id"])
+    assert claim["state"] == "claimed" and claim["holder"] == identities["replacement"]["agent"]
+    assert call("worker", "ready", page_id=page["id"]) == []
+    candidate = call("replacement", "submit_result", operation_id=op(), task_id=task["task_id"], epoch=claim["epoch"], result="Open result")
+    assert candidate["state"] == "awaiting_gate"
+    gate = dict(task_id=task["task_id"], expected_epoch=claim["epoch"], decision="pass")
+    assert call("replacement", "gate", 403, operation_id=op(), **gate)["code"] == "forbidden"
+    done = call("owner", "gate", operation_id=op(), **gate)
+    assert done["state"] == "done" and done["result"] == "Open result"
+    events = [row["event"] for row in call("owner", "list_audit", task_id=task["task_id"])]
+    assert "task.claimed" in events and not any(event.startswith("worker.") or event == "task.dispatched" for event in events)
+    headers = {"Authorization": "Bearer " + tokens["owner"], "Host": "bridge", "Accept": "application/json, text/event-stream"}
+    response = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 31, "method": "tools/call", "params": {
+        "name": "submit_task", "arguments": {"idempotency_key": "open-mcp", "prompt": "Open over MCP", "page_id": page["id"]}}})
+    result = response.json()["result"]
+    assert not result.get("isError", False)
+    over_mcp = result.get("structuredContent") or json.loads(result["content"][0]["text"])
+    assert over_mcp["execution_mode"] == "manual" and over_mcp["assignee"] is None and over_mcp["reviewers"] == [owner]
+    assert call("worker", "claim", operation_id=op(), task_id=over_mcp["task_id"])["state"] == "claimed"
 
 
 def work_face(**changes):
@@ -551,7 +407,7 @@ def test_prep_task_gates_construction_over_http(api):
     assert claimed["state"] == "claimed" and claimed["base_commit"] == "prepared-base" and claimed["work_face"] == work_face()
 
 
-def test_set_work_face_is_published_through_schema_and_mcp_with_the_same_dispatcher(api):
+def test_set_work_face_is_published_through_schema_and_mcp(api):
     client, call, identities, tokens, _, _ = api
     schema = client.get("/v1/space/schema", headers={"Authorization": "Bearer " + tokens["owner"]}).json()["operations"]
     request = schema["set_work_face"]["request"]

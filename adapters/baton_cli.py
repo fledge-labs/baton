@@ -393,7 +393,7 @@ def build_parser():
     sub.add_argument("--key", required=True, help="stable idempotency key")
     text_group(sub, "prompt", "prompt", "task instructions")
     sub.add_argument("--page", type=uuid_arg)
-    sub.add_argument("--assignee", help="assignee principal (manual pull task)")
+    sub.add_argument("--assignee", help="assignee principal; omit for an unassigned manual task that any editor of the page can claim")
     sub.add_argument("--scope", action="append", type=scope_arg, metavar="KIND=VALUE",
                      help="declared scope, repeatable; kind is path, module or migration; "
                           "'none' declares no repository footprint and cannot be combined")

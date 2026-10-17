@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Baton's own authenticated Space HTTP/MCP API and fenced worker bridge."""
+"""Baton's own authenticated Space HTTP/MCP API and its notification and escalation loops."""
 
 import asyncio
 import contextlib
@@ -7,9 +7,7 @@ import hashlib
 import inspect
 import json
 import logging
-import os
 import re
-import threading
 import time
 import types
 import typing
@@ -18,7 +16,6 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Any
 
-import httpx
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -29,15 +26,11 @@ from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 
 from bridge import common, webhooks
-from bridge.common import AuthMiddleware, audit, redact, safe_id, transport_origins, uuid_id
-from bridge.failures import failure_from_a2a
-from bridge.space_store import Actor, SpaceStore, StoreError
+from bridge.common import AuthMiddleware, audit, safe_id, transport_origins, uuid_id
+from bridge.space_store import SERVICE_ACTOR, Actor, SpaceStore, StoreError
 
 PROTOCOL = common.SPACE_PROTOCOL
-GATEWAY = os.environ.get("GATEWAY_INTERNAL", "http://gateway:3000").rstrip("/")
-SERVICE = Actor("codex-worker", "baton-service", "agent")
-LEASE_SECONDS = 300
-RENEW_SECONDS = 60
+SERVICE = SERVICE_ACTOR
 _STORE = None
 
 ERRORS = {
@@ -358,7 +351,7 @@ async def store_call(method, *args, **kwargs):
     except Exception:
         # SQL, DSNs and driver diagnostics must never cross an error boundary.
         raise BridgeError("storage_unavailable") from None
-    if PUBLIC_OPERATIONS[method][0] if method in PUBLIC_OPERATIONS else method == "finish_auto":
+    if method in PUBLIC_OPERATIONS and PUBLIC_OPERATIONS[method][0]:
         WAKEUP.notify()
     return result
 
@@ -397,8 +390,8 @@ async def wait_inbox(actor, after_seq, timeout_seconds, limit):
 
 
 def public_task(row):
-    # Manual recipients need the authorized task instructions. The automatic
-    # legacy status view continues to omit prompts and all views omit keys.
+    # Manual tasks show their authorized instructions. Legacy automatic (codex) rows
+    # stay readable but keep omitting prompts, and all views omit keys.
     excluded = {"idem", "idempotency_key", "token", "dispatch_started"}
     if row.get("execution_mode") != "manual":
         excluded.add("prompt")
@@ -479,7 +472,9 @@ async def submit_task(idempotency_key: str, prompt: str, ctx: Context, page_id: 
                       require_work_face: bool = False, task_kind: str = "construction", priority: str = "normal",
                       escalate_to: str | None = None, fallback_assignee: str | None = None,
                       approvals_required: int | None = None) -> dict:
-    """Submit a task; a named assignee uses the manual claim/review path. Reuse keys on retry."""
+    """Create a manual task and return it; Baton never executes it. With assignee_principal only that principal may claim
+    it; without one the task is unassigned and any principal with edit on the page sees it in ready and may claim it.
+    The reviewer is the requester, scopes default to none, and the usual gate applies. Reuse keys on retry."""
     request = ctx.request_context.request
     actor = request_actor(request)
     operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "baton/submit_task/" + actor.principal + "/" + idempotency_key))
@@ -528,161 +523,6 @@ def register_space_tool(name, operation):
 for tool_name in sorted(PUBLIC_OPERATIONS.keys() | ALIASES.keys()):
     if tool_name not in {"submit_task", "get_task", "list_tasks", "fetch_inbox"}:
         register_space_tool(tool_name, tool_name)
-
-
-class DispatchUncertain(RuntimeError):
-    """A request may have executed remotely; an automatic retry is forbidden."""
-
-
-def operation_id(task_id, epoch, phase):
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"baton/dispatch/{task_id}/{epoch}/{phase}"))
-
-
-def dispatch_owner_current(task):
-    """Recheck the saved submitting identity at the external-effect boundary."""
-    who = common.resolve_principal(task.get("owner"))
-    return bool(who and who.get("role") == "client" and who.get("agent") == task.get("owner")
-                and who.get("account") == task.get("owner_account")
-                and who.get("kind") == task.get("owner_kind"))
-
-
-async def cancel_dispatch(task):
-    """Persist cancellation under the current fence without sending to A2A."""
-    try:
-        stopped = await store_call("interrupt_auto", SERVICE,
-                                   operation_id(task["id"], task["epoch"], "cancelled"),
-                                   task["id"], task["epoch"], error_code="cancelled")
-    except BridgeError as exc:
-        audit("task.dispatch_unresolved", task_id=task["id"], agent=task["owner"],
-              epoch=task["epoch"], error_code=exc.code)
-        return None
-    audit("task.cancelled", task_id=task["id"], agent=task["owner"],
-          epoch=task["epoch"], error_code="cancelled")
-    return stopped
-
-
-async def dispatch(task):
-    task_id, epoch = task["id"], task["epoch"]
-    # Registry revocation/account changes must not inherit the service actor's
-    # authority. Page and dependency ACL checks remain solely in the store.
-    if not dispatch_owner_current(task):
-        return await cancel_dispatch(task)
-    # Commit the ambiguity boundary before sending a request to another process.
-    await store_call("mark_dispatched", SERVICE, operation_id(task_id, epoch, "start"), task_id, epoch)
-    # The database await may have waited on a lock while the registry changed.
-    # Recheck before creating the HTTP client; this cannot recall a sent request.
-    if not dispatch_owner_current(task):
-        return await cancel_dispatch(task)
-    audit("task.dispatched", task_id=task_id, agent=task["owner"], epoch=epoch)
-    lease_lost = asyncio.Event()
-
-    async def heartbeat():
-        while True:
-            await asyncio.sleep(RENEW_SECONDS)
-            try:
-                await store_call("renew_auto", SERVICE, str(uuid.uuid4()), task_id, epoch, lease_seconds=LEASE_SECONDS)
-            except Exception:
-                lease_lost.set()
-                return
-
-    renewer = asyncio.create_task(heartbeat())
-    try:
-        token = (common.SECRETS / "bridge" / "dispatcher.token").read_text().strip()
-        payload = {"jsonrpc": "2.0", "id": task_id, "method": "message/send", "params": {
-            "message": {"kind": "message", "role": "user", "messageId": task_id,
-                        "parts": [{"kind": "text", "text": json.dumps({
-                            "task_id": task_id, "owner": task["owner"], "prompt": task["prompt"],
-                        })}]}, "configuration": {"blocking": True}}}
-        async with httpx.AsyncClient(timeout=350) as http:
-            response = await http.post(GATEWAY + "/a2a/codex", json=payload, headers={
-                "Authorization": "Bearer " + token, "X-Request-ID": task_id, "A2A-Version": "0.3",
-            })
-            response.raise_for_status()
-            result = response.json()
-        if lease_lost.is_set() or "error" in result:
-            raise DispatchUncertain("Dispatch requires reconciliation")
-        result = result["result"]
-        a2a_id = uuid_id(result["id"])
-        if result.get("status", {}).get("state") == "failed":
-            # Only the worker's versioned code/stage is accepted; its text is never stored.
-            failure = failure_from_a2a(result["status"])
-            failed = await store_call("fail_auto", SERVICE, operation_id(task_id, epoch, "fail"),
-                                      task_id, epoch, failure.code, a2a_id)
-            audit("task.failed", task_id=task_id, agent=task["owner"], a2a_task_id=a2a_id, epoch=epoch,
-                  error_code=failure.code, stage=failure.stage)
-            audit("thread.failed", task_id=task_id, thread_id=task_id, agent=task["owner"])
-            return failed
-        artifacts = result.get("artifacts", [])
-        output = "\n".join(part.get("text", "") for artifact in artifacts for part in artifact.get("parts", []) if part.get("kind") == "text")
-        backend = next((artifact.get("metadata", {}).get("backend") for artifact in artifacts
-                        if artifact.get("metadata", {}).get("backend") in {"codex", "demo"}), None)
-        if result.get("status", {}).get("state") != "completed" or not output or not backend:
-            raise DispatchUncertain("Dispatch requires reconciliation")
-        output = redact(output)[:32000]
-        completed = await store_call("finish_auto", SERVICE, operation_id(task_id, epoch, "finish"),
-                                     task_id, epoch, output, a2a_id, backend, a2a_state="completed")
-        audit("task.completed", task_id=task_id, agent=task["owner"], a2a_task_id=a2a_id, epoch=epoch,
-              backend=backend, output_sha256=hashlib.sha256(output.encode()).hexdigest())
-        audit("thread.completed", task_id=task_id, thread_id=task_id, agent=task["owner"])
-        return completed
-    except Exception:
-        # Includes fenced-out results. Do not publish output or blindly retry.
-        raise DispatchUncertain("Dispatch outcome requires manual reconciliation") from None
-    finally:
-        renewer.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await renewer
-
-
-SCOPE_WARNING_SECONDS = 300
-_SCOPE_WARNED = {}
-_SCOPE_WARNED_LOCK = threading.Lock()
-
-
-def warn_scope_skip(task_id, blocking_task_id):
-    """Log that a queued automatic task is waiting on a scope held elsewhere, at most once per task per 5 minutes.
-
-    Only the two task ids are written, so a stuck task is visible to the operator without exposing any content.
-    """
-    now = time.monotonic()
-    with _SCOPE_WARNED_LOCK:
-        last = _SCOPE_WARNED.get(task_id)
-        if last is not None and now - last < SCOPE_WARNING_SECONDS:
-            return
-        for key in [key for key, stamp in _SCOPE_WARNED.items() if now - stamp >= SCOPE_WARNING_SECONDS]:
-            del _SCOPE_WARNED[key]
-        _SCOPE_WARNED[task_id] = now
-    audit("dispatch.blocked_by_scope", task_id=task_id, blocked_by=blocking_task_id, agent=SERVICE.principal, level="warning")
-
-
-async def claim_next():
-    return await store_call("claim_next", SERVICE, str(uuid.uuid4()), lease_seconds=LEASE_SECONDS,
-                            on_scope_skip=warn_scope_skip)
-
-
-async def recover_auto():
-    return await store_call("recover_auto", SERVICE, str(uuid.uuid4()))
-
-
-async def process_next():
-    await recover_auto()
-    task = await claim_next()
-    if not task:
-        return False
-    try:
-        await dispatch(task)
-    except Exception:
-        # This CAS can fail if the lease expired or another holder now owns the
-        # task. In that case recovery owns the state, never the old dispatcher.
-        try:
-            await store_call("interrupt_auto", SERVICE, operation_id(task["id"], task["epoch"], "interrupt"),
-                             task["id"], task["epoch"], error_code="dispatch_uncertain")
-        except BridgeError as exc:
-            audit("task.dispatch_unresolved", task_id=task["id"], agent=task["owner"],
-                  epoch=task["epoch"], error_code=exc.code)
-        else:
-            audit("task.interrupted", task_id=task["id"], agent=task["owner"], epoch=task["epoch"], error_code="dispatch_uncertain")
-    return True
 
 
 async def deliver_webhook(item, gate):
@@ -736,21 +576,11 @@ async def escalation_loop():
         await asyncio.sleep(ESCALATION_SECONDS)
 
 
-async def worker_loop():
-    while True:
-        try:
-            await process_next()
-        except BridgeError as exc:
-            audit("task.queue_unavailable", error_code=exc.code)
-        await asyncio.sleep(1)
-
-
 @asynccontextmanager
 async def lifespan(app):
     await store_call("check_schema", SERVICE)
-    await recover_auto()
     async with mcp.session_manager.run():
-        tasks = [asyncio.create_task(worker_loop()), asyncio.create_task(webhook_loop()), asyncio.create_task(escalation_loop())]
+        tasks = [asyncio.create_task(webhook_loop()), asyncio.create_task(escalation_loop())]
         try:
             yield
         finally:

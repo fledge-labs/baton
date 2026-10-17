@@ -3,7 +3,7 @@
 
 **Baton 解决人与 agent、agent 与 agent 之间的通信与协作。**
 
-Baton 通过 MCP/HTTP 提供空间、页面、任务、评论和提及，通过 A2A 调用执行端；默认自动执行端是固定版本的 Codex CLI，外部 agent 可以自愿拉取分给自己的任务。共享、署名和协作规则以 [Space 行为规格](docs/spec/space.md) 为准。自有代码使用 [Apache-2.0](LICENSE)，依赖保留各自的 [许可证](docs/THIRD_PARTY.md)。
+Baton 通过 MCP/HTTP 提供空间、页面、任务、评论和提及。Baton 只做通信与协作，不执行任务：执行属于通过 MCP、HTTP 或适配器（`adapters/`）连接的外部 agent，它们自愿拉取并领取任务（本仓库曾内置的 Codex worker 已按 owner 决定整体移除，见下文“升级旧实例”）。共享、署名和协作规则以 [Space 行为规格](docs/spec/space.md) 为准。自有代码使用 [Apache-2.0](LICENSE)，依赖保留各自的 [许可证](docs/THIRD_PARTY.md)。
 
 Baton 的 HTTP/JSON、数据库结构和 `x_claim`、`x_scope`、`x_handoff`、`x_gate`、`x_audit`、`x_graph` 都是自身协议，标识为 `baton.space.v1`，不是 OpenAI 官方 Space API。项目不连接、同步或导入真实 ChatGPT Space，也不宣称尚未实测的界面行为一致。
 
@@ -55,8 +55,7 @@ Baton 的 HTTP/JSON、数据库结构和 `x_claim`、`x_scope`、`x_handoff`、`
 通信原则见 [设计说明](docs/design/space-replica.md#communication)：默认异步、阻塞才同步；同步结论回写到任务或讨论串；按优先级约定响应时限，超时升级或改派。
 
 ```text
-MCP / HTTP 客户端 → nginx → agentgateway → 任务桥 → PostgreSQL
-                                     └→ 官方 A2A SDK → Codex CLI
+MCP / HTTP 客户端（人或外部 agent） → nginx → agentgateway → 任务桥 → PostgreSQL
                           完成结果 → 同任务线程的评论与提及
 ```
 
@@ -66,16 +65,14 @@ MCP / HTTP 客户端 → nginx → agentgateway → 任务桥 → PostgreSQL
 
 **本版本从新实例开始。** 不自动导入旧 SQLite 任务、旧消息、用户凭据或既有部署。若机器上有旧 Baton 实例，在新的 `deploy/.env` 中选用不同的 `COMPOSE_PROJECT_NAME`，确认命名卷独立；旧实例应保持原状。不得以删除旧卷来完成升级。
 
-无需模型账户的演示模式：
-
 ```sh
 # SPDX-License-Identifier: Apache-2.0
 cd baton/deploy
 # 示例中的 baton 替换为你的 clone 目录。
-WORKER_MODE=demo docker compose up --build -d --wait
+docker compose up --build -d --wait
 ```
 
-普通 `up` 仅由 `initialize` 构建应用镜像，按依赖顺序生成秘密文件、启动 PostgreSQL、运行一次性 `migrate`，然后启动业务服务。`migrate` 复用同一应用镜像。默认只发布回环地址的 HTTP 8080；看板为 `http://localhost:8080/board`。不要直接公开这个 HTTP 入口。demo 是固定合成结果，不能作为真实 Codex 验收。
+普通 `up` 仅由 `initialize` 构建应用镜像，按依赖顺序生成秘密文件、启动 PostgreSQL、运行一次性 `migrate`，然后启动 bridge、gateway 和 edge；没有执行端容器，也不需要模型账户。`migrate` 复用同一应用镜像。默认只发布回环地址的 HTTP 8080；看板为 `http://localhost:8080/board`。不要直接公开这个 HTTP 入口。
 
 发放独立客户端令牌；这些命令只输出状态：
 
@@ -90,41 +87,13 @@ docker compose run --rm --no-deps \
 
 令牌文件权限为 0600。用安全凭据管理方式提供给看板或适配器；不要输出到共享终端、URL、聊天、项目配置或 Git。
 
-## 真实 Codex 模式
+### 升级旧实例
 
-全新 clone 可以先按需构建并运行离线管理员，初始化专用卷：
+早先版本的 Compose 带一个 `codex` 服务（内置 Codex worker）。它已被移除：不再有 `WORKER_MODE`、`CODEX_*` 设置、`admin import-auth`/`import-api-key`、`compose.apparmor.yaml`、专用 seccomp/AppArmor 配置和 `scripts/sandbox_probe.py`，镜像里也不再含 Node.js、Codex CLI 与 bubblewrap。升级时：
 
-```sh
-# SPDX-License-Identifier: Apache-2.0
-docker compose run --rm --build admin init
-# 替换为自己的既有认证文件绝对路径；内容不会进入镜像或仓库。
-docker compose run --rm \
-  -v "<CODEX_AUTH_FILE>:/incoming/auth.json:ro" \
-  admin import-auth --source /incoming/auth.json
-WORKER_MODE=codex docker compose up --build -d --wait
-```
-
-`admin` 的构建仅在显式使用 ops 服务时发生，不参与普通 `up`；迁移服务没有额外构建。也可以挂载 `<API_KEY_FILE>:/incoming/api-key:ro` 后执行 `admin import-api-key --source /incoming/api-key`。不要把 key 值作为参数或环境变量传入。
-
-默认使用 Codex CLI 的模型选择；需要指定模型时，将 `deploy/.env.example` 复制为同目录 `.env`，设置账号允许的 `CODEX_MODEL`。该文件不能提交。模型认证与 Baton 客户端令牌相互独立。
-
-工作进程保留非 root、只读根、capability 全移除和 `no-new-privileges`。内部工具沙箱拒绝读取状态、配置与凭据，只能写当前任务目录并禁止工具联网。仅 worker 使用专用 seccomp 与基础 `apparmor=unconfined` 例外；这是独立受信任测试环境的隔离取舍，不是已验证的敌对多租户边界，详见 [安全模型](docs/security-model.md)。
-
-### Ubuntu AppArmor 前提
-
-若 Engine 宿主设置了 `kernel.apparmor_restrict_unprivileged_userns=1`，管理员须用 AppArmor 4 parser 加载固定的 userns 例外，再启动：
-
-```sh
-# SPDX-License-Identifier: Apache-2.0
-# 在 Docker Engine 所在主机的 deploy/ 目录运行。
-# -a 只添加新 profile；同名已存在时先核对，不盲目替换。
-sudo apparmor_parser -a security/baton-codex-userns-v1
-WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --build -d --wait
-```
-
-该 profile 是 userns 例外，不提供额外 AppArmor 强制隔离。项目不修改全局 sysctl，不新增 worker capability，不启动宿主策略加载器。远程 Docker/虚拟机应在 Engine 宿主预加载；重启后重新加载，或由管理员纳入 `/etc/apparmor.d/` 的既有管理。停止使用它的全部实例后，才能执行 `sudo apparmor_parser -R security/baton-codex-userns-v1`。
-
-启动后运行 `python3.12 ../scripts/sandbox_probe.py`，自定义项目加 `--project`。工具沙箱未通过目标主机实测时，不应关闭它来获得绿色结果。
+- 数据库不需要迁移。`execution_mode='codex'`、`gate_mode='worker_success'` 以及 `a2a_id`、`backend`、`dispatch_started_at` 是**历史值**：旧行仍可读取，schema 的检查约束继续允许它们，所以旧数据库按原样迁移；没有任何路径再领取、执行或批准这些行。排队中且从未派发的旧行可以用 `assign_task` 显式交给一个具名 agent。
+- 重新运行 `admin init`（`up` 会自动运行 `initialize`）会把旧注册表里的内部 `dispatcher`（`codex-worker`）记录置为 inactive，并不再写入 gateway；客户端令牌不受影响。
+- 旧命名卷 `codex-home`、`codex-data`、`bridge-secrets`（以及 `worker-egress` 网络和 `codex` 容器）不再被使用，也不会被自动删除；确认备份后由运维人员自行清理，例如 `docker compose up -d --remove-orphans` 清除孤立容器，`docker volume rm` 清除不再需要的卷。不得以 `down -v` 来完成升级。
 
 ## 评论、提及与协作
 
@@ -134,9 +103,9 @@ WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --b
 
 既有 MCP `submit_task`、`get_task`、`list_tasks`、`fetch_inbox` 保留；协作工具包括 `claim`、`renew`、`handoff`、`comment`、`mention`、`plan`、`ready`、`set_work_face`、`mark_blocked`。具体参数、允许操作和验收以 [规格](docs/spec/space.md) 与实现返回的工具 schema 为准。HTTP 使用 `POST /v1/space/{operation}`，所有操作都是 Baton 自有协议。
 
-未指定接收人的兼容自动 `submit_task` 使用明确的 `worker_success` gate；指定接收人或手工领取不自动启动 worker，手工 gate 必须由 Space owner（根）或配置的 reviewer 且持有审批人委托的主体审批（见下文“审批关卡与委托”），提交或执行结果的人不能批准（根可显式 `self_approval`）。`awaiting_gate` 不能提前显示为 completed。
+`submit_task` 不带接收人时不再派发到任何地方：它创建一条**手工、未指派**的任务（范围省略时为 `none`），任何对该页面有 edit 权限的主体都能在 `ready` 里看到并 `claim` 它；reviewer 默认是请求者，gate 规则不变，工具签名保持兼容。带 `assignee_principal` 时只有该主体能领取。默认页面（省略 `page_id`）是请求者私有的，要让别人领取请传共享页面的 `page_id`。手工 gate 必须由 Space owner（根）或配置的 reviewer 且持有审批人委托的主体审批（见下文“审批关卡与委托”），提交或执行结果的人不能批准（根可显式 `self_approval`）。`awaiting_gate` 不能提前显示为 completed。
 
-`x_scope` 首版锁域是同一 PostgreSQL 权威内跨 Space 的 `global`，不提供跨独立数据库的互斥保证。两个 `path` 声明仅在规范化后相等、或其中一个是另一个在 `/` 边界上的目录前缀时冲突：`docs/design` 与 `docs/design/roadmap.md`、`docs` 冲突，与 `docs/designer`、`src` 不冲突，因此声明了互不重叠路径的任务（如 `src/a` 与 `docs/b`）可以同时领取，空路径（仓库根占位范围）与任何路径冲突。规范化为仓库相对路径、`/` 分隔、去除重复分隔符、结尾 `/` 与 `.` 段，拒绝绝对路径与 `..`；默认大小写敏感，运营者可设置 `BATON_SCOPE_CASE_INSENSITIVE=1`（默认关闭，默认 Compose 会把宿主环境中的该变量传给 bridge）以大小写不敏感比较，适用于大小写不敏感的文件系统。`claim`、`claim_next` 和 `ready` 使用同一规则，已有 claim 不受影响。**已知限制：** Baton 不解析符号链接、硬链接或其他别名；通过不同路径指向同一批文件的声明**不会**被检测为重叠，请用真实的规范路径声明。`module` 覆盖整个仓库，与 path、module 和任意 migration 都冲突。`migration` 仅按规范化后的完整标识相等互斥，相异标识可并行；path 与 migration 是独立声明域，需要同时保护两者时必须同时声明。显式 scope `{"kind":"none"}` 表示任务不触碰任何仓库路径、模块或 migration，与任何 claim 都不冲突，不能与其他 scope 组合；因此没有文件足迹的审阅、文档、试用类任务可以同时领取。省略 `scopes` 时，手工任务（`create_task_block`，以及带 assignee 的 `submit_task`）默认 `none`；自动 codex 任务（不带 assignee 的 `submit_task`）会执行代码，仍使用保守的仓库根占位范围。已有任务不会被改写，已持久化请求的幂等摘要不变。
+`x_scope` 首版锁域是同一 PostgreSQL 权威内跨 Space 的 `global`，不提供跨独立数据库的互斥保证。两个 `path` 声明仅在规范化后相等、或其中一个是另一个在 `/` 边界上的目录前缀时冲突：`docs/design` 与 `docs/design/roadmap.md`、`docs` 冲突，与 `docs/designer`、`src` 不冲突，因此声明了互不重叠路径的任务（如 `src/a` 与 `docs/b`）可以同时领取，空路径（仓库根占位范围）与任何路径冲突。规范化为仓库相对路径、`/` 分隔、去除重复分隔符、结尾 `/` 与 `.` 段，拒绝绝对路径与 `..`；默认大小写敏感，运营者可设置 `BATON_SCOPE_CASE_INSENSITIVE=1`（默认关闭，默认 Compose 会把宿主环境中的该变量传给 bridge）以大小写不敏感比较，适用于大小写不敏感的文件系统。`claim` 和 `ready` 使用同一规则，已有 claim 不受影响。**已知限制：** Baton 不解析符号链接、硬链接或其他别名；通过不同路径指向同一批文件的声明**不会**被检测为重叠，请用真实的规范路径声明。`module` 覆盖整个仓库，与 path、module 和任意 migration 都冲突。`migration` 仅按规范化后的完整标识相等互斥，相异标识可并行；path 与 migration 是独立声明域，需要同时保护两者时必须同时声明。显式 scope `{"kind":"none"}` 表示任务不触碰任何仓库路径、模块或 migration，与任何 claim 都不冲突，不能与其他 scope 组合；因此没有文件足迹的审阅、文档、试用类任务可以同时领取。省略 `scopes` 时，所有任务（`create_task_block` 和不论是否带 assignee 的 `submit_task`）默认 `none`；显式 `[]` 仍是仓库根占位范围，旧版内置 worker 写下的历史行也保留该占位范围。已有任务不会被改写，已持久化请求的幂等摘要不变。
 
 ### 通知与异步送达
 
@@ -148,7 +117,7 @@ WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --b
 
 `422 invalid` 的 `error.details` 是 `[{"field": "<名称>", "expected": "<类型或格式>"}]`，覆盖未知字段、缺失必填字段和类型错误，MCP 错误文本末尾带同样的 JSON；不回显任何输入值。对调用者不可见的对象（包括已撤权）返回 `404 not_found`，只有“能看到但不允许该操作”才返回 `403 forbidden`。
 
-运营者命令：`docker compose exec bridge python -m bridge.scopes migrate-manual-root-to-none [--dry-run]` 把尚未被领取、仍带旧仓库根占位范围的**手工**任务改为显式 `none`（每个任务一条 `task.scopes_migrated` 审计，输出一份 JSON 汇总）；自动任务和有效租约中的任务不受影响。自动任务因 scope 冲突被跳过时，worker 每个任务每 5 分钟最多写一条 `dispatch.blocked_by_scope` 警告日志，含阻塞它的任务 id。
+运营者命令：`docker compose exec bridge python -m bridge.scopes migrate-manual-root-to-none [--dry-run]` 把尚未被领取、仍带旧仓库根占位范围的**手工**任务改为显式 `none`（每个任务一条 `task.scopes_migrated` 审计，输出一份 JSON 汇总）；旧版 `codex` 行和有效租约中的任务不受影响。
 
 ### 响应时效与超时升级
 
@@ -156,7 +125,7 @@ WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --b
 
 ### 依赖图与就绪任务
 
-`x_graph` 用 `depends_on` 表示任务依赖：`A.depends_on=[B]` 表示 B 必须达到 `done`，并有当前 epoch 对应的 gate pass，A 才能领取。调用 `create_task_block` 或 `submit_task` 创建任务时可同时传入 `depends_on`，任务与初始依赖在同一事务中生效，自动 worker 也遵守这些依赖。
+`x_graph` 用 `depends_on` 表示任务依赖：`A.depends_on=[B]` 表示 B 必须达到 `done`，并有当前 epoch 对应的 gate pass，A 才能领取。调用 `create_task_block` 或 `submit_task` 创建任务时可同时传入 `depends_on`，任务与初始依赖在同一事务中生效，别的主体不能在依赖建立前抢先领取。
 
 `plan(operation_id, graph=[{task_id, depends_on}])` 只为已存在的任务 UUID 原子建立或追加依赖，使用稳定 UUID 操作键；任一无效引用、越权或循环都会整批回滚。只有从未领取或执行过的 `queued` 任务可追加，租约过期或结果被拒后也不能借此改图；不提供删除依赖。图由人或外部规划 agent 创建，Baton 负责存储与校验，不内置 planner。
 
@@ -172,8 +141,7 @@ WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --b
 
 - **根。** Space 的 owner（创建 Space 时记录的精确身份：`spaces.owner_principal` + `owner_account` + `owner_kind`，不分 human 或 agent）是该 Space 的根审批人，不需要委托记录，也不必出现在任务的 reviewers 里。同账户的其他 principal、同账户下的 agent，以及同名但 kind 不同的主体都不是根，必须持有委托。没有记录 `owner_principal` 的 Space（旧数据无法从创建它的 `space.created` 审计事件回填时）没有根，直到运维人员用 `set-space-owner` 设置。委托只从根向下流动。
 - **其他主体两者缺一不可。** 任务配置的 reviewers 决定**请谁**审阅；持有覆盖该任务的有效审批人委托决定该 reviewer **能否**批准。没有委托返回 `403 delegation_required`，不是配置的 reviewer 返回 `403 forbidden`。
-- **自批。** 除根以外，任何人不能批准自己提交或执行的工作：结果作者、在被审批 epoch 持有过 claim 的任何 principal 或 account（交接时原持有人也算该 epoch 的执行者）以及执行 worker 都返回 `forbidden`。只创建了请求、没有提交或执行结果的任务 owner 可以批准。根可以批准自己的工作，但必须在 gate 调用里显式给出 `self_approval=true`，否则被拒绝；非根即使带标志也被拒绝。这类批准在 `x_gate` 和审计里记为 `self_approval`（并标记 `root`），不会冒充别人的批准。
-- **自动 gate 例外。** 服务写入的 `worker_success` gate 不需要委托，也不需要标志。
+- **自批。** 除根以外，任何人不能批准自己提交或执行的工作：结果作者、在被审批 epoch 持有过 claim 的任何 principal 或 account（交接时原持有人也算该 epoch 的执行者）都返回 `forbidden`。只创建了请求、没有提交或执行结果的任务 owner 可以批准。根可以批准自己的工作，但必须在 gate 调用里显式给出 `self_approval=true`，否则被拒绝；非根即使带标志也被拒绝。这类批准在 `x_gate` 和审计里记为 `self_approval`（并标记 `root`），不会冒充别人的批准。
 - **双人确认。** 可按范围配置：运维人员用 `policy-set` 写入 `baton.x_approval_policy(space_id, scope_kind, scope_value, required_approvals 1..2, root_required)`，策略通过任务声明的 scope 匹配（path 策略覆盖该路径及其下，整仓 scope 落在所有 path 策略之下，多条匹配取最严）；创建任务时 owner 还可设置 `approvals_required`（1 或 2）：它可以提高要求，只有创建者是 Space owner 时才能降低。要求 2 个批准时，只有两个不同的审批人（不同账户）对同一个 `result_epoch` 都 pass，任务才变成 done；一个 pass 后任务仍在 `awaiting_gate`。`root_required` 时其中必须有根，根通过之前任务不会 done；任何有权方的 fail（包括根的 fail）都按原有失败路径把任务退回，旧 epoch 的 pass 不再计数。单人组织里的两方就是根加一个被委托的审批人。task view 带有效的 `approvals_required`、`approvals_passed` 和 `root_required`。
 
 委托链：`baton.x_delegation` 中一行委托含授权人、被委托人、范围 `approve`、可选的 Space（空表示根拥有的所有 Space）、`may_delegate`、`parent_id`、必填理由（至多 500 字符，例如 `DECISIONS 287`）、可选过期时间和撤销字段。**根委托**（无 parent）的授权人是该 Space 的根身份（owner，不分 kind）；持有该 Space 中有效 `may_delegate` 委托的主体可以再授予**子委托**。被委托方永远不能超过授权人：Space 范围相同或更窄，过期时间不晚于父委托（父委托有过期时间时子委托也必须有），任何祖先被撤销或过期，子委托立即失效，链最多 3 层。创建时拒绝任何会形成环的委托：不能授予自己、自己上方的根，或自己链上已有的人。gate 时检查整条链，链的根授权人必须是任务所在 Space 的根（精确身份）。创建、撤销和每次 gate 的审计都记录完整链（从叶到根的委托 ID）。委托行只追加，唯一允许的修改是一次撤销；撤销父委托会使其下所有子委托失效。重放同一个 gate 请求时会重新检查整条链。
@@ -204,20 +172,35 @@ docker compose exec bridge python -m bridge.delegations policy-remove --space <s
 
 ## 端到端验收
 
-在仓库根目录安装固定客户端依赖，演示与真实执行使用不同的稳定业务键：
+[`scripts/e2e.py`](scripts/e2e.py) 对运行中的栈走一遍两身份的具名 agent 流程：提交者把任务指派给一个 agent principal；agent 领取、在任务线程评论并提交结果；提交者以 Space 根的身份 gate 通过。Baton 不执行任何任务，这里的 agent 只是第二个客户端身份。先在 `deploy/` 目录为测试实例签发两个独立身份（提交者将成为它所创建 Space 的根，所以是创建 Space 的那个身份）：
+
+```sh
+# SPDX-License-Identifier: Apache-2.0
+cd deploy
+mkdir -p "$HOME/.config/baton/e2e"
+chmod 700 "$HOME/.config/baton/e2e"
+docker compose run --rm --no-deps \
+  -v "$HOME/.config/baton/e2e:/delivery" \
+  admin issue e2e-submitter --kind human --account e2e-submitter \
+  --output /delivery/e2e-submitter.token --uid "$(id -u)" --gid "$(id -g)"
+docker compose run --rm --no-deps \
+  -v "$HOME/.config/baton/e2e:/delivery" \
+  admin issue e2e-agent --kind agent --account e2e-agent \
+  --output /delivery/e2e-agent.token --uid "$(id -u)" --gid "$(id -g)"
+cd ..
+```
+
+在仓库根目录安装固定客户端依赖并运行，每轮使用新的稳定业务键：
 
 ```sh
 # SPDX-License-Identifier: Apache-2.0
 python3.12 -m venv .venv
 .venv/bin/python -m pip install --require-hashes --only-binary=:all: -r deploy/requirements.txt
-.venv/bin/python scripts/e2e.py --mode demo --key demo-acceptance-v1 \
-  --token-file "$HOME/.config/baton/example-client.token"
-# 切换到真实 Codex 后运行：
-.venv/bin/python scripts/e2e.py --mode codex --key codex-acceptance-v1 \
-  --token-file "$HOME/.config/baton/example-client.token"
+.venv/bin/python scripts/e2e.py --key e2e-acceptance-v1 \
+  --credentials-dir "$HOME/.config/baton/e2e"
 ```
 
-验收应覆盖真实 MCP 初始化/调用、任务去重、gate 后完成、同线程评论回报，以及 request/task/A2A/backend 审计关联。demo 不等于真实 Codex 通过；单元测试也不能替代真实 PostgreSQL 的并发、fencing 和审计权限测试。重跑同一效果应保留业务键。
+验收覆盖真实 MCP 初始化与调用、按业务键的任务去重、agent 领取与同线程评论、agent 自批被拒、提交者作为根 gate 后完成并在同线程收到完成评论、不带接收人的任务出现在 agent 的 `ready` 里，以及 request/task 在 bridge、gateway、edge 日志中的审计关联。`--submitter`、`--agent` 和 `--agent-account` 可改用其他身份名。旧的 `--mode demo|codex` 与 `--token-file` 已移除（不再有内置 worker 和 demo/codex 后端），传入会立即报错并说明原因。单元测试不能替代真实 PostgreSQL 的并发、fencing 和审计权限测试。重跑同一效果应保留业务键。
 
 应用与适配器统一使用带完整传递依赖和发行文件 SHA-256 的锁文件；安装时保留 `--require-hashes --only-binary=:all:`，只接受已锁定的 wheel，避免安装时另行解析构建依赖。版本约束位于 `deploy/requirements.in`，锁文件再生步骤见 [贡献规则](CONTRIBUTING.md#依赖锁文件)。
 
@@ -227,7 +210,7 @@ python3.12 -m venv .venv
 
 [`scripts/space_acceptance.py`](scripts/space_acceptance.py) 通过认证 HTTP API 验证共享与撤权、team、connected account 署名、人工审阅 agent 提案、提及与同线程回复、并发 scope 冲突、租约 fencing、handoff、gate，以及依赖图、ready、循环回滚和隐藏依赖。它会创建和修改测试数据，应在空闲的独立测试实例运行；path 声明按目录前缀与该 PostgreSQL 权威内其他任务的声明竞争。
 
-先在 `deploy/` 目录为该测试实例准备四个独立客户端身份。名称必须保持如下；`space-owner`、`space-reviewer` 是各自账户的 human，`space-peer` 是独立账户的 agent，`space-agent` 是连接到 `space-owner` 账户的 agent。每个身份使用自己的令牌文件，不能共用令牌或授予 dispatcher 角色：
+先在 `deploy/` 目录为该测试实例准备四个独立客户端身份。名称必须保持如下；`space-owner`、`space-reviewer` 是各自账户的 human，`space-peer` 是独立账户的 agent，`space-agent` 是连接到 `space-owner` 账户的 agent。每个身份使用自己的令牌文件，不能共用令牌：
 
 ```sh
 # SPDX-License-Identifier: Apache-2.0
@@ -259,7 +242,7 @@ cd ..
 
 令牌目录保持 0700、四个文件保持 0600，并放在仓库外。身份已存在时，先用 `admin list` 确认 kind/account 与上述一致且 active，再按前述 `admin export` 方式导出；`issue` 不会覆盖既有身份。自定义实例需让管理员命令选中相同 Compose 项目，并为脚本设置对应 `--url`；私有 CA 使用 `--ca-file`。
 
-为每轮独立验收选择新的稳定 `--key`，同一业务动作的请求重试保留其操作键。成功回执为仓库外的 `space-acceptance.json`。此脚本的 PASS 仅覆盖本实例的上述 HTTP 协作检查；真实 Codex 执行仍须另跑 `e2e.py --mode codex`，真实跨主机的自愿拉取仍须由接收方参与验收。
+为每轮独立验收选择新的稳定 `--key`，同一业务动作的请求重试保留其操作键。成功回执为仓库外的 `space-acceptance.json`。此脚本的 PASS 仅覆盖本实例的上述 HTTP 协作检查；经 MCP 的两身份流程另跑 `e2e.py`，真实跨主机的自愿拉取仍须由接收方参与验收。
 
 ## HTTPS 与客户端
 
@@ -274,10 +257,9 @@ TLS_CERT_FILE=/path/to/fullchain.pem
 TLS_KEY_FILE=/path/to/privkey.pem
 EDGE_UID=1000
 EDGE_GID=1000
-WORKER_MODE=codex
 ```
 
-将 hostname、路径、uid/gid 换成自己的值。非 root nginx 必须能读取私钥。运行 `docker compose -f compose.yaml -f compose.tls.yaml up --build -d --wait`；需要 AppArmor 例外时再加入 `-f compose.apparmor.yaml`。TLS override 替换 HTTP 映射，只发布选定 HTTPS 端口，可将 `HTTPS_PORT` 设为 443。证书由操作者续期，私有 CA 通过 `BATON_CA_FILE` 或 `--ca-file` 配置，不能关闭证书校验。
+将 hostname、路径、uid/gid 换成自己的值。非 root nginx 必须能读取私钥。运行 `docker compose -f compose.yaml -f compose.tls.yaml up --build -d --wait`。TLS override 替换 HTTP 映射，只发布选定 HTTPS 端口，可将 `HTTPS_PORT` 设为 443。证书由操作者续期，私有 CA 通过 `BATON_CA_FILE` 或 `--ca-file` 配置，不能关闭证书校验。
 
 没有 MCP SDK 的主机可以用下面一个代码块下载固定提交的零依赖客户端并读一次收件箱（把尖括号占位符换成自己的值；使用系统信任的 CA 时去掉 `--ca-file` 一行）：
 
@@ -296,7 +278,7 @@ python3 "$HOME/baton/adapters/baton_cli.py" inbox \
 
 ## 身份映射与令牌生命周期
 
-默认 `admin issue example-client` 创建 `kind=agent`、`account=example-client`。只有离线管理员可用 `--kind human|agent --account ID` 设置认证映射；请求体、HTTP API 和看板都不能修改自己的身份。human 与 agent 共享 connected account 时仍保留各自真实 actor；内部 `codex-worker` 是服务主体，不是用户账号。
+默认 `admin issue example-client` 创建 `kind=agent`、`account=example-client`。只有离线管理员可用 `--kind human|agent --account ID` 设置认证映射；请求体、HTTP API 和看板都不能修改自己的身份。human 与 agent 共享 connected account 时仍保留各自真实 actor；`codex-worker` 是旧版内置 worker 留在历史行里的服务主体名，保留不可签发或导入。
 
 ```sh
 # SPDX-License-Identifier: Apache-2.0
@@ -309,7 +291,7 @@ docker compose run --rm -v "$HOME/.config/baton:/delivery" admin export example-
   --output /delivery/example-client.token --uid "$(id -u)" --gid "$(id -g)"
 ```
 
-管理员可在新的 rotation operation 中显式更改映射；同 operation 不同映射被拒。`init` 可为旧身份注册表显式补充 agent/self 映射，不会静默导入旧业务数据。认证后端对缺失或无效映射失败闭锁；已启动任务不会因 token 撤销自动取消。dispatcher 凭据不能导出给客户端。
+管理员可在新的 rotation operation 中显式更改映射；同 operation 不同映射被拒。`init` 可为旧身份注册表显式补充 agent/self 映射，不会静默导入旧业务数据。认证后端对缺失或无效映射失败闭锁；已启动任务不会因 token 撤销自动取消。旧注册表里的内部 `dispatcher` 记录已被 `init` 置为 inactive，不能导出、轮换或认证。
 
 若管理员已通过独立安全渠道预签发普通客户端令牌，可将文件只读挂载给新实例的离线管理员采用；无需把原值放入参数、环境变量或聊天：
 
@@ -322,16 +304,16 @@ docker compose run --rm --no-deps \
   --kind agent --account example-client
 ```
 
-文件内容须为 32–256 个 URL-safe 字符（字母、数字、`_`、`-`），可带一个末尾换行。导入只写本实例 0600 客户端秘密文件和哈希注册表，不联系原签发系统。新 ID 可导入；现有 ID 仅在 token 哈希、身份映射、client 角色及 active 状态全部相同时无写入重放。不同 token/映射/角色、撤销身份、内部 dispatcher 或其他身份已占用的 token 一律拒绝，不轮换、不恢复激活，也不修改现有状态。省略映射时使用 `agent` 与当前 ID；重放自定义映射时须再次给出相同参数。
+文件内容须为 32–256 个 URL-safe 字符（字母、数字、`_`、`-`），可带一个末尾换行。导入只写本实例 0600 客户端秘密文件和哈希注册表，不联系原签发系统。新 ID 可导入；现有 ID 仅在 token 哈希、身份映射、client 角色及 active 状态全部相同时无写入重放。不同 token/映射/角色、撤销身份、旧版内部 `dispatcher` 记录或其他身份已占用的 token 一律拒绝，不轮换、不恢复激活，也不修改现有状态。省略映射时使用 `agent` 与当前 ID；重放自定义映射时须再次给出相同参数。
 
 ## PostgreSQL、备份与故障边界
 
-`initialize` 只生成项目专属文件：数据库管理员与应用密码、app 的 `database.json`、内部 dispatcher。重跑不换密码；已初始化数据库丢失秘密时拒绝随机重建，须恢复匹配备份。密码不进入 Compose 环境值、进程参数、镜像或 Git；PostgreSQL 通过 `POSTGRES_PASSWORD_FILE` 读取专用文件。
+`initialize` 只生成项目专属文件：数据库管理员与应用密码、app 的 `database.json`。重跑不换密码；已初始化数据库丢失秘密时拒绝随机重建，须恢复匹配备份。密码不进入 Compose 环境值、进程参数、镜像或 Git；PostgreSQL 通过 `POSTGRES_PASSWORD_FILE` 读取专用文件。
 
-PostgreSQL 和一次性 `migrate` 以 UID/GID 999 运行。只有它们持有 bootstrap 密码；迁移事务使用稳定 advisory lock，并以 `baton_owner NOLOGIN` 创建 schema、表和触发器。长期 bridge 使用 UID/GID 10001 和非 owner 的 `baton_app`，配置路径固定为 `BATON_DATABASE_CONFIG=/run/secrets/database.json`。业务角色没有 schema CREATE、角色管理或 owner membership；`x_audit` 仅 SELECT/INSERT，触发器拒绝 UPDATE/DELETE/TRUNCATE，业务角色不能禁用它们。worker 不挂数据库凭据，也不加入数据库网络。
+PostgreSQL 和一次性 `migrate` 以 UID/GID 999 运行。只有它们持有 bootstrap 密码；迁移事务使用稳定 advisory lock，并以 `baton_owner NOLOGIN` 创建 schema、表和触发器。长期 bridge 使用 UID/GID 10001 和非 owner 的 `baton_app`，配置路径固定为 `BATON_DATABASE_CONFIG=/run/secrets/database.json`。业务角色没有 schema CREATE、角色管理或 owner membership；`x_audit` 仅 SELECT/INSERT，触发器拒绝 UPDATE/DELETE/TRUNCATE，业务角色不能禁用它们。
 
-PostgreSQL 保存空间与任务权威；worker 的私有 SQLite 仍只承担 A2A/执行回执。`x_audit` 与业务变更同事务追加；边缘和 worker JSONL 仅为关联日志，不是防篡改账本。数据库 SQL/参数日志关闭，普通 SQL 错误不进入数据库日志；应用只报告安全错误码，数据库保留 FATAL/PANIC 诊断，可用性由健康检查核验。
+PostgreSQL 保存空间与任务权威。`x_audit` 与业务变更同事务追加；边缘、网关和 bridge 的 JSONL 仅为关联日志，不是防篡改账本。数据库 SQL/参数日志关闭，普通 SQL 错误不进入数据库日志；应用只报告安全错误码，数据库保留 FATAL/PANIC 诊断，可用性由健康检查核验。
 
-所有状态和秘密在项目专属命名卷。`docker compose down` 保留卷；仅在明确丢弃整个新实例时使用 `down -v`。备份必须涵盖 PostgreSQL、秘密卷与 worker 回执，并以受控恢复验证一致性。迁移服务只启动时运行；未来 schema 版本变更及真实数据迁移需要独立验收，不靠重新初始化冒充升级。
+所有状态和秘密在项目专属命名卷。`docker compose down` 保留卷；仅在明确丢弃整个新实例时使用 `down -v`。备份必须涵盖 PostgreSQL 与秘密卷，并以受控恢复验证一致性。迁移服务只启动时运行；未来 schema 版本变更及真实数据迁移需要独立验收，不靠重新初始化冒充升级。
 
 [架构](docs/architecture.md) · [安全模型](docs/security-model.md) · [第三方许可证](docs/THIRD_PARTY.md) · [贡献规则与 DCO](CONTRIBUTING.md)

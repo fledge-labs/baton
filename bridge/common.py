@@ -1,25 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared identity, persistence and metadata-only audit boundaries."""
+"""Shared identity and metadata-only audit boundaries."""
 
 import hashlib
 import hmac
 import json
 import os
 import re
-import sqlite3
 import uuid
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from bridge.failures import HEALTH_STATES, STAGES
-from bridge.phases import sanitize_phases
-
 STATE = Path(os.environ.get("BATON_STATE", "/data"))
 CONFIG = Path(os.environ.get("BATON_CONFIG", "/config"))
-SECRETS = Path("/run/secrets")
-CODEX_HOME = Path("/home/agent/.codex")
 SPACE_PROTOCOL = "baton.space.v1"
 
 
@@ -64,7 +57,7 @@ def audit(event, **fields):
     for key, value in fields.items():
         if value is None:
             continue
-        if key in {"task_id", "a2a_task_id", "request_id", "operation_id", "thread_id", "probe_id", "blocked_by"}:
+        if key in {"task_id", "request_id", "operation_id", "thread_id", "blocked_by"}:
             try:
                 record[key] = uuid_id(value)
             except (ValueError, TypeError, AttributeError):
@@ -74,22 +67,9 @@ def audit(event, **fields):
                 record[key] = value
         elif key in {"agent", "error_type", "error_code"}:
             record[key] = safe_id(value)
-        elif key == "stage" and isinstance(value, str) and value in STAGES:
-            record[key] = value
-        elif key == "source" and value in {"resources", "canary"}:
-            record[key] = value
-        elif key == "health" and isinstance(value, str) and value in HEALTH_STATES:
-            record[key] = value
         elif key == "level" and value in {"info", "warning", "error"}:
             record[key] = value
-        elif key == "phases":
-            # Timing numbers and event type names only; anything else is dropped.
-            phases = sanitize_phases(value)
-            if phases is not None:
-                record[key] = phases
-        elif key == "backend" and value in {"demo", "codex"}:
-            record[key] = value
-        elif key in {"status", "exit_code", "epoch"} and type(value) is int:
+        elif key in {"status", "epoch"} and type(value) is int:
             record[key] = value
         elif key == "thread_message_ids":
             record[key] = []
@@ -114,10 +94,7 @@ def audit(event, **fields):
 
 def registry_identity(record):
     """Only the administrator's registry defines connected accounts and actor kinds."""
-    if record.get("active") is not True or record.get("role") not in {"client", "dispatcher"}:
-        return None
-    allowed_kinds = {"human", "agent"} if record["role"] == "client" else {"service"}
-    if record.get("kind") not in allowed_kinds:
+    if record.get("active") is not True or record.get("role") != "client" or record.get("kind") not in {"human", "agent"}:
         return None
     return {"agent": safe_id(record["agent"]), "role": record["role"],
             "account": safe_id(record["account"]), "kind": record["kind"]}
@@ -181,61 +158,3 @@ class AuthMiddleware:
             await send(message)
 
         await self.app(scope, receive, private_send)
-
-
-@contextmanager
-def database(name):
-    STATE.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(STATE / name, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    try:
-        with conn:
-            yield conn
-    finally:
-        conn.close()
-
-
-def known_secrets():
-    """Read only configured credential stores; never expose these values in diagnostics."""
-    values = set()
-    for path in SECRETS.rglob("*.token"):
-        try:
-            value = path.read_text().strip()
-            if value:
-                values.add(value)
-        except OSError:
-            continue
-    database_config = Path(os.environ.get("BATON_DATABASE_CONFIG", str(SECRETS / "database.json")))
-    if database_config.exists():
-        try:
-            password = json.loads(database_config.read_text())["password"]
-            if not isinstance(password, str) or not password:
-                raise ValueError("Invalid credential")
-            values.add(password)
-        except (OSError, ValueError, KeyError, TypeError):
-            raise RuntimeError("Credential store is unreadable") from None
-    auth = CODEX_HOME / "auth.json"
-    if auth.exists():
-        def walk(obj):
-            if isinstance(obj, dict):
-                for item in obj.values():
-                    yield from walk(item)
-            elif isinstance(obj, list):
-                for item in obj:
-                    yield from walk(item)
-            elif isinstance(obj, str) and len(obj) >= 8:
-                yield obj
-        try:
-            values.update(walk(json.loads(auth.read_text())))
-        except (OSError, ValueError):
-            # A malformed credential file cannot silently disable output filtering.
-            raise RuntimeError("Credential store is unreadable") from None
-    return values
-
-
-def redact(text, extra=()):
-    for value in sorted(known_secrets() | set(extra), key=len, reverse=True):
-        if value:
-            text = text.replace(value, "[REDACTED]")
-    return text

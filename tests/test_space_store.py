@@ -173,7 +173,6 @@ def test_comment_mentions_inbox_are_recipient_and_permission_filtered(pg):
     assert s.fetch_inbox(pg.reviewer)["messages"] == []
     s.share(pg.owner, operation(), "space", pg.space["id"], "person", pg.editor.account, None)
     assert s.fetch_inbox(pg.editor)["messages"] == []
-    assert s.claim_next(SERVICE_ACTOR, operation()) is None
 
 
 def test_person_mentions_target_principal_not_shared_account(pg):
@@ -396,12 +395,11 @@ def test_manual_gates_reject_self_review_and_old_candidate(pg, approver):
     assert any(row["thread_id"] == task["id"] and row["body_md"] == "Candidate two" for row in s.fetch_inbox(pg.owner)["messages"])
 
 
-def test_assigned_tasks_can_only_be_claimed_by_recipient_and_never_auto_dispatched(pg):
+def test_assigned_tasks_can_only_be_claimed_by_their_recipient(pg):
     s = pg.store
     task = s.submit_task(pg.owner, operation(), "assigned", "Assigned work", page_id=pg.page["id"], assignee=pg.editor,
                          scopes=[{"kind": "path", "value": pg.prefix}])
     assert task["assignee"] == pg.editor.principal and task["execution_mode"] == "manual"
-    assert s.claim_next(SERVICE_ACTOR, operation()) is None
     expect("forbidden", lambda: s.claim(pg.reviewer, operation(), task["id"]))
     claim = s.claim(pg.editor, operation(), task["id"])
     expect("stale_claim", lambda: s.assign_task(pg.owner, operation(), task["id"], pg.reviewer))
@@ -456,39 +454,71 @@ def test_task_comments_mentions_and_completion_have_full_audit_chain(pg):
     assert len([item for item in s.fetch_inbox(pg.editor)["messages"] if item["thread_id"] == task["id"]]) == 1
 
 
-def test_auto_queue_has_narrow_service_authority_and_ambiguous_restart_never_reexecutes(pg):
-    s = pg.store
-    op = operation()
-    task = s.submit_task(pg.owner, op, "auto", "Synthetic auto", page_id=pg.page["id"], scopes=[{"kind": "path", "value": pg.prefix}])
-    expect("forbidden", lambda: s.get_task(SERVICE_ACTOR, task["id"]))
-    expect("forbidden", lambda: s.claim_next(pg.owner, operation()))
-    claim = s.claim_next(SERVICE_ACTOR, operation())
-    assert claim["task_id"] == task["id"]
-    s.mark_dispatched(SERVICE_ACTOR, operation(), task["id"], claim["epoch"])
-    expire(pg, task["id"])
-    s.recover_auto(SERVICE_ACTOR, operation())
-    assert s.get_task(pg.owner, task["id"])["status"] == "interrupted"
-    assert s.claim_next(SERVICE_ACTOR, operation()) is None
-    assert s.submit_task(pg.owner, op, "auto", "Synthetic auto", page_id=pg.page["id"], scopes=[{"kind": "path", "value": pg.prefix}])["status"] == "interrupted"
-    expect("stale_claim", lambda: s.finish_auto(SERVICE_ACTOR, operation(), task["id"], claim["epoch"], "Late", operation(), "demo"))
+def to_legacy(pg, task_id, *, state="queued", dispatched=False, backend=None, error=None, result=None, epoch=0, claim_lapsed=False):
+    """Rewrite a task into the shape the removed built-in worker left behind; nothing writes these values any more."""
+    with pg.store._transaction(write=True) as conn:
+        conn.execute("""UPDATE baton.tasks SET execution_mode='codex',gate_mode='worker_success',reviewers='[]'::jsonb,scopes=%s::jsonb,
+            assignee=NULL,state=%s,backend=%s,error=%s,result=%s,result_epoch=%s,epoch=%s,
+            dispatch_started_at=CASE WHEN %s THEN clock_timestamp() END WHERE id=%s""",
+                     (json.dumps(ROOT), state, backend, error, result, epoch if result is not None else None, epoch, dispatched, task_id))
+        if claim_lapsed:
+            conn.execute("""INSERT INTO baton.x_claim(task_id,holder,holder_account,holder_kind,epoch,lease_expires_at,scopes)
+                VALUES (%s,'codex-worker','baton-service','agent',%s,clock_timestamp()-interval '1 second',%s::jsonb)""",
+                         (task_id, epoch, json.dumps(ROOT)))
+    return task_id
 
 
-def test_auto_gate_requires_dispatched_completed_evidence_and_same_thread(pg):
+def test_legacy_codex_rows_stay_readable_and_no_automatic_path_can_touch_them(pg):
     s = pg.store
-    task = s.submit_task(pg.owner, operation(), "auto-success", "Synthetic auto", page_id=pg.page["id"], scopes=[{"kind": "path", "value": pg.prefix}])
-    claim = s.claim_next(SERVICE_ACTOR, operation())
-    a2a = operation()
-    expect("gate_required", lambda: s.finish_auto(SERVICE_ACTOR, operation(), task["id"], claim["epoch"], "Demo output", a2a, "demo"))
-    s.mark_dispatched(SERVICE_ACTOR, operation(), task["id"], claim["epoch"])
-    expect("gate_required", lambda: s.finish_auto(SERVICE_ACTOR, operation(), task["id"], claim["epoch"], "Demo output", a2a, "demo", "failed"))
-    finish = operation()
-    done = s.finish_auto(SERVICE_ACTOR, finish, task["id"], claim["epoch"], "Demo output", a2a, "demo")
-    assert done["backend"] == "demo" and done["status"] == "completed"
-    assert s.finish_auto(SERVICE_ACTOR, finish, task["id"], claim["epoch"], "Demo output", a2a, "demo")["replay"]
-    rows = s.list_audit(pg.owner, task_id=task["id"])
-    assert len([r for r in rows if r["event"] == "task.completed"]) == 1
-    assert {row["event"] for row in rows} >= {"task.submitted", "thread.submitted", "worker.claimed", "task.dispatched", "worker.completed", "task.completed", "thread.completed"}
-    assert any(row["thread_id"] == task["id"] and row["body_md"] == "Demo output" for row in s.fetch_inbox(pg.owner)["messages"])
+    scopes = [{"kind": "path", "value": pg.prefix + "/legacy"}]
+    queued = s.submit_task(pg.owner, operation(), "legacy-queued", "Legacy queued prompt", page_id=pg.page["id"], scopes=scopes)
+    to_legacy(pg, queued["id"])
+    view = s.get_task(pg.owner, queued["id"])
+    assert (view["execution_mode"], view["gate_mode"], view["status"], view["scopes"]) == ("codex", "worker_success", "queued", ROOT)
+    assert "prompt" not in view and view["approvals_required"] is None
+    assert s.submit_task(pg.owner, operation(), "legacy-queued", "Legacy queued prompt", page_id=pg.page["id"], scopes=scopes)["id"] == queued["id"]
+    assert queued["id"] not in ready_ids(pg, pg.editor)
+    expect("forbidden", lambda: s.claim(pg.editor, operation(), queued["id"]))
+    expect("forbidden", lambda: s.gate(pg.owner, operation(), queued["id"], 1, "pass"))
+    expect("forbidden", lambda: s.get_task(SERVICE_ACTOR, queued["id"]))
+    for removed in ("claim_next", "recover_auto", "mark_dispatched", "finish_auto", "fail_auto", "interrupt_auto", "renew_auto"):
+        assert not hasattr(s, removed), removed
+
+    dispatched = s.submit_task(pg.owner, operation(), "legacy-dispatched", "Legacy dispatched", page_id=pg.page["id"])
+    to_legacy(pg, dispatched["id"], state="claimed", dispatched=True, backend="codex", epoch=1, claim_lapsed=True)
+    view = s.get_task(pg.owner, dispatched["id"])
+    assert view["status"] == "interrupted" and view["dispatch_started_at"] is not None and view["backend"] == "codex"
+    expect("stale_claim", lambda: s.assign_task(pg.owner, operation(), dispatched["id"], pg.editor))
+
+    finished = s.submit_task(pg.owner, operation(), "legacy-done", "Legacy done", page_id=pg.page["id"])
+    to_legacy(pg, finished["id"], state="done", dispatched=True, backend="demo", result="Demo output", epoch=1)
+    view = s.get_task(pg.owner, finished["id"])
+    assert (view["status"], view["result"], view["backend"], view["approvals_required"]) == ("completed", "Demo output", "demo", None)
+    assert finished["id"] in {row["id"] for row in s.list_tasks(pg.owner)}
+
+    assigned = s.assign_task(pg.owner, operation(), queued["id"], pg.editor)
+    assert (assigned["execution_mode"], assigned["gate_mode"], assigned["assignee"]) == ("manual", "reviewer", pg.editor.principal)
+    assert assigned["reviewers"] == [pg.owner.principal]
+
+
+def test_unassigned_submit_task_is_a_manual_task_with_the_manual_audit_chain(pg):
+    s = pg.store
+    task = s.submit_task(pg.owner, operation(), "open", "Synthetic open work", page_id=pg.page["id"], scopes=[{"kind": "path", "value": pg.prefix + "/open"}])
+    assert (task["execution_mode"], task["gate_mode"], task["state"], task["assignee"]) == ("manual", "reviewer", "queued", None)
+    assert task["reviewers"] == [pg.owner.principal] and task["respond_by"] is None and task["prompt"] == "Synthetic open work"
+    assert task["id"] in ready_ids(pg, pg.editor) and task["id"] in ready_ids(pg, pg.reviewer)
+    claim = s.claim(pg.editor, operation(), task["id"])
+    assert claim["holder"] == pg.editor.principal
+    s.comment(pg.editor, operation(), pg.page["id"], "Working on it", thread_id=task["id"])
+    s.submit_result(pg.editor, operation(), task["id"], claim["epoch"], "Open result")
+    expect("forbidden", lambda: s.gate(pg.editor, operation(), task["id"], claim["epoch"], "pass"))
+    done = s.gate(pg.owner, operation(), task["id"], claim["epoch"], "pass")
+    assert done["state"] == "done" and done["status"] == "completed"
+    events = {row["event"] for row in s.list_audit(pg.owner, task_id=task["id"])}
+    assert events >= {"task.submitted", "thread.submitted", "task.claimed", "comment.created", "task.result_submitted", "gate.reviewed",
+                      "task.completed", "thread.completed"}
+    assert not any(event.startswith("worker.") or event in {"task.dispatched", "task.interrupted"} for event in events)
+    assert any(row["thread_id"] == task["id"] and row["body_md"] == "Open result" for row in s.fetch_inbox(pg.owner)["messages"])
 
 
 def test_transaction_failure_rolls_back_business_operation_and_audit(pg, monkeypatch):
@@ -745,22 +775,22 @@ def test_graph_requires_dependency_visibility_without_exposing_private_content(p
     assert len(s.list_blocks(pg.owner, pg.page["id"])) == before
 
 
-def test_creation_dependencies_are_atomic_with_auto_queue_admission(pg, approver):
+def test_creation_dependencies_are_atomic_and_keep_an_unassigned_task_unclaimable_until_the_gate_passes(pg, approver):
     s = pg.store
     approver(s, pg.reviewer, by=pg.owner)
     parent = manual(pg, "parent")
-    child = s.submit_task(pg.owner, operation(), "auto-dependent", "Synthetic dependent auto task",
+    child = s.submit_task(pg.owner, operation(), "open-dependent", "Synthetic dependent open task",
                          page_id=pg.page["id"], depends_on=[parent["id"]])
-    assert child["depends_on"] == [parent["id"]]
-    assert s.claim_next(SERVICE_ACTOR, operation()) is None
+    assert child["depends_on"] == [parent["id"]] and child["assignee"] is None
+    assert child["id"] not in ready_ids(pg, pg.editor)
+    expect("dependency_blocked", lambda: s.claim(pg.editor, operation(), child["id"]))
     parent_claim = s.claim(pg.editor, operation(), parent["id"])
     s.submit_result(pg.editor, operation(), parent["id"], parent_claim["epoch"], "Candidate")
-    assert s.claim_next(SERVICE_ACTOR, operation()) is None
+    expect("dependency_blocked", lambda: s.claim(pg.editor, operation(), child["id"]))
     s.gate(pg.reviewer, operation(), parent["id"], parent_claim["epoch"], "pass")
-    claimed = s.claim_next(SERVICE_ACTOR, operation())
+    assert child["id"] in ready_ids(pg, pg.editor)
+    claimed = s.claim(pg.editor, operation(), child["id"])
     assert claimed["task_id"] == child["id"] and claimed["depends_on"] == [parent["id"]]
-    s.mark_dispatched(SERVICE_ACTOR, operation(), child["id"], claimed["epoch"])
-    assert s.finish_auto(SERVICE_ACTOR, operation(), child["id"], claimed["epoch"], "Synthetic graph demo", operation(), "demo")["state"] == "done"
 
 
 def test_empty_dependencies_preserve_v1_persisted_idempotency_hashes(pg):
@@ -804,10 +834,9 @@ def completed_private_dependency(pg, suffix="private"):
     space = s.create_space(pg.owner, operation(), "Private dependency " + suffix)
     page = s.create_page(pg.owner, operation(), space["id"], "Private dependency page")
     parent = s.submit_task(pg.owner, operation(), "dependency-" + suffix, "Private dependency instructions", page_id=page["id"])
-    claim = s.claim_next(SERVICE_ACTOR, operation())
-    assert claim["task_id"] == parent["id"]
-    s.mark_dispatched(SERVICE_ACTOR, operation(), parent["id"], claim["epoch"])
-    s.finish_auto(SERVICE_ACTOR, operation(), parent["id"], claim["epoch"], "Private dependency output", operation(), "demo")
+    claim = s.claim(pg.owner, operation(), parent["id"])
+    s.submit_result(pg.owner, operation(), parent["id"], claim["epoch"], "Private dependency output")
+    s.gate(pg.owner, operation(), parent["id"], claim["epoch"], "pass", self_approval=True)
     return page, parent
 
 
@@ -841,38 +870,6 @@ def test_revoked_dependency_blocks_ready_claim_and_plan_replay_without_id_leak(p
     projected = s.get_task(pg.editor, child["id"])
     assert projected["depends_on"] == [parent["id"]] and projected["has_hidden_dependencies"]
     assert other_parent["id"] not in json.dumps(projected)
-
-
-@pytest.mark.parametrize("lost_permission", ["dependency_view", "task_edit"])
-@pytest.mark.parametrize("after_claim", [False, True], ids=["before_claim", "before_dispatch"])
-def test_auto_rechecks_saved_requester_authority_without_impersonating_audit_actor(pg, lost_permission, after_claim):
-    s = pg.store
-    page, parent = completed_private_dependency(pg)
-    s.share(pg.owner, operation(), "page", page["id"], "person", pg.editor.account, "view")
-    child = s.submit_task(pg.editor, operation(), "requester-authority", "Authorized child", page_id=pg.page["id"], depends_on=[parent["id"]])
-    claim_op = operation()
-    claim = s.claim_next(SERVICE_ACTOR, claim_op) if after_claim else None
-    if after_claim:
-        assert claim["task_id"] == child["id"]
-    if lost_permission == "dependency_view":
-        resource_type, resource_id = "page", page["id"]
-    else:
-        resource_type, resource_id = "space", pg.space["id"]
-    s.share(pg.owner, operation(), resource_type, resource_id, "person", pg.editor.account, None)
-    if after_claim:
-        expect("forbidden", lambda: s.claim_next(SERVICE_ACTOR, claim_op))
-        expect("forbidden", lambda: s.mark_dispatched(SERVICE_ACTOR, operation(), child["id"], claim["epoch"]))
-        assert s.interrupt_auto(SERVICE_ACTOR, operation(), child["id"], claim["epoch"], "cancelled")["state"] == "interrupted"
-    else:
-        assert s.claim_next(SERVICE_ACTOR, claim_op) is None
-    with s._transaction() as conn:
-        raw = conn.execute("SELECT state,epoch,dispatch_started_at FROM baton.tasks WHERE id=%s", (child["id"],)).fetchone()
-    assert raw["dispatch_started_at"] is None
-    assert raw["epoch"] == (claim["epoch"] if after_claim else 0)
-    rows = s.list_audit(pg.owner, task_id=child["id"])
-    assert not any(row["event"] == "task.dispatched" for row in rows)
-    service_rows = [row for row in rows if row["event"] in {"worker.claimed", "task.interrupted"}]
-    assert all(row["performed_by"] == SERVICE_ACTOR.principal and row["requested_by"] == pg.editor.principal for row in service_rows)
 
 
 def face(**changes):
@@ -924,29 +921,6 @@ def test_work_face_missing_names_each_absent_part_and_scopes_cannot_be_repaired(
     expect("work_face_incomplete", lambda: s.claim(pg.owner, operation(), still["id"]))
     assert not {only_face["id"], only_base["id"], no_scopes["id"], nothing["id"]} & ready_ids(pg, pg.owner)
     assert s.set_work_face(pg.owner, operation(), only_face["id"], face(), base_commit="base-1")["work_face_missing"] == []
-
-
-def test_auto_queue_skips_incomplete_work_face_and_take_claim_enforces_it(pg):
-    s = pg.store
-    incomplete = s.submit_task(pg.owner, operation(), "wf-auto-incomplete", "Auto work needing a work face", page_id=pg.page["id"],
-                               scopes=disjoint(pg, "auto1"), require_work_face=True)
-    plain = s.submit_task(pg.owner, operation(), "wf-auto-plain", "Auto work without a checklist", page_id=pg.page["id"],
-                          scopes=disjoint(pg, "auto2"))
-    assert incomplete["work_face_missing"] == ["base_commit", "work_face"]
-    with s._transaction(write=True) as conn:
-        raw = s._row(conn, "tasks", incomplete["id"])
-        with pytest.raises(StoreError) as caught:
-            s._take_claim(conn, SERVICE_ACTOR, operation(), raw, 60)
-        assert caught.value.code == "work_face_incomplete"
-    first = s.claim_next(SERVICE_ACTOR, operation())
-    assert first["task_id"] == plain["id"]
-    s.set_work_face(pg.owner, operation(), incomplete["id"], face(), base_commit="auto-base")
-    claim_op = operation()
-    second = s.claim_next(SERVICE_ACTOR, claim_op)
-    assert second["task_id"] == incomplete["id"] and second["work_face"] == face()
-    with s._transaction(write=True) as conn:
-        conn.execute("UPDATE baton.tasks SET work_face=NULL WHERE id=%s", (incomplete["id"],))
-    expect("work_face_incomplete", lambda: s.claim_next(SERVICE_ACTOR, claim_op))
 
 
 def test_claim_replay_rechecks_work_face(pg):
@@ -1190,9 +1164,9 @@ def test_tasks_without_work_face_requirement_behave_as_before(pg):
     assert {plain["id"], decorated["id"]} <= ready_ids(pg, pg.editor)
     assert s.claim(pg.editor, operation(), plain["id"])["state"] == "claimed"
     assert s.claim(pg.editor, operation(), decorated["id"])["state"] == "claimed"
-    auto = s.submit_task(pg.owner, operation(), "plain-auto", "Plain automatic work", page_id=pg.page["id"], scopes=disjoint(pg, "plain3"))
-    assert auto["work_face_missing"] == [] and auto["task_kind"] == "construction"
-    assert s.claim_next(SERVICE_ACTOR, operation())["task_id"] == auto["id"]
+    open_task = s.submit_task(pg.owner, operation(), "plain-open", "Plain unassigned work", page_id=pg.page["id"], scopes=disjoint(pg, "plain3"))
+    assert open_task["work_face_missing"] == [] and open_task["task_kind"] == "construction"
+    assert s.claim(pg.editor, operation(), open_task["id"])["task_id"] == open_task["id"]
     with s._transaction() as conn:
         columns = {row["column_name"]: row for row in conn.execute(
             "SELECT column_name,column_default,is_nullable FROM information_schema.columns WHERE table_schema='baton' AND table_name='tasks'")}
@@ -1392,18 +1366,16 @@ def test_none_claims_neither_block_nor_are_blocked_by_other_scopes(pg):
     assert s.claim(pg.owner, operation(), manual(pg, "none-d", NONE)["id"])["state"] == "claimed"
 
 
-def test_automatic_tasks_without_scopes_keep_the_conservative_root_placeholder(pg):
+def test_unassigned_tasks_without_scopes_default_to_none_and_are_claimed_together(pg):
     s = pg.store
-    first = s.submit_task(pg.owner, operation(), "auto-root-1", "Automatic one", page_id=pg.page["id"])
-    second = s.submit_task(pg.owner, operation(), "auto-root-2", "Automatic two", page_id=pg.page["id"])
+    first = s.submit_task(pg.owner, operation(), "open-none-1", "Unassigned one", page_id=pg.page["id"])
+    second = s.submit_task(pg.owner, operation(), "open-none-2", "Unassigned two", page_id=pg.page["id"])
     for task in (first, second):
-        assert s.get_scopes(pg.owner, task["id"])["scopes"] == ROOT
-    claim = s.claim_next(SERVICE_ACTOR, operation())
-    assert claim["task_id"] == first["id"]
-    assert s.claim_next(SERVICE_ACTOR, operation()) is None
-    unrelated = manual(pg, "auto-root-blocked", [{"kind": "path", "value": pg.prefix + "/other"}])
-    expect("scope_conflict", lambda: s.claim(pg.owner, operation(), unrelated["id"]))
-    assert s.claim(pg.owner, operation(), manual(pg, "auto-root-none", NONE)["id"])["state"] == "claimed"
+        assert s.get_scopes(pg.owner, task["id"])["scopes"] == NONE and task["scopes"] == NONE
+    assert s.claim(pg.editor, operation(), first["id"])["state"] == "claimed"
+    assert s.claim(pg.owner, operation(), second["id"])["state"] == "claimed"
+    unrelated = manual(pg, "open-none-path", [{"kind": "path", "value": pg.prefix + "/other"}])
+    assert s.claim(pg.owner, operation(), unrelated["id"])["state"] == "claimed"
 
 
 def test_work_face_completeness_treats_none_as_undeclared(pg):
@@ -1436,6 +1408,7 @@ def test_omitted_scopes_keep_their_legacy_digests(pg):
                      "assignee": {"principal": pg.editor.principal, "account": pg.editor.account, "kind": pg.editor.kind}}
     auto_op = operation()
     auto = s.submit_task(pg.owner, auto_op, "legacy-omitted-auto", "Legacy omitted auto", page_id=pg.page["id"])
+    assert auto["scopes"] == NONE
     legacy_auto = {"idempotency_key": "legacy-omitted-auto", "prompt": "Legacy omitted auto", "page_id": pg.page["id"], "scopes": ROOT, "assignee": None}
     with s._transaction() as conn:
         for task, operation_name, op, args in ((block, "create_task_block", create_op, legacy_create),
@@ -1889,7 +1862,10 @@ def test_task_override_can_raise_a_policy_but_only_the_space_owner_can_lower_it(
     for bad in (3, 0, True, "2", 1.0):
         expect("invalid", lambda bad=bad: s.create_task_block(pg.owner, operation(), pg.page["id"], "Synthetic bad", [{"kind": "path", "value": pg.prefix}],
                                                               [one.principal], approvals_required=bad))
-    expect("invalid", lambda: s.submit_task(pg.owner, operation(), "auto-override", "Synthetic auto", page_id=pg.page["id"], approvals_required=2))
+    unassigned = s.submit_task(pg.owner, operation(), "open-override", "Synthetic open", page_id=pg.page["id"],
+                               scopes=[{"kind": "path", "value": pg.prefix + "/o5"}], approvals_required=2)
+    assert s.get_task(pg.owner, unassigned["id"])["approvals_required"] == 2
+    expect("invalid", lambda: s.submit_task(pg.owner, operation(), "open-override-bad", "Synthetic open", page_id=pg.page["id"], approvals_required=3))
     assigned = s.submit_task(pg.owner, operation(), "assigned-override", "Synthetic assigned", page_id=pg.page["id"], assignee=pg.editor,
                              scopes=[{"kind": "path", "value": pg.prefix + "/o4"}], approvals_required=2)
     assert s.get_task(pg.owner, assigned["id"])["approvals_required"] == 2
@@ -1918,17 +1894,20 @@ def test_policy_scopes_match_by_kind_and_prefix_and_changes_are_audited(pg):
     assert pg.prefix not in json.dumps(events)
 
 
-def test_worker_success_gate_needs_no_delegation_and_writes_none(pg):
+def test_legacy_worker_success_rows_stay_readable_and_nobody_can_gate_them(pg):
     s = pg.store
-    auto = s.submit_task(pg.owner, operation(), "auto-exempt", "Synthetic auto", page_id=pg.page["id"], scopes=[{"kind": "path", "value": pg.prefix}])
-    auto_claim = s.claim_next(SERVICE_ACTOR, operation())
-    assert auto_claim["task_id"] == auto["id"]
-    s.mark_dispatched(SERVICE_ACTOR, operation(), auto["id"], auto_claim["epoch"])
-    done = s.finish_auto(SERVICE_ACTOR, operation(), auto["id"], auto_claim["epoch"], "Demo output", operation(), "demo")
-    assert done["status"] == "completed" and done["approvals_required"] is None
-    row = gate_rows(pg, auto["id"])[0]
+    done = s.submit_task(pg.owner, operation(), "legacy-exempt", "Synthetic legacy", page_id=pg.page["id"], scopes=[{"kind": "path", "value": pg.prefix}])
+    to_legacy(pg, done["id"], state="done", dispatched=True, backend="demo", result="Demo output", epoch=1)
+    with pg.store._transaction(write=True) as conn:
+        conn.execute("""INSERT INTO baton.x_gate(id,task_id,epoch,decision,reviewer,reviewer_account,evidence)
+            VALUES (%s,%s,1,'pass','codex-worker','baton-service','{}'::jsonb)""", (uuid.uuid4(), done["id"]))
+    view = s.get_task(pg.owner, done["id"])
+    assert view["status"] == "completed" and view["gate_mode"] == "worker_success" and view["approvals_required"] is None
+    row = gate_rows(pg, done["id"])[0]
     assert (row["delegation_id"], row["grantor"], row["root"], row["self_approval"]) == (None, None, False, False)
-    expect("forbidden", lambda: s.gate(SERVICE_ACTOR, operation(), auto["id"], auto_claim["epoch"], "pass"))
+    for caller in (SERVICE_ACTOR, pg.owner, pg.reviewer):
+        expect("forbidden", lambda caller=caller: s.gate(caller, operation(), done["id"], 1, "pass"))
+    expect("invalid", lambda: s.delegation_create(pg.owner, operation(), Actor("codex-worker", "legacy-service", "agent"), reason="DECISIONS 291"))
 
 
 def test_delegation_api_validation_and_authority(pg):

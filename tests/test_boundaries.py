@@ -3,7 +3,6 @@
 import hashlib
 import importlib
 import json
-import time
 import uuid
 
 import pytest
@@ -12,7 +11,7 @@ from starlette.testclient import TestClient
 
 @pytest.mark.asyncio
 async def test_idempotency_is_stable_and_owner_scoped(modules, pg_store, make_context):
-    _, server, _ = modules
+    _, server = modules
     first = await server.submit_task("stable-key", "test prompt", make_context())
     replay = await server.submit_task("stable-key", "test prompt", make_context())
     assert first["task_id"] == replay["task_id"] and replay["replay"]
@@ -26,28 +25,12 @@ async def test_idempotency_is_stable_and_owner_scoped(modules, pg_store, make_co
     other = await server.submit_task("stable-key", "test prompt", make_context("other-client"))
     assert other["task_id"] != first["task_id"]
     view = await server.get_task(first["task_id"], make_context())
-    assert not {"prompt", "idem", "idempotency_key", "token"} & view.keys()
-
-
-@pytest.mark.asyncio
-async def test_restart_never_reexecutes_ambiguous_pg_dispatch(modules, pg_store, make_context):
-    _, server, _ = modules
-    task = await server.submit_task("stable-key", "test", make_context())
-    claim = pg_store.claim_next(server.SERVICE, str(uuid.uuid4()), lease_seconds=1)
-    assert claim["id"] == task["task_id"]
-    pg_store.mark_dispatched(server.SERVICE, str(uuid.uuid4()), claim["id"], claim["epoch"])
-    time.sleep(1.1)  # The authority is real PostgreSQL time, not a patched clock.
-    await server.recover_auto()
-    view = await server.get_task(task["task_id"], make_context())
-    assert view["status"] == "interrupted"
-    assert await server.claim_next() is None
-    replay = await server.submit_task("stable-key", "test", make_context())
-    assert replay["replay"] and replay["status"] == "interrupted"
-    assert await server.claim_next() is None
+    assert not {"idem", "idempotency_key", "token"} & view.keys()
+    assert view["execution_mode"] == "manual" and view["assignee"] is None and view["prompt"] == "test prompt"
 
 
 def test_identity_revocation_reloads_and_returns_no_hash(modules):
-    common, _, _ = modules
+    common, _ = modules
     token = "synthetic-client-credential"
     records = {"test-client": {"agent": "test-client", "role": "client", "active": True,
                                "account": "connected-account", "kind": "agent",
@@ -66,11 +49,17 @@ def test_identity_revocation_reloads_and_returns_no_hash(modules):
     assert common.identity("Bearer " + token) is None
     path.write_text("{")
     assert common.identity("Bearer " + token) is None
+    for role, kind in (("dispatcher", "service"), ("dispatcher", "agent"), ("service", "service")):
+        path.write_text(json.dumps({"test-client": {"agent": "test-client", "role": role, "kind": kind, "active": True,
+                                                    "account": "connected-account",
+                                                    "hash": hashlib.sha256(token.encode()).hexdigest()}}))
+        assert common.identity("Bearer " + token) is None
+        assert common.resolve_principal("test-client") is None
 
 
 @pytest.mark.asyncio
 async def test_audit_contains_metadata_not_prompts_or_untrusted_request_ids(modules, pg_store, make_context):
-    common, server, _ = modules
+    common, server = modules
     marker = "synthetic-private-prompt-and-token-marker"
     await server.submit_task("private-key", marker, make_context(request_id=marker))
     log = (common.STATE / "audit.jsonl").read_text()
@@ -84,12 +73,12 @@ async def test_audit_contains_metadata_not_prompts_or_untrusted_request_ids(modu
 
 
 def test_mcp_dynamic_origin_host_and_client_role(modules, pg_store, monkeypatch):
-    common, server, _ = modules
+    common, server = modules
     monkeypatch.setenv("PUBLIC_URL", "https://baton.example.com:9443")
     importlib.reload(server)
     monkeypatch.setattr(common, "identity", lambda value: {
         "Bearer client": {"agent": "test-client", "role": "client", "account": "test-account", "kind": "agent"},
-        "Bearer dispatcher": {"agent": "codex-worker", "role": "dispatcher", "account": "baton-service", "kind": "service"},
+        "Bearer other-role": {"agent": "test-other", "role": "other", "account": "test-other", "kind": "agent"},
     }.get(value))
     request = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
         "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "synthetic-test", "version": "1"},
@@ -103,24 +92,12 @@ def test_mcp_dynamic_origin_host_and_client_role(modules, pg_store, monkeypatch)
         assert client.post("/mcp", json=request, headers={**headers, "Host": "evil.invalid"}).status_code == 421
         assert client.post("/mcp", json=request, headers={**headers, "Host": "bridge", "Origin": "https://evil.invalid"}).status_code == 403
         assert client.get("/healthz").status_code == 401
-        assert client.get("/healthz", headers={"Authorization": "Bearer dispatcher"}).status_code == 403
-
-
-def test_nested_and_database_credentials_are_redacted(modules, monkeypatch):
-    common, _, _ = modules
-    secret = "synthetic-database-password"
-    path = common.SECRETS / "database.json"
-    path.write_text(json.dumps({"password": secret}))
-    monkeypatch.setenv("BATON_DATABASE_CONFIG", str(path))
-    assert common.redact(secret + " synthetic-dispatcher-credential") == "[REDACTED] [REDACTED]"
-    path.write_text("{")
-    with pytest.raises(RuntimeError, match="Credential store is unreadable"):
-        common.redact(secret)
+        assert client.get("/healthz", headers={"Authorization": "Bearer other-role"}).status_code == 403
 
 
 @pytest.mark.parametrize("url", ["ftp://example.com", "https://user:password@example.com", "https://example.com/path", "https://example.com?token=test"])
 def test_public_origin_rejects_credentials_and_paths(modules, monkeypatch, url):
-    common, _, _ = modules
+    common, _ = modules
     monkeypatch.setenv("PUBLIC_URL", url)
     with pytest.raises(ValueError):
         common.public_url()

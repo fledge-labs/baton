@@ -2,7 +2,6 @@
 import hashlib
 import importlib.util
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -34,13 +33,37 @@ def test_issue_rotate_replay_revoke_and_export(tmp_path,capsys):
     with pytest.raises(ValueError):invoke(root,'export','example-client','--output',str(output))
     assert new not in capsys.readouterr().out
 
-def test_internal_dispatcher_not_exportable(tmp_path):
+def test_init_creates_no_internal_identity_and_no_worker_state(tmp_path):
     root=tmp_path/'runtime';invoke(root,'init')
-    with pytest.raises(ValueError):invoke(root,'export','codex-worker','--output',str(tmp_path/'worker.token'))
-    registry=json.loads((root/'config/identities.json').read_text())
-    before=registry['codex-worker']['hash']
+    assert json.loads((root/'config/identities.json').read_text())=={}
+    assert json.loads((root/'config/gateway.json').read_text())['binds'][0]['listeners'][0]['routes'][0]['policies']['apiKey']['keys']==[]
+    assert sorted(path.name for path in (root/'secrets').iterdir())==['clients','database-admin','database-app']
+    assert sorted(path.name for path in (root/'data').iterdir())==['bridge','postgres']
+
+def test_admin_actions_are_only_the_credential_operations(tmp_path,capsys):
+    with pytest.raises(SystemExit):invoke(tmp_path/'runtime','--help')
+    assert '{init,issue,revoke,rotate,export,list,import-client}' in capsys.readouterr().out
+    with pytest.raises(SystemExit):invoke(tmp_path/'runtime','import-credentials','--source',str(tmp_path/'auth.json'))
+    assert not (tmp_path/'runtime').exists()
+
+
+def test_init_retires_a_legacy_dispatcher_identity_without_exporting_or_rotating_it(tmp_path):
+    root=tmp_path/'runtime';invoke(root,'init');invoke(root,'issue','example-client')
+    registry=root/'config/identities.json';entries=json.loads(registry.read_text())
+    token='D'*48;digest=hashlib.sha256(token.encode()).hexdigest()
+    entries['codex-worker']={'agent':'codex-worker','role':'dispatcher','kind':'service','account':'baton-service','hash':digest,'active':True}
+    registry.write_text(json.dumps(entries))
     invoke(root,'init')
-    assert json.loads((root/'config/identities.json').read_text())['codex-worker']['hash']==before
+    retired=json.loads(registry.read_text())['codex-worker']
+    assert retired['active'] is False and retired['hash']==digest
+    assert json.loads(registry.read_text())['example-client']['active'] is True
+    gateway=(root/'config/gateway.json').read_text()
+    assert digest not in gateway and hashlib.sha256(
+        (root/'secrets/clients/example-client.token').read_text().strip().encode()).hexdigest() in gateway
+    before=registry.read_bytes()
+    with pytest.raises(ValueError):invoke(root,'export','codex-worker','--output',str(tmp_path/'worker.token'))
+    with pytest.raises(SystemExit):invoke(root,'rotate','codex-worker','--operation-id','no-change')
+    assert registry.read_bytes()==before
 
 
 def test_database_files_are_private_stable_and_not_gateway_metadata(tmp_path,capsys):
@@ -53,16 +76,10 @@ def test_database_files_are_private_stable_and_not_gateway_metadata(tmp_path,cap
     assert config['password']!=files[0].read_text().strip()
     assert all(path.stat().st_mode & 0o777==0o600 for path in files)
     assert not (root/'secrets/mail').exists()
-    assert not (root/'secrets/bridge/mail.token').exists()
-    mountpoint=root/'secrets/database-app/bridge'
-    assert mountpoint.is_dir() and not list(mountpoint.iterdir())
-    mountpoint.rmdir()  # Reproduce an already-initialized volume missing the mountpoint.
+    assert not (root/'secrets/bridge').exists()
+    assert not (root/'secrets/database-app/bridge').exists()
     invoke(root,'init')
     assert {path:path.read_bytes() for path in files}==first
-    assert mountpoint.is_dir() and not list(mountpoint.iterdir())
-    assert mountpoint.stat().st_mode & 0o777==0o700
-    if os.geteuid()==0:
-        assert (mountpoint.stat().st_uid,mountpoint.stat().st_gid)==(tokens.SERVICE_UID,tokens.SERVICE_GID)
     public=(root/'config/identities.json').read_text()+(root/'config/gateway.json').read_text()+capsys.readouterr().out
     assert files[0].read_text().strip() not in public
     assert config['password'] not in public
@@ -115,7 +132,6 @@ def test_only_admin_client_issue_and_rotate_accept_mapping(tmp_path):
     with pytest.raises(SystemExit):invoke(root,'issue','example','--account','')
     with pytest.raises(SystemExit):invoke(root,'issue','example','--kind','service')
     with pytest.raises(SystemExit):invoke(root,'rotate','codex-worker','--operation-id','no-change','--kind','human')
-    assert json.loads((root/'config/identities.json').read_text())['codex-worker']['kind']=='service'
 
 
 def test_admin_init_explicitly_upgrades_legacy_mapping_without_rotating(tmp_path):
@@ -183,13 +199,12 @@ def test_import_client_conflict_leaves_all_runtime_state_unchanged(tmp_path,caps
     assert hashlib.sha256(('A'*48).encode()).hexdigest() not in logs
 
 
-def test_import_client_cannot_reuse_another_identity_or_import_dispatcher(tmp_path):
+def test_import_client_cannot_reuse_another_identity_or_import_the_reserved_legacy_name(tmp_path):
     root=tmp_path/'runtime';invoke(root,'init');invoke(root,'issue','existing-client')
     source=root/'secrets/clients/existing-client.token';before=runtime_snapshot(root)
     with pytest.raises(SystemExit):invoke(root,'import-client','another-client','--source',str(source))
     assert runtime_snapshot(root)==before
-    worker=root/'secrets/bridge/dispatcher.token'
-    with pytest.raises(SystemExit):invoke(root,'import-client','codex-worker','--source',str(worker))
+    with pytest.raises(SystemExit):invoke(root,'import-client','codex-worker','--source',str(source))
     assert runtime_snapshot(root)==before
 
 

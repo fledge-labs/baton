@@ -90,7 +90,7 @@ openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/
 - `--prompt-file`、`--body-file`、`--result-file`、`--json-file` 传 `-` 表示读取 stdin。`--epoch` 在 `gate` 中对应 API 的 `expected_epoch`，即被审阅结果所属的 epoch；省略时见下文“审阅人流程”。`--edited-result-file` 同样可传 `-` 读取 stdin。
 - stdout 始终是纯 JSON，并以 UTF-8 输出原文（`ensure_ascii=False`），中文不会被转义成 `\uXXXX`。
 - `claim`、`renew`、`result`、`gate`、`block` 默认再向 stderr 打印一行摘要，如 `task <id> state=claimed epoch=3`；用 `--no-summary` 关闭，`submit`、`task`、`comment`、`call` 可用 `--summary` 打开。stdout 不受影响。`gate` 的摘要行还带审批人与权限来源，见下文。`watch` 的 `--summary` 含义不同，见下文。
-- 省略 scope 时，带 `--assignee` 的手工任务默认声明 `none`（不占用任何 scope，多个无文件足迹的审阅、文档任务可同时领取）；不带 `--assignee` 的自动任务仍使用保守的仓库根占位范围。
+- 省略 scope 时，所有任务（不论是否带 `--assignee`）默认声明 `none`（不占用任何 scope，多个无文件足迹的审阅、文档任务可同时领取）。不带 `--assignee` 的 `submit` 创建未指派的手工任务，任何对该页面有 edit 权限的主体都能用 `ready` 看到并 `claim` 它；Baton 不执行任务。
 - 写操作失败后，stderr 会多打一行 `operation_id=...`。网络中断后不知道操作是否生效时，用同一个 `--operation-id` 重试，服务端保证只产生一次效果；不要重新生成。
 
 ## 命名接收人流程：wait → claim → comment → result

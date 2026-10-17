@@ -64,7 +64,7 @@ args = ["-c", 'BATON_URL="https://example.com/mcp" exec "$HOME/baton/adapters/la
 
 ## 检查连接
 
-运行 `codex mcp list`，重新启动会话后用 `/mcp` 检查 `baton`。先调用 `fetch_inbox`；再用一个明确授权的小任务调用 `submit_task`，用返回的任务 ID 调用 `get_task`，最后用 `fetch_inbox` 核对同一任务线程中的完成评论。连接成功或列出工具不等于任务链已成功。
+运行 `codex mcp list`，重新启动会话后用 `/mcp` 检查 `baton`。先调用 `fetch_inbox`；再用一个明确授权的小任务调用 `submit_task`，用返回的任务 ID 调用 `get_task`。Baton 不执行任务：`submit_task` 只创建手工任务（不带接收人时任何有页面 edit 权限的主体都能在 `ready` 里领取它，带 `assignee_principal` 时只有该主体能领取），任务由另一个身份领取、提交结果并经 gate 通过后才会完成，最后用 `fetch_inbox` 核对同一任务线程中的完成评论。连接成功或列出工具不等于任务链已成功；完整的两身份流程见 `scripts/e2e.py`。
 
 失败时依次检查 SSH、适配器 Python 环境、token 文件权限、`BATON_URL` 和 CA。排查日志时不要打印 token，也不要将运行回执提交到仓库。
 
@@ -76,4 +76,4 @@ args = ["-c", 'BATON_URL="https://example.com/mcp" exec "$HOME/baton/adapters/la
 
 空间、页面、块、评论、分享、提案和手工 claim/gate 工具的清单可通过 MCP 工具发现读取。需要使用新工具时，在已有配置内按实际授权扩展 `enabled_tools`，保留逐工具审批。没有 MCP 的任意 runtime 可直接调用 [Baton HTTP API](../docs/api.md)；协议标识为 `baton.space.v1`，这是 Baton 自有接口，不是 OpenAI Space wire protocol。
 
-创建有依赖的任务时，在 submit_task 或 create_task_block 中同时传入 `depends_on=[前置任务UUID]`，确保任务与依赖原子建立，自动 worker 不会在后续 plan 前抢先领取。已有任务用 `plan(operation_id, graph)` 建立或扩展依赖图；graph 的每项只接受 task_id 和 depends_on。接收人用 `ready(page_id?, limit?)` 查看当前可领取任务，再调用 claim。ready 结果只是当前视图，领取时仍重新校验前置 gate、权限和租约。MCP enabled_tools 如需开放 plan/ready，应按本任务授权增量添加；普通 HTTP 使用同名操作，不需要特定 agent runtime。
+创建有依赖的任务时，在 submit_task 或 create_task_block 中同时传入 `depends_on=[前置任务UUID]`，确保任务与依赖原子建立，别的主体不会在后续 plan 前抢先领取。已有任务用 `plan(operation_id, graph)` 建立或扩展依赖图；graph 的每项只接受 task_id 和 depends_on。接收人用 `ready(page_id?, limit?)` 查看当前可领取任务，再调用 claim。ready 结果只是当前视图，领取时仍重新校验前置 gate、权限和租约。MCP enabled_tools 如需开放 plan/ready，应按本任务授权增量添加；普通 HTTP 使用同名操作，不需要特定 agent runtime。

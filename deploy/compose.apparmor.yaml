@@ -1,8 +1,0 @@
-# SPDX-License-Identifier: Apache-2.0
-# Requires this exact profile to be loaded on the Docker Engine host first.
-services:
-  codex:
-    security_opt: !override
-      - no-new-privileges:true
-      - seccomp=./security/codex-seccomp.json
-      - apparmor=baton-codex-userns-v1

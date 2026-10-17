@@ -10,10 +10,9 @@ Acceptance criteria are written as checks that can be run or observed; each mile
 ## W2 (next week)
 
 ### W2-0 D6 cutover leftovers
-- Work: codex-mode end-to-end run; a memory limit for the codex worker; 南瓜 switches its clients to the new layer.
+- Decision (owner): the built-in Codex worker is removed entirely, so the former items "codex-mode end-to-end run" and "a memory limit for the codex worker" are dropped, not postponed. Baton is a communication and collaboration layer; execution belongs to external agents that connect over MCP, HTTP or A2A, or through an adapter. `submit_task` without an assignee now creates a manual, unassigned task that any principal with edit on the page can claim. The end-to-end check is the two-identity named-agent flow in `scripts/e2e.py`.
+- Work: 南瓜 switches its clients to the new layer.
 - Acceptance:
-  - the codex-mode e2e passes (submit, completed, thread report, audit);
-  - the codex worker runs under a configured memory limit, and exceeding it fails the task with a clear error instead of affecting other services;
   - 南瓜 reaches Baton through its switched clients, and the file mailbox is used only as a fallback.
 - Depends on: nothing new.
 

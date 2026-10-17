@@ -5,17 +5,12 @@ validation errors, blocked markers, invisible-object 404s and legacy root-scope 
 Every identity, prompt, comment and token is synthetic.
 """
 
-import asyncio
 import json
 import subprocess
 import sys
-import time
 import uuid
 from pathlib import Path
 
-import pytest
-
-from bridge.space_store import Actor, SERVICE_ACTOR, StoreError
 from test_bridge import api, mcp_call, op, shared_page  # noqa: F401  (api is a fixture)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,18 +83,21 @@ def test_preview_is_omitted_when_the_reader_lost_view_permission(api, pg_store):
     assert wait(call, "worker")[0]["body_preview"] == "Synthetic revoked-text probe"
 
 
-def test_automatic_task_prompts_stay_private_in_notification_rows(api, pg_store, modules):
+def test_legacy_automatic_task_prompts_stay_private_in_notification_rows(api, pg_store, legacy_codex):
     _, call, identities, _, _, _ = api
-    _, server, _ = modules
     _, page = shared_page(call, identities)
-    task = call("owner", "submit_task", operation_id=op(), idempotency_key="df1-auto", prompt="Synthetic automatic probe", page_id=page["id"])
-    claim = pg_store.claim_next(server.SERVICE, op(), lease_seconds=300)
-    pg_store.mark_dispatched(server.SERVICE, op(), claim["id"], claim["epoch"])
-    pg_store.fail_auto(server.SERVICE, op(), claim["id"], claim["epoch"], "CODEX_TIMEOUT", str(uuid.uuid4()))
+    task = call("owner", "submit_task", operation_id=op(), idempotency_key="df1-legacy", prompt="Synthetic legacy probe", page_id=page["id"])
+    legacy_codex(task["task_id"], state="failed", dispatched=True, backend="codex", error="CODEX_TIMEOUT")
+    with pg_store._transaction(write=True) as conn:
+        conn.execute("""INSERT INTO baton.x_notify(id,recipient,recipient_account,event,object_type,object_id,thread_id,actor,actor_kind)
+            VALUES (%s,%s,%s,'task.failed','task',%s,%s,'codex-worker','service')""",
+                     (uuid.uuid4(), identities["owner"]["agent"], identities["owner"]["account"], task["task_id"], task["task_id"]))
     row = wait(call, "owner")[0]
     assert row["event"] == "task.failed" and row["subject"] == "[failed] " + task["task_id"]
     assert "body_preview" not in row and "probe" not in json.dumps(row)
-    assert row["actor"] == {"principal": SERVICE_ACTOR.principal, "kind": "service"}
+    assert row["actor"] == {"principal": "codex-worker", "kind": "service"}
+    view = call("owner", "get_task", task_id=task["task_id"])
+    assert view["status"] == "failed" and view["error"] == "CODEX_TIMEOUT" and "prompt" not in view
 
 
 def test_fetch_inbox_messages_gain_actor_and_preview_without_changing_subject(api):
@@ -296,7 +294,7 @@ def test_reviewers_may_mark_blocked_and_everyone_else_is_refused(api):
     assert wait(call, "owner")[0]["event"] == "task.blocked"
 
 
-def test_mark_blocked_validates_reason_note_and_task_kind(api):
+def test_mark_blocked_validates_reason_note_and_task_kind(api, legacy_codex):
     _, call, identities, _, _, _ = api
     _, page = shared_page(call, identities)
     task = manual_task(call, identities, page)
@@ -307,8 +305,9 @@ def test_mark_blocked_validates_reason_note_and_task_kind(api):
     assert call("worker", "mark_blocked", 422, operation_id=op(), task_id=task["task_id"], reason_code="other", note=" ")["code"] == "invalid"
     assert call("worker", "mark_blocked", 422, operation_id=op(), task_id=task["task_id"])["details"] == [
         {"field": "reason_code", "expected": "required string"}]
-    auto = call("owner", "submit_task", operation_id=op(), idempotency_key="df7-auto", prompt="Automatic", page_id=page["id"])
-    assert call("owner", "mark_blocked", 403, operation_id=op(), task_id=auto["task_id"], reason_code="other")["code"] == "forbidden"
+    legacy = call("owner", "submit_task", operation_id=op(), idempotency_key="df7-legacy", prompt="Legacy", page_id=page["id"])
+    legacy_codex(legacy["task_id"])
+    assert call("owner", "mark_blocked", 403, operation_id=op(), task_id=legacy["task_id"], reason_code="other")["code"] == "forbidden"
 
 
 def test_reassignment_clears_the_blocked_marker_and_done_tasks_cannot_be_marked(api):
@@ -396,7 +395,7 @@ def make_legacy(call, identities, page, prompt, **extra):
     return manual_task(call, identities, page, prompt=prompt, scopes=[], **extra)
 
 
-def test_migration_rewrites_only_unclaimed_manual_root_scope_tasks(api, pg_store, capsys):
+def test_migration_rewrites_only_unclaimed_manual_root_scope_tasks(api, pg_store, capsys, legacy_codex):
     from bridge import scopes
     _, call, identities, _, _, _ = api
     _, page = shared_page(call, identities)
@@ -406,6 +405,8 @@ def test_migration_rewrites_only_unclaimed_manual_root_scope_tasks(api, pg_store
     declared = manual_task(call, identities, page, prompt="Declared", scopes=[{"kind": "path", "value": "src/x"}])
     explicit = manual_task(call, identities, page, prompt="Explicit none", scopes=[{"kind": "none"}])
     automatic = call("owner", "submit_task", operation_id=op(), idempotency_key="df13-auto", prompt="Auto", page_id=page["id"])
+    assert scopes_of(call, "owner", automatic["task_id"]) == NONE_SCOPE, "an unassigned submit_task declares no scope unless asked"
+    legacy_codex(automatic["task_id"])
     for task in (legacy, claimed, automatic):
         assert scopes_of(call, "owner", task["task_id"]) == ROOT_SCOPE
 
@@ -418,7 +419,7 @@ def test_migration_rewrites_only_unclaimed_manual_root_scope_tasks(api, pg_store
     assert summary == {"dry_run": False, "matched": 1, "migrated": 1, "skipped_claimed": 1, "task_ids": [legacy["task_id"]]}
     assert scopes_of(call, "owner", legacy["task_id"]) == NONE_SCOPE
     assert scopes_of(call, "owner", claimed["task_id"]) == ROOT_SCOPE, "a live claim is never touched"
-    assert scopes_of(call, "owner", automatic["task_id"]) == ROOT_SCOPE, "automatic tasks keep the root placeholder"
+    assert scopes_of(call, "owner", automatic["task_id"]) == ROOT_SCOPE, "legacy automatic tasks keep the root placeholder"
     assert scopes_of(call, "owner", declared["task_id"]) == [{"kind": "path", "value": "src/x"}]
     assert scopes_of(call, "owner", explicit["task_id"]) == NONE_SCOPE
     assert audit_events(pg_store, legacy["task_id"]).count("task.scopes_migrated") == 1
@@ -462,68 +463,6 @@ def test_migration_command_line_prints_one_json_summary(api, pg_store, capsys):
     assert subprocess.run([sys.executable, "-m", "bridge.scopes"], cwd=ROOT, capture_output=True, text=True).returncode == 2
 
 
-def audit_records(common, event):
-    path = common.STATE / "audit.jsonl"
-    if not path.exists():
-        return []
-    return [row for row in map(json.loads, path.read_text().splitlines()) if row["event"] == event]
-
-
-def test_scope_blocked_automatic_tasks_are_logged_once_per_five_minutes(api, pg_store, modules, monkeypatch):
-    common, server, _ = modules
-    _, call, identities, _, _, _ = api
-    _, page = shared_page(call, identities)
-    holder = manual_task(call, identities, page, prompt="Holds a path", scopes=[{"kind": "path", "value": "src/held"}])
-    call("worker", "claim", operation_id=op(), task_id=holder["task_id"])
-    stuck = call("owner", "submit_task", operation_id=op(), idempotency_key="df13-stuck", prompt="Stuck auto", page_id=page["id"],
-                 scopes=[{"kind": "path", "value": "src/held/other"}])
-    server._SCOPE_WARNED.clear()
-    clock = [1000.0]
-    monkeypatch.setattr(server.time, "monotonic", lambda: clock[0])
-
-    for _ in range(3):
-        assert asyncio.run(server.claim_next()) is None
-    records = audit_records(common, "dispatch.blocked_by_scope")
-    assert len(records) == 1, "rate limited to one warning per task"
-    assert records[0]["task_id"] == stuck["task_id"] and records[0]["blocked_by"] == holder["task_id"]
-    assert records[0]["level"] == "warning" and records[0]["agent"] == server.SERVICE.principal
-    assert "Stuck auto" not in json.dumps(records[0])
-
-    clock[0] += 299
-    asyncio.run(server.claim_next())
-    assert len(audit_records(common, "dispatch.blocked_by_scope")) == 1
-    clock[0] += 2
-    asyncio.run(server.claim_next())
-    assert len(audit_records(common, "dispatch.blocked_by_scope")) == 2
-
-    other = call("owner", "submit_task", operation_id=op(), idempotency_key="df13-second", prompt="Second stuck", page_id=page["id"],
-                 scopes=[{"kind": "path", "value": "src/held/more"}])
-    asyncio.run(server.claim_next())
-    warned = {row["task_id"] for row in audit_records(common, "dispatch.blocked_by_scope")}
-    assert warned == {stuck["task_id"], other["task_id"]}, "every skipped task gets its own warning"
-
-
-def test_claim_next_runs_disjoint_paths_in_parallel_and_skips_only_prefix_overlaps(api, pg_store, modules):
-    common, server, _ = modules
-    _, call, identities, _, _, _ = api
-    _, page = shared_page(call, identities)
-    holder = manual_task(call, identities, page, prompt="Holds a path", scopes=[{"kind": "path", "value": "src/a"}])
-    call("worker", "claim", operation_id=op(), task_id=holder["task_id"])
-    inside = call("owner", "submit_task", operation_id=op(), idempotency_key="prefix-inside", prompt="Inside auto", page_id=page["id"],
-                  scopes=[{"kind": "path", "value": "src/a/deep"}])
-    sibling = call("owner", "submit_task", operation_id=op(), idempotency_key="prefix-sibling", prompt="Sibling auto", page_id=page["id"],
-                   scopes=[{"kind": "path", "value": "src/ab"}])
-    docs = call("owner", "submit_task", operation_id=op(), idempotency_key="prefix-docs", prompt="Docs auto", page_id=page["id"],
-                scopes=[{"kind": "path", "value": "docs/b"}])
-    skipped = []
-    first = pg_store.claim_next(server.SERVICE, op(), on_scope_skip=lambda task, blocker: skipped.append((task, blocker)))
-    second = pg_store.claim_next(server.SERVICE, op(), on_scope_skip=lambda task, blocker: skipped.append((task, blocker)))
-    assert (first["task_id"], second["task_id"]) == (sibling["task_id"], docs["task_id"])
-    assert pg_store.claim_next(server.SERVICE, op()) is None
-    assert (inside["task_id"], holder["task_id"]) in skipped
-    assert call("owner", "get_task", task_id=inside["task_id"])["state"] == "queued"
-
-
 def test_ready_lists_only_candidates_whose_paths_do_not_overlap_a_live_claim(api, pg_store):
     _, call, identities, _, _, _ = api
     _, page = shared_page(call, identities)
@@ -534,22 +473,3 @@ def test_ready_lists_only_candidates_whose_paths_do_not_overlap_a_live_claim(api
     ready = {task["task_id"] for task in call("worker", "ready", page_id=page["id"])}
     assert disjoint["task_id"] in ready and nested["task_id"] not in ready
     call("worker", "claim", operation_id=op(), task_id=disjoint["task_id"])
-
-
-def test_unblocked_automatic_tasks_log_nothing_and_a_failing_hook_cannot_change_the_claim(api, pg_store, modules):
-    common, server, _ = modules
-    _, call, identities, _, _, _ = api
-    _, page = shared_page(call, identities)
-    holder = manual_task(call, identities, page, prompt="Holds a path", scopes=[{"kind": "path", "value": "src/held"}])
-    call("worker", "claim", operation_id=op(), task_id=holder["task_id"])
-    free = call("owner", "submit_task", operation_id=op(), idempotency_key="df13-free", prompt="Free auto", page_id=page["id"],
-                scopes=[{"kind": "migration", "value": "7"}])
-    server._SCOPE_WARNED.clear()
-    claimed = asyncio.run(server.claim_next())
-    assert claimed["task_id"] == free["task_id"] and audit_records(common, "dispatch.blocked_by_scope") == []
-
-    def broken(task_id, blocker):
-        raise RuntimeError("log sink down")
-    stuck = call("owner", "submit_task", operation_id=op(), idempotency_key="df13-hook", prompt="Stuck", page_id=page["id"])
-    assert pg_store.claim_next(server.SERVICE, op(), on_scope_skip=broken) is None
-    assert call("owner", "get_task", task_id=stuck["task_id"])["state"] == "queued"
