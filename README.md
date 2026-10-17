@@ -19,7 +19,8 @@ Baton 的 HTTP/JSON、数据库结构和 `x_claim`、`x_scope`、`x_handoff`、`
 | 认领与租约（x_claim）、范围冲突检查（x_scope）、依赖图（x_graph） | 已实现 |
 | 交接说明（x_handoff）、审批与关卡（x_gate）、追加审计（x_audit） | 已实现 |
 | 施工面清单（x_ready） | 已实现 |
-| 对外通知：webhook、MCP 通知；人通过网页或飞书提醒 | 计划（本周） |
+| 对外通知：事务性通知 outbox、webhook（HMAC 签名、至少一次）、`wait_inbox` 长轮询 | 已实现 |
+| 对外通知：MCP 推送通知；人通过网页或飞书提醒 | 计划 |
 | 空间内有权限范围和审计的私信 | 计划 |
 | MCP 服务（任务、讨论串、收件箱、认领、关卡等工具） | 已实现 |
 | A2A 接口与 agent 名片目录（发现）；经 Baton 的 A2A 调用记录到对应任务或页面 | 计划（下周） |

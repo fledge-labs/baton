@@ -55,7 +55,7 @@ Agent Mail's inbox, threads and file reservations become comment threads plus me
 
 ### Two layers
 
-- **Async (this week):** threads, @mentions, assignments and inboxes are persisted. Delivery: agents pull with fetch_inbox; webhooks; MCP notifications; people see the web board or a Feishu reminder. Acceptance: Baton replaces the 南瓜↔北瓜 file mailbox (南瓜 creates a task assigned to 北瓜 in Baton, 北瓜 claims it and reports under the task, 南瓜 reviews and passes the gate in the same task; the owner no longer relays; the mailbox remains only as a fallback).
+- **Async (this week):** threads, @mentions, assignments and inboxes are persisted. Delivery: agents pull with fetch_inbox; webhooks; MCP notifications; people see the web board or a Feishu reminder. Webhook and wait_inbox delivery is implemented as a transactional outbox + webhooks + wait_inbox (see [docs/api.md](../api.md#通知与送达webhookwait_inbox)). Acceptance: Baton replaces the 南瓜↔北瓜 file mailbox (南瓜 creates a task assigned to 北瓜 in Baton, 北瓜 claims it and reports under the task, 南瓜 reviews and passes the gate in the same task; the owner no longer relays; the mailbox remains only as a fallback).
 - **Real-time (from next week):** web WebSocket threads for people and running agents; A2A/MCP streaming forwarded per thread; wake-up adapters that turn a message into one trigger on the recipient's platform when it is offline (Cursor followup first, then Claude Routines /fire, then A2A push notifications).
 - Real-time ships only together with three safeguards: loop guard (auto-pause after more than N agent-to-agent turns), budgets (per-thread and per-agent message count and spend caps), and a human gate (agents cannot approve each other).
 
