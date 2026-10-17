@@ -158,8 +158,7 @@ def test_overdue_creates_exactly_one_notification_and_audit(team, pg_store):
 
     view = call("owner", "get_task", task_id=task_id)
     assert view["escalated_at"] and view["overdue"] is True and view["assignee"] == identities["worker"]["agent"]
-    private = json.dumps(notes(call, "owner")) + json.dumps(call("owner", "list_audit", task_id=task_id))
-    assert PROMPT not in private
+    assert PROMPT not in json.dumps(call("owner", "list_audit", task_id=task_id)), "audit never carries prompt text"
 
 
 def test_escalation_goes_to_escalate_to_and_the_owner(team, pg_store):
@@ -438,8 +437,9 @@ def test_set_priority_recomputes_the_open_window_and_checks_authority(team, pg_s
 
     assert call("reviewer", "set_priority", operation_id=op(), task_id=task_id, priority="low")["priority"] == "low"
     assert close_to(minutes_left(pg_store, task_id), 1440)
-    for label in ("worker", "replacement", "stranger"):
+    for label in ("worker", "replacement"):
         assert call(label, "set_priority", 403, operation_id=op(), task_id=task_id, priority="urgent")["code"] == "forbidden"
+    assert call("stranger", "set_priority", 404, operation_id=op(), task_id=task_id, priority="urgent")["code"] == "not_found"
     for bad in ("high", "", None, 5):
         assert call("owner", "set_priority", 422, operation_id=op(), task_id=task_id, priority=bad)["code"] == "invalid"
 

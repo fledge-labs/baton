@@ -36,7 +36,13 @@ MESSAGES = {
     "rate_limited": "Too many requests",
 }
 NOTIFY_EVENTS = frozenset({"mention.created", "task.assigned", "comment.created", "task.awaiting_gate",
-                           "gate.decided", "task.handed_off", "task.failed", "task.overdue"})
+                           "gate.decided", "task.handed_off", "task.failed", "task.overdue", "task.blocked"})
+PREVIEW_CHARS = 200
+SUBJECT_TITLE_CHARS = 60
+EVENT_LABELS = {"task.assigned": "assigned", "task.handed_off": "handed_off", "task.awaiting_gate": "awaiting_gate",
+                "gate.decided": "gate_decided", "task.failed": "failed", "task.overdue": "overdue", "task.blocked": "blocked"}
+BLOCK_REASONS = ("scope_conflict", "lease_held", "dependency_blocked", "waiting_input", "other")
+SCOPE_WARNING_SECONDS = 300
 WEBHOOK_LIMIT = 10
 WEBHOOK_MAX_ATTEMPTS = 8
 # Delay after failed attempt n (1-based); the seven delays between eight attempts total about an hour.
@@ -53,8 +59,10 @@ ESCALATION_BATCH = 100
 
 
 class StoreError(Exception):
-    def __init__(self, code):
+    def __init__(self, code, field=None, expected=None):
         self.code = code
+        # Static, value-free description of what was wrong; the rejected input itself is never kept.
+        self.details = [{"field": field, "expected": expected}] if code == "invalid" and field and expected else []
         super().__init__(MESSAGES.get(code, MESSAGES["storage_unavailable"]))
 
 
@@ -79,19 +87,19 @@ def parse_response_minutes(value):
     return policy
 
 
-def _identifier(value):
+def _identifier(value, field=None):
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", value):
-        raise StoreError("invalid")
+        raise StoreError("invalid", field, "string of 1-96 letters, digits, '_', '.' or '-', starting with a letter or digit")
     return value
 
 
-def _uuid(value):
+def _uuid(value, field=None):
     try:
         if not isinstance(value, str) or str(uuid.UUID(value)) != value.lower():
             raise ValueError()
         return str(uuid.UUID(value))
     except (ValueError, TypeError, AttributeError):
-        raise StoreError("invalid") from None
+        raise StoreError("invalid", field, "UUID string in canonical lowercase form") from None
 
 
 @dataclass(frozen=True)
@@ -127,21 +135,21 @@ def _canonical(value):
         raise StoreError("invalid") from None
 
 
-def _payload(value):
+def _payload(value, field=None):
     if len(_canonical(value)) > 262144:
-        raise StoreError("invalid")
+        raise StoreError("invalid", field, "JSON value of at most 262144 bytes")
     return value
 
 
-def _text(value, maximum=16000):
+def _text(value, maximum=16000, field=None):
     if not isinstance(value, str) or not value.strip() or len(value) > maximum or "\x00" in value:
-        raise StoreError("invalid")
+        raise StoreError("invalid", field, f"non-blank string of at most {maximum} characters without NUL")
     return value
 
 
-def _integer(value, minimum=1, maximum=3600):
+def _integer(value, minimum=1, maximum=3600, field=None):
     if type(value) is not int or not minimum <= value <= maximum:
-        raise StoreError("invalid")
+        raise StoreError("invalid", field, f"integer between {minimum} and {maximum}")
     return value
 
 
@@ -149,45 +157,50 @@ def _items(value):
     return [] if value is None else _payload(value if isinstance(value, list) else [value])
 
 
+SCOPES_EXPECTED = ("array of at most 100 scope objects: {kind: path|module|migration, value: string} "
+                   "or {kind: none}")
+
+
 def normalize_scopes(scopes):
     """Keep declarations for display; v1 cannot prove physical path independence."""
     if scopes is None or scopes == []:
         return [{"kind": "path", "value": ""}]
     if not isinstance(scopes, list) or len(scopes) > 100:
-        raise StoreError("invalid")
+        raise StoreError("invalid", "scopes", SCOPES_EXPECTED)
     result = []
     for scope in scopes:
         kind = scope.get("kind") if isinstance(scope, dict) else None
         if not isinstance(kind, str) or kind not in {"path", "module", "migration", "none"}:
-            raise StoreError("invalid")
+            raise StoreError("invalid", "scopes", SCOPES_EXPECTED)
         if scope["kind"] == "none":
             if set(scope) != {"kind"}:
-                raise StoreError("invalid")
+                raise StoreError("invalid", "scopes", SCOPES_EXPECTED)
             item = {"kind": "none"}
             if item not in result:
                 result.append(item)
             continue
         if set(scope) != {"kind", "value"}:
-            raise StoreError("invalid")
+            raise StoreError("invalid", "scopes", SCOPES_EXPECTED)
         value = scope["value"]
         if not isinstance(value, str) or len(value) > 240:
-            raise StoreError("invalid")
+            raise StoreError("invalid", "scopes", SCOPES_EXPECTED)
         if value.startswith("/") or not re.fullmatch(r"[A-Za-z0-9_./-]*", value) or ".." in value.split("/"):
-            raise StoreError("invalid")
+            raise StoreError("invalid", "scopes", SCOPES_EXPECTED)
         value = value.casefold()
         if kind == "path":
             value = "/".join(part for part in value.split("/") if part not in {"", "."})
         else:
-            _identifier(value)
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", value):
+                raise StoreError("invalid", "scopes", SCOPES_EXPECTED)
             if "/" in value or value in {".", ".."}:
-                raise StoreError("invalid")
+                raise StoreError("invalid", "scopes", SCOPES_EXPECTED)
             if kind == "migration" and value.isdecimal():
                 value = str(int(value))
         item = {"kind": kind, "value": value}
         if item not in result:
             result.append(item)
     if any(item["kind"] == "none" for item in result) and len(result) > 1:
-        raise StoreError("invalid")
+        raise StoreError("invalid", "scopes", SCOPES_EXPECTED)
     return sorted(result, key=lambda item: (item["kind"], item.get("value", "")))
 
 
@@ -230,16 +243,17 @@ NONE_SCOPES = [{"kind": "none"}]
 EXECUTION_FIELDS = ("dispatch_started_at", "result_epoch", "result", "result_author", "result_author_account", "a2a_id", "backend")
 
 
-def _trimmed(value, maximum):
+def _trimmed(value, maximum, field="work_face"):
+    expected = f"non-blank UTF-8 string of at most {maximum} characters without NUL"
     if not isinstance(value, str) or "\x00" in value:
-        raise StoreError("invalid")
+        raise StoreError("invalid", field, expected)
     try:
         value.encode()
     except UnicodeEncodeError:
-        raise StoreError("invalid") from None
+        raise StoreError("invalid", field, expected) from None
     value = value.strip()
     if not value or len(value) > maximum:
-        raise StoreError("invalid")
+        raise StoreError("invalid", field, expected)
     return value
 
 
@@ -248,35 +262,41 @@ def normalize_work_face(value):
 
     Baton stores the acceptance command as reviewer-facing text. It never runs it.
     """
-    if not isinstance(value, dict) or set(value) != WORK_FACE_KEYS:
-        raise StoreError("invalid")
+    if not isinstance(value, dict):
+        raise StoreError("invalid", "work_face", "object with keys " + ", ".join(sorted(WORK_FACE_KEYS)))
+    # Only the names a client is missing are reported; unexpected key names are never echoed.
+    missing = sorted(WORK_FACE_KEYS - set(value))
+    if missing:
+        raise StoreError("invalid", "work_face." + missing[0], "required key of work_face")
+    if set(value) != WORK_FACE_KEYS:
+        raise StoreError("invalid", "work_face", "object with exactly the keys " + ", ".join(sorted(WORK_FACE_KEYS)))
     result = {}
     for key in WORK_FACE_LISTS:
         items = value[key]
         if not isinstance(items, list) or len(items) > 20:
-            raise StoreError("invalid")
-        result[key] = [_trimmed(item, 500) for item in items]
-    result["migration"] = None if value["migration"] is None else _trimmed(value["migration"], 200)
-    result["acceptance_command"] = _trimmed(value["acceptance_command"], 2000)
+            raise StoreError("invalid", "work_face." + key, "array of at most 20 non-blank strings")
+        result[key] = [_trimmed(item, 500, "work_face." + key) for item in items]
+    result["migration"] = None if value["migration"] is None else _trimmed(value["migration"], 200, "work_face.migration")
+    result["acceptance_command"] = _trimmed(value["acceptance_command"], 2000, "work_face.acceptance_command")
     return result
 
 
 def _task_kind(value):
     if not isinstance(value, str) or value not in TASK_KINDS:
-        raise StoreError("invalid")
+        raise StoreError("invalid", "task_kind", "one of " + ", ".join(sorted(TASK_KINDS)))
     return value
 
 
 def _work_face_request(work_face, require_work_face, task_kind):
     if type(require_work_face) is not bool:
-        raise StoreError("invalid")
+        raise StoreError("invalid", "require_work_face", "boolean")
     face = None if work_face is None else normalize_work_face(work_face)
     return face, require_work_face, _task_kind(task_kind)
 
 
 def _priority(value):
     if not isinstance(value, str) or value not in PRIORITIES:
-        raise StoreError("invalid")
+        raise StoreError("invalid", "priority", "one of " + ", ".join(PRIORITIES))
     return value
 
 
@@ -284,11 +304,11 @@ def _response_request(priority, escalate_to, fallback_assignee, owner, assignee)
     """Validate response-time options and return them with the digest entries for non-default values only."""
     priority = _priority(priority)
     if escalate_to is not None:
-        _identifier(escalate_to)
+        _identifier(escalate_to, "escalate_to")
     if fallback_assignee is not None:
-        _identifier(fallback_assignee)
+        _identifier(fallback_assignee, "fallback_assignee")
         if assignee is not None and fallback_assignee == assignee.principal:
-            raise StoreError("invalid")
+            raise StoreError("invalid", "fallback_assignee", "principal different from the assignee")
     if escalate_to == owner:
         escalate_to = None
     args = {}
@@ -305,28 +325,28 @@ def _dependency_ids(values):
     if values is None:
         return []
     if not isinstance(values, list) or len(values) > 100:
-        raise StoreError("invalid")
-    return sorted({_uuid(value) for value in values})
+        raise StoreError("invalid", "depends_on", "array of at most 100 task UUID strings")
+    return sorted({_uuid(value, "depends_on") for value in values})
 
 
 def _graph_entries(graph):
     if not isinstance(graph, list) or not graph or len(graph) > 100:
-        raise StoreError("invalid")
+        raise StoreError("invalid", "graph", "array of 1-100 {task_id, depends_on} objects with unique task_id")
     normalized = []
     seen = set()
     for entry in graph:
         if not isinstance(entry, dict) or set(entry) != {"task_id", "depends_on"} or not isinstance(entry["depends_on"], list):
-            raise StoreError("invalid")
-        task_id = _uuid(entry["task_id"])
+            raise StoreError("invalid", "graph", "array of 1-100 {task_id, depends_on} objects with unique task_id")
+        task_id = _uuid(entry["task_id"], "graph.task_id")
         if task_id in seen:
-            raise StoreError("invalid")
+            raise StoreError("invalid", "graph", "array of 1-100 {task_id, depends_on} objects with unique task_id")
         seen.add(task_id)
         dependencies = _dependency_ids(entry["depends_on"])
         if task_id in dependencies:
             raise StoreError("graph_cycle")
         normalized.append({"task_id": task_id, "depends_on": dependencies})
     if sum(len(entry["depends_on"]) for entry in normalized) > 1000:
-        raise StoreError("invalid")
+        raise StoreError("invalid", "graph", "array of 1-100 {task_id, depends_on} objects with unique task_id")
     return sorted(normalized, key=lambda entry: entry["task_id"])
 
 
@@ -445,8 +465,14 @@ class SpaceStore:
             (space["id"], page_ids, account, account)).fetchall()
         return max((row["role"] for row in grants), key=ROLES.get, default=None)
 
-    def _require(self, conn, actor, resource_type, resource_id, role="view"):
-        if ROLES[self._role(conn, actor, resource_type, resource_id)] < ROLES[role]:
+    def _require(self, conn, actor, resource_type, resource_id, role="view", hidden="not_found"):
+        """Check the caller's role. An object the caller cannot even view is reported as absent (X7);
+        a visible object with too little permission is `forbidden`. `hidden="forbidden"` is for checks
+        on someone else (an assignee or handoff target) where the caller can see the object."""
+        held = self._role(conn, actor, resource_type, resource_id)
+        if held is None:
+            raise StoreError(hidden)
+        if ROLES[held] < ROLES[role]:
             raise StoreError("forbidden")
 
     def _page_for_block(self, conn, actor, block_id, role="view"):
@@ -465,7 +491,7 @@ class SpaceStore:
                    "role", "decision", "backend", "a2a_task_id", "input_sha256", "output_sha256", "error_code",
                    "count", "target_type", "execution_mode", "old_epoch", "work_face_keys", "work_face_sha256", "stage",
                    "subscription_id", "notification_id", "attempts", "http_status", "notify_event", "object_type",
-                   "priority", "escalate_to", "from_assignee", "to_assignee"}
+                   "priority", "escalate_to", "from_assignee", "to_assignee", "reason_code"}
         if not set(metadata) <= allowed:
             raise StoreError("invalid")
         conn.execute("""INSERT INTO baton.x_audit(id,event,agent,actor_account,actor_kind,requested_by,performed_by,
@@ -514,9 +540,10 @@ class SpaceStore:
             principal, account = party
             if self._account_role(conn, account, "page", str(page_id)) is None:
                 continue
-            row = conn.execute("""INSERT INTO baton.x_notify(id,recipient,recipient_account,event,object_type,object_id,thread_id)
-                VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-                (uuid.uuid4(), principal, account, event, object_type, object_id, thread_id)).fetchone()
+            row = conn.execute("""INSERT INTO baton.x_notify(id,recipient,recipient_account,event,object_type,object_id,thread_id,actor,actor_kind)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (uuid.uuid4(), principal, account, event, object_type, object_id, thread_id, actor.principal,
+                 "service" if actor == SERVICE_ACTOR else actor.kind)).fetchone()
             for subscription in conn.execute("""SELECT id FROM baton.x_webhook WHERE principal=%s AND account=%s
                 AND (events IS NULL OR events @> %s)""", (principal, account, Jsonb([event]))).fetchall():
                 conn.execute("INSERT INTO baton.x_webhook_delivery(subscription_id,notification_id) VALUES (%s,%s)",
@@ -541,15 +568,15 @@ class SpaceStore:
                 "mentions": "id comment_id target_type target_id action_requested requested_by created_at",
                 "proposals": "id block_id expected_revision proposed_content status revision",
                 "proposal_revisions": "proposal_id revision content author_principal",
-                "tasks": "id page_id block_id owner owner_account owner_kind assignee idempotency_key input_hash prompt execution_mode gate_mode reviewers scopes state epoch result_epoch result result_author result_author_account base_commit context evidence a2a_id backend dispatch_started_at error work_face require_work_face task_kind priority respond_by responded_at escalated_at escalate_to fallback_assignee",
+                "tasks": "id page_id block_id owner owner_account owner_kind assignee idempotency_key input_hash prompt execution_mode gate_mode reviewers scopes state epoch result_epoch result result_author result_author_account base_commit context evidence a2a_id backend dispatch_started_at error work_face require_work_face task_kind priority respond_by responded_at escalated_at escalate_to fallback_assignee blocked_reason blocked_by blocked_at",
                 "task_dependencies": "task_id depends_on created_at",
                 "x_claim": "task_id holder holder_account holder_kind epoch lease_expires_at scopes scope_repository",
                 "x_handoff": "task_id old_epoch new_epoch base_commit context evidence",
                 "x_gate": "task_id epoch decision reviewer reviewer_account evidence",
                 "operations": "principal operation_id request_hash method result",
                 "x_audit": "id time event agent actor_account actor_kind requested_by performed_by operation_id space_id task_id metadata",
-                "x_notify": "id recipient recipient_account event object_type object_id thread_id created_at seq",
-                "x_webhook": "id principal account url events secret created_at",
+                "x_notify": "id recipient recipient_account event object_type object_id thread_id created_at seq actor actor_kind",
+                "x_webhook": "id principal account url events secret created_at include_preview",
                 "x_webhook_delivery": "subscription_id notification_id state attempts next_attempt_at created_at finished_at",
                 "x_webhook_attempt": "id subscription_id notification_id attempt outcome http_status duration_ms created_at",
             }
@@ -568,7 +595,7 @@ class SpaceStore:
 
     def create_space(self, actor, operation_id, name):
         self._user(actor)
-        _text(name, 200)
+        _text(name, 200, field="name")
         def effect(conn):
             identity = str(uuid.uuid4())
             row = conn.execute("INSERT INTO baton.spaces(id,name,owner_account) VALUES (%s,%s,%s) RETURNING *", (identity, name, actor.account)).fetchone()
@@ -588,7 +615,7 @@ class SpaceStore:
                                                if self._role(conn, actor, "space", str(row["id"]))])
 
     def create_page(self, actor, operation_id, space_id, title, parent_id=None):
-        _text(title, 200)
+        _text(title, 200, field="title")
         def authorize(conn):
             self._require(conn, actor, "page" if parent_id else "space", parent_id or space_id, "edit")
             if parent_id and str(self._row(conn, "pages", parent_id)["space_id"]) != _uuid(space_id):
@@ -623,10 +650,10 @@ class SpaceStore:
 
     def create_block(self, actor, operation_id, page_id, kind, content, position=None):
         if not isinstance(kind, str) or kind not in {"text", "file", "prompt", "agent_instructions"}:
-            raise StoreError("invalid")
-        _payload(content)
+            raise StoreError("invalid", 'kind', 'one of text, file, prompt, agent_instructions')
+        _payload(content, "content")
         if position is not None:
-            _integer(position, 0, 1000000000)
+            _integer(position, 0, 1000000000, "position")
         def effect(conn):
             order = position if position is not None else conn.execute("SELECT COALESCE(MAX(position),-1)+1 AS n FROM baton.blocks WHERE page_id=%s", (page_id,)).fetchone()["n"]
             row = conn.execute("""INSERT INTO baton.blocks(id,page_id,kind,content,position,author_principal,author_account,author_kind)
@@ -661,23 +688,25 @@ class SpaceStore:
         return block
 
     def update_block(self, actor, operation_id, block_id, expected_revision, content):
-        _integer(expected_revision, 1, 2**63 - 1)
-        _payload(content)
+        _integer(expected_revision, 1, 2**63 - 1, "expected_revision")
+        _payload(content, "content")
         return self._mutate(actor, operation_id, "update_block", {"block_id": block_id, "expected_revision": expected_revision, "content": content},
                             lambda conn: self._page_for_block(conn, actor, block_id, "edit"),
                             lambda conn: self._update_block(conn, actor, operation_id, block_id, expected_revision, content))
 
     def share(self, actor, operation_id, resource_type, resource_id, subject_type, subject_id, role):
-        if (not isinstance(resource_type, str) or not isinstance(subject_type, str)
-                or (role is not None and not isinstance(role, str))
-                or resource_type not in {"space", "page"} or subject_type not in {"person", "team"} or role not in ROLES):
-            raise StoreError("invalid")
+        if not isinstance(resource_type, str) or resource_type not in {"space", "page"}:
+            raise StoreError("invalid", "resource_type", "one of space, page")
+        if not isinstance(subject_type, str) or subject_type not in {"person", "team"}:
+            raise StoreError("invalid", "subject_type", "one of person, team")
+        if role is not None and (not isinstance(role, str) or role not in ROLES):
+            raise StoreError("invalid", "role", "one of view, comment, edit, or null to remove the grant")
         if subject_type == "team":
-            _uuid(subject_id)
+            _uuid(subject_id, "subject_id")
             if role == "comment":
-                raise StoreError("invalid")
+                raise StoreError("invalid", "role", "view or edit for a team (comment is not available), or null")
         else:
-            _identifier(subject_id)
+            _identifier(subject_id, "subject_id")
         def authorize(conn):
             self._user(actor)
             row = self._row(conn, "spaces" if resource_type == "space" else "pages", resource_id)
@@ -698,7 +727,7 @@ class SpaceStore:
         return self._mutate(actor, operation_id, "share", {"resource_type": resource_type, "resource_id": resource_id, "subject_type": subject_type, "subject_id": subject_id, "role": role}, authorize, effect)
 
     def create_team(self, actor, operation_id, name):
-        _text(name, 200)
+        _text(name, 200, field="name")
         def effect(conn):
             row = conn.execute("INSERT INTO baton.teams VALUES (%s,%s,%s) RETURNING *", (uuid.uuid4(), name, actor.account)).fetchone()
             conn.execute("INSERT INTO baton.team_members VALUES (%s,%s)", (row["id"], actor.account))
@@ -707,9 +736,9 @@ class SpaceStore:
         return self._mutate(actor, operation_id, "create_team", {"name": name}, lambda conn: self._user(actor), effect)
 
     def set_team_member(self, actor, operation_id, team_id, account, member):
-        _identifier(account)
+        _identifier(account, "account")
         if type(member) is not bool:
-            raise StoreError("invalid")
+            raise StoreError("invalid", 'member', 'boolean')
         def authorize(conn):
             self._user(actor)
             if self._row(conn, "teams", team_id)["owner_account"] != actor.account:
@@ -734,10 +763,10 @@ class SpaceStore:
         return row
 
     def comment(self, actor, operation_id, page_id, body, thread_id=None, selection=None):
-        _text(body)
-        _payload(selection)
+        _text(body, field="body")
+        _payload(selection, "selection")
         if thread_id:
-            _uuid(thread_id)
+            _uuid(thread_id, "thread_id")
         def effect(conn):
             if thread_id and not conn.execute("SELECT 1 FROM baton.comments WHERE page_id=%s AND thread_id=%s", (page_id, thread_id)).fetchone():
                 raise StoreError("not_found")
@@ -755,18 +784,29 @@ class SpaceStore:
         return self._mutate(actor, operation_id, "comment", {"page_id": page_id, "body": body, "thread_id": thread_id, "selection": selection},
                             lambda conn: self._require(conn, actor, "page", page_id, "comment"), effect)
 
-    def list_comments(self, actor, page_id, thread_id=None):
+    def list_comments(self, actor, page_id=None, thread_id=None, task_id=None):
+        """Comments of a page, optionally one thread; `task_id` names a task's page and thread instead."""
         if thread_id:
-            _uuid(thread_id)
+            _uuid(thread_id, "thread_id")
+        if task_id is not None:
+            _uuid(task_id, "task_id")
+            if page_id is not None or thread_id is not None:
+                raise StoreError("invalid", "task_id", "given alone, not together with page_id or thread_id")
+        elif page_id is None:
+            raise StoreError("invalid", "page_id", "UUID string, or give task_id instead")
         def read(conn):
+            nonlocal page_id, thread_id
+            if task_id is not None:
+                task = self._task_for(conn, actor, task_id)
+                page_id, thread_id = str(task["page_id"]), str(task["id"])
             self._require(conn, actor, "page", page_id)
             return conn.execute("SELECT * FROM baton.comments WHERE page_id=%s AND (%s::uuid IS NULL OR thread_id=%s::uuid) ORDER BY created_at,id", (page_id, thread_id, thread_id)).fetchall()
         return self._read(actor, read)
 
     def mention(self, actor, operation_id, comment_id, target_type, target_id):
         if not isinstance(target_type, str) or target_type not in {"person", "agent"}:
-            raise StoreError("invalid")
-        _identifier(target_id)
+            raise StoreError("invalid", 'target_type', 'one of person, agent')
+        _identifier(target_id, "target_id")
         def authorize(conn):
             comment = self._row(conn, "comments", comment_id)
             self._require(conn, actor, "page", str(comment["page_id"]), "comment")
@@ -790,7 +830,7 @@ class SpaceStore:
         return self._mutate(actor, operation_id, "mention", {"comment_id": comment_id, "target_type": target_type, "target_id": target_id}, authorize, effect)
 
     def fetch_inbox(self, actor, limit=30):
-        _integer(limit, 1, 100)
+        _integer(limit, 1, 100, "limit")
         self._user(actor)
         def read(conn):
             rows = conn.execute("""SELECT c.*,m.id AS mention_id,m.action_requested AS mention_action_requested,
@@ -809,6 +849,8 @@ class SpaceStore:
                 message = {"id": str(row["id"]), "thread_id": str(row["thread_id"]), "subject": row["subject"],
                            "from": row["author_principal"], "to": [actor.principal], "created_ts": row["activity_at"],
                            "comment_created_at": row["created_at"], "body_md": row["body"],
+                           "actor": {"principal": row["author_principal"], "kind": row["author_kind"]},
+                           "body_preview": row["body"][:PREVIEW_CHARS],
                            "requested_by": request["requested_by"], "action_requested": request["action_requested"], "requests": []}
                 threads.setdefault(message["thread_id"], message)["requests"].append(request)
             assigned = conn.execute("SELECT * FROM baton.tasks WHERE assignee=%s ORDER BY created_at DESC", (actor.principal,)).fetchall()
@@ -818,6 +860,7 @@ class SpaceStore:
                 identity = str(task["id"])
                 message = threads.setdefault(identity, {"id": identity, "thread_id": identity, "subject": "[assigned] " + identity,
                     "from": task["owner"], "to": [actor.principal], "created_ts": task["created_at"], "body_md": task["prompt"],
+                    "actor": {"principal": task["owner"], "kind": task["owner_kind"]}, "body_preview": task["prompt"][:PREVIEW_CHARS],
                     "requested_by": task["owner"], "action_requested": True, "requests": []})
                 view = self._task_view(conn, actor, identity)
                 message.update(task_id=identity, assignee=task["assignee"], prompt=task["prompt"], state=view["state"], kind="assignment",
@@ -840,13 +883,51 @@ class SpaceStore:
         owner = conn.execute(f"SELECT page_id FROM baton.{table} WHERE id=%s", (row["object_id"],)).fetchone()
         return owner["page_id"] if owner else None
 
+    @staticmethod
+    def _title(prompt):
+        return " ".join(prompt.split())[:SUBJECT_TITLE_CHARS]
+
+    def _notification_preview(self, conn, row):
+        """Actor, subject and body preview of one notification, read from the live objects.
+
+        Call only after the recipient's current view permission on the object's page was confirmed. Nothing
+        here is stored in the outbox, so a revoked or edited object never leaves a stale copy behind.
+        Automatic tasks keep their prompts private, as in the task view, so only their id is shown.
+        """
+        actor = {"principal": row["actor"], "kind": row["actor_kind"]} if row.get("actor") and row.get("actor_kind") else None
+        subject = body = None
+        if row["object_type"] == "comment":
+            comment = conn.execute("SELECT thread_id,body,author_principal,author_kind FROM baton.comments WHERE id=%s", (row["object_id"],)).fetchone()
+            if comment:
+                actor = actor or {"principal": comment["author_principal"], "kind": comment["author_kind"]}
+                task = conn.execute("SELECT 1 FROM baton.tasks WHERE id=%s", (comment["thread_id"],)).fetchone()
+                where = str(comment["thread_id"]) if task else "thread " + str(comment["thread_id"])
+                subject = ("mention in " if row["event"] == "mention.created" else "comment on ") + where
+                body = comment["body"][:PREVIEW_CHARS]
+        elif row["object_type"] == "task":
+            task = conn.execute("SELECT id,prompt,execution_mode FROM baton.tasks WHERE id=%s", (row["object_id"],)).fetchone()
+            if task:
+                label = "[" + EVENT_LABELS.get(row["event"], row["event"]) + "] "
+                if task["execution_mode"] == "manual":
+                    subject, body = label + self._title(task["prompt"]), task["prompt"][:PREVIEW_CHARS]
+                else:
+                    subject = label + str(task["id"])
+        result = {}
+        if actor:
+            result["actor"] = actor
+        if subject is not None:
+            result["subject"] = subject
+        if body is not None:
+            result["body_preview"] = body
+        return result
+
     def poll_notifications(self, actor, after_seq=0, limit=50):
         """One non-blocking pass over the caller's outbox, rechecking view permission on every row.
 
         Rows hidden by a revoked permission are skipped but still advance next_seq so callers never rescan them.
         """
-        _integer(after_seq, 0, 2**63 - 1)
-        _integer(limit, 1, 100)
+        _integer(after_seq, 0, 2**63 - 1, "after_seq")
+        _integer(limit, 1, 100, "limit")
         self._user(actor)
         def read(conn):
             visible, cursor, scanned, more, roles = [], after_seq, 0, False, {}
@@ -868,7 +949,7 @@ class SpaceStore:
                             roles[page] = False
                     if roles[page]:
                         visible.append({key: row[key] for key in ("id", "seq", "event", "object_type", "object_id", "thread_id", "created_at")}
-                                       | {"recipient": row["recipient"]})
+                                       | {"recipient": row["recipient"]} | self._notification_preview(conn, row))
                 more = scanned >= NOTIFY_SCAN_LIMIT and len(visible) < limit
             return {"notifications": visible, "next_seq": cursor, "more": more}
         return self._read(actor, read)
@@ -880,9 +961,9 @@ class SpaceStore:
         return self._read(actor, read)
 
     def proposal_create(self, actor, operation_id, block_id, expected_revision, proposed_content, selection=None):
-        _integer(expected_revision, 1, 2**63 - 1)
-        _payload(proposed_content)
-        _payload(selection)
+        _integer(expected_revision, 1, 2**63 - 1, "expected_revision")
+        _payload(proposed_content, "proposed_content")
+        _payload(selection, "selection")
         def effect(conn):
             block = self._page_for_block(conn, actor, block_id, "comment")
             if block["kind"] == "task":
@@ -914,7 +995,7 @@ class SpaceStore:
 
     def proposal_review(self, actor, operation_id, proposal_id, decision, content=None):
         if not isinstance(decision, str) or decision not in {"accept", "reject", "revise"} or (decision == "revise" and content is None) or (decision != "revise" and content is not None):
-            raise StoreError("invalid")
+            raise StoreError("invalid", 'decision', 'accept or reject (without content), or revise (with content)')
         _payload(content)
         def authorize(conn):
             if actor.kind != "human":
@@ -942,8 +1023,8 @@ class SpaceStore:
         return self._mutate(actor, operation_id, "proposal_review", {"proposal_id": proposal_id, "decision": decision, "content": content}, authorize, effect)
 
     def revert_block(self, actor, operation_id, block_id, expected_revision, target_revision):
-        _integer(target_revision, 1, 2**63 - 1)
-        _integer(expected_revision, 1, 2**63 - 1)
+        _integer(target_revision, 1, 2**63 - 1, "target_revision")
+        _integer(expected_revision, 1, 2**63 - 1, "expected_revision")
         def authorize(conn):
             if actor.kind != "human":
                 raise StoreError("forbidden")
@@ -959,6 +1040,8 @@ class SpaceStore:
         row = dict(self._row(conn, "tasks", task_id))
         row.pop("input_hash")
         row.pop("idempotency_key")
+        reason, blocker, blocked_at = (row.pop(key) for key in ("blocked_reason", "blocked_by", "blocked_at"))
+        row["blocked"] = {"reason_code": reason, "by": blocker, "at": blocked_at} if reason else None
         if not include_prompt and row["execution_mode"] != "manual":
             row.pop("prompt")
         claim = conn.execute("SELECT *,lease_expires_at>clock_timestamp() AS lease_valid FROM baton.x_claim WHERE task_id=%s", (task_id,)).fetchone()
@@ -1097,9 +1180,9 @@ class SpaceStore:
 
     def ready(self, actor, page_id=None, limit=50):
         self._user(actor)
-        _integer(limit, 1, 100)
+        _integer(limit, 1, 100, "limit")
         if page_id is not None:
-            _uuid(page_id)
+            _uuid(page_id, "page_id")
         def read(conn):
             if page_id is not None:
                 self._require(conn, actor, "page", page_id)
@@ -1142,7 +1225,7 @@ class SpaceStore:
     def set_work_face(self, actor, operation_id, task_id, work_face, base_commit=None):
         face = normalize_work_face(work_face)
         if base_commit is not None:
-            _text(base_commit, 200)
+            _text(base_commit, 200, field="base_commit")
         def authorize(conn):
             task = self._task_for(conn, actor, task_id, "edit")
             if (task["owner"] == actor.principal and task["owner_account"] == actor.account) or actor.principal in task["reviewers"]:
@@ -1195,7 +1278,7 @@ class SpaceStore:
         if assignee is not None:
             if not isinstance(assignee, Actor):
                 raise StoreError("invalid")
-            self._require(conn, assignee, "page", page_id, "edit")
+            self._require(conn, assignee, "page", page_id, "edit", hidden="forbidden")
         task_id = uuid.uuid4()
         block_id = uuid.uuid4()
         content = {"task_id": str(task_id), "prompt": prompt, "execution_mode": mode}
@@ -1239,8 +1322,8 @@ class SpaceStore:
     def submit_task(self, actor, operation_id, idempotency_key, prompt, page_id=None, scopes=None, assignee=None, depends_on=None,
                     work_face=None, require_work_face=False, task_kind="construction",
                     priority="normal", escalate_to=None, fallback_assignee=None):
-        _identifier(idempotency_key)
-        _text(prompt)
+        _identifier(idempotency_key, "idempotency_key")
+        _text(prompt, field="prompt")
         normalized = normalize_scopes(scopes)
         stored = _stored_scopes(scopes, normalized, manual=assignee is not None)
         dependencies = _dependency_ids(depends_on)
@@ -1248,7 +1331,7 @@ class SpaceStore:
         if assignee is not None and not isinstance(assignee, Actor):
             raise StoreError("invalid")
         if assignee is not None and assignee.principal == actor.principal:
-            raise StoreError("invalid")
+            raise StoreError("invalid", 'assignee_principal', 'principal different from the requester')
         priority, escalate_to, fallback_assignee, response_args = _response_request(priority, escalate_to, fallback_assignee, actor.principal, assignee)
         args = {"idempotency_key": idempotency_key, "prompt": prompt, "page_id": page_id, "scopes": normalized,
                 "assignee": asdict(assignee) if assignee else None}
@@ -1285,17 +1368,17 @@ class SpaceStore:
     def create_task_block(self, actor, operation_id, page_id, prompt, scopes, reviewers, base_commit=None, context=None, evidence=None, assignee=None, depends_on=None,
                           work_face=None, require_work_face=False, task_kind="construction",
                           priority="normal", escalate_to=None, fallback_assignee=None):
-        _text(prompt)
+        _text(prompt, field="prompt")
         normalized = normalize_scopes(scopes)
         stored = _stored_scopes(scopes, normalized, manual=True)
         dependencies = _dependency_ids(depends_on)
         face, require_work_face, task_kind = _work_face_request(work_face, require_work_face, task_kind)
         if not isinstance(reviewers, list) or not reviewers or len(reviewers) > 100:
-            raise StoreError("invalid")
+            raise StoreError("invalid", 'reviewers', 'array of 1-100 principal identifiers')
         for reviewer in reviewers:
-            _identifier(reviewer)
+            _identifier(reviewer, "reviewers")
         if base_commit is not None:
-            _text(base_commit, 200)
+            _text(base_commit, 200, field="base_commit")
         _items(context)
         _items(evidence)
         if assignee is not None and not isinstance(assignee, Actor):
@@ -1328,7 +1411,7 @@ class SpaceStore:
 
     def list_tasks(self, actor, limit=50):
         self._user(actor)
-        _integer(limit, 1, 100)
+        _integer(limit, 1, 100, "limit")
         def read(conn):
             rows = conn.execute("SELECT * FROM baton.tasks WHERE owner=%s ORDER BY created_at DESC,id DESC", (actor.principal,)).fetchall()
             return [self._task_view(conn, actor, str(row["id"])) for row in rows if self._role(conn, actor, "page", str(row["page_id"]))][:limit]
@@ -1352,7 +1435,7 @@ class SpaceStore:
 
     @staticmethod
     def _live(conn, actor, task_id, epoch):
-        _integer(epoch, 1, 2**63 - 1)
+        _integer(epoch, 1, 2**63 - 1, "epoch")
         claim = conn.execute("""SELECT c.* FROM baton.x_claim c JOIN baton.tasks t ON t.id=c.task_id
             WHERE c.task_id=%s AND c.holder=%s AND c.holder_account=%s AND c.holder_kind=%s AND c.epoch=%s
             AND t.epoch=c.epoch AND t.state='claimed' AND c.lease_expires_at>clock_timestamp()""",
@@ -1374,7 +1457,7 @@ class SpaceStore:
             raise StoreError("forbidden")
         if require_owner:
             authority = self._authorization_context(actor, task)
-            self._require(conn, authority, "page", str(task["page_id"]), "edit")
+            self._require(conn, authority, "page", str(task["page_id"]), "edit", hidden="forbidden")
             self._require_dependency_access(conn, authority, task_id)
         return task
 
@@ -1393,14 +1476,15 @@ class SpaceStore:
         conn.execute("""INSERT INTO baton.x_claim(task_id,holder,holder_account,holder_kind,epoch,lease_expires_at,scopes)
             VALUES (%s,%s,%s,%s,%s,clock_timestamp()+%s*interval '1 second',%s)""",
             (task["id"], actor.principal, actor.account, actor.kind, epoch, lease_seconds, Jsonb(task["scopes"])))
-        conn.execute("UPDATE baton.tasks SET state='claimed',epoch=%s,result_epoch=NULL,error=NULL WHERE id=%s", (epoch, task["id"]))
+        conn.execute("""UPDATE baton.tasks SET state='claimed',epoch=%s,result_epoch=NULL,error=NULL,
+            blocked_reason=NULL,blocked_by=NULL,blocked_at=NULL WHERE id=%s""", (epoch, task["id"]))
         if task["assignee"] == actor.principal:
             conn.execute("UPDATE baton.tasks SET responded_at=COALESCE(responded_at,clock_timestamp()) WHERE id=%s", (task["id"],))
         self._task_audit(conn, actor, operation_id, "worker.claimed" if task["execution_mode"] == "codex" else "task.claimed", task, epoch=epoch)
         return self._task_view(conn, actor, str(task["id"]), include_prompt=True)
 
     def claim(self, actor, operation_id, task_id, lease_seconds=300):
-        _integer(lease_seconds)
+        _integer(lease_seconds, field="lease_seconds")
         def authorize(conn):
             task = self._manual(conn, actor, task_id)
             self._require_dependency_access(conn, actor, task_id)
@@ -1417,8 +1501,13 @@ class SpaceStore:
             return self._task_view(conn, actor, task_id, include_prompt=True)
         return self._mutate(actor, operation_id, "claim", {"task_id": task_id, "lease_seconds": lease_seconds}, authorize, effect, replay)
 
-    def claim_next(self, actor, operation_id, lease_seconds=300):
-        _integer(lease_seconds)
+    def claim_next(self, actor, operation_id, lease_seconds=300, on_scope_skip=None):
+        """Claim the oldest runnable automatic task.
+
+        `on_scope_skip(task_id, blocking_task_id)` is told about each queued task passed over only because a
+        live claim overlaps its scopes. It is a log hook: it cannot change the outcome and its failures are ignored.
+        """
+        _integer(lease_seconds, field="lease_seconds")
         def effect(conn):
             self._expire(conn, operation_id)
             for task in conn.execute("SELECT * FROM baton.tasks WHERE execution_mode='codex' AND state='queued' ORDER BY created_at,id").fetchall():
@@ -1431,9 +1520,15 @@ class SpaceStore:
                     raise
                 if not satisfied or self._work_face_missing(task):
                     continue
-                conflicts = any(scopes_overlap(task["scopes"], row["scopes"]) for row in conn.execute("SELECT scopes FROM baton.x_claim WHERE lease_expires_at>clock_timestamp()"))
-                if not conflicts:
+                live = conn.execute("SELECT task_id,scopes FROM baton.x_claim WHERE lease_expires_at>clock_timestamp() ORDER BY task_id").fetchall()
+                blocker = next((row["task_id"] for row in live if scopes_overlap(task["scopes"], row["scopes"])), None)
+                if blocker is None:
                     return self._take_claim(conn, actor, operation_id, task, lease_seconds)
+                if on_scope_skip is not None:
+                    try:
+                        on_scope_skip(str(task["id"]), str(blocker))
+                    except Exception:
+                        pass
             return None
         def replay(conn, old):
             if old is not None:
@@ -1446,7 +1541,7 @@ class SpaceStore:
         return self._mutate(actor, operation_id, "claim_next", {"lease_seconds": lease_seconds}, lambda conn: self._service(actor), effect, replay)
 
     def _renew(self, actor, operation_id, task_id, epoch, lease_seconds, automatic):
-        _integer(lease_seconds)
+        _integer(lease_seconds, field="lease_seconds")
         method = "renew_auto" if automatic else "renew"
         authorize = lambda conn: self._auto(conn, actor, task_id) if automatic else self._manual(conn, actor, task_id)
         def effect(conn):
@@ -1480,16 +1575,16 @@ class SpaceStore:
         return self._mutate(actor, operation_id, "mark_dispatched", {"task_id": task_id, "epoch": epoch}, lambda conn: self._auto(conn, actor, task_id), effect, replay)
 
     def handoff(self, actor, operation_id, task_id, epoch, target, base_commit=None, context=None, evidence=None, lease_seconds=300):
-        _integer(lease_seconds)
+        _integer(lease_seconds, field="lease_seconds")
         if not isinstance(target, Actor) or target.principal == actor.principal:
             raise StoreError("invalid")
         _items(context)
         _items(evidence)
         if base_commit is not None:
-            _text(base_commit, 200)
+            _text(base_commit, 200, field="base_commit")
         def authorize(conn):
             task = self._manual(conn, actor, task_id)
-            self._require(conn, target, "page", str(task["page_id"]), "edit")
+            self._require(conn, target, "page", str(task["page_id"]), "edit", hidden="forbidden")
             self._require_dependency_access(conn, target, task_id)
         def effect(conn):
             self._live(conn, actor, task_id, epoch)
@@ -1534,7 +1629,8 @@ class SpaceStore:
     def _assign(self, conn, actor, operation_id, task, principal, account, event="task.assigned", default_reviewer=None, body="Task assigned", **metadata):
         """Move an unclaimed task to a manual assignee. Shared by assign_task and the escalation runner."""
         reviewers = task["reviewers"] or [default_reviewer or actor.principal]
-        conn.execute("UPDATE baton.tasks SET assignee=%s,execution_mode='manual',gate_mode='reviewer',reviewers=%s WHERE id=%s", (principal, Jsonb(reviewers), task["id"]))
+        conn.execute("""UPDATE baton.tasks SET assignee=%s,execution_mode='manual',gate_mode='reviewer',reviewers=%s,
+            blocked_reason=NULL,blocked_by=NULL,blocked_at=NULL WHERE id=%s""", (principal, Jsonb(reviewers), task["id"]))
         if task["assignee"] != principal:
             self._start_clock(conn, task)
         self._task_audit(conn, actor, operation_id, event, task, **metadata)
@@ -1546,7 +1642,7 @@ class SpaceStore:
             raise StoreError("invalid")
         def authorize(conn):
             task = self._task_for(conn, actor, task_id, "edit")
-            self._require(conn, target, "page", str(task["page_id"]), "edit")
+            self._require(conn, target, "page", str(task["page_id"]), "edit", hidden="forbidden")
         def effect(conn):
             self._expire(conn, operation_id)
             task = self._row(conn, "tasks", task_id)
@@ -1560,6 +1656,36 @@ class SpaceStore:
                 raise StoreError("stale_claim")
             return self._task_view(conn, actor, task_id)
         return self._mutate(actor, operation_id, "assign_task", {"task_id": task_id, "target": asdict(target)}, authorize, effect, replay)
+
+    def mark_blocked(self, actor, operation_id, task_id, reason_code, note=None):
+        """An assignee or reviewer who cannot claim says why, in the thread and to the owner.
+
+        It changes no ownership and claims nothing; the marker lasts until the task is claimed or reassigned.
+        """
+        if not isinstance(reason_code, str) or reason_code not in BLOCK_REASONS:
+            raise StoreError("invalid", "reason_code", "one of " + ", ".join(BLOCK_REASONS))
+        if note is not None:
+            _text(note, 2000, field="note")
+        def authorize(conn):
+            task = self._manual(conn, actor, task_id, "comment")
+            if task["assignee"] != actor.principal and actor.principal not in task["reviewers"]:
+                raise StoreError("forbidden")
+        def view(conn):
+            return self._task_view(conn, actor, task_id)
+        def effect(conn):
+            task = self._row(conn, "tasks", task_id)
+            state = self._task_view(conn, actor, task_id)
+            if state["state"] not in {"queued", "claimed"} or (state["holder"] == actor.principal and state["lease_valid"]):
+                raise StoreError("stale_claim")
+            conn.execute("UPDATE baton.tasks SET blocked_reason=%s,blocked_by=%s,blocked_at=clock_timestamp() WHERE id=%s",
+                         (reason_code, actor.principal, task_id))
+            self._task_audit(conn, actor, operation_id, "task.blocked", task, reason_code=reason_code)
+            self._notify_task(conn, actor, operation_id, task, "blocked", "[blocked] " + reason_code + (": " + note if note else ""), task["owner"])
+            self._record_response(conn, actor, task)
+            self._enqueue(conn, actor, "task.blocked", "task", task["id"], task["page_id"], [self._task_parties(conn, task)["owner"]], task["id"])
+            return view(conn)
+        return self._mutate(actor, operation_id, "mark_blocked", {"task_id": task_id, "reason_code": reason_code, "note": note},
+                            authorize, effect, lambda conn, old: view(conn))
 
     def set_priority(self, actor, operation_id, task_id, priority):
         priority = _priority(priority)
@@ -1578,6 +1704,28 @@ class SpaceStore:
             return self._task_view(conn, actor, task_id)
         return self._mutate(actor, operation_id, "set_priority", {"task_id": task_id, "priority": priority}, authorize, effect,
                             lambda conn, old: self._task_view(conn, actor, task_id))
+
+    def migrate_manual_root_scopes(self, actor, dry_run=False):
+        """Operator migration: manual tasks still carrying the legacy root placeholder get the explicit "none" scope.
+
+        Automatic tasks keep the root placeholder because they execute code, and a task with a live claim is
+        never touched, so a held scope reservation cannot change under its holder. One audit event per task.
+        """
+        self._service(actor)
+        if type(dry_run) is not bool:
+            raise StoreError("invalid", "dry_run", "boolean")
+        operation_id = uuid.uuid4()
+        with self._transaction(write=not dry_run) as conn:
+            rows = conn.execute("""SELECT t.*,EXISTS (SELECT 1 FROM baton.x_claim c WHERE c.task_id=t.id
+                AND c.lease_expires_at>clock_timestamp()) AS claimed FROM baton.tasks t
+                WHERE t.execution_mode='manual' AND t.scopes=%s ORDER BY t.created_at,t.id""", (Jsonb(ROOT_SCOPES),)).fetchall()
+            eligible = [row for row in rows if not row["claimed"]]
+            if not dry_run:
+                for task in eligible:
+                    conn.execute("UPDATE baton.tasks SET scopes=%s WHERE id=%s", (Jsonb(NONE_SCOPES), task["id"]))
+                    self._task_audit(conn, actor, operation_id, "task.scopes_migrated", task, execution_mode="manual")
+            return {"dry_run": dry_run, "matched": len(eligible), "migrated": 0 if dry_run else len(eligible),
+                    "skipped_claimed": len(rows) - len(eligible), "task_ids": [str(task["id"]) for task in eligible]}
 
     def escalate_overdue(self, actor, limit=ESCALATION_BATCH):
         """One pass over overdue unanswered tasks; safe to run from several bridge replicas at once.
@@ -1624,7 +1772,7 @@ class SpaceStore:
         reassigned.append(str(task["id"]))
 
     def submit_result(self, actor, operation_id, task_id, epoch, result, evidence=None):
-        _text(result, 32000)
+        _text(result, 32000, field="result")
         _items(evidence)
         def effect(conn):
             self._live(conn, actor, task_id, epoch)
@@ -1648,9 +1796,9 @@ class SpaceStore:
                             lambda conn: self._manual(conn, actor, task_id), effect, replay)
 
     def gate(self, actor, operation_id, task_id, expected_epoch, decision, evidence=None):
-        _integer(expected_epoch, 1, 2**63 - 1)
+        _integer(expected_epoch, 1, 2**63 - 1, "expected_epoch")
         if not isinstance(decision, str) or decision not in {"pass", "fail"}:
-            raise StoreError("invalid")
+            raise StoreError("invalid", 'decision', 'one of pass, fail')
         _items(evidence)
         def authorize(conn):
             task = self._manual(conn, actor, task_id)
@@ -1772,8 +1920,8 @@ class SpaceStore:
 
     def list_audit(self, actor, task_id=None, space_id=None, limit=100):
         if not task_id and not space_id:
-            raise StoreError("invalid")
-        _integer(limit, 1, 1000)
+            raise StoreError("invalid", 'task_id', 'task_id or space_id is required')
+        _integer(limit, 1, 1000, "limit")
         def read(conn):
             if task_id:
                 task = self._task_for(conn, actor, task_id)
@@ -1791,12 +1939,14 @@ class SpaceStore:
             return None
         if not isinstance(events, list) or not events or len(events) > len(NOTIFY_EVENTS) \
                 or any(not isinstance(event, str) or event not in NOTIFY_EVENTS for event in events):
-            raise StoreError("invalid")
+            raise StoreError("invalid", 'events', 'non-empty array of known notification event names')
         return sorted(set(events))
 
-    def webhook_subscribe(self, actor, operation_id, url, events=None):
+    def webhook_subscribe(self, actor, operation_id, url, events=None, include_preview=False):
         self._user(actor)
         events = self._events(events)
+        if type(include_preview) is not bool:
+            raise StoreError("invalid", "include_preview", "boolean")
         try:
             # DNS happens before the transaction so a slow resolver never holds the write lock.
             webhooks.check_url(url)
@@ -1806,16 +1956,18 @@ class SpaceStore:
             if conn.execute("SELECT count(*) AS n FROM baton.x_webhook WHERE principal=%s", (actor.principal,)).fetchone()["n"] >= WEBHOOK_LIMIT:
                 raise StoreError("rate_limited")
             identity, secret = uuid.uuid4(), secrets.token_bytes(32)
-            conn.execute("INSERT INTO baton.x_webhook(id,principal,account,url,events,secret) VALUES (%s,%s,%s,%s,%s,%s)",
-                         (identity, actor.principal, actor.account, url, None if events is None else Jsonb(events), secret))
+            conn.execute("INSERT INTO baton.x_webhook(id,principal,account,url,events,secret,include_preview) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                         (identity, actor.principal, actor.account, url, None if events is None else Jsonb(events), secret, include_preview))
             self._audit(conn, actor, operation_id, "webhook.subscribed", subscription_id=identity)
             return {"subscription_id": identity, "_once": {"signing_secret": secret.hex()}}
-        return self._mutate(actor, operation_id, "webhook_subscribe", {"url": url, "events": events}, lambda conn: self._user(actor), effect)
+        # The default is left out of the digest so requests recorded before the option existed replay unchanged.
+        args = {"url": url, "events": events, **({"include_preview": True} if include_preview else {})}
+        return self._mutate(actor, operation_id, "webhook_subscribe", args, lambda conn: self._user(actor), effect)
 
     def webhook_list(self, actor):
         self._user(actor)
         def read(conn):
-            rows = conn.execute("""SELECT w.id,w.url,w.events,w.created_at,
+            rows = conn.execute("""SELECT w.id,w.url,w.events,w.include_preview,w.created_at,
                 count(*) FILTER (WHERE d.state='pending') AS pending, count(*) FILTER (WHERE d.state='delivered') AS delivered,
                 count(*) FILTER (WHERE d.state='dead') AS dead
                 FROM baton.x_webhook w LEFT JOIN baton.x_webhook_delivery d ON d.subscription_id=w.id
@@ -1824,7 +1976,7 @@ class SpaceStore:
         return self._read(actor, read)
 
     def webhook_delete(self, actor, operation_id, subscription_id):
-        _uuid(subscription_id)
+        _uuid(subscription_id, "subscription_id")
         def effect(conn):
             row = conn.execute("DELETE FROM baton.x_webhook WHERE id=%s AND principal=%s AND account=%s RETURNING id",
                                (subscription_id, actor.principal, actor.account)).fetchone()
@@ -1865,8 +2017,8 @@ class SpaceStore:
         self._service(actor)
         _integer(limit, 1, 100)
         with self._transaction(write=True) as conn:
-            rows = conn.execute("""SELECT d.subscription_id,d.notification_id,d.attempts,w.url,w.secret,w.account,n.seq,n.event,
-                n.object_type,n.object_id,n.thread_id,n.created_at,n.recipient,n.recipient_account
+            rows = conn.execute("""SELECT d.subscription_id,d.notification_id,d.attempts,w.url,w.secret,w.account,w.include_preview,n.seq,n.event,
+                n.object_type,n.object_id,n.thread_id,n.created_at,n.recipient,n.recipient_account,n.actor,n.actor_kind
                 FROM baton.x_webhook_delivery d JOIN baton.x_webhook w ON w.id=d.subscription_id
                 JOIN baton.x_notify n ON n.id=d.notification_id
                 WHERE d.state='pending' AND d.next_attempt_at<=clock_timestamp()
@@ -1883,12 +2035,14 @@ class SpaceStore:
                     continue
                 conn.execute("""UPDATE baton.x_webhook_delivery SET next_attempt_at=clock_timestamp()+%s*interval '1 second'
                     WHERE subscription_id=%s AND notification_id=%s""", (WEBHOOK_LEASE_SECONDS, row["subscription_id"], row["notification_id"]))
+                # Previews are opt-in per subscription and read now, after the permission check above, never stored.
+                preview = self._notification_preview(conn, row) if row["include_preview"] else {}
                 claimed.append({"subscription_id": str(row["subscription_id"]), "notification_id": str(row["notification_id"]),
                                 "attempts": row["attempts"], "url": row["url"], "secret": bytes(row["secret"]),
                                 "payload": _json({"id": row["notification_id"], "seq": row["seq"], "event": row["event"],
                                                   "object_type": row["object_type"], "object_id": row["object_id"],
                                                   "thread_id": row["thread_id"], "created_at": row["created_at"],
-                                                  "recipient": row["recipient"]})})
+                                                  "recipient": row["recipient"], **preview})})
             return claimed
 
     def webhook_record(self, actor, subscription_id, notification_id, expected_attempts, outcome, http_status=None, duration_ms=0):

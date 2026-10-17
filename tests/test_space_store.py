@@ -82,7 +82,7 @@ def test_roles_inherit_and_direct_removal_does_not_remove_inheritance(pg):
     expect("forbidden", lambda: s.comment(pg.reader, operation(), child["id"], "Not permitted"))
     expect("forbidden", lambda: s.share(pg.editor, operation(), "page", child["id"], "person", pg.reader.account, "edit"))
     s.share(pg.owner, operation(), "space", pg.space["id"], "person", pg.reader.account, None)
-    expect("forbidden", lambda: s.get_page(pg.reader, child["id"]))
+    expect("not_found", lambda: s.get_page(pg.reader, child["id"]))
 
 
 def test_comment_role_can_reply_but_not_edit_or_share_and_cycles_are_rejected(pg):
@@ -110,8 +110,8 @@ def test_created_page_does_not_bypass_revocation_and_team_owner_is_separate(pg):
     block_op = operation()
     s.create_block(pg.editor, block_op, page["id"], "text", "Synthetic content")
     s.set_team_member(pg.owner, operation(), team["id"], pg.editor.account, False)
-    expect("forbidden", lambda: s.get_page(pg.editor, page["id"]))
-    expect("forbidden", lambda: s.create_block(pg.editor, block_op, page["id"], "text", "Synthetic content"))
+    expect("not_found", lambda: s.get_page(pg.editor, page["id"]))
+    expect("not_found", lambda: s.create_block(pg.editor, block_op, page["id"], "text", "Synthetic content"))
     expect("invalid", lambda: s.share(pg.owner, operation(), "space", pg.space["id"], "team", team["id"], "comment"))
 
 
@@ -124,7 +124,7 @@ def test_operation_replays_reauthorize_and_changed_payload_conflicts(pg):
     assert first["revision"] == replay["revision"] == 2 and replay["replay"]
     expect("operation_conflict", lambda: s.update_block(pg.editor, op, block["id"], 1, "Different"))
     s.share(pg.owner, operation(), "space", pg.space["id"], "person", pg.editor.account, None)
-    expect("forbidden", lambda: s.update_block(pg.editor, op, block["id"], 1, "Updated"))
+    expect("not_found", lambda: s.update_block(pg.editor, op, block["id"], 1, "Updated"))
     assert len(s.list_attribution(pg.owner, block["id"])) == 2
 
 
@@ -600,7 +600,7 @@ def test_graph_plan_appends_idempotently_and_reauthorizes_replays(pg):
     events = s.list_audit(pg.owner, task_id=child["id"])
     assert len([event for event in events if event["event"] == "task.dependencies_added"]) == 2
     s.share(pg.owner, operation(), "space", pg.space["id"], "person", pg.editor.account, None)
-    expect("forbidden", lambda: s.plan(pg.editor, op, graph))
+    expect("not_found", lambda: s.plan(pg.editor, op, graph))
 
 
 def test_graph_cycle_batch_is_atomic_and_concurrent_opposite_edges_cannot_both_commit(pg):
@@ -699,7 +699,7 @@ def test_graph_requires_dependency_visibility_without_exposing_private_content(p
     assert private_task["id"] not in json.dumps(inbox)
     assert child["id"] not in {row["id"] for row in s.ready(pg.editor)}
     expect("forbidden", lambda: s.claim(pg.editor, operation(), child["id"]))
-    expect("forbidden", lambda: s.get_task(pg.editor, private_task["id"]))
+    expect("not_found", lambda: s.get_task(pg.editor, private_task["id"]))
     before = len(s.list_blocks(pg.owner, pg.page["id"]))
     for automatic in (False, True):
         op = operation()
@@ -707,7 +707,7 @@ def test_graph_requires_dependency_visibility_without_exposing_private_content(p
             call = lambda: s.submit_task(pg.editor, op, "invisible-dep", "Forbidden node", page_id=pg.page["id"], depends_on=[private_task["id"]])
         else:
             call = lambda: s.create_task_block(pg.editor, op, pg.page["id"], "Forbidden node", [], [pg.reviewer.principal], depends_on=[private_task["id"]])
-        expect("forbidden", call)
+        expect("not_found", call)
         with s._transaction() as conn:
             assert not conn.execute("SELECT 1 FROM baton.operations WHERE operation_id=%s", (op,)).fetchone()
     assert len(s.list_blocks(pg.owner, pg.page["id"])) == before
@@ -954,7 +954,7 @@ def test_set_work_face_requires_edit_and_owner_reviewer_or_live_prep_holder(pg):
     task = manual(pg, "wf-auth", scopes=disjoint(pg, "auth"), require_work_face=True)
     def attempt(actor):
         return lambda: s.set_work_face(actor, operation(), task["id"], face())
-    expect("forbidden", attempt(pg.reader))
+    expect("not_found", attempt(pg.reader))
     s.share(pg.owner, operation(), "space", pg.space["id"], "person", pg.reader.account, "view")
     expect("forbidden", attempt(pg.reader))
     s.share(pg.owner, operation(), "space", pg.space["id"], "person", pg.reviewer.account, "view")
