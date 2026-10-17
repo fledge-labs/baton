@@ -122,7 +122,7 @@ WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --b
 
 未指定接收人的兼容自动 `submit_task` 使用明确的 `worker_success` gate；指定接收人或手工领取不自动启动 worker，手工 gate 必须由有资格的 reviewer 审批，结果作者不能自批。`awaiting_gate` 不能提前显示为 completed。
 
-`x_scope` 首版锁域是同一 PostgreSQL 权威内跨 Space 的 `global`，不提供跨独立数据库的互斥保证。由于尚无可信的文件拓扑与别名映射，任意两个 `path` 声明都冲突，即使声明为 `src/a` 与 `docs/b` 也不能并行领取；展示路径不代表细粒度锁。`module` 覆盖整个仓库，与 path、module 和任意 migration 都冲突。`migration` 仅按规范化后的完整标识相等互斥，相异标识可并行；path 与 migration 是独立声明域，需要同时保护两者时必须同时声明。
+`x_scope` 首版锁域是同一 PostgreSQL 权威内跨 Space 的 `global`，不提供跨独立数据库的互斥保证。由于尚无可信的文件拓扑与别名映射，任意两个 `path` 声明都冲突，即使声明为 `src/a` 与 `docs/b` 也不能并行领取；展示路径不代表细粒度锁。`module` 覆盖整个仓库，与 path、module 和任意 migration 都冲突。`migration` 仅按规范化后的完整标识相等互斥，相异标识可并行；path 与 migration 是独立声明域，需要同时保护两者时必须同时声明。显式 scope `{"kind":"none"}` 表示任务不触碰任何仓库路径、模块或 migration，与任何 claim 都不冲突，不能与其他 scope 组合；因此没有文件足迹的审阅、文档、试用类任务可以同时领取。省略 `scopes` 时，手工任务（`create_task_block`，以及带 assignee 的 `submit_task`）默认 `none`；自动 codex 任务（不带 assignee 的 `submit_task`）会执行代码，仍使用保守的仓库根占位范围。已有任务不会被改写，已持久化请求的幂等摘要不变。
 
 ### 通知与异步送达
 

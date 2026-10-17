@@ -1167,3 +1167,137 @@ def test_tasks_without_work_face_requirement_behave_as_before(pg):
         with pytest.raises(psycopg.errors.CheckViolation):
             with conn.transaction():
                 conn.execute("UPDATE baton.tasks SET task_kind='other' WHERE id=%s", (plain["id"],))
+
+
+# --- explicit "none" scope -------------------------------------------------------------------
+
+NONE = [{"kind": "none"}]
+ROOT = [{"kind": "path", "value": ""}]
+
+
+def test_none_scope_normalization_and_validity():
+    assert normalize_scopes(NONE) == NONE
+    assert normalize_scopes(NONE + NONE) == NONE
+    assert normalize_scopes(None) == ROOT and normalize_scopes([]) == ROOT
+    for invalid in (
+        NONE + [{"kind": "path", "value": "src"}],
+        [{"kind": "migration", "value": "0001"}, {"kind": "none"}],
+        NONE + [{"kind": "module", "value": "core"}],
+        NONE + ROOT,
+        [{"kind": "none", "value": ""}],
+        [{"kind": "none", "value": "x"}],
+        [{"kind": "none", "extra": 1}],
+        [{"kind": ["none"]}],
+        [{"kind": "None"}],
+        [{}],
+    ):
+        expect("invalid", lambda invalid=invalid: normalize_scopes(invalid))
+
+
+def test_none_scope_never_overlaps_anything():
+    from bridge.space_store import scopes_overlap
+    others = (NONE, ROOT, [{"kind": "path", "value": "src/a"}], [{"kind": "module", "value": "core"}],
+              [{"kind": "migration", "value": "7"}])
+    for other in others:
+        assert not scopes_overlap(NONE, other) and not scopes_overlap(other, NONE)
+    assert scopes_overlap(ROOT, ROOT) and scopes_overlap([{"kind": "module", "value": "a"}], ROOT)
+
+
+def test_none_with_other_scopes_is_rejected_by_the_store_entry_points(pg):
+    s = pg.store
+    mixed = NONE + [{"kind": "path", "value": pg.prefix + "/x"}]
+    expect("invalid", lambda: s.create_task_block(pg.owner, operation(), pg.page["id"], "Mixed", mixed, [pg.reviewer.principal]))
+    expect("invalid", lambda: s.submit_task(pg.owner, operation(), "mixed-none", "Mixed", page_id=pg.page["id"], scopes=mixed, assignee=pg.editor))
+
+
+def test_manual_tasks_without_scopes_default_to_none_and_are_claimed_together(pg):
+    s = pg.store
+    block = s.create_task_block(pg.owner, operation(), pg.page["id"], "Review without footprint", None, [pg.reviewer.principal])
+    submitted = s.submit_task(pg.owner, operation(), "no-scopes-manual", "Doc task", page_id=pg.page["id"], assignee=pg.editor)
+    explicit = s.create_task_block(pg.owner, operation(), pg.page["id"], "Explicit none", NONE, [pg.reviewer.principal])
+    for task in (block, submitted, explicit):
+        assert s.get_scopes(pg.owner, task["id"])["scopes"] == NONE
+        assert task["scopes"] == NONE
+    assert {block["id"], submitted["id"], explicit["id"]} <= ready_ids(pg, pg.owner) | ready_ids(pg, pg.editor)
+    assert s.claim(pg.owner, operation(), block["id"])["state"] == "claimed"
+    assert s.claim(pg.editor, operation(), submitted["id"])["state"] == "claimed"
+    assert s.claim(pg.reviewer, operation(), explicit["id"])["state"] == "claimed"
+
+
+def test_none_claims_neither_block_nor_are_blocked_by_other_scopes(pg):
+    s = pg.store
+    none_task = manual(pg, "none-a", NONE)
+    path_task = manual(pg, "none-path", [{"kind": "path", "value": pg.prefix + "/p"}])
+    module_task = manual(pg, "none-module", [{"kind": "module", "value": "unknown"}])
+    root_task = manual(pg, "none-root", [])
+    s.claim(pg.owner, operation(), path_task["id"])
+    assert s.claim(pg.owner, operation(), none_task["id"])["state"] == "claimed"
+    expect("scope_conflict", lambda: s.claim(pg.owner, operation(), module_task["id"]))
+    expect("scope_conflict", lambda: s.claim(pg.owner, operation(), root_task["id"]))
+    later = manual(pg, "none-b", NONE)
+    assert later["id"] in ready_ids(pg, pg.owner)
+    assert s.claim(pg.owner, operation(), later["id"])["state"] == "claimed"
+    expire(pg, path_task["id"])
+    s.claim(pg.owner, operation(), module_task["id"])
+    assert manual(pg, "none-c", NONE)["id"] in ready_ids(pg, pg.owner)
+    assert s.claim(pg.owner, operation(), manual(pg, "none-d", NONE)["id"])["state"] == "claimed"
+
+
+def test_automatic_tasks_without_scopes_keep_the_conservative_root_placeholder(pg):
+    s = pg.store
+    first = s.submit_task(pg.owner, operation(), "auto-root-1", "Automatic one", page_id=pg.page["id"])
+    second = s.submit_task(pg.owner, operation(), "auto-root-2", "Automatic two", page_id=pg.page["id"])
+    for task in (first, second):
+        assert s.get_scopes(pg.owner, task["id"])["scopes"] == ROOT
+    claim = s.claim_next(SERVICE_ACTOR, operation())
+    assert claim["task_id"] == first["id"]
+    assert s.claim_next(SERVICE_ACTOR, operation()) is None
+    unrelated = manual(pg, "auto-root-blocked", [{"kind": "path", "value": pg.prefix + "/other"}])
+    expect("scope_conflict", lambda: s.claim(pg.owner, operation(), unrelated["id"]))
+    assert s.claim(pg.owner, operation(), manual(pg, "auto-root-none", NONE)["id"])["state"] == "claimed"
+
+
+def test_work_face_completeness_treats_none_as_undeclared(pg):
+    s = pg.store
+    task = s.create_task_block(pg.owner, operation(), pg.page["id"], "No scopes, checklist required", None, [pg.reviewer.principal],
+                               require_work_face=True, base_commit="base-1", work_face=face())
+    assert task["scopes"] == NONE and task["work_face_missing"] == ["scopes"]
+    explicit = manual(pg, "none-face", NONE, require_work_face=True)
+    assert explicit["work_face_missing"] == ["base_commit", "scopes", "work_face"]
+    done = s.set_work_face(pg.owner, operation(), explicit["id"], face(), base_commit="base-1")
+    assert done["work_face_missing"] == ["scopes"]
+    expect("work_face_incomplete", lambda: s.claim(pg.owner, operation(), task["id"]))
+    assert not {task["id"], explicit["id"]} & ready_ids(pg, pg.owner)
+    plain = manual(pg, "none-no-face", NONE)
+    assert plain["work_face_missing"] == [] and plain["id"] in ready_ids(pg, pg.owner)
+
+
+def test_omitted_scopes_keep_their_legacy_digests(pg):
+    s = pg.store
+    actor_fields = {"principal": pg.owner.principal, "account": pg.owner.account, "kind": pg.owner.kind}
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()).hexdigest()
+    create_op = operation()
+    block = s.create_task_block(pg.owner, create_op, pg.page["id"], "Legacy omitted", None, [pg.reviewer.principal])
+    legacy_create = {"page_id": pg.page["id"], "prompt": "Legacy omitted", "scopes": ROOT, "reviewers": [pg.reviewer.principal],
+                     "base_commit": None, "context": None, "evidence": None, "assignee": None}
+    submit_op = operation()
+    submitted = s.submit_task(pg.owner, submit_op, "legacy-omitted", "Legacy omitted submit", page_id=pg.page["id"], assignee=pg.editor)
+    legacy_submit = {"idempotency_key": "legacy-omitted", "prompt": "Legacy omitted submit", "page_id": pg.page["id"], "scopes": ROOT,
+                     "assignee": {"principal": pg.editor.principal, "account": pg.editor.account, "kind": pg.editor.kind}}
+    auto_op = operation()
+    auto = s.submit_task(pg.owner, auto_op, "legacy-omitted-auto", "Legacy omitted auto", page_id=pg.page["id"])
+    legacy_auto = {"idempotency_key": "legacy-omitted-auto", "prompt": "Legacy omitted auto", "page_id": pg.page["id"], "scopes": ROOT, "assignee": None}
+    with s._transaction() as conn:
+        for task, operation_name, op, args in ((block, "create_task_block", create_op, legacy_create),
+                                               (submitted, "submit_task", submit_op, legacy_submit),
+                                               (auto, "submit_task", auto_op, legacy_auto)):
+            assert conn.execute("SELECT input_hash FROM baton.tasks WHERE id=%s", (task["id"],)).fetchone()["input_hash"] == digest(args)
+            assert conn.execute("SELECT request_hash FROM baton.operations WHERE principal=%s AND operation_id=%s",
+                                (pg.owner.principal, op)).fetchone()["request_hash"] == digest([actor_fields, operation_name, args])
+    assert s.create_task_block(pg.owner, create_op, pg.page["id"], "Legacy omitted", None, [pg.reviewer.principal])["replay"]
+    assert s.submit_task(pg.owner, operation(), "legacy-omitted", "Legacy omitted submit", page_id=pg.page["id"], assignee=pg.editor)["id"] == submitted["id"]
+    expect("operation_conflict", lambda: s.submit_task(pg.owner, operation(), "legacy-omitted", "Legacy omitted submit", page_id=pg.page["id"],
+                                                       scopes=NONE, assignee=pg.editor))
+    legacy_row = s.create_task_block(pg.owner, operation(), pg.page["id"], "Stored root", [], [pg.reviewer.principal])
+    assert s.get_scopes(pg.owner, legacy_row["id"])["scopes"] == ROOT

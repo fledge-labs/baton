@@ -133,7 +133,7 @@ PUBLIC_OPERATIONS = {
     "get_proposal": (False, {"proposal_id": (str, ...)}),
     "list_proposals": (False, {"block_id": (str, ...)}),
     "list_attribution": (False, {"block_id": (str, ...)}),
-    "create_task_block": (True, {"page_id": (str, ...), "prompt": (str, ...), "scopes": (list[dict], ...), "reviewers": (list[str], ...), "base_commit": (str | None, None), "context": (Any, None), "evidence": (Any, None), "assignee_principal": (str | None, None), "depends_on": (list[str] | None, None),
+    "create_task_block": (True, {"page_id": (str, ...), "prompt": (str, ...), "scopes": (list[dict] | None, None), "reviewers": (list[str], ...), "base_commit": (str | None, None), "context": (Any, None), "evidence": (Any, None), "assignee_principal": (str | None, None), "depends_on": (list[str] | None, None),
                           "work_face": (dict[str, Any] | None, None), "require_work_face": (bool, False), "task_kind": (str, "construction"),
                           "priority": (str, "normal"), "escalate_to": (str | None, None), "fallback_assignee": (str | None, None)}),
     "submit_task": (True, {"idempotency_key": (str, ...), "prompt": (str, ...), "page_id": (str | None, None), "scopes": (list[dict] | None, None), "assignee_principal": (str | None, None), "depends_on": (list[str] | None, None),
