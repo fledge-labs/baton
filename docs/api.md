@@ -337,6 +337,65 @@ MCP 与适配器：`submit_task` 工具和 `create_task_block` 带上述三个�
 
 预设只展开为已知工具名；以 `@` 开头的未知预设（包括大小写不同的 `@Reader`）、空名称和通配符都是错误（退出码 2，错误信息不回显输入）。默认白名单（`submit_task,get_task,list_tasks,fetch_inbox`）不变，显式 `--allow-tools` 仍然**替换**它。预设只缩小适配器暴露的工具，不扩大服务端权限：`@reviewer` 能调用 `gate`，不代表能通过 gate（仍需根身份或审批人委托）。
 
+## A2A v1.0 公共端点（W2-1）
+
+Baton 在 MCP 与 `/v1/space/*` 之外提供标准 A2A v1.0 接口（JSON-RPC 绑定）。它与 bridge→worker 的内部 A2A 路径（`/a2a/codex`）无关，也不改动那条路径。设计依据见 `docs/design/space-replica.md` 的 “A2A”，行为契约见 `docs/spec/space.md` 的 X26。
+
+| 端点 | 认证 | 说明 |
+| --- | --- | --- |
+| `GET /.well-known/agent-card.json` | 无（公开） | Baton 自己的已签名 Agent Card，`Cache-Control: public, max-age=300`，带 `ETag`，支持 `If-None-Match`。 |
+| `GET /.well-known/jwks.json` | 无（公开） | 公钥集（当前密钥和已退役密钥的公开部分）。 |
+| `GET /a2a/agents` | Baton bearer（client） | 调用者可见的 agent 主体的已签名卡片：`{"agents":[card,...]}`。 |
+| `POST /a2a/rpc` | Baton bearer（client） | JSON-RPC 2.0：`SendMessage`、`SendStreamingMessage`、`GetTask`、`CancelTask`、`SubscribeToTask`。 |
+
+**签名密钥。** 实例签名密钥（ES256，P-256）由运维人员在 bridge 容器内生成，保存在 bridge 状态卷（`$BATON_STATE/a2a/signing-key.pem`，目录 0700、文件 0600），不在仓库里，也从不写入日志或输出：
+
+```sh
+# SPDX-License-Identifier: Apache-2.0
+docker compose exec bridge python -m bridge.a2a_public init-keys
+```
+
+命令只打印 `kid` 和公钥 JWK。已有密钥时拒绝覆盖；`--force` 换新密钥，旧密钥的公开部分留在 JWKS 里（退役列表，至多 10 个），所以轮换前签出的卡片在重新获取前仍能验证。权限比 0600 宽的密钥文件会被拒绝使用。尚未生成密钥时，卡片与 JWKS 端点和有可见 agent 的目录都返回 `503 agent_card_key_unavailable`，绝不提供未签名的卡片。
+
+**Agent Card。** `supportedInterfaces[0]` 是 `{"url":"<PUBLIC_URL>/a2a/rpc","protocolBinding":"JSONRPC","protocolVersion":"1.0"}`；`capabilities` 声明 `streaming:true`、`pushNotifications:false`、`extendedAgentCard:false`，以及一个文档化的扩展 `urn:fledge-labs:baton:a2a:work-object:v1`（`required:false`，只描述下面的工作对象约定）；`securitySchemes.baton_bearer` 是 HTTP Bearer；技能只有一个 `submit-task`（向指定 Baton agent 提交任务）。签名按 A2A 8.4：去掉 `signatures`、去掉默认值成员（null、空串、空数组；显式布尔值保留），按 RFC 8785（JCS）规范化，作为 JWS（RFC 7515）载荷；受保护头为 `{"alg":"ES256","typ":"JOSE","kid":"<RFC 7638 指纹>","jku":"<PUBLIC_URL>/.well-known/jwks.json"}`，签名是确定性 ECDSA（RFC 6979，同一内容得到同一字节）。验证：用 `kid` 在 `jku` 的 JWKS 里取公钥，按相同规则重算载荷并验签；任何内容被改动、`alg` 不是 ES256、`kid` 不在 JWKS 里都验证失败。`bridge.a2a_public.verify_card(card, jwks)` 是参考实现。
+
+**目录。** `GET /a2a/agents` 用调用者的 Baton token 认证，只列出调用者“看得见”的 agent 主体：调用者自己，以及与调用者共享至少一个页面的 agent（两者的连接账户在该页面上都有至少 view 权限，沿用 Space/父页面/Team 继承规则）。每张卡片的名称是 agent 的 principal，`supportedInterfaces[0].tenant` 也是该 principal；卡片同样已签名。看不见的 agent 不出现，也没有“存在但无权”的提示。
+
+**工作对象约定。** 每个 `SendMessage`/`SendStreamingMessage` 必须在 `message.metadata.baton` 里指明工作对象，否则返回 `-32602`（`reason: WORK_OBJECT_REQUIRED`）、不创建任何东西，并追加一条无任务的 `a2a.refused` 审计：
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{
+  "messageId":"<客户端生成，同一调用者内唯一>","role":"ROLE_USER","parts":[{"text":"请准备发布说明"}],
+  "metadata":{"baton":{"page_id":"<页面 UUID>","agent":"<目标 agent principal>"}}}}}
+```
+
+- `{"page_id","agent"}`（`agent` 也可用请求的 `tenant` 给出，两者都给时必须相等）：在该页面上创建一个任务并派给该 agent（手工路径，`scopes` 缺省为 `none`，可在 `baton.scopes` 里声明，格式与 `submit_task` 相同）。调用者需要页面的 edit 权限，目标 agent 也要有（与 `submit_task` 相同）；目标必须是已登记的 `agent` 类 principal，不能是调用者自己。返回 `{"task": Task}`，`Task.id` 就是 Baton 的 task id，任务立即出现在被派者的 `fetch_inbox`/`wait_inbox` 里。
+- `{"task_id"}`（也可用 A2A 原生的 `message.taskId`，两者都给时必须相等；`contextId` 给出时必须等于任务所在页面 id）：在该任务的线程里追加一条评论（作者是调用者），并通知任务相关方；需要页面的 comment 权限。任务已处于 A2A 终止状态（completed、failed、canceled、rejected）时返回 `-32004`。
+- `metadata.baton` 只接受 `task_id`、`page_id`、`agent`、`scopes`，多余键返回 `-32602`。消息只接受 `text` 部分；`raw`/`url`/`data` 返回 `-32005`；`role` 必须是 `ROLE_USER`。
+
+`messageId` 就是幂等键：同一调用者重发同一 `messageId` 和相同内容得到同一个任务/评论（不重复创建），内容不同返回 `-32000`（`reason: OPERATION_CONFLICT`）。**与规范的差异：** A2A 规定 `SendMessage` 默认阻塞到任务终止或中断；Baton 的任务按人和 agent 的时间尺度完成，所以总是立即返回当前 Task（等同 `returnImmediately: true`），调用者用 `GetTask` 轮询或用 `SendStreamingMessage`/`SubscribeToTask` 订阅。`Task.contextId` 是页面 id；`history` 是任务线程的评论（调用者自己写的为 `ROLE_USER`，其余为 `ROLE_AGENT`，`metadata.baton` 带作者与创建时间），遵循 `historyLength`（缺省全部、0 不返回、n 返回最近 n 条）。已完成任务有一个 `result` 制品。
+
+**状态映射。** Baton 保留超集状态作为权威，并投影到 A2A；精确的 Baton 状态放在 `Task.metadata.baton.state`（原始任务存储状态在 `store_state`），所以投影可以逆转。表中八个状态与 A2A 八个 `TASK_STATE_*` 一一对应（`bridge.a2a_public.BATON_TO_A2A` / `baton_from_a2a`，有测试）：
+
+| Baton 状态 | A2A | 来源 |
+| --- | --- | --- |
+| `submitted` | `TASK_STATE_SUBMITTED` | 任务存储 `queued`（未被标记为等待输入） |
+| `working` | `TASK_STATE_WORKING` | `claimed`（租约有效） |
+| `input_required` | `TASK_STATE_INPUT_REQUIRED` | `awaiting_gate`（等待审批），或 `queued` 且被 `mark_blocked` 标为 `waiting_input` |
+| `auth_required` | `TASK_STATE_AUTH_REQUIRED` | 暂无产生者（保留在映射里） |
+| `completed` | `TASK_STATE_COMPLETED` | `done` |
+| `failed` | `TASK_STATE_FAILED` | `failed`；`interrupted`（自动任务派发结果未知，是死端）也读作 failed |
+| `canceled` | `TASK_STATE_CANCELED` | `CancelTask`（见下） |
+| `rejected` | `TASK_STATE_REJECTED` | 暂无产生者（表 `baton.x_a2a_task_state` 已能记录） |
+
+**GetTask / CancelTask / 流。** `GetTask {"id","historyLength"?}` 需要任务的 view 权限，否则 `-32001`（与不存在无法区分）。`CancelTask {"id"}` 只允许任务的提交者（owner）或其配置的 reviewer，且需页面 edit 权限；它在 `baton.x_a2a_task_state` 追加一条 `canceled`（只追加，触发器拒绝改删）、立即释放该任务 claim 的 scope 保留、并在线程里写一条 `[canceled]` 评论通知被派者。取消后所有公开接口（HTTP 与 MCP 的 `claim`、`renew`、`handoff`、`submit_result`、`gate`、`assign_task`）对该任务返回 `409 task_canceled`（看不到该任务的人仍得到 404）。已终止的任务、已取消的任务、自动（codex）任务不可取消，返回 `-32002`。`SendStreamingMessage` 先完成与 `SendMessage` 相同的创建/追加，然后以 `text/event-stream` 返回；`SubscribeToTask` 对未终止的任务重新接入同一个流。每个 SSE 事件是 `data: {"jsonrpc":"2.0","id":<请求 id>,"result":<StreamResponse>}`：先是当前 `task`，之后有新评论就推 `message`，Baton 状态变化就推 `statusUpdate`（`metadata.baton` 带精确状态）。流在终止状态、或新进入中断状态（`input_required` 等，发完最后一条更新）、或最长 300 秒后结束，每 15 秒无事件发一行 `: keepalive`；从中断状态开始的订阅会一直持续到状态变化。当前以 1 秒为间隔轮询存储（MCP/A2A 推送和 outbox 唤醒是后续工作）；失去 view 权限时推一条错误事件并结束。
+
+**其他方法与版本。** v0.3 方法名（`message/send`、`message/stream`、`tasks/get`、`tasks/cancel`、`tasks/resubscribe` 等）一律返回 `-32009`（`VersionNotSupportedError`），消息写明 v1.0 的替代名；`A2A-Version` 头给出且主次版本不是 `1.0` 时同样 `-32009`（头缺省按 v1.0 处理，因为方法名已能区分版本）。推送配置四个方法返回 `-32003`；`ListTasks`、`GetExtendedAgentCard` 返回 `-32004`；未知方法 `-32601`；坏 JSON `-32700`；不合法的请求（含批量数组、超过 256 KiB）`-32600`。错误体带 `google.rpc.ErrorInfo`（`domain: a2a-protocol.org`，`reason` 为稳定的大写代码），参数错误另带 `BadRequest.fieldViolations`；没有权限是 `-32000`（`PERMISSION_DENIED`），状态冲突同为 `-32000`（`reason` 为 Baton 错误码的大写形式），存储不可用 `-32603`。错误文本是固定的，不回显请求内容。
+
+**审计。** 每个任务相关的 A2A 调用都在 `baton.x_audit` 追加一行，`agent`、`actor_account`、`actor_kind` 是 bearer token 对应的真实调用者：`a2a.message_sent`（`outcome`: `task_created`、`comment_appended`、`replayed`；`input_sha256` 是正文哈希，不存正文）、`a2a.task_streamed`、`a2a.task_read`、`a2a.task_canceled`、`a2a.refused`（无工作对象或无权取消；无工作对象的没有 task_id）。元数据只含方法名、结果、`a2a_version`、`a2a_state` 和请求 id（`X-Request-ID` 为 UUID 时）。对调用者不可见的任务不留下审计行（不泄漏存在性）。这些行在 `list_audit` 里与其他任务事件一起可读。
+
+**部署路由。** agentgateway 的 `baton-space` 路由增加精确路径 `/a2a/rpc` 与 `/a2a/agents`（client 角色，与 `/v1/space/` 相同的 ACL），新增 `baton-a2a-public` 路由承接两个公开文档（apiKey `optional`，无授权规则）；它们按精确路径优先于 `codex-a2a` 的 `/a2a/` 前缀（已用 agentgateway v1.6.0 实测）。`/.well-known/agent-card.json` 原先由 `codex-a2a` 路由转给 worker（需要 dispatcher 身份），现在由 Baton 自己的卡片占用该路径；worker 的 `/a2a/codex` 路由与 dispatcher ACL 不变，bridge 到 worker 的派发不使用那张卡片。nginx 为两个公开文档单独设置 location：保留 `nosniff`（TLS 版也保留 HSTS），不再附加服务级的 `Cache-Control: no-store`，使 bridge 给出的缓存头生效；SSE 沿用已有的 `proxy_buffering off` 与 370 秒读超时。
+
 ## MCP 兼容与发现
 
 `submit_task(idempotency_key,prompt,page_id=None,scopes=None,assignee_principal=None,depends_on=None,work_face=None,require_work_face=False,task_kind="construction",priority="normal",escalate_to=None,fallback_assignee=None)`、`get_task(task_id)`、`list_tasks()`、`fetch_inbox()` 保持既有工具入口与结果形状。兼容 submit_task 在服务端从 principal + 业务 key 派生稳定 operation_id。其他工具与上列 HTTP 同名同参数，返回包含 x_protocol 和 result 的对象；它们通过同一个 operation dispatcher 执行，MCP 工具发现提供完整 JSON Schema。
@@ -349,7 +408,7 @@ MCP 与适配器：`submit_task` 工具和 `create_task_block` 带上述三个�
 - `403 forbidden`：对象对调用者可见，但当前权限不允许该操作（例如只有 view 权限却要评论、不是指定接收人却要领取）。
 - `403 delegation_required`：gate 的调用者（人或 agent）不是根审批人，也没有覆盖该任务的有效审批人委托；错误体的 `error.details` 与其他错误相同，不回显输入值。
 - `404 not_found`：资源不存在，或调用者对它没有 view 权限（包括已被撤权）；两种情况的响应完全相同，不泄漏存在性（规格 X7）。`get_task`、`list_comments`、`get_page`、`comment` 等读写一律如此。对他人目标（assignee、handoff 目标）缺权限的检查仍报告 `403`，因为调用者看得到该对象。
-- `409 operation_conflict / scope_conflict / stale_claim / revision_conflict / gate_required / dependency_blocked / graph_cycle / work_face_incomplete`：幂等、作用域、租约、版本、gate、依赖图或施工面清单不满足当前条件。
+- `409 operation_conflict / scope_conflict / stale_claim / revision_conflict / gate_required / dependency_blocked / graph_cycle / work_face_incomplete / task_canceled`：幂等、作用域、租约、版本、gate、依赖图、施工面清单不满足当前条件，或任务已通过 A2A `CancelTask` 取消。
 - `422 invalid`：未知操作、额外字段、无效类型或无效业务参数。响应的 `error.details` 在可定位时给出字段级提示，见下。
 - `429 rate_limited`：webhook 订阅数或 wait_inbox 并发等待数超过上限。
 - `503 storage_unavailable`：数据库不可用，不能当作成功；重试须沿用同一 operation_id。
