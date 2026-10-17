@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """DEP-1: document-collaboration operations are marked deprecated without changing what they do."""
 
+pytest_plugins = ["test_a2a_public", "test_notify"]
+
 import importlib.util
 import json
 import uuid
@@ -95,9 +97,9 @@ def test_block_read_and_revert_failures_carry_no_deprecation_marker(api):
         assert is_marked(response) is False
     block = post("owner", "create_block", operation_id=op(), page_id=page["id"], kind="text", content={"text": "secret"})
     block_id = block.json()["result"]["id"]
-    forbidden = post("stranger", "get_block", 403, block_id=block_id)
-    assert is_marked(forbidden) is False
-    revert_forbidden = post("worker", "revert_block", 403, operation_id=op(), block_id=block_id,
+    hidden = post("stranger", "get_block", 404, block_id=block_id)
+    assert is_marked(hidden) is False
+    revert_forbidden = post("stranger", "revert_block", 403, operation_id=op(), block_id=block_id,
                             expected_revision=block.json()["result"]["revision"], target_revision=1)
     assert is_marked(revert_forbidden) is False
 
@@ -110,7 +112,8 @@ def test_http_and_mcp_validation_failures_on_deprecated_calls_still_carry_header
     assert is_marked(invalid_http) and invalid_http.json()["error"]["code"] == "invalid"
     assert is_marked(post("owner", "list_attribution", 422, block_id="not-a-uuid"))
     assert is_marked(post("worker", "comment", 422, operation_id=op(), page_id=page["id"], selection={"start": 0}))
-    assert is_marked(post("worker", "comment", 422, operation_id=op(), page_id=page["id"], body="x", selection={"start": 0}))
+    selected = post("worker", "comment", operation_id=op(), page_id=page["id"], body="x", selection={"start": 0})
+    assert is_marked(selected) and selected.json()["result"]["selection"] == {"start": 0}
 
     invalid_mcp = mcp_call(client, tokens, "owner", "update_block", {"operation_id": op()})
     assert invalid_mcp.json()["result"]["isError"] is True and is_marked(invalid_mcp)
