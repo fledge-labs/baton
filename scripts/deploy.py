@@ -8,20 +8,24 @@ Run it on the machine that runs Docker, from the directory your Compose files ar
         --smoke-token-file ~/.config/baton/smoke.token --backup-dir ~/baton-backups
 
 Steps, each with a hard timeout (the recovery path too):
-  1. preflight: read the migration SQL (a missing file is an error) and run a textual early warning over it;
-     when a build will run, refuse unless every tracked path the build context would include is readable by
+  1. preflight: read the migration SQL (a missing file is an error). When a build will run, refuse unless every
+     tracked path the build context would include is readable by
      other users (files need o+r, directories o+rx), before any docker command. Paths excluded by
      .dockerignore, including deploy/.env, may stay private. --no-build skips this check. Services that the
      Compose files no longer declare (orphans) must be acknowledged with --allow-remove-orphans;
   2. take an exclusive flock for this project (wait is bounded by --lock-timeout). Two deploys cannot interleave
      tagging, pg_dump, up, or a rollback's docker tag. The lock is held until this process returns;
   3. record the image of every container of the project, running or not, and tag each local image per service as
-     `baton-deploy-rollback:<service>-<id>` so it cannot be garbage-collected;
+     `baton-deploy-rollback:<service>-<id>` so it cannot be garbage-collected. Then diff the migration against the
+     schema recorded on the running image label or in the deploy state (if neither is known, the whole file is
+     treated as added and the report says so). Crude tokens on added lines abort unless
+     `--allow-incompatible-migration` is set. That flag does not override the catalog diff;
   4. if a database volume exists, make sure the database container is up (even when every application container
      is stopped or gone), then (a) precheck the migration in a separate Postgres container (same image, --network none,
      its own superuser, tmpfs data) loaded from a schema-only dump and a roles-only dump with no passwords; the
      migration runs there the way migrate.py runs it, and the catalog diff includes roles, memberships, privileges,
-     row level security and index shape; any breaking change, or any step that fails, aborts (fail closed); and
+     row level security and index shape; any breaking change, or any step that fails, aborts unless
+     `--allow-breaking-catalog` is set (fail closed); and
      (b) back up the database with pg_dump (custom format) into --backup-dir, still before the real migration. The dump file is
      created with O_EXCL|O_NOFOLLOW and fchmod 0600 under an unpredictable name; an existing file or symbolic link
      is left untouched and the backup fails. A failed dump aborts;
@@ -51,6 +55,8 @@ not verified to be running (rollback failed or incomplete, or there was nothing 
 Python 3.9+ standard library only.
 """
 import argparse
+import base64
+import difflib
 import fcntl
 import http.client
 import json
@@ -77,6 +83,8 @@ LOCAL_HOSTS = frozenset({'localhost', '127.0.0.1', '::1'})
 SMOKE_STEPS = ('board', 'mcp_unauthenticated', 'mcp_initialize', 'mcp_list_tools', 'mcp_fetch_inbox')
 MCP_PROTOCOL = '2025-06-18'
 HOLD_REPOSITORY = 'baton-deploy-rollback'
+SCHEMA_LABEL = 'org.baton.deployed-schema'
+APP_SCHEMA_SERVICES = ('admin', 'bridge', 'initialize', 'migrate')
 OUTPUT_TAIL = 2000
 DATABASE_SERVICE = 'database'
 DATA_VOLUME = 'postgres-data'
@@ -113,9 +121,8 @@ INCOMPATIBLE_SQL = (
      r'\b(?:NO\s+FORCE|ENABLE|DISABLE|FORCE)\s+ROW\s+LEVEL\s+SECURITY\b'),
     ('disables a trigger', r'\bDISABLE\s+TRIGGER\b'),
 )
-# Crude on purpose. Comments are blanked; strings, dollar quotes and quoted identifiers are kept.
-# Each hit names the token and the line. This does not parse SQL.
-COMMENT_ONLY = re.compile(r'--[^\n]*|/\*.*?\*/', re.DOTALL)
+# Crude on purpose. Applied only to lines added since the deployed revision, on the raw text:
+# comments and strings are not removed. This does not parse SQL. END is not a token.
 CRUDE_TOKENS = (
     ('alter system', re.compile(r'\balter\s+system\b', re.IGNORECASE)),
     ('alter database', re.compile(r'\balter\s+database\b', re.IGNORECASE)),
@@ -127,13 +134,14 @@ CRUDE_TOKENS = (
     ('session_authorization', re.compile(r'\bsession_authorization\b', re.IGNORECASE)),
     ('authorization', re.compile(r'\bauthorization\b', re.IGNORECASE)),
     ('role', re.compile(r'\brole\b', re.IGNORECASE)),
-    ('do', re.compile(r'\bdo\b', re.IGNORECASE)),
+    # DO only when it introduces a block (dollar quote, string, or LANGUAGE). ON CONFLICT DO NOTHING does not.
+    ('do', re.compile(r"""\bdo\b(?=\s*(?:\$|'|language\b))""", re.IGNORECASE)),
     ('commit', re.compile(r'\bcommit\b', re.IGNORECASE)),
     ('rollback', re.compile(r'\brollback\b', re.IGNORECASE)),
     ('abort', re.compile(r'\babort\b', re.IGNORECASE)),
-    ('end', re.compile(r'\bend\b', re.IGNORECASE)),
     ('savepoint', re.compile(r'\bsavepoint\b', re.IGNORECASE)),
     ('release', re.compile(r'\brelease\b', re.IGNORECASE)),
+    ('reset', re.compile(r'\breset\b', re.IGNORECASE)),
 )
 ADD_CLAUSE = re.compile(r'\bADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?'
                         r'(?!CONSTRAINT\b|PRIMARY\b|UNIQUE\b|CHECK\b|FOREIGN\b|LIKE\b|EXCLUDE\b)([^;]*?)'
@@ -300,14 +308,17 @@ class Config:
     def __init__(self, compose_files, project=None, env_file=None, project_directory=None, profiles=(), build=True,
                  build_network=None, wait_timeout=300, build_timeout=1800, command_timeout=120, backup_timeout=900,
                  backup_dir=None, no_backup=False, allow_remove_orphans=False, allow_incompatible_migration=False,
-                 schema_file=None, precheck_timeout=300, base_url='http://127.0.0.1:8080', ca_file=None, smoke_token_file=None,
+                 allow_breaking_catalog=False, schema_file=None, precheck_timeout=300,
+                 base_url='http://127.0.0.1:8080', ca_file=None, smoke_token_file=None,
                  smoke_timeout=60, request_timeout=20, dry_run=False, lock_timeout=None):
         self.compose_files, self.project, self.env_file = compose_files, project, env_file
         self.project_directory, self.profiles, self.build = project_directory, list(profiles), build
         self.build_network, self.wait_timeout, self.build_timeout = build_network, wait_timeout, build_timeout
         self.command_timeout, self.backup_timeout, self.backup_dir = command_timeout, backup_timeout, backup_dir
         self.no_backup, self.allow_remove_orphans = no_backup, allow_remove_orphans
-        self.allow_incompatible_migration, self.schema_file = allow_incompatible_migration, schema_file or SCHEMA_FILE
+        self.allow_incompatible_migration = allow_incompatible_migration
+        self.allow_breaking_catalog = allow_breaking_catalog
+        self.schema_file = schema_file or SCHEMA_FILE
         self.precheck_timeout = precheck_timeout
         self.base_url, self.ca_file, self.smoke_token_file = base_url, ca_file, smoke_token_file
         self.smoke_timeout, self.request_timeout, self.dry_run = smoke_timeout, request_timeout, dry_run
@@ -736,37 +747,46 @@ def psql_meta_command(sql):
     return False
 
 
-def _blank_comments(sql):
-    """Replace comments with spaces, keeping newlines so a later match still has the original line number."""
-    return COMMENT_ONLY.sub(lambda match: re.sub(r'[^\n]', ' ', match.group(0)), sql)
+def added_scan_text(sql, baseline):
+    """Text of the new migration with lines that already deployed blanked out.
+
+    ``baseline is None`` means the deployed revision is unknown, so the whole file is scanned. Otherwise
+    ``difflib`` compares the raw lines. Equal lines become empty so a later match keeps the new file's line
+    number, and unchanged schema text is never re-flagged. Inserted and replaced lines are kept raw.
+    """
+    if baseline is None:
+        return sql
+    old_lines, new_lines = baseline.splitlines(), sql.splitlines()
+    kept = []
+    for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False).get_opcodes():
+        if tag == 'equal':
+            kept.extend([''] * (j2 - j1))
+        elif tag in ('insert', 'replace'):
+            kept.extend(new_lines[j1:j2])
+    return '\n'.join(kept)
 
 
 def crude_fail_closed(sql):
-    """Token hits that make a migration incompatible. Fail closed, and do not try to parse SQL.
+    """Token hits on raw text. Fail closed, and do not try to parse SQL.
 
-    The search runs on comment-stripped text and still sees string literals, dollar quotes and quoted
-    identifiers. ``END`` inside ``BEGIN ATOMIC`` or a ``CASE`` expression counts. The first line of each
-    token is reported so a reviewer can pass ``--allow-incompatible-migration`` after reading it.
+    Nothing is stripped: a token inside a comment, a string, a dollar quote or a quoted identifier counts.
+    ``END`` is not a token, so ``CASE ... END`` and ``BEGIN ATOMIC`` do not match. The first line of each
+    token is reported. ``--allow-incompatible-migration`` is the only override for these findings.
     """
-    text = _blank_comments(sql)
     hits = []
     for name, pattern in CRUDE_TOKENS:
-        match = pattern.search(text)
+        match = pattern.search(sql)
         if match:
-            hits.append((text.count('\n', 0, match.start()), name))
+            hits.append((sql.count('\n', 0, match.start()), name))
     hits.sort()
     return ['%s on line %d' % (name, line + 1) for line, name in hits]
 
 
-def unsafe_migration_statements(sql):
-    """Early warning: textual descriptions of statements that a previous image could not survive.
+def catalog_shaped_statements(sql):
+    """Catalog-shaped warnings on comment-and-string-stripped text, plus a psql meta-command on the raw text.
 
-    Comments and string literals are blanked before the catalog-shaped patterns, so a comment marker inside
-    one cannot hide a ``DROP`` or ``GRANT``. A psql meta-command is reported from the raw script. Separately,
-    ``crude_fail_closed`` only strips comments: a token inside a string, a dollar quote or a quoted identifier
-    still counts, and the finding names that token and its line. ``BEFORE UPDATE ON`` and ``ON UPDATE``
-    foreign-key actions are not rewrites. This is not a proof of compatibility; precheck_migration() is the
-    authoritative check for what the catalog can see.
+    These are not crude tokens. ``--allow-breaking-catalog`` is what overrides them, together with the
+    catalog diff. ``BEFORE UPDATE ON`` and ``ON UPDATE`` foreign-key actions are not rewrites.
     """
     text = FK_ACTION.sub(' ', NOISE.sub(' ', sql))
     found = [label for label, pattern in INCOMPATIBLE_SQL if re.search(pattern, text, re.IGNORECASE)]
@@ -776,8 +796,24 @@ def unsafe_migration_statements(sql):
             break
     if psql_meta_command(sql):
         found.append('contains a psql meta-command')
-    found.extend(crude_fail_closed(sql))
     return found
+
+
+def migration_findings(sql, baseline=None):
+    """Token and catalog-shaped findings for the lines added since ``baseline``.
+
+    ``baseline is None`` scans the whole file (the deployed revision is unknown). A baseline equal to ``sql``
+    adds nothing, so an unchanged schema is not re-flagged.
+    """
+    added = added_scan_text(sql, baseline)
+    tokens = crude_fail_closed(added)
+    statements = catalog_shaped_statements(added)
+    return {'tokens': tokens, 'statements': statements, 'unsafe': statements + tokens}
+
+
+def unsafe_migration_statements(sql, baseline=None):
+    """Findings that make the added part of a migration incompatible. See ``migration_findings``."""
+    return migration_findings(sql, baseline)['unsafe']
 
 
 def read_migration(config):
@@ -791,9 +827,119 @@ def read_migration(config):
     return sql
 
 
-def check_migration(config):
-    sql = read_migration(config)
-    return {'checked': True, 'file': str(config.schema_file), 'unsafe': unsafe_migration_statements(sql)}, sql
+def deploy_state_path(project):
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '_', project or '') or 'project'
+    return Path(LOCK_DIR) / safe / 'deployed-schema.sql'
+
+
+def read_deploy_state(project):
+    """``(text, broken)``. ``text`` is None when nothing usable is recorded.
+
+    ``broken`` is true when a record is present but cannot be trusted (symlink, unreadable, not a file).
+    """
+    path = deploy_state_path(project)
+    if not path.exists() and not path.is_symlink():
+        return None, False
+    if path_has_symlink(path) or path.is_symlink() or not path.is_file():
+        return None, True
+    try:
+        return path.read_text(encoding='utf-8'), False
+    except (OSError, UnicodeError):
+        return None, True
+
+
+def write_deploy_state(project, sql):
+    """Record the schema that this successful deploy applied. A symlink is refused and left untouched."""
+    path = deploy_state_path(project)
+    error = private_directory(path.parent, 'deploy state directory')
+    if error:
+        return error
+    if path_has_symlink(path) or path.is_symlink():
+        return 'deploy state is a symbolic link'
+    temporary = path.with_name(path.name + '.tmp')
+    if path_has_symlink(temporary) or temporary.exists() or temporary.is_symlink():
+        return 'deploy state temporary file already exists'
+    fd = None
+    try:
+        fd = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow_flag(), 0o600)
+        os.fchmod(fd, 0o600)
+        os.write(fd, sql.encode('utf-8'))
+    except OSError as exc:
+        if fd is not None:
+            os.close(fd)
+            fd = None
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        return 'cannot record the deployed schema: %s' % (exc.strerror or exc.errno)
+    finally:
+        if fd is not None:
+            os.close(fd)
+    try:
+        os.replace(temporary, path)
+    except OSError as exc:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        return 'cannot record the deployed schema: %s' % (exc.strerror or exc.errno)
+    return None
+
+
+def image_schema_label(docker, image_id):
+    """``('ok', text)``, ``('absent', None)`` or ``('bad', None)`` for one image's deployed-schema label."""
+    result = docker.run(['docker', 'image', 'inspect', '--format',
+                         '{{ index .Config.Labels "%s" }}' % SCHEMA_LABEL, image_id])
+    if result.returncode != 0:
+        return 'absent', None
+    raw = result.stdout.strip()
+    if not raw or raw == '<no value>':
+        return 'absent', None
+    try:
+        text = base64.b64decode(raw, validate=True).decode('utf-8')
+    except (ValueError, UnicodeError):
+        return 'bad', None
+    return 'ok', text
+
+
+def deployed_schema(docker, previous, project):
+    """The schema text the running deployment applied, and where it came from.
+
+    The running application image's ``org.baton.deployed-schema`` label wins. A recorded deploy state is the
+    fallback. When neither is usable the deployed revision is unknown: the caller scans the whole file and
+    says so. Disagreeing labels are unknown as well.
+    """
+    statuses = []
+    for image_id in sorted({info['image_id'] for service, info in previous.items()
+                            if service in APP_SCHEMA_SERVICES and info.get('image_id')}):
+        statuses.append(image_schema_label(docker, image_id))
+    if any(status == 'bad' for status, _text in statuses):
+        return None, 'unknown', ('the deployed schema label could not be read; '
+                                 'the whole migration file was treated as added')
+    found = {text for status, text in statuses if status == 'ok'}
+    if len(found) > 1:
+        return None, 'unknown', ('running images disagree about the deployed schema; '
+                                 'the whole migration file was treated as added')
+    if len(found) == 1:
+        return next(iter(found)), 'image-label', None
+    recorded, broken = read_deploy_state(project)
+    if broken:
+        return None, 'unknown', ('the recorded deploy state could not be read; '
+                                 'the whole migration file was treated as added')
+    if recorded is not None:
+        return recorded, 'deploy-state', None
+    return None, 'unknown', 'deployed revision is unknown; the whole migration file was treated as added'
+
+
+def classify_migration(sql, config, baseline, baseline_kind, baseline_note):
+    """Report of token findings (added lines only) and catalog-shaped statements on those same lines."""
+    findings = migration_findings(sql, None if baseline_kind == 'unknown' else baseline)
+    report = {'checked': True, 'file': str(config.schema_file), 'baseline': baseline_kind,
+              'tokens': findings['tokens'], 'statements': findings['statements'], 'unsafe': findings['unsafe']}
+    if baseline_note:
+        report['baseline_note'] = baseline_note
+    return report
 
 
 def schema_breaking_changes(before, after):
@@ -1492,15 +1638,31 @@ class DeployLock:
         os.close(fd)
 
 
-def run_build(docker, config, model):
-    """`docker compose build` has no network flag, so --build-network goes in as a throw-away override file."""
+def build_override(services, sql, network):
+    """Compose override that stamps the schema onto the image and, when asked, sets the build network."""
+    encoded = base64.b64encode(sql.encode('utf-8')).decode('ascii')
+    lines = ['services:']
+    for name in services:
+        lines.append('  %s:' % name)
+        lines.append('    build:')
+        if network:
+            lines.append('      network: %s' % network)
+        lines.append('      labels:')
+        lines.append('        %s: "%s"' % (SCHEMA_LABEL, encoded))
+    return '\n'.join(lines) + '\n'
+
+
+def run_build(docker, config, model, sql):
+    """`docker compose build` has no label or network flag, so both go in as a throw-away override file.
+
+    The label is the schema this image will apply, base64-encoded, so the next deploy can diff against it.
+    """
     plain = config.compose_base() + ['build']
-    if not config.build_network or not model['build']:
+    if not model['build']:
         return docker.run(plain, mutating=True, timeout=config.build_timeout)
-    text = 'services:\n' + ''.join('  %s:\n    build:\n      network: %s\n' % (name, config.build_network)
-                                   for name in model['build'])
+    text = build_override(model['build'], sql, config.build_network)
     with tempfile.TemporaryDirectory(prefix='baton-deploy-') as directory:
-        override = Path(directory) / 'build-network.yaml'
+        override = Path(directory) / 'build-override.yaml'
         override.write_text(text)
         return docker.run(config.compose_base([override]) + ['build'], mutating=True, timeout=config.build_timeout)
 
@@ -1775,12 +1937,7 @@ def deploy(config, runner, http=None, log=None, clock=time.monotonic, sleep=time
                       rollback={'attempted': False, 'reason': reason})
         return report
 
-    migration, migration_sql = check_migration(config)
-    report['migration'] = migration
-    if migration['unsafe'] and not config.allow_incompatible_migration:
-        return stop('aborted', 'the migration SQL is not backward compatible (%s); nothing was changed; a rollback '
-                    'could not restore the previous image. Split it into an expand release and a later contract '
-                    'release, or pass --allow-incompatible-migration' % '; '.join(migration['unsafe']))
+    migration_sql = read_migration(config)
 
     if config.build:
         offending = unreadable_build_paths(source_root())
@@ -1800,6 +1957,21 @@ def deploy(config, runner, http=None, log=None, clock=time.monotonic, sleep=time
         previous = project_snapshot(docker, project)
         report['previous_images'] = previous
         log('recorded %d service image(s), running or stopped' % len(previous))
+
+        baseline, baseline_kind, baseline_note = deployed_schema(docker, previous, project)
+        migration = report['migration'] = classify_migration(
+            migration_sql, config, baseline, baseline_kind, baseline_note)
+        blocks = []
+        if migration['tokens'] and not config.allow_incompatible_migration:
+            blocks.append('token findings (%s); pass --allow-incompatible-migration after reading them'
+                          % '; '.join(migration['tokens']))
+        if migration['statements'] and not config.allow_breaking_catalog:
+            blocks.append('catalog-shaped statements (%s); pass --allow-breaking-catalog after reading them'
+                          % '; '.join(migration['statements']))
+        if blocks:
+            note = (' ' + baseline_note) if baseline_note else ''
+            return stop('aborted', 'the migration SQL is not backward compatible%s: %s; nothing was changed. '
+                        'Split it into an expand release and a later contract release' % (note, '; '.join(blocks)))
 
         orphans = sorted(set(previous) - set(model['services']))
         report['orphans'] = [dict(info, service=name) for name, info in sorted(previous.items()) if name in orphans]
@@ -1825,11 +1997,11 @@ def deploy(config, runner, http=None, log=None, clock=time.monotonic, sleep=time
             log('prechecking the migration in an isolated database container')
             precheck = report['precheck'] = precheck_migration(
                 docker, config, migration_sql, previous, project, clock, sleep)
-            if not precheck['ok'] and not config.allow_incompatible_migration:
+            if not precheck['ok'] and not config.allow_breaking_catalog:
                 detail = ('the precheck could not be completed (%s); treated as incompatible' % precheck['error']
                           if precheck['error'] else 'it would break the previous image: ' + '; '.join(precheck['changes']))
                 return stop('aborted', 'the migration is not backward compatible: %s; nothing was changed. Split it into an '
-                            'expand release and a later contract release, or pass --allow-incompatible-migration' % detail)
+                            'expand release and a later contract release, or pass --allow-breaking-catalog' % detail)
 
         backup, backup_ok = backup_database(docker, config, project, database)
         report['backup'] = backup
@@ -1838,7 +2010,7 @@ def deploy(config, runner, http=None, log=None, clock=time.monotonic, sleep=time
 
         if config.build:
             log('building')
-            build = run_build(docker, config, model)
+            build = run_build(docker, config, model, migration_sql)
             report['build'] = command_report(build, [token], config.dry_run)
             if build.returncode != 0:
                 return stop('build_failed', 'the build failed or timed out before any container was changed')
@@ -1866,6 +2038,9 @@ def deploy(config, runner, http=None, log=None, clock=time.monotonic, sleep=time
 
         action = decide(up.returncode == 0, smoke, core)
         if action == 'deployed':
+            state_error = write_deploy_state(project, migration_sql)
+            if state_error:
+                report['warnings'].append(state_error)
             report.update(status='deployed', ok=True, rollback={'attempted': False})
         elif action == 'fail':
             report.update(status='failed', ok=False, rollback={'attempted': False, 'reason': 'no previous deployment existed'})
@@ -1924,8 +2099,11 @@ def parse_args(argv):
     parser.add_argument('--allow-remove-orphans', action='store_true',
                         help='acknowledge that containers of services the Compose files no longer declare are deleted')
     parser.add_argument('--allow-incompatible-migration', action='store_true',
-                        help='deploy even though the migration precheck found changes the previous image cannot survive '
-                             '(or could not run)')
+                        help='deploy even though added migration lines contain a crude escalation token '
+                             '(role, reset, commit, and the rest). Does not override the catalog diff')
+    parser.add_argument('--allow-breaking-catalog', action='store_true',
+                        help='deploy even though the catalog diff, or a catalog-shaped statement in the added SQL, '
+                             'would break the previous image (or the precheck could not run)')
     parser.add_argument('--schema-file', metavar='FILE',
                         help='the migration SQL the image being built applies (default: bridge/space_schema.sql of this checkout)')
     parser.add_argument('--precheck-timeout', type=positive, default=300, metavar='SECONDS',
@@ -1956,7 +2134,8 @@ def main(argv=None, runner=None, http=None, stdout=None, stderr=None, clock=time
         config = Config(args.compose_files, args.project, args.env_file, args.project_directory, args.profiles,
                         args.build, args.build_network, args.wait_timeout, args.build_timeout, args.command_timeout,
                         args.backup_timeout, args.backup_dir, args.no_backup, args.allow_remove_orphans,
-                        args.allow_incompatible_migration, args.schema_file, args.precheck_timeout, parse_base_url(args.base_url), args.ca_file,
+                        args.allow_incompatible_migration, args.allow_breaking_catalog, args.schema_file,
+                        args.precheck_timeout, parse_base_url(args.base_url), args.ca_file,
                         args.smoke_token_file, args.smoke_timeout, args.request_timeout, args.dry_run, args.lock_timeout)
         report = deploy(config, runner or SubprocessRunner(), http, log, clock, sleep)
     except UsageError as exc:

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Edge configuration and the deploy script's smoke/rollback decisions, with a fake docker and a fake gateway."""
 
+import base64
 import importlib.util
 import io
 import json
@@ -345,6 +346,7 @@ class FakeDocker:
         self.tags = {APP_REF: OLD_APP} if existing else {}
         self.serving = OLD_APP if existing else None
         self.override_text = None
+        self.schema_labels = {}
         self.containers = {}
         if existing:
             for service, ref, image_id, running in [("bridge", APP_REF, OLD_APP, True), ("database", DB_REF, DB_ID, True),
@@ -373,6 +375,9 @@ class FakeDocker:
         if argv[:2] == ["docker", "inspect"]:
             return deploy.Result(0, json.dumps([self.inspect(name) for name in argv[2:]]))
         if argv[:3] == ["docker", "image", "inspect"]:
+            if deploy.SCHEMA_LABEL in " ".join(argv):
+                encoded = self.schema_labels.get(argv[-1], "")
+                return deploy.Result(0, (encoded + "\n") if encoded else "\n")
             ref = argv[-1]
             return deploy.Result(0, self.tags[ref] + "\n") if ref in self.tags else deploy.Result(1, "", "no such image")
         if argv[:2] == ["docker", "run"]:
@@ -395,7 +400,7 @@ class FakeDocker:
             Path(stdout_path).write_bytes(b"PGDMP" + b"\0" * 64 if self.dump == "ok" else b"not a dump")
             return deploy.Result(0)
         if argv[:2] == ["docker", "compose"] and argv[-1] == "build":
-            self.override_text = next((Path(a).read_text() for a in argv if a.endswith("build-network.yaml")), None)
+            self.override_text = next((Path(a).read_text() for a in argv if str(a).endswith("build-override.yaml")), None)
             if self.build_timeout:
                 return deploy.Result(124, "", "timed out", timed_out=True)
             if not self.build_ok:
@@ -936,17 +941,18 @@ def test_backup_dir_is_required_unless_no_backup_is_given(files, capsys):
     "DROP ROLE extra;", "COPY baton.t TO PROGRAM 'id';", "COPY baton.t FROM PROGRAM 'id';",
     "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;", "DO $$ BEGIN NULL; END $$;",
     "DO LANGUAGE plpgsql $$ BEGIN NULL; END $$;", "DO 'BEGIN NULL; END';",
-    "DO E'BEGIN NULL; END';", "DO U&'BEGIN NULL; END';", "do language plpgsql e'BEGIN NULL; END';",
+    "do language plpgsql $$ BEGIN NULL; END $$;",
     "COMMIT;", "COMMIT WORK;", "START TRANSACTION;",
-    "END;", "END WORK;", "ROLLBACK;", "ROLLBACK TO SAVEPOINT s;", "ABORT;",
+    "ROLLBACK;", "ROLLBACK TO SAVEPOINT s;", "ABORT;",
     "SAVEPOINT s;", "RELEASE SAVEPOINT s;", "RELEASE s;", "PREPARE TRANSACTION 'x';",
     'SET "role" = \'x\';', 'RESET "role";', 'SET "session_authorization" = \'x\';',
-    "INSERT INTO baton.t(a) VALUES (1) ON CONFLICT DO NOTHING;",
     "COPY program TO stdout;",
-    "SELECT CASE WHEN true THEN 1 ELSE 0 END;",
     "SELECT 'SET ROLE baton_owner';",
     "SELECT 'COPY baton.t TO PROGRAM ''id''';",
     "SELECT 'DO $$ BEGIN NULL; END $$';",
+    "SELECT '--';\nCOMMIT;",
+    "SELECT '/*';\nRESET ROLE;\nALTER SYSTEM SET a = 1;\n*/",
+    "-- COMMIT\n/* START TRANSACTION; role */ SELECT 1;",
 ])
 def test_migration_lint_flags_contract_statements_a_previous_image_cannot_survive(statement):
     assert deploy.unsafe_migration_statements("CREATE TABLE IF NOT EXISTS baton.t(a int);\n" + statement + "\n")
@@ -972,10 +978,14 @@ def test_migration_lint_flags_contract_statements_a_previous_image_cannot_surviv
     "ALTER TABLE baton.child ADD COLUMN parent_id int REFERENCES baton.parent(id) ON UPDATE NO ACTION;",
     "SET statement_timeout = '1s';",
     "SET session_replication_role = 'replica';",
-    "-- COMMIT\n/* START TRANSACTION; END; role */ SELECT 1;",
+    "END;",
+    "END WORK;",
+    "INSERT INTO baton.t(a) VALUES (1) ON CONFLICT DO NOTHING;",
+    "SELECT CASE WHEN true THEN 1 ELSE 0 END;",
+    "DO E'BEGIN NULL; END';",
+    "DO U&'BEGIN NULL; END';",
+    "CREATE FUNCTION baton.f(a int) RETURNS int LANGUAGE sql\nBEGIN ATOMIC\n  SELECT a;\nEND;",
     "-- DROP TABLE baton.commented;\n/* DELETE FROM baton.t; UPDATE baton.t SET a = 1; */ SELECT 1;",
-    "-- RESET ROLE\n/* ALTER SYSTEM SET x = 1; ALTER DATABASE baton SET y = 1; */\n"
-    "CREATE TABLE baton.n(id int);",
 ])
 def test_migration_lint_accepts_expand_only_statements(statement):
     assert deploy.unsafe_migration_statements(statement) == []
@@ -986,35 +996,61 @@ def test_assigning_a_column_named_role_is_a_rewrite_and_names_the_token():
         "rewrites rows", "role on line 1"]
 
 
-def test_crude_tokens_name_the_line_for_every_role_escape_and_for_end():
-    samples = (
-        ('SET "role" = \'x\';\n', "role on line 1"),
-        ('RESET "role";\n', "role on line 1"),
-        ('SET "Role" TO x;\n', "role on line 1"),
-        ('SET "session_authorization" = \'x\';\n', "session_authorization on line 1"),
-        ("SET SESSION AUTHORIZATION baton_owner;\n", "authorization on line 1"),
-        ("CREATE FUNCTION baton.f() RETURNS void LANGUAGE sql SET role = 'x' AS $$ SELECT 1; $$;\n",
-         "role on line 1"),
-        ("CREATE FUNCTION baton.f() RETURNS void LANGUAGE plpgsql AS $$\nSET role = 'x';\n$$\n", "role on line 2"),
-        ("CREATE FUNCTION baton.f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n"
-         "  PERFORM set_config('role', 'x', true);\nEND;\n$$\n", "set_config on line 3"),
-        ("CREATE FUNCTION baton.f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n"
-         "  PERFORM set_config('session_authorization', 'x', true);\nEND;\n$$\n", "session_authorization on line 3"),
-        ("CREATE FUNCTION baton.f() RETURNS void LANGUAGE sql AS $$\nRESET ROLE;\nSELECT 1;\n$$\n", "role on line 2"),
-        ("CREATE FUNCTION baton.f(a int) RETURNS int LANGUAGE sql\nBEGIN ATOMIC\n  SELECT a;\nEND;\n", "end on line 4"),
-        ("SELECT CASE WHEN true THEN 1 ELSE 0 END;\n", "end on line 1"),
-        ("SELECT 'SET ROLE baton_owner';\nSELECT 'COPY baton.t TO PROGRAM ''id''';\n"
-         "SELECT 'DO $$ BEGIN NULL; END $$';\n", "role on line 1"),
-        ("SELECT 'SET ROLE baton_owner';\nSELECT 'COPY baton.t TO PROGRAM ''id''';\n"
-         "SELECT 'DO $$ BEGIN NULL; END $$';\n", "copy program on line 2"),
-        ("SELECT 'SET ROLE baton_owner';\nSELECT 'COPY baton.t TO PROGRAM ''id''';\n"
-         "SELECT 'DO $$ BEGIN NULL; END $$';\n", "do on line 3"),
-        ("SELECT 'SET ROLE baton_owner';\nSELECT 'COPY baton.t TO PROGRAM ''id''';\n"
-         "SELECT 'DO $$ BEGIN NULL; END $$';\n", "end on line 3"),
-    )
-    for sql, expected in samples:
-        found = deploy.unsafe_migration_statements(sql)
+def test_a_string_comment_marker_does_not_hide_a_later_commit():
+    sql = "SELECT '--';\nCOMMIT;\n"
+    assert "commit on line 2" in deploy.unsafe_migration_statements(sql)
+    hidden = "SELECT '/*';\nCOMMIT;\nRESET ROLE;\nSELECT set_config('role', 'x', true);\nCOPY t TO PROGRAM 'id';\nALTER SYSTEM SET a = 1;\n*/\n"
+    found = deploy.unsafe_migration_statements(hidden)
+    for expected in ("commit on line 2", "reset on line 3", "role on line 3", "set_config on line 4",
+                     "copy program on line 5", "alter system on line 6"):
         assert expected in found, (expected, found)
+
+
+def test_crude_tokens_on_added_lines_name_the_line_and_leave_the_deployed_text_alone():
+    base = "CREATE TABLE baton.note (id int);\n"
+    samples = (
+        ('SET "role" = \'x\';\n', "role on line 2"),
+        ('RESET "role";\n', "reset on line 2"),
+        ('SET "Role" TO x;\n', "role on line 2"),
+        ('SET "session_authorization" = \'x\';\n', "session_authorization on line 2"),
+        ("SET SESSION AUTHORIZATION baton_owner;\n", "authorization on line 2"),
+        ("CREATE FUNCTION baton.f() RETURNS void LANGUAGE sql SET role = 'x' AS $$ SELECT 1; $$;\n", "role on line 2"),
+        ("CREATE FUNCTION baton.f() RETURNS void LANGUAGE plpgsql AS $$\nSET role = 'x';\n$$\n", "role on line 3"),
+        ("CREATE FUNCTION baton.f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n"
+         "  PERFORM set_config('role', 'x', true);\nEND;\n$$\n", "set_config on line 4"),
+        ("CREATE FUNCTION baton.f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n"
+         "  PERFORM set_config('session_authorization', 'x', true);\nEND;\n$$\n", "session_authorization on line 4"),
+        ("CREATE FUNCTION baton.f() RETURNS void LANGUAGE sql AS $$\nRESET ROLE;\nSELECT 1;\n$$\n", "reset on line 3"),
+        ("RESET ALL;\n", "reset on line 2"),
+        ("ALTER SYSTEM SET log_statement = 'all';\n", "alter system on line 2"),
+        ("ALTER DATABASE baton SET log_statement = 'all';\n", "alter database on line 2"),
+        ("COPY baton.t TO PROGRAM 'id';\n", "copy program on line 2"),
+        ("CREATE EXTENSION pg_stat_statements;\n", "create extension on line 2"),
+        ("COMMIT;\n", "commit on line 2"),
+        ("ROLLBACK;\n", "rollback on line 2"),
+        ("ABORT;\n", "abort on line 2"),
+        ("SAVEPOINT s;\n", "savepoint on line 2"),
+        ("RELEASE SAVEPOINT s;\n", "release on line 2"),
+        ("START TRANSACTION;\n", "start transaction on line 2"),
+        ("PREPARE TRANSACTION 'x';\n", "prepare transaction on line 2"),
+        ("DO $$ BEGIN NULL; END $$;\n", "do on line 2"),
+        ("DO LANGUAGE plpgsql $$ BEGIN NULL; END $$;\n", "do on line 2"),
+        ("DO 'BEGIN NULL; END';\n", "do on line 2"),
+    )
+    for statement, expected in samples:
+        found = deploy.unsafe_migration_statements(base + statement, baseline=base)
+        assert expected in found, (expected, found)
+    already = "COMMIT;\nRESET ROLE;\n" + base
+    assert deploy.unsafe_migration_statements(already + "ALTER TABLE baton.note ADD COLUMN note text NULL;\n",
+                                              baseline=already) == []
+
+
+def test_do_nothing_and_case_end_in_added_lines_pass():
+    base = "CREATE TABLE baton.note (id int);\n"
+    sql = (base + "INSERT INTO baton.note(id) VALUES (1) ON CONFLICT DO NOTHING;\n"
+           "SELECT CASE WHEN true THEN 1 ELSE 0 END;\n"
+           "CREATE FUNCTION baton.f(a int) RETURNS int LANGUAGE sql\nBEGIN ATOMIC\n  SELECT a;\nEND;\n")
+    assert deploy.unsafe_migration_statements(sql, baseline=base) == []
 
 
 def test_a_plain_expand_migration_passes_the_crude_token_rules():
@@ -1024,12 +1060,88 @@ def test_a_plain_expand_migration_passes_the_crude_token_rules():
     assert deploy.unsafe_migration_statements(sql) == []
 
 
-def test_the_shipped_migration_sql_is_expand_only_except_its_backfill_update():
-    schema = ROOT / "bridge/space_schema.sql"
-    found = deploy.unsafe_migration_statements(schema.read_text(encoding="utf-8"))
-    assert "rewrites rows" in found
-    assert "do on line 7" in found and "role on line 51" in found and "end on line 21" in found
-    assert "UPDATE baton.spaces" in schema.read_text(encoding="utf-8")
+def test_reapplying_the_shipped_schema_needs_no_override_once_the_revision_is_known(files, monkeypatch):
+    schema = (ROOT / "bridge/space_schema.sql").read_text(encoding="utf-8")
+    path = files[0].parent / "shipped.sql"
+    path.write_text(schema)
+    monkeypatch.setattr(deploy, "SCHEMA_FILE", path)
+    state = deploy.deploy_state_path("demo")
+    state.parent.mkdir(parents=True, mode=0o700)
+    state.write_text(schema)
+    docker = FakeDocker()
+    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP))
+    assert code == 0 and report["status"] == "deployed"
+    assert report["migration"]["baseline"] == "deploy-state"
+    assert report["migration"]["tokens"] == [] and report["migration"]["statements"] == []
+    assert "baseline_note" not in report["migration"]
+    docker = FakeDocker()
+    docker.schema_labels[OLD_APP] = base64.b64encode(schema.encode()).decode()
+    state.unlink()
+    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP))
+    assert code == 0 and report["migration"]["baseline"] == "image-label"
+    assert report["migration"]["tokens"] == [] and report["migration"]["statements"] == []
+
+
+def test_an_unknown_deployed_revision_scans_the_whole_file_and_says_so(files, monkeypatch):
+    schema = (ROOT / "bridge/space_schema.sql").read_text(encoding="utf-8")
+    path = files[0].parent / "shipped.sql"
+    path.write_text(schema)
+    monkeypatch.setattr(deploy, "SCHEMA_FILE", path)
+    docker = FakeDocker()
+    code, report, _ = run(files, docker, FakeGateway(docker))
+    assert code == 1 and report["migration"]["baseline"] == "unknown"
+    assert "whole migration file was treated as added" in report["migration"]["baseline_note"]
+    assert "whole migration file was treated as added" in report["rollback"]["reason"]
+    assert any(item.startswith("role on line ") for item in report["migration"]["tokens"])
+    assert any(item.startswith("do on line ") for item in report["migration"]["tokens"])
+    assert "rewrites rows" in report["migration"]["statements"]
+    assert not docker.ups() and not dump_calls(docker)
+    docker = FakeDocker()
+    code, report, _ = run(files, docker, FakeGateway(docker), "--allow-incompatible-migration")
+    assert code == 1 and "rewrites rows" in report["rollback"]["reason"]
+    docker = FakeDocker()
+    code, report, _ = run(files, docker, FakeGateway(docker), "--allow-breaking-catalog")
+    assert code == 1 and "role on line " in report["rollback"]["reason"]
+    docker = FakeDocker()
+    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP),
+                          "--allow-incompatible-migration", "--allow-breaking-catalog")
+    assert code == 0 and report["status"] == "deployed"
+
+
+def test_a_commit_hidden_behind_a_string_comment_marker_on_an_added_line_aborts(files, tmp_path, monkeypatch):
+    base = "CREATE TABLE IF NOT EXISTS baton.note (id int);\n"
+    schema = tmp_path / "added.sql"
+    schema.write_text(base + "SELECT '--';\nCOMMIT;\n")
+    monkeypatch.setattr(deploy, "SCHEMA_FILE", schema)
+    state = deploy.deploy_state_path("demo")
+    state.parent.mkdir(parents=True, mode=0o700)
+    state.write_text(base)
+    docker = FakeDocker()
+    code, report, _ = run(files, docker, FakeGateway(docker))
+    assert code == 1 and "commit on line 3" in report["rollback"]["reason"]
+    assert report["migration"]["baseline"] == "deploy-state"
+    docker = FakeDocker()
+    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--allow-incompatible-migration")
+    assert code == 0 and report["migration"]["tokens"] == ["commit on line 3"]
+
+
+def test_disagreeing_schema_labels_are_unknown_and_the_report_says_so(files):
+    docker = FakeDocker(overrides={"migrate": {"id": NEW_APP}})
+    docker.schema_labels[OLD_APP] = base64.b64encode(b"CREATE TABLE a(id int);\n").decode()
+    docker.schema_labels[NEW_APP] = base64.b64encode(b"CREATE TABLE b(id int);\n").decode()
+    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP))
+    assert code == 0 and report["migration"]["baseline"] == "unknown"
+    assert "disagree" in report["migration"]["baseline_note"]
+
+
+def test_the_shipped_schema_reapplied_unchanged_has_no_findings():
+    schema = (ROOT / "bridge/space_schema.sql").read_text(encoding="utf-8")
+    assert deploy.unsafe_migration_statements(schema, baseline=schema) == []
+    unknown = deploy.migration_findings(schema, None)
+    assert "rewrites rows" in unknown["statements"]
+    assert any(item.startswith("role on line ") for item in unknown["tokens"])
+    assert any(item.startswith("do on line ") for item in unknown["tokens"])
+    assert "UPDATE baton.spaces" in schema
 
 
 def migration_file(tmp_path, monkeypatch, sql):
@@ -1039,15 +1151,20 @@ def migration_file(tmp_path, monkeypatch, sql):
     return schema
 
 
-def test_an_obviously_destructive_migration_fails_fast_before_any_docker_command(files, tmp_path, monkeypatch):
+def test_an_obviously_destructive_migration_aborts_before_backup_and_needs_the_catalog_flag(files, tmp_path, monkeypatch):
     migration_file(tmp_path, monkeypatch, "ALTER TABLE baton.t DROP COLUMN c;\n")
     docker = FakeDocker()
     code, report, _ = run(files, docker, FakeGateway(docker))
-    assert code == 1 and report["status"] == "aborted" and not docker.calls
+    assert code == 1 and report["status"] == "aborted"
     assert "not backward compatible" in report["rollback"]["reason"] and "DROP" in report["rollback"]["reason"]
+    assert "--allow-breaking-catalog" in report["rollback"]["reason"]
+    assert not docker.ups() and not dump_calls(docker) and not [c for c in docker.calls if c[-1:] == ["build"]]
     docker = FakeDocker()
-    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--allow-incompatible-migration")
-    assert code == 0 and report["migration"]["unsafe"]
+    code, report, _ = run(files, docker, FakeGateway(docker), "--allow-incompatible-migration")
+    assert code == 1 and "DROP" in report["rollback"]["reason"]
+    docker = FakeDocker()
+    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--allow-breaking-catalog")
+    assert code == 0 and report["migration"]["statements"]
 
 
 @pytest.mark.parametrize("extra", [[], ["--allow-incompatible-migration"]])
@@ -1213,13 +1330,21 @@ def test_the_migration_is_applied_in_an_isolated_container_never_to_the_live_dat
 def test_a_role_change_is_caught_on_the_isolated_cluster_and_never_sent_to_the_live_database(files, tmp_path, monkeypatch):
     migration_file(tmp_path, monkeypatch, "RESET ROLE;\nALTER ROLE baton_app NOLOGIN;\nALTER ROLE baton_app CONNECTION LIMIT 0;\n")
     assert "role on line 1" in deploy.unsafe_migration_statements("RESET ROLE;\n")
+    assert "reset on line 1" in deploy.unsafe_migration_statements("RESET ROLE;\n")
     assert "role on line 1" in deploy.unsafe_migration_statements("ALTER ROLE baton_app NOLOGIN;\n")
     docker = FakeDocker(precheck="role")
     code, report, _ = run(files, docker, FakeGateway(docker))
-    assert code == 1 and report["status"] == "aborted" and not docker.calls
+    assert code == 1 and report["status"] == "aborted" and not docker.ups() and not dump_calls(docker)
     assert "role on line 1" in report["rollback"]["reason"]
+    assert "--allow-incompatible-migration" in report["rollback"]["reason"]
     docker = FakeDocker(precheck="role")
-    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--allow-incompatible-migration")
+    code, report, _ = run(files, docker, FakeGateway(docker), "--allow-incompatible-migration")
+    assert code == 1 and "changes role baton_app" in report["rollback"]["reason"]
+    assert "--allow-breaking-catalog" in report["rollback"]["reason"]
+    assert not docker.ups() and not dump_calls(docker)
+    docker = FakeDocker(precheck="role")
+    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP),
+                          "--allow-incompatible-migration", "--allow-breaking-catalog")
     assert code == 0 and "changes role baton_app" in report["precheck"]["changes"]
     live = [s for c, s in zip(docker.calls, docker.stdins)
             if c[:2] == ["docker", "compose"] and "exec" in c and "-Fc" not in c[-1]]
@@ -1244,7 +1369,10 @@ def test_a_breaking_schema_diff_aborts_before_anything_changes_and_the_throwaway
     assert ["docker", "rm", "-f", report["precheck"]["database"]] in docker.calls, "cleanup runs even when the check fails"
     assert not docker.ups() and not dump_calls(docker) and not [c for c in docker.calls if c[-1:] == ["build"]]
     docker = FakeDocker(precheck="breaking")
-    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--allow-incompatible-migration")
+    code, report, _ = run(files, docker, FakeGateway(docker), "--allow-incompatible-migration")
+    assert code == 1 and "drops column baton.tasks.assignee" in report["rollback"]["reason"]
+    docker = FakeDocker(precheck="breaking")
+    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--allow-breaking-catalog")
     assert code == 0 and report["precheck"]["changes"] and report["backup"]["ok"], "acknowledged, still recorded and backed up"
 
 
@@ -1258,7 +1386,10 @@ def test_a_precheck_that_cannot_complete_fails_closed(files, failure):
     created = failure not in ("fail:create", "fail:clone")
     assert (["docker", "rm", "-f", report["precheck"]["database"]] in docker.calls) == created
     docker = FakeDocker(precheck=failure)
-    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--allow-incompatible-migration")
+    code, report, _ = run(files, docker, FakeGateway(docker), "--allow-incompatible-migration")
+    assert code == 1 and "could not be completed" in report["rollback"]["reason"]
+    docker = FakeDocker(precheck=failure)
+    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--allow-breaking-catalog")
     assert code == 0 and not report["precheck"]["ok"]
 
 
@@ -1272,12 +1403,13 @@ def test_a_throwaway_database_that_cannot_be_dropped_is_reported(files):
     "\\c baton\n", "\\! id\n", "SELECT 1;\n\\c baton\n", "SELECT 1; \\g\n", "\\copy baton.t TO stdout\n",
     "COMMIT;\n\\connect baton\nDROP TABLE baton.t;\n",
 ])
-def test_psql_meta_commands_are_rejected_before_any_docker_command(files, tmp_path, monkeypatch, statement):
+def test_psql_meta_commands_are_rejected_before_backup(files, tmp_path, monkeypatch, statement):
     migration_file(tmp_path, monkeypatch, statement)
     docker = FakeDocker()
     code, report, _ = run(files, docker, FakeGateway(docker))
-    assert code == 1 and report["status"] == "aborted" and not docker.calls
+    assert code == 1 and report["status"] == "aborted" and not docker.ups() and not dump_calls(docker)
     assert "psql meta-command" in report["rollback"]["reason"]
+    assert "--allow-breaking-catalog" in report["rollback"]["reason"]
 
 
 @pytest.mark.parametrize("statement", [
@@ -1289,11 +1421,14 @@ def test_a_backslash_inside_a_literal_or_comment_is_not_a_psql_meta_command(stat
     assert "psql meta-command" not in deploy.unsafe_migration_statements(statement)
 
 
-def test_allowing_an_incompatible_migration_still_disables_psql_meta_commands(files, tmp_path, monkeypatch):
+def test_allowing_a_breaking_catalog_still_sends_restrict_before_a_psql_meta_command(files, tmp_path, monkeypatch):
     migration_file(tmp_path, monkeypatch, "\\c baton\nSELECT 1;\n")
     docker = FakeDocker()
-    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--allow-incompatible-migration")
-    assert code == 0 and report["migration"]["unsafe"]
+    code, report, _ = run(files, docker, FakeGateway(docker), "--allow-incompatible-migration")
+    assert code == 1 and "psql meta-command" in report["rollback"]["reason"]
+    docker = FakeDocker()
+    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--allow-breaking-catalog")
+    assert code == 0 and report["migration"]["statements"]
     applied = next(s for s in docker.stdins if s and s.startswith("BEGIN;"))
     assert applied.index("\\restrict ") < applied.index("\\c baton")
     assert re.search(r"\\restrict [0-9a-f]{32}\n", applied)
@@ -1478,7 +1613,8 @@ def test_comments_and_strings_do_not_count_as_privilege_changes():
     assert deploy.unsafe_migration_statements("SELECT 'REVOKE ALL ON baton.t FROM PUBLIC';") == []
     hidden = "DO $$ BEGIN EXECUTE 'GRANT SELECT ON baton.t TO PUBLIC'; END $$;"
     found = deploy.unsafe_migration_statements(hidden)
-    assert "do on line 1" in found and "end on line 1" in found
+    assert "do on line 1" in found
+    assert not any(item.startswith("end on line ") for item in found)
     assert not any("privileges" in item for item in found)
 
 
@@ -1638,16 +1774,19 @@ def test_build_network_is_applied_through_an_override_for_services_with_a_build(
     build = next(c for c in docker.calls if c[-1:] == ["build"])
     assert build[:2] == ["docker", "compose"] and build.count("-f") == 2
     assert build[build.index("-f") + 1] == str(files[0]), "the operator's file comes first"
-    assert docker.override_text == "services:\n  bridge:\n    build:\n      network: host\n" \
-                                   "  initialize:\n    build:\n      network: host\n"
+    assert docker.override_text.count("network: host") == 2
+    assert deploy.SCHEMA_LABEL in docker.override_text
     up = docker.ups()[0]
-    assert up.count("-f") == 1 and "build-network.yaml" not in " ".join(up)
+    assert up.count("-f") == 1 and "build-override.yaml" not in " ".join(up)
 
 
 def test_without_build_network_the_plain_compose_build_runs_and_no_build_skips_it(files):
     docker = FakeDocker()
     run(files, docker, FakeGateway(docker, good_image=OLD_APP))
-    assert [c for c in docker.calls if c[-1:] == ["build"]][0][2:] == ["-f", str(files[0]), "-p", "demo", "build"]
+    build = next(c for c in docker.calls if c[-1:] == ["build"])
+    assert build.count("-f") == 2 and build[build.index("-f") + 1] == str(files[0])
+    encoded = base64.b64encode(deploy.SCHEMA_FILE.read_text(encoding="utf-8").encode()).decode()
+    assert deploy.SCHEMA_LABEL in docker.override_text and encoded in docker.override_text
     docker = FakeDocker()
     _, report, _ = run(files, docker, FakeGateway(docker, good_image=OLD_APP), "--no-build")
     assert report["build"] == {"skipped": True} and not [c for c in docker.calls if c[-1:] == ["build"]]
