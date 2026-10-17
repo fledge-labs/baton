@@ -22,10 +22,12 @@ Baton 提供通信、权限、审计和工作流秩序；执行属于外部 agen
 
 | 状态 | 内容 |
 | --- | --- |
-| **现已提供** | MCP/HTTP/A2A、webhook、`wait_inbox`、任务与讨论串 API、审批关卡与委托链（经 API/CLI）、只读 web 看板（运维视图，非人的主入口） |
+| **现已提供** | MCP/HTTP、webhook、`wait_inbox`、任务与讨论串 API、审批关卡与委托链（经 API/CLI）、只读 web 看板（运维视图，非人的主入口）；**A2A v1.0 公共接口**（签名 Agent Card、`SendMessage` / 流式等，见 [spec A39](spec/space.md) 与 `bridge/a2a_public.py`） |
 | **计划（第 4 批 / W4 等）** | **飞书**为第一个通道实现：互动卡片（审批：通过 / 拒绝 / 要修改；状态：派出、完成、超时；**预算告警**待防循环与预算能力落地后随状态卡片一并提供），同一对象只更新同一张卡片；飞书用户映射到 Baton 人类身份，按钮回写并按委托链校验、全程审计。**Slack** 等后续接入。 |
 
 防循环与预算在 README 能力表中仍为**计划**（审批关卡已实现）；与上表「预算告警」卡片一致，均属未来工作，不在此文档中表述为已上线。
+
+**A2A 交付状态（避免误读）：** 上表「A2A v1.0 公共接口」以规格 **A39** 与 `bridge/a2a_public.py` 为准，属**已实现**。 [README](../README.md) 能力表「A2A 集成」一行仍写「计划」，措辞未与 A39 同步；本文件不重复「部分已实现」说法，也不把 A2A 与 webhook 混为一档。
 
 ## 投入方向
 
@@ -34,13 +36,14 @@ Baton 提供通信、权限、审计和工作流秩序；执行属于外部 agen
 **通信**
 
 - 讨论串、@ 提及、收件箱和通知（已实现）
-- A2A、webhook（部分已实现，见 README）
+- webhook（已实现，见 README）
+- A2A v1.0 公共接口（已实现，见 spec A39；README 能力表一行待同步）
 - 飞书卡片和链接（**planned**，第 4 批）
 
 **任务协作**
 
 - 派单、认领、租约、作用域、交接、依赖图、审批和委托、审计（已实现，见规格与 API）
-- 岗位队列（按 README / 路线图）
+- 岗位队列（按岗位/角色的就绪与派单，**planned**；owner 产品用语，README 与 [路线图](design/roadmap.md) 尚未单独立项）
 - 防循环和预算（**planned**）
 
 ## 必须守住的能力
@@ -71,7 +74,7 @@ ChatGPT Space、Claude Tag 是「一个助手融入团队」；Baton 管的是�
 
 ## 与 WAG、WorkGoal 的边界
 
-**说明（owner 口径，2026-10-17）：** 下表为生态分工的**目标陈述**，不是对本仓库或外部产品的实测结论；WorkGoal 仅在此文档出现，WAG 在 [space-replica.md](design/space-replica.md) 等处亦按「尚未核实的外部说法」分级，勿与 [spec/space.md](spec/space.md) 中已核实的 Space 证据混为一谈。
+**说明（owner 口径，2026-10-17）：** 下表为生态分工的**目标陈述**，不是对本仓库或外部产品的实测结论；WorkGoal 仅在此文档出现。 [space-replica.md](design/space-replica.md) 第 48 行将「WAG 复刻 Agents API」写作设计前提，**未**单独标「尚未核实」；同文件仅第 170 行 owner 输入的 Cedar 说法标为尚未核实——勿把后者概括为「WAG 相关说法均已分级为未核实」。勿与 [spec/space.md](spec/space.md) 中已核实的 Space 证据混为一谈。
 
 | | WAG | WorkGoal | Baton |
 | --- | --- | --- | --- |
