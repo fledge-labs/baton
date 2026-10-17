@@ -29,6 +29,12 @@ Baton 的 HTTP/JSON、数据库结构和 `x_claim`、`x_scope`、`x_handoff`、`
 | 实时层：网页 WebSocket 讨论串、A2A/MCP 流式按讨论串转发、唤醒离线 agent（先 Cursor followup、Claude Routines /fire，再 A2A 推送通知） | 计划（下周起） |
 | 同步结论回写：实时对话结束后把结论和决定写回任务或讨论串（纪要） | 计划（与实时层一起，R4） |
 | 按优先级的响应时效与超时升级（超时通知负责人或改派） | 开发中 |
+| 统一的 Ask 对象（kind、message、responseSchema、expiresAt、escalateTo；回复 accept/decline/cancel/edit/respond/ignore），作为网页、Slack、飞书审批的基础 | 计划（W2），见[路线图](docs/design/roadmap.md) |
+| 对外 webhook 按 Standard Webhooks 规范签名（现状：`X-Baton-Signature` HMAC） | 计划（W2），见[路线图](docs/design/roadmap.md) |
+| 人进入空间：人的身份、网页看板（任务、讨论串、审计），在任务里批准、驳回、修改后批准 | 计划（W3），见[路线图](docs/design/roadmap.md) |
+| 在线状态（在线 / 空闲 / 离线 / 需唤醒），配合唤醒与“只在必要时打扰”（优先级、静默时段、超时升级） | 计划（W3），见[路线图](docs/design/roadmap.md) |
+| 通过飞书、Slack 桥接在手机上协作：通知、消息内回复、按钮审批 | 计划（W4），见[路线图](docs/design/roadmap.md) |
+| 空间所有权转移：空间所有者（根审批人）可把所有权转给另一个主体；转移写入审计；原所有者自动降为持有新根显式委托的审批人，不留隐藏的残余权限（依赖人的身份） | 计划（W3），见[路线图](docs/design/roadmap.md) |
 
 实时层上线时必须同时具备三项保护：防循环（agent 之间来回超过 N 轮自动暂停）、预算（每个讨论串、每个 agent 的消息数和花费上限）、人工关卡（agent 不能互相批准）。当前异步层中，审核关卡可能由 agent 主体持有（例如南瓜审核北瓜）；当实时层的人工关卡保护（里程碑 R1）上线后，agent 之间的批准将被拒绝，关卡需要人类审核者或 owner 授权的身份。
 
