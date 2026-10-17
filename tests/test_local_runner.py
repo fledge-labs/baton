@@ -80,6 +80,9 @@ for address in scenario.get("probe_connect", []):
         probes["connect"] = "ok"
     except OSError as error:
         probes["connect"] = "denied:" + type(error).__name__
+if scenario.get("run_git"):
+    done = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
+    probes["git_status"] = "rc=%d" % done.returncode
 report["probes"] = probes
 Path("fake-report.json").write_text(json.dumps(report))
 Path("fake-output.txt").write_text("changed by the fake cli\\n")
@@ -828,6 +831,13 @@ def test_the_documented_example_config_parses_and_keeps_the_agreed_workers(monke
     assert len(tokens) == 1 and tokens.pop().endswith("/.config/baton-runner")
     for worker in config.workers:
         assert lr.refused_flags(worker.command) == []
+    home = os.path.realpath(os.path.expanduser("~"))
+    for name, worker in workers.items():
+        if name == "xigua":
+            continue
+        assert worker.home_read, name + " names the config directories its CLI needs"
+        assert all(os.path.realpath(path).startswith(home + "/") for path in worker.home_read)
+        assert not worker.allow_keychain, "the Keychain stays denied in every example"
 
 
 STUB_SECURITY = '''#!{python}
@@ -993,20 +1003,242 @@ def test_sandbox_exec_profile_denies_the_keychain_files_and_security_daemons(tmp
     assert "Keychains" not in plain_profile and "mach-lookup" not in plain_profile
 
 
-def test_sandbox_plan_adds_keychain_denials_only_for_workers_that_use_it(tmp_path, monkeypatch):
+def plans_for(tmp_path, monkeypatch, *overrides):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    data = base_config(tmp_path, env_from_keychain={"K": "svc"}, sandbox={"backend": "sandbox-exec"})
-    data["workers"].append({**data["workers"][0], "principal": "w2", "token_file": str(tmp_path / "t2"),
-                            "workdir_root": str(tmp_path / "r2"), "env_from_keychain": {}})
+    data = base_config(tmp_path, sandbox={"backend": "sandbox-exec"}, **overrides[0])
+    for index, extra_fields in enumerate(overrides[1:], start=2):
+        data["workers"].append({**data["workers"][0], "principal": "w%d" % index,
+                                "token_file": str(tmp_path / ("t%d" % index)),
+                                "workdir_root": str(tmp_path / ("r%d" % index)), **extra_fields})
     config = lr.parse_config(data)
     runner = type("R", (), {"config": config, "stop": threading.Event(), "secrets": []})()
-    plans = [lr.WorkerRunner(runner, w, None, None).sandbox_plan(tmp_path / "wt", tmp_path / "tmp")
-             for w in config.workers]
-    assert plans[0].keychain_dirs == [os.path.realpath(str(tmp_path / "home/Library/Keychains")),
-                                      os.path.realpath("/Library/Keychains")]
-    assert plans[1].keychain_dirs == []
-    assert "com.apple.SecurityServer" in lr.sandbox_exec_profile(plans[0])
-    assert "com.apple.SecurityServer" not in lr.sandbox_exec_profile(plans[1])
+    return config, [lr.WorkerRunner(runner, w, None, None).sandbox_plan(tmp_path / "wt", tmp_path / "tmp")
+                    for w in config.workers]
+
+
+def test_keychain_is_denied_for_every_sandboxed_worker_unless_allow_keychain_is_set(tmp_path, monkeypatch):
+    config, plans = plans_for(tmp_path, monkeypatch, {}, {"env_from_keychain": {"K": "svc"}}, {"allow_keychain": True})
+    expected = [os.path.realpath(str(tmp_path / "home/Library/Keychains")), os.path.realpath("/Library/Keychains")]
+    assert plans[0].keychain_dirs == expected, "denied by default, even without env_from_keychain"
+    assert plans[1].keychain_dirs == expected
+    assert plans[2].keychain_dirs == [] and config.workers[2].allow_keychain is True
+    for plan, denied in zip(plans, (True, True, False)):
+        profile = lr.sandbox_exec_profile(plan)
+        assert ("com.apple.SecurityServer" in profile) == denied
+        assert ("/Library/Keychains" in profile) == denied and ("(deny mach-lookup" in profile) == denied
+    assert lr.parse_config(base_config(tmp_path)).workers[0].allow_keychain is False
+    for bad in ("true", 1, None):
+        with pytest.raises(lr.ConfigError):
+            lr.parse_config(base_config(tmp_path, allow_keychain=bad))
+
+
+def test_allow_keychain_logs_a_loud_warning_and_env_from_keychain_still_works(tmp_path, capsys):
+    assert shutil.which("bwrap"), "bubblewrap must be installed: the sandbox tests may not be skipped"
+    init_runner_files(tmp_path)
+    data = base_config(tmp_path, command=["x"], sandbox={"backend": "bwrap"}, allow_keychain=True)
+    runner = lr.Runner(lr.parse_config(data))
+    assert [w.principal for w in runner.prepare()] == ["w1"]
+    err = capsys.readouterr().err
+    assert "WARNING allow_keychain=true" in err and "synthetic-token" not in err
+    quiet = lr.Runner(lr.parse_config(base_config(tmp_path, command=["x"], sandbox={"backend": "bwrap"})))
+    quiet.prepare()
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def home_config(tmp_path, monkeypatch, workers):
+    """A config whose tokens, state, roots and workers all live under a fake HOME."""
+    home = tmp_path / "home"
+    (home / ".config/baton-runner").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    entries = []
+    for index, extra_fields in enumerate(workers, start=1):
+        entries.append({"principal": "w%d" % index, "token_file": str(home / (".config/baton-runner/w%d.token" % index)),
+                        "command": ["cli"], "prompt_via": "stdin", "workdir_root": str(home / ("work/w%d" % index)),
+                        "task_timeout_seconds": 10, "sandbox": {"backend": "bwrap"}, **extra_fields})
+    return {"url": "https://example.com", "state_dir": str(home / ".local/state/baton-runner"),
+            "repo": str(tmp_path / "repo"), "hourly_task_cap": 3, "workers": entries}
+
+
+def test_home_read_accepts_the_clis_own_directories(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    data = home_config(tmp_path, monkeypatch, [{"home_read": ["~/.codex", "~/.local/bin/codex", "~/.shared"]},
+                                                {"home_read": ["~/.config/grok", "~/.shared"]}])
+    config = lr.parse_config(data)
+    assert config.workers[0].home_read == [str(home / ".codex"), str(home / ".local/bin/codex"), str(home / ".shared")]
+    assert lr.parse_config(home_config(tmp_path, monkeypatch, [{}])).workers[0].home_read == []
+
+
+@pytest.mark.parametrize("entry,why", [
+    ("~/.config/baton-runner", "the token directory"), ("~/.config", "a parent of the token directory"),
+    ("~/.config/baton-runner/w1.token", "a token file"), ("~/.ssh", "~/.ssh"), ("~/.ssh/known_hosts", "inside ~/.ssh"),
+    ("~/.local/state/baton-runner", "the state dir"), ("~/.local/state", "a parent of the state dir"),
+    ("~/.local", "a parent of the state dir"),
+    ("~/work/w1", "own workdir_root"), ("~/work/w2", "another worker's workdir_root"),
+    ("~/work/w2/some-task", "inside another worker's workdir_root"), ("~/work", "a parent of the worker roots"),
+    ("~", "HOME itself"), ("/etc/hosts", "outside HOME"), ("relative/dir", "not absolute"),
+])
+def test_home_read_validation_rejects_protected_and_foreign_paths(tmp_path, monkeypatch, entry, why):
+    data = home_config(tmp_path, monkeypatch, [{"home_read": [entry]}, {}])
+    with pytest.raises(lr.ConfigError):
+        lr.parse_config(data)
+
+
+def test_home_read_validation_follows_symlinks_and_checks_the_config_file(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    data = home_config(tmp_path, monkeypatch, [{}])
+    (home / ".ssh").mkdir()
+    (home / "innocent").symlink_to(home / ".ssh")
+    data["workers"][0]["home_read"] = ["~/innocent"]
+    with pytest.raises(lr.ConfigError):
+        lr.parse_config(data)
+    (home / ".runner").mkdir()
+    data["workers"][0]["home_read"] = ["~/.runner"]
+    with pytest.raises(lr.ConfigError):
+        lr.parse_config(data, str(home / ".runner" / "config.json"))
+    assert lr.parse_config(data, str(home / ".other" / "config.json")).workers[0].home_read == [str(home / ".runner")]
+
+
+def test_a_worker_may_not_reach_into_another_workers_home_read(tmp_path, monkeypatch):
+    for first, second in ((["~/.config"], ["~/.config/grok"]), (["~/.config/grok"], ["~/.config/grok/sub"]),
+                          (["~/.config/grok/sub"], ["~/.config/grok"]), (["~/.a"], ["~/.a/sub", "~/.b"])):
+        data = home_config(tmp_path, monkeypatch, [{"home_read": first}, {"home_read": second}])
+        with pytest.raises(lr.ConfigError):
+            lr.parse_config(data)
+    shared = home_config(tmp_path, monkeypatch, [{"home_read": ["~/.a", "~/.b"]}, {"home_read": ["~/.a", "~/.c"]}])
+    assert lr.parse_config(shared), "an entry both workers list themselves is not 'reaching into' the other"
+    disjoint = home_config(tmp_path, monkeypatch, [{"home_read": ["~/.config/a"]}, {"home_read": ["~/.config/b"]}])
+    assert lr.parse_config(disjoint)
+
+
+def test_extra_write_paths_get_the_same_protection_and_may_not_cover_home(tmp_path, monkeypatch):
+    for entry in ("~", str(tmp_path), "~/.ssh", "~/.config/baton-runner/x", "~/.local/state"):
+        data = home_config(tmp_path, monkeypatch, [{"sandbox": {"backend": "bwrap", "extra_write_paths": [entry]}}])
+        with pytest.raises(lr.ConfigError):
+            lr.parse_config(data)
+    ok = home_config(tmp_path, monkeypatch, [{"sandbox": {"backend": "bwrap", "extra_write_paths": ["~/.codex/sessions"]}}])
+    assert lr.parse_config(ok)
+
+
+def test_sandbox_exec_profile_denies_home_first_then_reallows_only_what_the_task_needs(tmp_path):
+    home = str(tmp_path / "home")
+    plan = make_plan(tmp_path, home_dirs=[home, "/private" + home], home_read=[home + "/.codex", home + "/.local/bin/agent"],
+                     extra_write=[home + "/.codex/sessions"], worktree=home + "/work/w1/task",
+                     tmpdir=home + "/work/w1/.tmp/task", own_root=home + "/work/w1",
+                     token_dirs=[home + "/.config/baton-runner"], ssh_dir=home + "/.ssh", state_dir=home + "/.state",
+                     config_file=home + "/cfg.json", other_roots=[home + "/work/w2"])
+    profile = lr.sandbox_exec_profile(plan)
+    lines = profile.splitlines()
+    assert lines[:2] == ["(version 1)", "(allow default)"], "system paths outside HOME stay reachable"
+    for directory in plan.home_dirs:
+        assert '(deny file-read* (subpath "%s"))' % directory in lines
+        assert '(deny file-write* (subpath "%s"))' % directory in lines
+    last_home_deny = max(i for i, line in enumerate(lines) if line.startswith("(deny file-") and "subpath" in line
+                         and any('"%s"' % d in line for d in plan.home_dirs))
+    allows = [i for i, line in enumerate(lines) if line.startswith("(allow file-read")]
+    assert allows and min(allows) > last_home_deny, "every re-allow comes after the HOME deny"
+    reads = {line for line in lines if line.startswith("(allow file-read* ")}
+    for path in (plan.worktree, plan.tmpdir, home + "/.codex", home + "/.local/bin/agent", home + "/.codex/sessions"):
+        assert '(allow file-read* (subpath "%s"))' % path in reads
+    assert '(allow file-read* (subpath "%s"))' % home not in reads
+    write_line = next(line for line in lines if line.startswith("(allow file-write*"))
+    assert '(subpath "%s")' % plan.worktree in write_line and '(subpath "%s")' % (home + "/.codex/sessions") in write_line
+    assert '(subpath "%s")' % (home + "/.codex") not in write_line, "home_read is read-only"
+    assert lines.index("(deny file-write*)") < lines.index(write_line)
+    assert '(allow file-read-metadata (literal "%s"))' % home in lines, "stat of HOME itself is not content"
+    assert '(allow file-read-metadata (literal "%s"))' % (home + "/work/w1") in lines
+    assert not any(line.startswith("(allow file-read") and "/.ssh" in line for line in lines)
+
+
+def test_sandbox_exec_profile_without_home_dirs_has_no_home_rules(tmp_path):
+    profile = lr.sandbox_exec_profile(make_plan(tmp_path))
+    assert "file-read-metadata" not in profile
+
+
+def test_bwrap_home_is_emptied_first_then_home_read_is_bound_read_only_then_the_worktree(tmp_path):
+    home = tmp_path / "home"
+    for name in (".codex", ".ssh", "work/w1/task", "work/w1/.tmp/task", ".config/baton-runner", ".state", "work/w2"):
+        (home / name).mkdir(parents=True)
+    (home / "cfg.json").write_text("{}")
+    plan = make_plan(tmp_path, backend="bwrap", home_dirs=[str(home)], home_read=[str(home / ".codex"), str(home / "gone")],
+                     worktree=str(home / "work/w1/task"), tmpdir=str(home / "work/w1/.tmp/task"),
+                     own_root=str(home / "work/w1"), token_dirs=[str(home / ".config/baton-runner")],
+                     ssh_dir=str(home / ".ssh"), state_dir=str(home / ".state"), config_file=str(home / "cfg.json"),
+                     other_roots=[str(home / "work/w2")], extra_write=[])
+    command = lr.wrap_command(plan, ["agent"])
+    first_home = command.index(str(home))
+    assert command[first_home - 1] == "--tmpfs"
+    ro = [i for i, arg in enumerate(command) if arg == "--ro-bind" and command[i + 1] == str(home / ".codex")]
+    binds = [i for i, arg in enumerate(command) if arg == "--bind"]
+    masks = [i for i, arg in enumerate(command) if arg == "--tmpfs"]
+    assert ro and command[ro[0] + 2] == str(home / ".codex")
+    assert first_home - 1 == min(masks), "HOME tmpfs is the first mask"
+    assert max(masks) < ro[0] < min(binds), "masks, then read-only home_read, then the writable binds"
+    assert str(home / "gone") not in command, "a missing home_read path is skipped instead of breaking bwrap"
+    assert command[binds[0] + 1] == str(home / "work/w1/task")
+
+
+def test_bwrap_denies_home_by_default_and_each_worker_sees_only_its_own_home_read(
+        lab, bridge, space, repo, monkeypatch, tmp_path):
+    assert shutil.which("bwrap"), "bubblewrap must be installed: the sandbox tests may not be skipped"
+    home = tmp_path / "home"
+    planted = {".aws/credentials": "aws", ".config/gh/hosts.yml": "gh", ".config/hcloud/cli.toml": "hcloud",
+               ".netrc": "netrc", ".docker/config.json": "docker", ".kube/config": "kube", ".gnupg/secring": "gpg",
+               ".ssh/id_test": "ssh", "other-repo/secret.txt": "other repo", "Downloads/artifact.bin": "artifact",
+               ".mozilla/firefox/profile/logins.json": "browser", ".other-cli/creds": "the other worker's config"}
+    for name, text in planted.items():
+        (home / name).parent.mkdir(parents=True, exist_ok=True)
+        (home / name).write_text(text)
+    (home / ".codex").mkdir()
+    (home / ".codex" / "auth.json").write_text("own cli config")
+    (home / ".other-cli").mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    tokens = home / ".config" / "baton-runner"
+    tokens.mkdir(parents=True)
+    copies = {}
+    for label in ("worker", "worker2"):
+        copies[label] = tokens / (label + ".token")
+        copies[label].write_text(bridge.tokens[label].read_text())
+        copies[label].chmod(0o600)
+    local_repo = home / "src" / "repo"
+    shutil.copytree(repo.path, local_repo)
+    reads = [str(home / name) for name in planted] + [str(home / ".codex" / "auth.json"), str(copies["worker"]),
+                                                       str(copies["worker2"])]
+    scenario = lab.scenario(probe_read=reads, run_git=True,
+                            probe_write=[str(home / "planted-write.txt"), str(home / ".codex" / "x"), "inside-worktree.txt"])
+    sandbox = {"backend": "bwrap"}
+    workers = [
+        lab.worker(scenario=scenario, sandbox=sandbox, token_file=str(copies["worker"]),
+                   workdir_root=str(home / "work" / "w1"), home_read=[str(home / ".codex")], home="real"),
+        lab.worker("worker2", sandbox=sandbox, token_file=str(copies["worker2"]),
+                   workdir_root=str(home / "work" / "w2"), home_read=[str(home / ".other-cli")], home="real")]
+    task_id = assign(space, bridge, "worker")
+    lab.start(workers, repo=str(local_repo), state_dir=str(home / ".local" / "state" / "baton-runner"))
+    wait_state(space, task_id, "awaiting_gate")
+    report = json.loads((home / "work" / "w1" / task_id / "fake-report.json").read_text())
+    probes = report["probes"]
+    assert probes[str(home / ".codex" / "auth.json")] == "read:own cli config", "the worker's own home_read is readable"
+    for name in planted:
+        assert not probes[str(home / name)].startswith("read:"), name + " must not be readable"
+    assert not probes[str(copies["worker"])].startswith("read:") and not probes[str(copies["worker2"])].startswith("read:")
+    assert probes[str(home / "planted-write.txt")].startswith("denied:") and not (home / "planted-write.txt").exists()
+    assert probes[str(home / ".codex" / "x")].startswith("denied:"), "home_read is read-only"
+    assert probes["inside-worktree.txt"] == "written"
+    assert probes["git_status"] == "rc=0", "the repo's git dir stays readable so git works in the worktree"
+    assert report["env"]["HOME"] == str(home)
+
+
+def test_bwrap_worker_cannot_read_a_file_planted_under_home_outside_home_read_with_the_default_layout(
+        lab, bridge, space, monkeypatch, tmp_path):
+    assert shutil.which("bwrap"), "bubblewrap must be installed: the sandbox tests may not be skipped"
+    home = tmp_path / "home"
+    (home / ".cache").mkdir(parents=True)
+    (home / ".cache" / "note.txt").write_text("planted")
+    monkeypatch.setenv("HOME", str(home))
+    scenario = lab.scenario(probe_read=[str(home / ".cache" / "note.txt")])
+    task_id = assign(space, bridge, "worker")
+    lab.start([lab.worker(scenario=scenario, sandbox={"backend": "bwrap"})])
+    wait_state(space, task_id, "awaiting_gate")
+    assert lab.report("worker", task_id)["probes"][str(home / ".cache" / "note.txt")].startswith("denied:")
 
 
 def test_keychain_values_are_redacted_from_captured_output_boundaries():

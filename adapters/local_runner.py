@@ -88,7 +88,7 @@ CONFIG_KEYS = frozenset({
 WORKER_KEYS = frozenset({
     "principal", "token_file", "command", "prompt_via", "workdir_root", "concurrency", "task_timeout_seconds",
     "sandbox", "env_passthrough", "home", "enabled", "implicit_auto_approve",
-    "env_from_keychain",
+    "env_from_keychain", "home_read", "allow_keychain",
 })
 SANDBOX_KEYS = frozenset({"backend", "allow_network", "extra_write_paths"})
 
@@ -146,6 +146,8 @@ class WorkerConfig:
     enabled: bool = True
     implicit_auto_approve: bool = False
     env_from_keychain: dict = field(default_factory=dict)
+    home_read: list = field(default_factory=list)
+    allow_keychain: bool = False
 
 
 @dataclass
@@ -265,6 +267,13 @@ def parse_worker(raw, index):
         if (not isinstance(service, str) or not service or len(service) > 200
                 or re.search(r"[\x00-\x1f\x7f]", service)):
             raise ConfigError(what + ".env_from_keychain service names must be plain strings without control characters")
+    home_read = raw.get("home_read", [])
+    if not isinstance(home_read, list):
+        raise ConfigError(what + ".home_read must be a list of paths inside HOME")
+    home_read = [_path({"p": item}, "p", what + ".home_read") for item in home_read]
+    allow_keychain = raw.get("allow_keychain", False)
+    if not isinstance(allow_keychain, bool):
+        raise ConfigError(what + ".allow_keychain must be true or false")
     implicit = raw.get("implicit_auto_approve", False)
     if not isinstance(implicit, bool):
         raise ConfigError(what + ".implicit_auto_approve must be true or false")
@@ -277,7 +286,57 @@ def parse_worker(raw, index):
         task_timeout_seconds=_int(raw, "task_timeout_seconds", what, None, 1, MAX_LEASE_SECONDS - 1),
         sandbox=SandboxConfig(backend, allow_network, extra_paths), env_passthrough=list(passthrough), home=home,
         enabled=enabled, implicit_auto_approve=implicit,
-        env_from_keychain=dict(keychain))
+        env_from_keychain=dict(keychain), home_read=home_read, allow_keychain=allow_keychain)
+
+
+def _inside(path, directory):
+    return path.startswith(directory.rstrip("/") + "/")
+
+
+def validate_home_access(workers, state_dir, config_path):
+    """Check home_read and extra_write_paths against everything the sandbox protects.
+
+    Entries are compared by real path. home_read must be strictly inside HOME. No entry may be, contain or sit
+    inside a token directory, the state dir, the config file, ~/.ssh or any worker's workdir_root, and a worker
+    may not reach into another worker's entries unless it lists the same entry itself.
+    """
+    home = os.path.realpath(os.path.expanduser("~"))
+    protected = [("token directory", d) for w in workers
+                 for d in {os.path.dirname(os.path.realpath(w.token_file)),
+                           os.path.dirname(os.path.realpath(os.path.abspath(w.token_file)))}]
+    protected += [("state dir", os.path.realpath(state_dir)), ("~/.ssh", os.path.join(home, ".ssh")),
+                  ("~/.ssh", os.path.realpath(os.path.join(home, ".ssh")))]
+    protected += [("worker root", os.path.realpath(w.workdir_root)) for w in workers]
+    if config_path:
+        protected.append(("config file", os.path.realpath(config_path)))
+    owned = []
+    for index, worker in enumerate(workers):
+        what = "workers[%d]" % index
+        mine = set()
+        for key, paths in (("home_read", worker.home_read), ("sandbox.extra_write_paths", worker.sandbox.extra_write_paths)):
+            for path in paths:
+                real = os.path.realpath(path)
+                inside = _inside(real, home)
+                if key == "home_read" and not inside:
+                    raise ConfigError(what + ".home_read entries must be inside HOME (and not HOME itself)")
+                if key != "home_read" and _nested(real, home) and not inside:
+                    raise ConfigError(what + "." + key + " may not be HOME or contain it")
+                for label, other in protected:
+                    if _nested(real, other):
+                        raise ConfigError("%s.%s has an entry that is, contains or lies inside a protected path (%s)"
+                                          % (what, key, label))
+                if inside:
+                    mine.add(real)
+        owned.append(mine)
+    for index, mine in enumerate(owned):
+        for other_index, theirs in enumerate(owned):
+            if index == other_index:
+                continue
+            for entry in mine:
+                for foreign in theirs - mine:
+                    if _nested(entry, foreign):
+                        raise ConfigError("workers[%d] reaches into the home paths of workers[%d]; each worker may "
+                                          "only expose its own CLI's directories" % (index, other_index))
 
 
 def parse_config(data, path=None):
@@ -315,10 +374,12 @@ def parse_config(data, path=None):
     if len(set(tokens)) != len(tokens):
         raise ConfigError("each worker needs its own token_file")
     renew = data.get("renew_interval_seconds")
+    state_dir = _path(data, "state_dir", "config")
+    validate_home_access(workers, state_dir, path)
     if renew is not None:
         renew = _number(data, "renew_interval_seconds", "config", None, 0.1, MAX_LEASE_SECONDS)
     return Config(
-        url=url, state_dir=_path(data, "state_dir", "config"), repo=_path(data, "repo", "config"),
+        url=url, state_dir=state_dir, repo=_path(data, "repo", "config"),
         hourly_task_cap=_int(data, "hourly_task_cap", "config", None, 1, 100000), workers=workers,
         ca_file=_path(data, "ca_file", "config", required=False), pin_sha256=pin,
         max_failures_per_task=_int(data, "max_failures_per_task", "config", 2, 1, 10), default_branch=branch,
@@ -442,6 +503,8 @@ class SandboxPlan:
     config_file: str
     extra_write: list = field(default_factory=list)
     keychain_dirs: list = field(default_factory=list)
+    home_dirs: list = field(default_factory=list)
+    home_read: list = field(default_factory=list)
 
 
 def _real(path):
@@ -458,19 +521,49 @@ def hidden_dirs(plan):
     return result
 
 
+def _under(path, directories):
+    return any(path == d or path.startswith(d.rstrip("/") + "/") for d in directories)
+
+
+def home_ancestors(plan, paths):
+    """HOME and the directories between it and each re-allowed path, whose metadata (not contents) stays visible."""
+    result = []
+    for home in plan.home_dirs:
+        for path in paths:
+            if not _under(path, [home]):
+                continue
+            current = os.path.dirname(path)
+            while _under(current, [home]) and current not in result:
+                result.append(current)
+                if current == home:
+                    break
+                current = os.path.dirname(current)
+    return result
+
+
 def bwrap_command(plan, argv):
     args = ["bwrap", "--die-with-parent", "--unshare-pid", "--unshare-ipc", "--ro-bind", "/", "/",
             "--dev", "/dev", "--proc", "/proc"]
     if not plan.allow_network:
         args.append("--unshare-net")
-    # Masks come first, then the writable binds: the worktree and temp dir may live below a masked directory.
-    for directory in hidden_dirs(plan):
-        if os.path.isdir(directory):
-            args += ["--tmpfs", directory]
+    # HOME is emptied first, then masks, then the read-only home_read binds, then the writable binds: the
+    # worktree and temp dir may live below HOME or a masked directory.
+    masked = []
+    for home in plan.home_dirs:
+        if os.path.isdir(home) and not os.path.islink(home) and home != "/":
+            masked.append(home)
+    masked += [directory for directory in hidden_dirs(plan) if os.path.isdir(directory)]
+    for directory in masked:
+        args += ["--tmpfs", directory]
     if plan.config_file and os.path.exists(plan.config_file):
         args += ["--ro-bind", "/dev/null", plan.config_file]
+    for path in plan.home_read:
+        if os.path.exists(path):
+            args += ["--ro-bind", path, path]
     for path in [plan.worktree, plan.tmpdir, *plan.extra_write]:
         args += ["--bind", path, path]
+    for directory in masked:
+        args += ["--remount-ro", directory]  # the empty tmpfs stays empty; the binds above remain separate mounts
     return args + ["--chdir", plan.worktree, "--"] + list(argv)
 
 
@@ -483,6 +576,9 @@ def _sbpl(path):
 def sandbox_exec_profile(plan):
     """macOS Seatbelt profile text: later rules win, so denies come first and the task's own paths re-allow."""
     lines = ["(version 1)", "(allow default)"]
+    for home in plan.home_dirs:
+        lines.append("(deny file-read* (subpath %s))" % _sbpl(home))
+        lines.append("(deny file-write* (subpath %s))" % _sbpl(home))
     for directory in hidden_dirs(plan):
         lines.append("(deny file-read* (subpath %s))" % _sbpl(directory))
     if plan.config_file:
@@ -491,8 +587,11 @@ def sandbox_exec_profile(plan):
         lines.append("(deny file-read* (subpath %s))" % _sbpl(directory))
     if plan.keychain_dirs:
         lines.append("(deny mach-lookup %s)" % " ".join("(global-name %s)" % _sbpl(n) for n in KEYCHAIN_MACH_SERVICES))
-    for path in (plan.worktree, plan.tmpdir):
+    readable = [plan.worktree, plan.tmpdir, *plan.extra_write, *plan.home_read]
+    for path in readable:
         lines.append("(allow file-read* (subpath %s))" % _sbpl(path))
+    for path in home_ancestors(plan, readable):
+        lines.append("(allow file-read-metadata (literal %s))" % _sbpl(path))
     lines.append("(deny file-write*)")
     writable = [plan.worktree, plan.tmpdir, *plan.extra_write]
     lines.append("(allow file-write* %s (literal \"/dev/null\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/tty\"))"
@@ -1118,7 +1217,7 @@ class WorkerRunner:
                 commit, admin = create_worktree(config, str(workdir), claimed.get("base_commit"), claimed.get("scopes"))
                 prompt_file = self.prepare_temp(tmpdir, task_id, prompt, claimed.get("scopes"))
                 argv = self.build_argv(_real(str(prompt_file)))
-                plan = self.sandbox_plan(workdir, tmpdir)
+                plan = self.sandbox_plan(workdir, tmpdir, admin)
                 env = self.child_env(tmpdir, keychain)
                 try:
                     outcome = run_child(wrap_command(plan, argv), str(workdir), env, self.stdin_bytes(prompt_file),
@@ -1181,7 +1280,22 @@ class WorkerRunner:
         write_private(path, header + prompt + "\n")
         return path
 
-    def sandbox_plan(self, workdir, tmpdir):
+    def home_read_paths(self, admin_dir):
+        """The worker's own home_read, plus what every task needs: the command's binary and the repo's git dir."""
+        home = _real(os.path.expanduser("~"))
+        paths = [_real(path) for path in self.worker.home_read]
+        executable = shutil.which(self.worker.command[0], path=os.environ.get("PATH", "/usr/bin:/bin"))
+        if executable:
+            paths.append(_real(executable))
+        if admin_dir:
+            paths.append(os.path.dirname(os.path.dirname(_real(admin_dir))))
+        result = []
+        for path in paths:
+            if _inside(path, home) and path not in result:
+                result.append(path)
+        return result
+
+    def sandbox_plan(self, workdir, tmpdir, admin=None):
         workers = self.runner.config.workers
         return SandboxPlan(
             backend=self.worker.sandbox.backend, allow_network=self.worker.sandbox.allow_network,
@@ -1192,8 +1306,11 @@ class WorkerRunner:
             ssh_dir=_real(os.path.join(os.path.expanduser("~"), ".ssh")), state_dir=_real(self.config.state_dir),
             config_file=_real(self.config.path) if self.config.path else None,
             extra_write=[_real(path) for path in self.worker.sandbox.extra_write_paths],
-            keychain_dirs=([_real(os.path.join(os.path.expanduser("~"), "Library", "Keychains")),
-                            _real("/Library/Keychains")] if self.worker.env_from_keychain else []))
+            keychain_dirs=([] if self.worker.allow_keychain else
+                           [_real(os.path.join(os.path.expanduser("~"), "Library", "Keychains")),
+                            _real("/Library/Keychains")]),
+            home_dirs=sorted({os.path.normpath(os.path.expanduser("~")), _real(os.path.expanduser("~"))}),
+            home_read=self.home_read_paths(admin))
 
     def child_env(self, tmpdir, keychain=None):
         home = os.path.expanduser("~") if self.worker.home == "real" else str(tmpdir / "home")
@@ -1374,6 +1491,9 @@ class Runner:
             if missing:
                 self.refuse(worker, "sandbox.extra_write_paths entry is not a directory")
                 continue
+            if worker.allow_keychain and worker.sandbox.backend != "none":
+                event(worker.principal, None, "WARNING allow_keychain=true: the sandbox lets this worker's CLI "
+                      "read the Keychain, so any secret stored there can be exfiltrated over the network")
             self.secrets.extend(os.environ[name] for name in worker.env_passthrough
                                 if len(os.environ.get(name, "")) >= 8)
             ensure_private_dir(worker.workdir_root)
