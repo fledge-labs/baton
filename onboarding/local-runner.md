@@ -178,6 +178,30 @@ worktree 保留在磁盘上供审阅（改动不会自动提交或推送）。�
       }
     },
     {
+      "principal": "xianggua",
+      "token_file": "~/.config/baton-runner/xianggua.token",
+      "command": [
+        "dsh",
+        "headless",
+        "{prompt_instruction}"
+      ],
+      "prompt_via": "wrapper",
+      "workdir_root": "<WORK_ROOT>/xianggua",
+      "task_timeout_seconds": 1800,
+      "home": "real",
+      "env_passthrough": [],
+      "env_from_keychain": {
+        "DEEPSEEK_API_KEY": "fledge-deepseek-key"
+      },
+      "sandbox": {
+        "backend": "sandbox-exec",
+        "allow_network": true,
+        "extra_write_paths": [
+          "<DSH_STATE_DIR>"
+        ]
+      }
+    },
+    {
       "principal": "xigua",
       "enabled": false,
       "token_file": "~/.config/baton-runner/xigua.token",
@@ -223,6 +247,7 @@ worker 字段：
 | `task_timeout_seconds` | 超时（1–3599 秒） |
 | `home` | `task`（默认）：`HOME` 指向每任务的临时目录，任务结束即删除；`real`：使用执行器用户真实的 `HOME` |
 | `env_passthrough` | 允许传给子进程的环境变量名（例如模型 API key）。不得是 `BATON_*` 或固定变量 |
+| `env_from_keychain` | 对象：环境变量名 → macOS Keychain 通用密码的服务名；启动子进程时才读取，只给该 worker 的子进程。只支持 macOS，且必须有沙箱，见“香瓜”一节 |
 | `sandbox.backend` | `sandbox-exec`、`bwrap` 或 `none` |
 | `sandbox.allow_network` | 默认 `true`；设为 `false` 时 CLI 无法访问模型 API |
 | `sandbox.extra_write_paths` | 沙箱内额外可写的已存在目录（例如 CLI 把登录态或会话写在 `HOME` 下） |
@@ -255,9 +280,32 @@ worker 字段：
 | 丝瓜（opencode） | `sigua` | `["opencode", "run", "-m", "opencode/big-pickle", "{prompt_instruction}"]` | `wrapper` | `opencode/big-pickle` 是免费模型，默认模型可能不可用，所以显式指定 `-m` |
 | 苦瓜（Cline） | `kugua` | `["cline", "-p", "{prompt_instruction}"]` | `wrapper` | `implicit_auto_approve: true`，必须有沙箱，见下 |
 | 地瓜（Devin CLI） | `digua` | `["~/.local/bin/devin", "-p", "--", "{prompt_instruction}"]` | `wrapper` | 要用 `~/.local/bin/devin`，而不是 `/opt/homebrew/bin/devin`（那是桌面应用）。`~` 只在第一个元素展开 |
+| 香瓜（DeepSeek dsh 0.2.1-rc.2） | `xianggua` | `["dsh", "headless", "{prompt_instruction}"]` | `wrapper` | 提示词是 argv 参数，所以用 `wrapper`；API key 用 `env_from_keychain` 注入，见下 |
 | 西瓜（Muse） | `xigua` | `["muse", "exec"]` | `stdin`（未验证） | 保持 `enabled: false`，暂时不加入 |
 
 冬瓜（主人的 grok 机器人）不使用本执行器：它走自己的网关或 API 接入 Baton。
+
+### 香瓜（DeepSeek dsh）与 macOS Keychain 注入环境变量
+
+香瓜（DeepSeek `dsh`，版本 0.2.1-rc.2）的无人值守命令是 `dsh headless "<任务>"`。提示词是 argv 参数，所以必须用 `prompt_via: "wrapper"`：argv 里只有固定指令句和提示词文件路径，永远没有任务文字（见上文）。它需要模型 API key，用每个 worker 的 `env_from_keychain` 从 macOS Keychain 取：
+
+```json
+"env_from_keychain": {"DEEPSEEK_API_KEY": "fledge-deepseek-key"}
+```
+
+键是环境变量名（必须匹配 `^[A-Z_][A-Z0-9_]*$`，不能是 `BATON_*`、固定变量或已在 `env_passthrough` 里的名字），值是 Keychain 里“通用密码”的服务名（`security add-generic-password -s fledge-deepseek-key -a <ACCOUNT> -w` 添加；服务名是普通字符串，不含控制字符）。语义：
+
+- **只在启动子进程时读取**，只给该 worker 的这一个子进程：执行器运行 `/usr/bin/security find-generic-password -s <服务名> -w`（argv 列表，不经 shell），把值放进子进程环境，之后随即丢弃。值不落盘、不写日志，不进评论、结果、证据和审计，也永远不会传给别的 worker 的进程。
+- **输出脱敏**：捕获到的子进程输出里，该值与令牌同样做字面脱敏（含截断处残留的片段），发评论和结果前处理。
+- **缺失处理**：任何一项读取失败（不存在、为空、Keychain 锁定或无法运行 `security`）都让该任务失败：不启动命令，`mark_blocked(reason_code="other", note="keychain item missing")`，并按 `max_failures_per_task` 计失败。消息固定，不透露任何条目（包括其他条目）的名称。
+- **平台与沙箱**：只支持 macOS。在其他平台上，带 `env_from_keychain` 的 worker 会被拒绝启动（配置错误，不会悄悄忽略）。同时必须配置 `none` 以外的沙箱后端，否则同样拒绝启动：没有沙箱时，子进程自己就能运行 `security` 读取整个 Keychain。
+- **沙箱对 Keychain 的限制**（`sandbox-exec` 配置，仅对使用 `env_from_keychain` 的 worker 生成）：
+  - 禁止读取文件：`~/Library/Keychains` 和 `/Library/Keychains`（以真实路径为准）。
+  - 禁止 `mach-lookup` 的服务，正好是这五个：`com.apple.SecurityServer`、`com.apple.securityd`、`com.apple.security.agent`、`com.apple.secd`、`com.apple.security.authhost`。
+  - 这样子进程除了注入的那个环境变量，没有别的途径拿到 Keychain 里的密钥。
+  - 该配置文本由测试检查内容，但没有在 macOS 上真实执行；上面五个服务名是否覆盖了目标 macOS 版本上所有 Keychain 相关服务，**未验证**。副作用同样未验证：`/Library/Keychains` 里管理员安装的根证书对子进程不可读，访问依赖这些证书的内网 TLS 站点可能失败；依赖 Keychain 保存登录态的 CLI 在这个沙箱里也会失败，所以不要给这类 worker 配 `env_from_keychain`。
+
+**限制，请明确知晓**：被注入的 API key 就在子进程自己的环境变量里（这正是目的），所以恶意或被攻破的 CLI 完全可以通过网络把**这把 key** 发出去。沙箱只能阻止它读取**其他**密钥（其他 Keychain 条目、令牌目录、`~/.ssh` 等），不能保护已经交给它的这一把。因此要给这把 key 设置最小额度、独立的账号和告警，并默认网络放行的前提下假设它可能泄露。执行器的脱敏只覆盖发回 Baton 的文本，不能阻止子进程自己把它发往别处。
 
 ### 苦瓜（Cline）：默认自动批准
 
@@ -285,6 +333,7 @@ worker 字段：
 任务文字是不可信数据：它只写进提示词文件，永远不会被拼进 argv、shell 或环境变量；唯一的替换是把整项 `{prompt_file}` 换成文件路径，或把整项 `{prompt_instruction}` 换成只含该路径的固定指令句。
 
 - **令牌**：只有执行器进程读取。子进程环境是显式白名单：`PATH`、`HOME`（每任务临时目录，或按配置的真实 `HOME`）、`LANG`、`TERM`、`TMPDIR`，加上该 worker 自己的 `env_passthrough`。没有任何 `BATON_*` 变量、令牌、令牌路径或其他 worker 的变量。
+- **Keychain 注入的 key**：`env_from_keychain` 的值只在启动时读取、只给该 worker 的子进程，不落盘、不写日志并从输出里脱敏；子进程自己能看到它，沙箱不能保护这一把 key（见“香瓜”一节）。
 - **沙箱**（`sandbox-exec` 或 `bwrap`）：
   - 禁止读取：令牌所在的整个目录（`~/.config/baton-runner/`，不只是当前 worker 的令牌文件）、`~/.ssh`、执行器的 `state_dir` 和配置文件、其他 worker 的 `workdir_root`（以及本 worker 其他任务的 worktree）。
   - 禁止写入：任务 worktree、该任务的临时目录以及 `extra_write_paths` 之外的所有位置。`bwrap` 下系统整体只读，用 tmpfs 盖住上述目录。
