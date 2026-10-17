@@ -149,10 +149,17 @@ for path, payload in (('$APP_CONFIG', app), ('$ADMIN_CONFIG', admin)):
 export BATON_TEST_DATABASE_CONFIG="$APP_CONFIG"
 export BATON_TEST_DATABASE_ADMIN_CONFIG="$ADMIN_CONFIG"
 
+# A run that skips tests proves less than it appears to (for example when the
+# database configuration is not picked up), so it counts as a failure.
 set +e
-"${TEST_PYTHON:-python}" -m pytest -q -rfEs "$@"
+"${TEST_PYTHON:-python}" -m pytest -q -rfEs "$@" >"$WORK_DIR/pytest.log" 2>&1
 PYTEST_STATUS=$?
 set -e
+cat "$WORK_DIR/pytest.log"
+if [ "$PYTEST_STATUS" -eq 0 ] && grep -Eq '(^|[ ,])[0-9]+ skipped' "$WORK_DIR/pytest.log"; then
+  echo "error: tests were skipped; the PostgreSQL run must have 0 skipped" >&2
+  PYTEST_STATUS=1
+fi
 
 python3 scripts/check_public_tree.py
 
