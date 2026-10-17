@@ -199,6 +199,10 @@ CREATE TABLE IF NOT EXISTS baton.x_notify (
 -- Who caused the notification; previews of content are computed at read time and are never stored.
 ALTER TABLE baton.x_notify ADD COLUMN IF NOT EXISTS actor text;
 ALTER TABLE baton.x_notify ADD COLUMN IF NOT EXISTS actor_kind text;
+-- The result a task.awaiting_gate notification is about, so an approver can gate without another read.
+-- An epoch number and a principal name: identifiers only, never result text.
+ALTER TABLE baton.x_notify ADD COLUMN IF NOT EXISTS result_epoch bigint;
+ALTER TABLE baton.x_notify ADD COLUMN IF NOT EXISTS result_author text;
 CREATE INDEX IF NOT EXISTS notify_recipient ON baton.x_notify(recipient,seq);
 CREATE TABLE IF NOT EXISTS baton.x_webhook (
     id uuid PRIMARY KEY, principal text NOT NULL, account text NOT NULL, url text NOT NULL,
@@ -263,6 +267,12 @@ ALTER TABLE baton.x_gate ADD COLUMN IF NOT EXISTS grantor text;
 -- (only the root may, and only with the explicit flag); it is never shown as someone else's approval.
 ALTER TABLE baton.x_gate ADD COLUMN IF NOT EXISTS root boolean NOT NULL DEFAULT false;
 ALTER TABLE baton.x_gate ADD COLUMN IF NOT EXISTS self_approval boolean NOT NULL DEFAULT false;
+-- Approve with edits: an 'edit' decision is stored as a pass with edited=true, keeping the result as it was
+-- submitted (original_result) beside the approver's replacement (edited_result) and the optional reason.
+ALTER TABLE baton.x_gate ADD COLUMN IF NOT EXISTS edited boolean NOT NULL DEFAULT false;
+ALTER TABLE baton.x_gate ADD COLUMN IF NOT EXISTS original_result text;
+ALTER TABLE baton.x_gate ADD COLUMN IF NOT EXISTS edited_result text;
+ALTER TABLE baton.x_gate ADD COLUMN IF NOT EXISTS reason text;
 -- Two-party confirmation. A policy matches a task through its declared scopes; the strictest match wins.
 -- A task may raise (or, when its creator is the space owner, replace) the requirement at creation.
 CREATE TABLE IF NOT EXISTS baton.x_approval_policy (
@@ -276,6 +286,13 @@ ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS approvals_override_root boolean
 DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='baton.x_gate'::regclass AND conname='gate_delegation_pair') THEN
         ALTER TABLE baton.x_gate ADD CONSTRAINT gate_delegation_pair CHECK ((delegation_id IS NULL) = (grantor IS NULL));
+    END IF;
+END; $$;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='baton.x_gate'::regclass AND conname='gate_edit_pair') THEN
+        ALTER TABLE baton.x_gate ADD CONSTRAINT gate_edit_pair CHECK (
+            edited = (original_result IS NOT NULL AND edited_result IS NOT NULL AND decision='pass')
+            AND (edited OR (original_result IS NULL AND edited_result IS NULL)));
     END IF;
 END; $$;
 

@@ -2149,3 +2149,150 @@ def test_migration_backfills_owner_principal_from_the_space_creation_audit(pg):
         with pytest.raises(psycopg.errors.CheckViolation):
             with conn.transaction():
                 conn.execute("UPDATE baton.spaces SET owner_principal='x' WHERE id=%s", (unknown,))
+
+
+# --- DF-14' approve with edits, approver identity in gate responses; DF-15 result epoch in awaiting_gate notifications ---
+
+def sha(text):
+    import hashlib
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def overridden_events(pg, task_id):
+    return [row for row in pg.store.list_audit(pg.owner, task_id=task_id) if row["event"] == "gate.result_overridden"]
+
+
+def test_edit_decision_approves_with_edits_keeping_both_results_and_recording_the_override(pg):
+    s = pg.store
+    judge = principal(pg, "editor-judge")
+    task, claim = awaiting(pg, "edit-one", [judge])
+    original = "Candidate edit-one"
+    root = grant(pg, judge)
+    done = s.gate(judge, operation(), task["id"], claim["epoch"], "edit", edited_result="Corrected result", reason="Fixed the figures")
+    assert done["state"] == "done" and done["result"] == "Corrected result" and done["approvals_passed"] == 1
+    assert done["original_result"] == original and done["result_author"] == pg.editor.principal
+    assert done["result_edits"][0]["approver"] == judge.principal and done["result_edits"][0]["reason"] == "Fixed the figures"
+    assert done["result_edits"][0]["original_sha256"] == sha(original) and done["result_edits"][0]["edited_sha256"] == sha("Corrected result")
+    assert done["gate"]["decision"] == "edit" and done["gate"]["counted_as"] == "pass" and done["gate"]["edited"] is True
+    assert s.get_task(pg.owner, task["id"])["result"] == "Corrected result"
+    row = gate_rows(pg, task["id"])[0]
+    assert (row["decision"], row["edited"], row["original_result"], row["edited_result"], row["reason"]) == (
+        "pass", True, original, "Corrected result", "Fixed the figures")
+    assert str(row["delegation_id"]) == root["id"]
+    event = overridden_events(pg, task["id"])[0]
+    assert event["agent"] == judge.principal and event["metadata"]["approver"] == judge.principal
+    assert event["metadata"]["original_sha256"] == sha(original) and event["metadata"]["edited_sha256"] == sha("Corrected result")
+    assert event["metadata"]["reason"] == "Fixed the figures" and event["metadata"]["epoch"] == claim["epoch"]
+    assert "Corrected result" not in json.dumps(event["metadata"]) and original not in json.dumps(event["metadata"])
+    assert reviewed_events(pg, task["id"])[0]["metadata"]["decision"] == "pass"
+    assert any(row["event"] == "task.completed" for row in s.list_audit(pg.owner, task_id=task["id"]))
+
+
+def test_edit_decision_validation_and_a_no_op_edit_is_refused(pg):
+    s = pg.store
+    task, claim = awaiting(pg, "edit-invalid", [pg.reviewer])
+    for bad in (None, "", "   ", 5, "x" * 32001, "bad\x00nul"):
+        expect("invalid", lambda bad=bad: s.gate(pg.owner, operation(), task["id"], claim["epoch"], "edit", edited_result=bad))
+    expect("invalid", lambda: s.gate(pg.owner, operation(), task["id"], claim["epoch"], "pass", edited_result="Not allowed here"))
+    expect("invalid", lambda: s.gate(pg.owner, operation(), task["id"], claim["epoch"], "fail", edited_result="Not allowed here"))
+    expect("invalid", lambda: s.gate(pg.owner, operation(), task["id"], claim["epoch"], "edit", edited_result="Fine", reason=" "))
+    expect("invalid", lambda: s.gate(pg.owner, operation(), task["id"], claim["epoch"], "edit", edited_result="Fine", reason=7))
+    expect("invalid", lambda: s.gate(pg.owner, operation(), task["id"], claim["epoch"], "approve"))
+    expect("invalid", lambda: s.gate(pg.owner, operation(), task["id"], claim["epoch"], "edit", edited_result="Candidate edit-invalid"))
+    assert s.get_task(pg.owner, task["id"])["state"] == "awaiting_gate" and gate_rows(pg, task["id"]) == []
+
+
+def test_edit_is_allowed_only_for_approvers_and_follows_the_self_approval_rules(pg):
+    s = pg.store
+    judge = principal(pg, "edit-undelegated")
+    task, claim = awaiting(pg, "edit-auth", [judge])
+    expect("delegation_required", lambda: s.gate(judge, operation(), task["id"], claim["epoch"], "edit", edited_result="Sneaky"))
+    expect("not_found", lambda: s.gate(pg.reader, operation(), task["id"], claim["epoch"], "edit", edited_result="Sneaky"))
+    expect("forbidden", lambda: s.gate(pg.editor, operation(), task["id"], claim["epoch"], "edit", edited_result="Sneaky"))
+    assert s.get_task(pg.owner, task["id"])["result"] == "Candidate edit-auth"
+    own = s.create_task_block(pg.owner, operation(), pg.page["id"], "Synthetic owner executes", [{"kind": "path", "value": pg.prefix + "/edit-self"}], [pg.reviewer.principal])
+    own_claim = s.claim(pg.owner, operation(), own["id"])
+    s.submit_result(pg.owner, operation(), own["id"], own_claim["epoch"], "Owner candidate")
+    expect("forbidden", lambda: s.gate(pg.owner, operation(), own["id"], own_claim["epoch"], "edit", edited_result="Owner edited"))
+    done = s.gate(pg.owner, operation(), own["id"], own_claim["epoch"], "edit", edited_result="Owner edited", self_approval=True)
+    assert done["state"] == "done" and done["gate"]["authority"] == "root (self-approval)"
+    assert gate_rows(pg, own["id"])[0]["self_approval"] is True
+
+
+def test_edit_counts_as_one_pass_in_two_party_confirmation_and_the_second_approver_sees_the_edit(pg):
+    s = pg.store
+    one, two = principal(pg, "edit-two-a"), principal(pg, "edit-two-b")
+    grant(pg, one)
+    grant(pg, two)
+    task, claim = awaiting(pg, "edit-two", [one, two], approvals_required=2)
+    first = s.gate(one, operation(), task["id"], claim["epoch"], "edit", edited_result="First edit")
+    assert first["state"] == "awaiting_gate" and first["approvals_passed"] == 1 and first["result"] == "First edit"
+    expect("forbidden", lambda: s.gate(one, operation(), task["id"], claim["epoch"], "pass"))
+    expect("forbidden", lambda: s.gate(one, operation(), task["id"], claim["epoch"], "edit", edited_result="Again"))
+    second = s.gate(two, operation(), task["id"], claim["epoch"], "edit", edited_result="Second edit", reason="Tightened wording")
+    assert second["state"] == "done" and second["approvals_passed"] == 2 and second["result"] == "Second edit"
+    rows = gate_rows(pg, task["id"])
+    assert [(row["edited_result"], row["original_result"]) for row in rows] == [("First edit", "Candidate edit-two"), ("Second edit", "First edit")]
+    assert second["original_result"] == "Candidate edit-two" and [edit["approver"] for edit in second["result_edits"]] == [one.principal, two.principal]
+    assert len(overridden_events(pg, task["id"])) == 2
+
+
+def test_edit_replays_with_the_same_operation_id_and_a_different_edit_conflicts(pg):
+    s = pg.store
+    task, claim = awaiting(pg, "edit-replay", [pg.reviewer])
+    op = operation()
+    first = s.gate(pg.owner, op, task["id"], claim["epoch"], "edit", edited_result="Edited once", reason="why")
+    again = s.gate(pg.owner, op, task["id"], claim["epoch"], "edit", edited_result="Edited once", reason="why")
+    assert again["replay"] is True and again["gate"] == first["gate"] and len(gate_rows(pg, task["id"])) == 1
+    assert again["result"] == "Edited once"
+    expect("operation_conflict", lambda: s.gate(pg.owner, op, task["id"], claim["epoch"], "edit", edited_result="Edited twice", reason="why"))
+    expect("operation_conflict", lambda: s.gate(pg.owner, op, task["id"], claim["epoch"], "edit", edited_result="Edited once", reason="other"))
+    assert len(overridden_events(pg, task["id"])) == 1
+
+
+def test_a_failed_gate_after_an_edit_cannot_keep_the_pass_and_edit_needs_the_current_epoch(pg):
+    s = pg.store
+    task, claim = awaiting(pg, "edit-stale", [pg.reviewer])
+    expect("stale_claim", lambda: s.gate(pg.owner, operation(), task["id"], claim["epoch"] + 1, "edit", edited_result="Late"))
+    failed = s.gate(pg.owner, operation(), task["id"], claim["epoch"], "fail", reason="Not good enough")
+    assert failed["state"] == "queued" and failed["gate"]["decision"] == "fail" and failed["gate"]["edited"] is False
+    assert gate_rows(pg, task["id"])[0]["reason"] == "Not good enough"
+
+
+def test_gate_responses_show_the_approver_and_how_authority_was_obtained(pg):
+    s = pg.store
+    judge = principal(pg, "who-judge")
+    task, claim = awaiting(pg, "who-root", [pg.reviewer])
+    done = s.gate(pg.owner, operation(), task["id"], claim["epoch"], "pass")
+    assert done["gate"] == {
+        "decision": "pass", "counted_as": "pass", "epoch": claim["epoch"], "approver": pg.owner.principal,
+        "approver_account": pg.owner.account, "approver_kind": "human", "root": True, "self_approval": False,
+        "authority": "root", "delegation_id": None, "grantor": None, "edited": False, "approvals": 1,
+        "approvals_required": 1, "complete": True}
+    delegated, delegated_claim = awaiting(pg, "who-delegated", [judge])
+    root = grant(pg, judge)
+    done = s.gate(judge, operation(), delegated["id"], delegated_claim["epoch"], "pass")
+    assert done["gate"]["authority"] == f"delegated by {pg.owner.principal} via {root['id']}"
+    assert (done["gate"]["root"], done["gate"]["approver"], done["gate"]["grantor"], done["gate"]["delegation_id"]) == (
+        False, judge.principal, pg.owner.principal, root["id"])
+    own = s.create_task_block(pg.owner, operation(), pg.page["id"], "Synthetic who self", [{"kind": "path", "value": pg.prefix + "/who-self"}], [pg.reviewer.principal])
+    own_claim = s.claim(pg.owner, operation(), own["id"])
+    s.submit_result(pg.owner, operation(), own["id"], own_claim["epoch"], "Owner candidate")
+    done = s.gate(pg.owner, operation(), own["id"], own_claim["epoch"], "pass", self_approval=True)
+    assert done["gate"]["authority"] == "root (self-approval)" and done["gate"]["self_approval"] is True
+    replay_op = operation()
+    other, other_claim = awaiting(pg, "who-replay", [pg.reviewer])
+    first = s.gate(pg.owner, replay_op, other["id"], other_claim["epoch"], "pass")
+    assert s.gate(pg.owner, replay_op, other["id"], other_claim["epoch"], "pass")["gate"] == first["gate"]
+
+
+def test_edit_rows_must_be_internally_consistent(pg):
+    s = pg.store
+    task, claim = awaiting(pg, "edit-constraint", [pg.reviewer])
+    with s._transaction(write=True) as conn:
+        for original, edited, edit_flag, decision in (("a", None, True, "pass"), (None, "b", True, "pass"), ("a", "b", False, "pass"),
+                                                       ("a", "b", True, "fail"), (None, None, True, "pass")):
+            with pytest.raises(psycopg.errors.CheckViolation):
+                with conn.transaction():
+                    conn.execute("""INSERT INTO baton.x_gate(id,task_id,epoch,decision,reviewer,reviewer_account,evidence,edited,original_result,edited_result)
+                        VALUES (%s,%s,%s,%s,'r','a','[]',%s,%s,%s)""", (uuid.uuid4(), task["id"], claim["epoch"], decision, edit_flag, original, edited))

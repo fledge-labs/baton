@@ -254,7 +254,7 @@ PUBLIC_OPERATIONS = {
     "submit_result": (True, {"task_id": (str, ...), "epoch": (int, ...), "result": (str, ...), "evidence": (Any, None)}),
     "handoff": (True, {"task_id": (str, ...), "epoch": (int, ...), "target_principal": (str, ...), "base_commit": (str | None, None), "context": (Any, None), "evidence": (Any, None), "lease_seconds": (int, 300)}),
     "gate": (True, {"task_id": (str, ...), "expected_epoch": (int, ...), "decision": (str, ...), "evidence": (Any, None),
-                    "self_approval": (bool, False)}),
+                    "self_approval": (bool, False), "edited_result": (str | None, None), "reason": (str | None, None)}),
     "delegation_create": (True, {"delegate_principal": (str, ...), "scope": (str, "approve"), "space_id": (str | None, None),
                                  "expires_at": (str | None, None), "may_delegate": (bool, False), "reason": (str, ...)}),
     "delegation_revoke": (True, {"delegation_id": (str, ...)}),

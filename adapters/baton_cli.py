@@ -39,6 +39,7 @@ SUMMARY_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[
 SUMMARY_STATE_RE = re.compile(r"[a-z][a-z_]{0,31}")
 ERROR_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 BLOCK_REASONS = ("scope_conflict", "lease_held", "dependency_blocked", "waiting_input", "other")
+GATE_DECISIONS = ("pass", "fail", "edit")
 DETAIL_FIELD_RE = re.compile(r"[A-Za-z0-9_.\[\]<>?-]{1,100}")
 DETAIL_EXPECTED_RE = re.compile(r"[\x20-\x7e]{1,200}")
 MAX_DETAILS = 20
@@ -444,12 +445,15 @@ def build_parser():
     sub = command("gate", "gate: review a submitted result", summary=True)
     add_write_options(sub)
     sub.add_argument("--task", required=True, type=uuid_arg)
-    sub.add_argument("--epoch", required=True, type=int, help="epoch of the result under review")
-    sub.add_argument("--decision", required=True, choices=("pass", "fail"))
+    sub.add_argument("--epoch", type=int,
+                     help="epoch of the result under review (default: the task's current result_epoch, read with one get_task)")
+    sub.add_argument("--decision", required=True, choices=GATE_DECISIONS,
+                     help="pass, fail, or edit (approve with edits; needs --edited-result or --edited-result-file)")
     sub.add_argument("--self-approval", action="store_true",
                      help="the space owner approving work it submitted or executed; refused for everyone else")
-    sub.set_defaults(build=lambda a: ("gate", {"task_id": a.task, "expected_epoch": a.epoch, "decision": a.decision,
-                                               **({"self_approval": True} if a.self_approval else {})}), write=True)
+    text_group(sub, "edited_result", "edited-result", "the replacement result for --decision edit", required=False)
+    sub.add_argument("--reason", help="why the result was passed, failed or edited (recorded with the decision)")
+    sub.set_defaults(build=build_gate, prepare=prepare_gate, write=True)
 
     sub = command("audit", "list_audit: append-only audit for a task or space")
     sub.add_argument("--task", type=uuid_arg)
@@ -527,6 +531,34 @@ def build_block(args):
     return "mark_blocked", arguments
 
 
+def build_gate(args):
+    arguments = {"task_id": args.task, "expected_epoch": args.epoch, "decision": args.decision}
+    if args.self_approval:
+        arguments["self_approval"] = True
+    has_edit = args.edited_result is not None or args.edited_result_file is not None
+    if (args.decision == "edit") != has_edit:
+        raise UsageError("--edited-result or --edited-result-file goes with --decision edit, and only with it")
+    if has_edit:
+        arguments["edited_result"] = text_value(args, "edited_result")
+    if args.reason is not None:
+        arguments["reason"] = args.reason
+    return "gate", arguments
+
+
+def prepare_gate(args, client, arguments):
+    """Without --epoch, gate the result the task holds now: one get_task, and say which epoch was used."""
+    if arguments["expected_epoch"] is not None:
+        return
+    task = client.call("get_task", {"task_id": arguments["task_id"]})
+    epoch = task.get("result_epoch") if isinstance(task, dict) else None
+    if type(epoch) is not int or epoch < 1:
+        state = task.get("state") if isinstance(task, dict) else None
+        suffix = " (state=" + state + ")" if isinstance(state, str) and SUMMARY_STATE_RE.fullmatch(state) else ""
+        raise UsageError("cannot default --epoch: the task has no submitted result to gate" + suffix)
+    arguments["expected_epoch"] = epoch
+    say("gate: --epoch not given; using result_epoch=" + str(epoch) + " from get_task")
+
+
 def build_audit(args):
     if args.task is None and args.space is None:
         raise UsageError("audit needs --task or --space")
@@ -584,7 +616,27 @@ def print_summary(result):
     line = "task " + task_id + " state=" + state
     if type(epoch) is int:
         line += " epoch=" + str(epoch)
+    line += gate_summary(result.get("gate"))
     print(line, file=sys.stderr, flush=True)
+
+
+def gate_summary(gate):
+    """' gate=<decision> approver=<principal> authority=<how>' from a gate response; fields that are not well formed are left out."""
+    if not isinstance(gate, dict):
+        return ""
+    text = ""
+    if gate.get("decision") in GATE_DECISIONS:
+        text += " gate=" + gate["decision"]
+    approver = gate.get("approver")
+    if isinstance(approver, str) and AGENT_RE.fullmatch(approver):
+        text += " approver=" + approver
+    grantor, delegation = gate.get("grantor"), gate.get("delegation_id")
+    if gate.get("root") is True:
+        text += " authority=" + ("root (self-approval)" if gate.get("self_approval") is True else "root")
+    elif (gate.get("root") is False and isinstance(grantor, str) and AGENT_RE.fullmatch(grantor)
+            and isinstance(delegation, str) and SUMMARY_UUID_RE.fullmatch(delegation)):
+        text += " authority=delegated by " + grantor + " via " + delegation
+    return text
 
 
 def make_client(args):
@@ -610,6 +662,8 @@ def run_command(args):
     client = make_client(args)
     read_timeout = getattr(args, "read_timeout", None)
     try:
+        if hasattr(args, "prepare"):
+            args.prepare(args, client, arguments)
         result = client.call(operation, arguments,
                              read_timeout=args.request_timeout + read_timeout(args) if read_timeout else None)
     except (BatonError, NetworkError) as error:
@@ -733,6 +787,11 @@ def notification_line(notification):
     if isinstance(principal, str) and AGENT_RE.fullmatch(principal):
         kind_name = actor.get("kind")
         parts.append("from=" + principal + ("(" + kind_name + ")" if kind_name in ("human", "agent", "service") else ""))
+    if type(notification.get("result_epoch")) is int:
+        parts.append("result_epoch=" + str(notification["result_epoch"]))
+        author = notification.get("result_author")
+        if isinstance(author, str) and AGENT_RE.fullmatch(author):
+            parts.append("result_author=" + author)
     if isinstance(notification.get("subject"), str):
         parts.append("- " + plain(notification["subject"], 100))
     return " ".join(parts)

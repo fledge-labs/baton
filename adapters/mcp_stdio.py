@@ -37,11 +37,30 @@ def safe_agent(value):
     return value
 
 
+ROLE_PRESETS = {"@reader": frozenset({"get_task", "list_tasks", "fetch_inbox", "wait_inbox", "list_comments",
+                                      "get_page", "list_pages", "list_audit", "ready"})}
+ROLE_PRESETS["@assignee"] = ROLE_PRESETS["@reader"] | {"claim", "renew", "comment", "submit_result",
+                                                       "mark_blocked", "handoff"}
+ROLE_PRESETS["@reviewer"] = ROLE_PRESETS["@reader"] | {"comment", "gate"}
+ROLE_PRESETS["@owner"] = ROLE_PRESETS["@reviewer"] | {
+    "submit_task", "create_task_block", "assign_task", "plan", "set_work_face", "set_priority", "share",
+    "create_space", "create_page", "delegation_create", "delegation_revoke", "delegation_list"}
+assert all(tools <= TOOLS for tools in ROLE_PRESETS.values())
+
+
 def parse_allow_tools(value):
     names = [name.strip() for name in value.split(",")]
-    if any(not name or name not in TOOLS for name in names):
-        raise argparse.ArgumentTypeError("Use comma-separated known Baton tool names; empty names and wildcards are not allowed")
-    return frozenset(names)
+    allowed = set()
+    for name in names:
+        if name in TOOLS:
+            allowed.add(name)
+        elif name in ROLE_PRESETS:
+            allowed |= ROLE_PRESETS[name]
+        else:
+            raise argparse.ArgumentTypeError(
+                "Use comma-separated known Baton tool names or role presets "
+                "(@reader, @assignee, @reviewer, @owner); empty names, unknown presets and wildcards are not allowed")
+    return frozenset(allowed)
 
 
 def valid_uuid(value):
@@ -189,7 +208,8 @@ def parse_args(argv=None):
     parser.add_argument("--audit-file", type=Path, default=os.environ.get("BATON_AUDIT_FILE") or None)
     parser.add_argument("--allow-tools", type=parse_allow_tools, default=DEFAULT_ALLOWED_TOOLS,
                         metavar="NAME,NAME,...",
-                        help="Comma-separated known Baton tool names; replaces the default allowlist: "
+                        help="Comma-separated known Baton tool names and/or role presets (@reader, @assignee, "
+                             "@reviewer, @owner); replaces the default allowlist: "
                              "submit_task,get_task,list_tasks,fetch_inbox (no wildcards)")
     return parser.parse_args(argv)
 

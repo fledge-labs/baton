@@ -79,7 +79,7 @@ with urlopen(request) as response:
 - `renew(operation_id: str, task_id: str, epoch: int, lease_seconds: int = 300)` — 写入。
 - `submit_result(operation_id: str, task_id: str, epoch: int, result: str, evidence: Any = None)` — 写入。
 - `handoff(operation_id: str, task_id: str, epoch: int, target_principal: str, base_commit: str | None = None, context: Any = None, evidence: Any = None, lease_seconds: int = 300)` — 写入。
-- `gate(operation_id: str, task_id: str, expected_epoch: int, decision: str, evidence: Any = None, self_approval: bool = False)` — 写入；`self_approval=true` 只对 Space owner（根）批准自己提交或执行的工作有效，见下文。
+- `gate(operation_id: str, task_id: str, expected_epoch: int, decision: str, evidence: Any = None, self_approval: bool = False, edited_result: str | None = None, reason: str | None = None)` — 写入；`decision` 为 `pass`、`fail` 或 `edit`（带修改批准，见“审批 UX”）；`self_approval=true` 只对 Space owner（根）批准自己提交或执行的工作有效，见下文。
 - `delegation_create(operation_id: str, delegate_principal: str, scope: str = "approve", space_id: str | None = None, expires_at: str | None = None, may_delegate: bool = False, reason: str)` — 写入；Space owner 创建根委托，持有 `may_delegate` 委托的主体创建子委托，授权人就是调用者。
 - `delegation_revoke(operation_id: str, delegation_id: str)` — 写入；仅授权人本人。
 - `delegation_list()` — 读取；返回调用者作为授权人或被委托方的委托。
@@ -106,13 +106,21 @@ with urlopen(request) as response:
 
 `create_task_block` 创建手工任务，绝不自动派发。领取和交接返回 task view，其中 epoch 是单调 fence，lease_expires_at 来自数据库时钟。renew、submit_result 和 handoff 必须带当前 epoch；续租重放不延长第二次，过期旧 fence 即使重放旧操作也失败。base_commit 是任务创建后的不可变基线（包括 null）；handoff 只能省略它或重复原值。未提供的 context/evidence 保留，thread_id 不变。
 
-手工 submit_result 只进入 awaiting_gate。gate 必须携带对应候选的 expected_epoch 和 pass/fail；只有 Space owner（根），或配置 reviewer、具备当前 edit 权限、持有审批人委托且不是结果作者或执行者的主体，才可通过；需要双人确认时还要两个不同审批人都通过。只有 gate 通过才会 done。
+手工 submit_result 只进入 awaiting_gate。gate 必须携带对应候选的 expected_epoch 和 pass/fail/edit（edit 是带修改的批准，计为一次 pass）；只有 Space owner（根），或配置 reviewer、具备当前 edit 权限、持有审批人委托且不是结果作者或执行者的主体，才可通过；需要双人确认时还要两个不同审批人都通过。只有 gate 通过才会 done。
 
 **审批关卡。** 只有持有审批人委托的主体（人或 agent）才能批准，任何人不能批准自己提交或执行的工作。Space 的 owner（创建时记录的精确身份：`owner_principal` + `owner_account` + `owner_kind`，不分 kind）是**根审批人**，天然拥有审批权，不需要委托，也不必在 reviewers 里；同账户的其他 principal、人类账户下的 agent、同名但 kind 不同的主体都不是根。没有 `owner_principal` 的 Space 没有根，直到运维人员用 `set-space-owner` 设置。其他主体做 gate 必须同时满足：（1）是任务配置的 reviewer，并有当前页面 edit 权限，否则 `403 forbidden`；（2）持有覆盖该任务的有效审批人委托（范围 `approve`，`space_id` 为空或等于任务所在 Space，被委托方 principal、account、kind 匹配，整条委托链未过期、未撤销，且链的根授权人正是任务所在 Space 的根身份），否则 `403 delegation_required`；（3）不是结果作者，也不是在被审批 epoch 持有过 claim 的 principal 或 account（含 handoff 的原持有人）或执行 worker，否则 `403 forbidden`。只创建了请求、没有提交或执行结果的任务 owner 可以批准。**根可以批准自己提交或执行的工作，但必须带 `self_approval=true`**，否则 `403 forbidden`；非根带该标志仍被拒绝。服务自动写入的 `worker_success` gate 不受影响。`gate.reviewed` 审计和 `x_gate` 记录带 `self_approval`、`root`，非根的批准还带 `delegation_id` 与 `grantor`，审计另含完整委托链 `chain` 以及已计入的 `approvals` 和 `approvals_required`；同一 `operation_id` 的重试会重新检查整条链，委托失效后同样返回 `delegation_required`。
 
 **双人确认。** 任务可以要求两个批准：运维人员为某个范围配置策略（`python -m bridge.delegations policy-set`，见 README），或创建任务时在 `create_task_block`（或带 assignee 的 `submit_task`）传 `approvals_required`（1 或 2；非法值返回 `422 invalid`，自动任务不允许）；任务的值可以提高策略要求，只有创建者是 Space owner 时才能降低。要求 2 个批准时，任务只有在两个不同的审批人（不同 principal 和 account）对同一个 `result_epoch` 都 pass 之后才变成 done，第一个 pass 后仍是 `awaiting_gate`，同一审批人再次 pass 返回 `403 forbidden`。策略的 `root_required` 要求根必须是其中之一，根 pass 之前任务不会 done。任何有权方的 fail（包括根的 fail）都把任务退回 `queued`，旧 epoch 的 pass 不再计数。task view 带有效的 `approvals_required`、已通过的 `approvals_passed` 和 `root_required`。
 
-Task view 包含 `blocked`（`null`，或 `{"reason_code","by","at"}`，见“阻塞标记”）、id/task_id/thread_id、work_face/require_work_face/task_kind/work_face_missing、priority/respond_by/responded_at/escalated_at/overdue、page_id/block_id、owner/owner_account、execution_mode、state/status、epoch、holder/holder_account、lease_expires_at/lease_valid、scopes、base_commit、context、evidence、result/result_epoch、a2a_id/backend、gate_mode/reviewers 和错误元数据。canonical state 为 queued/claimed/awaiting_gate/done/failed/interrupted；兼容 status 将 claimed→working、done→completed。手工任务在当前 page view 权限下返回 prompt，方便接收人读取指令；自动任务的旧兼容状态视图仍省略 prompt。所有状态视图都不返回 idempotency key 或凭据。
+**审批 UX：带修改批准与审批人身份（DF-14′）。** 这是 Baton 自有 x_扩展。
+
+- **`decision="edit"`（带修改批准）。** 必须带 `edited_result`（非空字符串，至多 32000 字符、无 NUL，且与当前结果不同）；`reason`（可选，至多 1000 字符）说明为何修改。`pass`、`fail` 带 `edited_result` 返回 `422 invalid`（`field` 为 `edited_result`），`decision` 不是 `pass`/`fail`/`edit` 也返回 `422 invalid`。授权与 `pass` 完全相同——只有 Space owner（根）或持有覆盖委托的配置 reviewer 可以 edit，委托失效、自批、同一审批人重复通过的规则同样适用（`delegation_required`、`forbidden`）；根 edit 自己提交或执行的工作同样需要 `self_approval=true`。edit 在 `x_gate` 中记为一次 `pass`（`edited=true`），计入双人确认的批准数，也可以完成任务。
+- **两份结果都保留。** `x_gate` 行保存提交时的 `original_result` 和审批人的 `edited_result`（以及 `reason`）；任务的 `result` 变成修改后的文本，`result_author` 仍是原作者。双人确认时第二位审批人看到的就是已修改的文本，第二次 edit 的 `original_result` 是前一次修改后的文本。task view 增加 `original_result`（本 epoch 最初提交的文本，没有修改时为 `null`）和 `result_edits`（`[{"approver","reason","at","original_sha256","edited_sha256"}]`，按时间排序，没有修改时为空数组）。
+- **覆盖事件。** 每次 edit 在 `gate.reviewed`（`decision` 记为 `pass`）之外追加一条审计 `gate.result_overridden`，含 `approver`、`reason`（若有）、`original_sha256`、`edited_sha256`（两份结果的 SHA-256，不含正文）、`epoch`、`root`、`self_approval`，以及非根时的 `delegation_id`、`grantor` 和 `chain`。
+- **响应里的审批人身份。** `gate` 的返回值是 task view 加一个 `gate` 对象：`{"decision","counted_as","epoch","approver","approver_account","approver_kind","root","self_approval","authority","delegation_id","grantor","edited","approvals","approvals_required","complete"}`。`decision` 是请求的决定（`pass`/`fail`/`edit`），`counted_as` 对 edit 为 `pass`；`authority` 说明权限如何取得，只有三种写法：`root`、`root (self-approval)`、`delegated by <grantor> via <delegation id>`。同一 `operation_id` 的重放返回最初的 `gate` 对象。命令行 `gate` 的 `--summary` 行在 `task <id> state=… epoch=…` 之后追加 `gate=<decision> approver=<principal> authority=<…>`。
+- **兼容。** 旧请求（不带 `edited_result`、`reason`）的幂等摘要不变；新增列由幂等迁移添加，`check_schema` 要求它们存在。
+
+Task view 包含 `original_result`/`result_edits`（见“审批 UX”）、`blocked`（`null`，或 `{"reason_code","by","at"}`，见“阻塞标记”）、id/task_id/thread_id、work_face/require_work_face/task_kind/work_face_missing、priority/respond_by/responded_at/escalated_at/overdue、page_id/block_id、owner/owner_account、execution_mode、state/status、epoch、holder/holder_account、lease_expires_at/lease_valid、scopes、base_commit、context、evidence、result/result_epoch、a2a_id/backend、gate_mode/reviewers 和错误元数据。canonical state 为 queued/claimed/awaiting_gate/done/failed/interrupted；兼容 status 将 claimed→working、done→completed。手工任务在当前 page view 权限下返回 prompt，方便接收人读取指令；自动任务的旧兼容状态视图仍省略 prompt。所有状态视图都不返回 idempotency key 或凭据。
 
 自动派发前先持久化 dispatch_started，并且每次结果写入检查 holder、当前 epoch 和未过期租约。网络结果不确定时进入 interrupted；自动恢复不会再次执行可能已派发的任务，旧 worker 不能覆盖新持有人。worker 明确报告失败时，任务进入 failed，`error` 只保存封闭词汇中的错误码（如 `CODEX_TIMEOUT`、`CODEX_AUTH_UNAUTHORIZED`；无法接受的诊断为 `A2A_FAILED_UNCLASSIFIED`），并在任务线程追加固定文本的 `[failed]` 评论；worker 的原始错误文本不会进入任务、线程或审计。
 
@@ -161,21 +169,23 @@ Baton 不会执行 `acceptance_command`。它只是显示给领取人和 gate �
 
 ### 通知 outbox
 
-表 `baton.x_notify(id, recipient, recipient_account, event, object_type, object_id, thread_id, created_at, seq, actor, actor_kind)`（`actor`/`actor_kind` 只记录触发者的 principal 与种类，不含内容）。`seq` 是 bigserial；所有写事务持同一把 advisory 事务锁串行提交，因此 seq 的提交顺序与大小顺序一致，读者按 `seq > after_seq` 推进不会漏掉较晚提交的较小编号。通知行与产生它的业务效果、`x_audit` 在同一事务写入：操作回滚则没有通知；幂等重放（同 operation_id 或同业务 key）不会再写。
+表 `baton.x_notify(id, recipient, recipient_account, event, object_type, object_id, thread_id, created_at, seq, actor, actor_kind, result_epoch, result_author)`（`actor`/`actor_kind` 只记录触发者的 principal 与种类，不含内容；`result_epoch`/`result_author` 只在 `task.awaiting_gate` 行填写）。`seq` 是 bigserial；所有写事务持同一把 advisory 事务锁串行提交，因此 seq 的提交顺序与大小顺序一致，读者按 `seq > after_seq` 推进不会漏掉较晚提交的较小编号。通知行与产生它的业务效果、`x_audit` 在同一事务写入：操作回滚则没有通知；幂等重放（同 operation_id 或同业务 key）不会再写。
 
 | event | 触发 | 收件人 | object |
 | --- | --- | --- | --- |
 | `mention.created` | `mention` | 被提及的 principal（经 registry 解析） | comment；thread_id 为评论线程 |
 | `task.assigned` | `submit_task`/`create_task_block` 带 assignee，或 `assign_task` | 新接收人 | task |
 | `comment.created` | `comment` 写入某任务的线程 | 该任务的 owner、assignee、当前持有人、reviewers（不含评论作者） | comment |
-| `task.awaiting_gate` | `submit_result` 使任务进入 awaiting_gate | reviewers | task |
-| `gate.decided` | `gate` 决定（pass 或 fail），以及自动任务的 worker_success 通过 | owner、assignee、持有人（提交结果的 holder） | task |
+| `task.awaiting_gate` | `submit_result` 使任务进入 awaiting_gate；通知带 `result_epoch` 与 `result_author`（见下） | reviewers | task |
+| `gate.decided` | `gate` 决定（pass、fail 或 edit），以及自动任务的 worker_success 通过 | owner、assignee、持有人（提交结果的 holder） | task |
 | `task.handed_off` | `handoff` | 新持有人 | task |
 | `task.failed` | 自动任务的 worker 确定性失败（`fail_auto`，同时写入 `[failed]` 线程评论） | owner | task |
 | `task.overdue` | 后台升级循环发现任务超过 `respond_by` 仍无响应（见“响应时效与超时升级”） | `escalate_to`，与其不同时还有 owner | task |
 | `task.blocked` | `mark_blocked`（见“阻塞标记”） | 任务 owner（不含操作者） | task |
 
-操作者本人不会收到自己操作产生的通知，同一 principal 在一次事件中只收到一条。收件人在插入时必须对对象所在页面有 view 权限，否则不写行。outbox 与 webhook 默认负载只含元数据：`id`、`seq`、`event`、`object_type`、`object_id`、`thread_id`、`created_at`、`recipient`；outbox、审计和日志从不存放 prompt、评论正文或结果文本，接收者凭 object_id 再用 `get_task`、`list_comments` 等带权限检查的读取操作取完整内容。
+操作者本人不会收到自己操作产生的通知，同一 principal 在一次事件中只收到一条。收件人在插入时必须对对象所在页面有 view 权限，否则不写行。outbox 与 webhook 默认负载只含元数据：`id`、`seq`、`event`、`object_type`、`object_id`、`thread_id`、`created_at`、`recipient`；`task.awaiting_gate` 另带 `result_epoch`（被通知的结果所属 epoch）与 `result_author`（提交结果的 principal），见下一段；outbox、审计和日志从不存放 prompt、评论正文或结果文本，接收者凭 object_id 再用 `get_task`、`list_comments` 等带权限检查的读取操作取完整内容。
+
+**`task.awaiting_gate` 的 `result_epoch`（DF-15）。** `submit_result` 写入该通知时，同时把当次结果的 epoch 和作者记在 outbox 行（`x_notify.result_epoch`、`x_notify.result_author`，只是整数和 principal 名，不含结果文本）。`wait_inbox` 返回的该事件行与 webhook 负载（无论是否 `include_preview`）都带这两个字段，审批人可以直接用 `gate(expected_epoch=result_epoch)`，不必先 `get_task`。其他事件没有这两个字段。审批人收到的是通知发出时的 epoch：任务之后被退回并重新提交，会有一条新通知带新 epoch，用旧 epoch gate 返回 `409 stale_claim`。命令行 `gate --task <id>` 省略 `--epoch` 时用任务当前的 `result_epoch`（一次 `get_task`）；`watch --summary` 的通知行显示 `result_epoch=` 与 `result_author=`。
 
 **`wait_inbox` 通知预览。** 为了不必为每条通知多读一次，`wait_inbox` 返回的每一行在上述元数据之外，在**读取时**由当前对象现算三个字段（不进入 outbox）：
 
@@ -314,6 +324,19 @@ print(task["priority"], task["respond_by"], task["overdue"])
 ```
 
 MCP 与适配器：`submit_task` 工具和 `create_task_block` 带上述三个可选参数，`set_priority` 与其他 x_ 工具一样可用；适配器已知工具含 `set_priority`，默认白名单不变，需要时用 `--allow-tools` 显式放行。通知 `task.overdue` 见上文事件表。
+
+## 适配器角色预设
+
+`adapters/mcp_stdio.py --allow-tools`（以及 `launch_mcp.sh` 透传的同名参数）除工具名外还接受角色预设，可与工具名混用，重复合并：
+
+| 预设 | 展开为 |
+| --- | --- |
+| `@reader` | `get_task`、`list_tasks`、`fetch_inbox`、`wait_inbox`、`list_comments`、`get_page`、`list_pages`、`list_audit`、`ready` |
+| `@assignee` | `@reader` + `claim`、`renew`、`comment`、`submit_result`、`mark_blocked`、`handoff` |
+| `@reviewer` | `@reader` + `comment`、`gate` |
+| `@owner` | `@reviewer` + `submit_task`、`create_task_block`、`assign_task`、`plan`、`set_work_face`、`set_priority`、`share`、`create_space`、`create_page`、`delegation_create`、`delegation_revoke`、`delegation_list` |
+
+预设只展开为已知工具名；以 `@` 开头的未知预设（包括大小写不同的 `@Reader`）、空名称和通配符都是错误（退出码 2，错误信息不回显输入）。默认白名单（`submit_task,get_task,list_tasks,fetch_inbox`）不变，显式 `--allow-tools` 仍然**替换**它。预设只缩小适配器暴露的工具，不扩大服务端权限：`@reviewer` 能调用 `gate`，不代表能通过 gate（仍需根身份或审批人委托）。
 
 ## MCP 兼容与发现
 
