@@ -29,4 +29,4 @@ Reference agentgateway, MCP Agent Mail, the A2A SDK and Codex as pinned dependen
 3. Every source file carries `SPDX-License-Identifier: Apache-2.0` (copied third-party files keep their own). Every commit is signed off (`git commit -s`).
 4. The lab deployment keeps running unchanged. This migration copies; it never moves or edits the live lab.
 
-Out of scope for this step: the claim/lease and overlap-check layer (next milestone).
+The claim/lease and overlap-check layer that was out of scope for this step is now implemented; see docs/api.md.
