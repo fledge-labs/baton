@@ -524,6 +524,19 @@ def test_compose_healthcheck_uses_the_read_only_check():
     assert "pids_limit: 128" in codex
 
 
+def test_gateway_does_not_wait_for_the_worker_canary_but_the_worker_stays_strictly_healthchecked():
+    compose = (Path(__file__).parents[1] / "deploy/compose.yaml").read_text()
+    gateway = re.search(r"\n  gateway:\n(.*?)\n  bridge:\n", compose, re.S).group(1)
+    depends = re.search(r"depends_on:\n((?:      .*\n?)+)", gateway).group(1)
+    # A cold-start canary timeout must not keep the whole stack from starting.
+    assert "codex: {condition: service_started}" in depends
+    assert "bridge: {condition: service_healthy}" in depends
+    codex = re.search(r"\n  codex:\n(.*?)\n  database:", compose, re.S).group(1)
+    assert "test: [CMD, python, -m, bridge.worker_health, check]" in codex
+    assert not any(re.search(r"condition:\s*service_healthy", line) and "codex" in line
+                   for line in compose.splitlines())
+
+
 @pytest.mark.parametrize("backend", ["demo", "codex"])
 def test_worker_http_health_is_authenticated_and_starts_background_checks(health_setup, monkeypatch, backend):
     setup = health_setup
