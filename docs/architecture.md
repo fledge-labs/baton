@@ -1,4 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
+
+产品定位见 [Baton 定位](positioning.md)。
+
 # 架构与范围
 
 nginx 提供静态看板与反向代理；agentgateway 校验 bearer、只放行 client 角色，转发 MCP 与 HTTP 请求并记录请求元数据。应用使用官方 MCP Python SDK。Baton 是通信与协作层，不执行任务：执行属于通过 MCP、HTTP 或适配器（`adapters/`）连接的外部 agent。空间产品语义及未验证范围见 [规格](spec/space.md)；`baton.space.v1` HTTP/JSON、表结构和全部 `x_` 协作协议属于 Baton，不是官方 Space API。
