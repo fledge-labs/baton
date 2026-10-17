@@ -328,3 +328,27 @@ UPDATE baton.spaces s SET owner_principal=a.agent, owner_kind=a.actor_kind
 FROM (SELECT space_id, min(agent) AS agent, min(actor_kind) AS actor_kind, min(actor_account) AS actor_account
       FROM baton.x_audit WHERE event='space.created' AND space_id IS NOT NULL GROUP BY space_id HAVING count(*)=1) a
 WHERE a.space_id=s.id AND s.owner_principal IS NULL AND a.actor_account=s.owner_account AND a.actor_kind IN ('human','agent');
+
+-- A2A public interface (W2-1). Baton task states the task store cannot express are recorded here and projected onto
+-- the A2A task state (see docs/design/space-replica.md, "Protocols" item 9). Only terminal overlays exist: a task
+-- that was canceled (CancelTask) or rejected by its agent. One row per task, append-only for every role.
+CREATE TABLE IF NOT EXISTS baton.x_a2a_task_state (
+    task_id uuid PRIMARY KEY REFERENCES baton.tasks(id),
+    state text NOT NULL CHECK (state IN ('canceled','rejected')),
+    set_by text NOT NULL, set_by_account text NOT NULL, set_by_kind text NOT NULL CHECK (set_by_kind IN ('human','agent')),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE OR REPLACE FUNCTION baton.reject_a2a_state_change() RETURNS trigger
+LANGUAGE plpgsql AS $$ BEGIN
+    RAISE EXCEPTION USING ERRCODE='42501', MESSAGE='Baton A2A task states are append-only';
+END; $$;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid='baton.x_a2a_task_state'::regclass AND tgname='a2a_state_no_change') THEN
+        CREATE TRIGGER a2a_state_no_change BEFORE UPDATE OR DELETE ON baton.x_a2a_task_state
+            FOR EACH ROW EXECUTE FUNCTION baton.reject_a2a_state_change();
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid='baton.x_a2a_task_state'::regclass AND tgname='a2a_state_no_truncate') THEN
+        CREATE TRIGGER a2a_state_no_truncate BEFORE TRUNCATE ON baton.x_a2a_task_state
+            FOR EACH STATEMENT EXECUTE FUNCTION baton.reject_a2a_state_change();
+    END IF;
+END; $$;

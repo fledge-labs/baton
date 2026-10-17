@@ -46,6 +46,16 @@
                   "path": {
                     "pathPrefix": "/v1/space/"
                   }
+                },
+                {
+                  "path": {
+                    "exact": "/a2a/rpc"
+                  }
+                },
+                {
+                  "path": {
+                    "exact": "/a2a/agents"
+                  }
                 }
               ],
               "policies": {
@@ -70,6 +80,38 @@
                   "rules": [
                     "apiKey.role == 'client'"
                   ]
+                }
+              },
+              "backends": [
+                {
+                  "host": "bridge:9000"
+                }
+              ]
+            },
+            {
+              "name": "baton-a2a-public",
+              "matches": [
+                {
+                  "path": {
+                    "exact": "/.well-known/agent-card.json"
+                  }
+                },
+                {
+                  "path": {
+                    "exact": "/.well-known/jwks.json"
+                  }
+                }
+              ],
+              "policies": {
+                "apiKey": {
+                  "keys": [],
+                  "mode": "optional",
+                  "location": {
+                    "header": {
+                      "name": "authorization",
+                      "prefix": "Bearer "
+                    }
+                  }
                 }
               },
               "backends": [
