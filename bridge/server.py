@@ -14,6 +14,7 @@ import typing
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any
 
 import uvicorn
@@ -143,25 +144,7 @@ class SafeFastMCP(FastMCP):
     async def call_tool(self, name, arguments):
         # FastMCP's default validation errors include the rejected input. Keep
         # only our stable code, including when validation fails before a tool.
-        try:
-            if arguments is None:
-                arguments = {}
-            canonical = ALIASES.get(name, name)
-            if canonical not in PUBLIC_OPERATIONS:
-                raise BridgeError("invalid")
-            if name in {"submit_task", "get_task", "list_tasks", "fetch_inbox"}:
-                allowed = {"submit_task": {"idempotency_key", "prompt", "page_id", "scopes", "assignee_principal", "depends_on",
-                                           "work_face", "require_work_face", "task_kind", "priority", "escalate_to",
-                                           "fallback_assignee", "approvals_required"}, "get_task": {"task_id"},
-                           "list_tasks": set(), "fetch_inbox": set()}[name]
-                if not isinstance(arguments, dict):
-                    raise BridgeError("invalid", [{"field": "arguments", "expected": "object"}])
-                if set(arguments) - allowed:
-                    raise BridgeError("invalid", unknown_field_details(arguments, allowed))
-            else:
-                MODELS[canonical].model_validate(arguments)
-            return await super().call_tool(name, arguments)
-        except Exception as exc:
+        def tool_error(exc):
             code, details = "invalid", []
             current = exc
             for _ in range(8):
@@ -179,6 +162,34 @@ class SafeFastMCP(FastMCP):
             if details:
                 message += "; details=" + json.dumps(details, separators=(",", ":"))
             raise ToolError(message) from None
+
+        try:
+            if arguments is None:
+                arguments = {}
+            canonical = ALIASES.get(name, name)
+            if canonical not in PUBLIC_OPERATIONS:
+                raise BridgeError("invalid")
+            if name in {"submit_task", "get_task", "list_tasks", "fetch_inbox"}:
+                allowed = {"submit_task": {"idempotency_key", "prompt", "page_id", "scopes", "assignee_principal", "depends_on",
+                                           "work_face", "require_work_face", "task_kind", "priority", "escalate_to",
+                                           "fallback_assignee", "approvals_required"}, "get_task": {"task_id"},
+                           "list_tasks": set(), "fetch_inbox": set()}[name]
+                if not isinstance(arguments, dict):
+                    raise BridgeError("invalid", [{"field": "arguments", "expected": "object"}])
+                if set(arguments) - allowed:
+                    raise BridgeError("invalid", unknown_field_details(arguments, allowed))
+            else:
+                MODELS[canonical].model_validate(arguments)
+        except Exception as exc:
+            context = self.get_context()
+            request = context.request_context.request if context and context.request_context else None
+            if request is not None and isinstance(exc, (BridgeError, ValidationError)):
+                note_deprecated(ALIASES.get(name, name), arguments if isinstance(arguments, dict) else {}, None, True, request)
+            tool_error(exc)
+        try:
+            return await super().call_tool(name, arguments)
+        except Exception as exc:
+            tool_error(exc)
 
 
 allowed_hosts, allowed_origins = transport_origins()
@@ -406,8 +417,94 @@ def public_task(row):
     return task
 
 
+DEPRECATION_NOTICE = "[deprecated] Baton no longer develops document collaboration; use tasks, comments and links instead."
+DEPRECATION_HEADERS = ((b"deprecation", b"true"), (b"link", b'<docs/api.md#deprecated>; rel="deprecation"'))
+# Deprecated for every call; the value is the log "kind" used when the block kind is not known.
+DEPRECATED_ALWAYS = {"update_block": "block", "proposal_create": "proposal", "proposal_review": "proposal",
+                     "get_proposal": "proposal", "list_proposals": "proposal", "list_attribution": "attribution"}
+# Deprecated only when a non-task block is involved (kind='task' blocks stay supported).
+DEPRECATED_NON_TASK = frozenset({"create_block", "get_block", "list_blocks", "revert_block"})
+DEPRECATED_TOOLS = frozenset(DEPRECATED_ALWAYS) | DEPRECATED_NON_TASK
+SAFE_KIND = re.compile(r"[a-z][a-z_]{0,31}")
+DEPRECATED_CALLS = {}
+
+
+def log_kind(value):
+    return value if isinstance(value, str) and SAFE_KIND.fullmatch(value) else "other"
+
+
+def deprecated_kind(operation, payload, result, failed):
+    """Return the log kind when this call is deprecated, else None. Reads only operation names and block kinds."""
+    arguments = payload if isinstance(payload, dict) else {}
+    if operation in DEPRECATED_ALWAYS:
+        kind = result.get("kind") if isinstance(result, dict) else None
+        return log_kind(kind) if kind is not None else DEPRECATED_ALWAYS[operation]
+    if operation == "create_block":
+        kind = arguments.get("kind")
+        return log_kind(kind) if isinstance(kind, str) and kind != "task" else None
+    if operation in {"get_block", "revert_block"} and not failed and isinstance(result, dict):
+        return log_kind(result.get("kind")) if result.get("kind") != "task" else None
+    if operation == "list_blocks" and not failed and isinstance(result, list):
+        kinds = sorted({log_kind(row.get("kind")) for row in result if isinstance(row, dict) and row.get("kind") != "task"})
+        return ",".join(kinds) if kinds else None
+    if operation == "comment" and arguments.get("selection") is not None:
+        return "selection"
+    return None
+
+
+def note_deprecated(operation, payload, result, failed, request):
+    kind = deprecated_kind(operation, payload, result, failed)
+    if kind is None:
+        return
+    request.state.baton_deprecated = True
+    try:
+        principal = request_actor(request).principal
+    except BridgeError:
+        principal = "unknown"
+    DEPRECATED_CALLS[operation] = DEPRECATED_CALLS.get(operation, 0) + 1
+    print(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "event": "deprecated.call", "operation": operation,
+                      "principal": principal, "kind": kind,
+                      "metric": "baton_deprecated_calls_total", "value": DEPRECATED_CALLS[operation]}), flush=True)
+
+
+def deprecated_metrics():
+    """Prometheus text exposition of baton_deprecated_calls_total{operation}."""
+    lines = ["# TYPE baton_deprecated_calls_total counter"]
+    lines += [f'baton_deprecated_calls_total{{operation="{name}"}} {count}' for name, count in sorted(DEPRECATED_CALLS.items())]
+    return "\n".join(lines) + "\n"
+
+
+class DeprecationHeaders:
+    """Add Deprecation and Link headers to responses of calls that invoke() marked as deprecated."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        async def marked_send(message):
+            if message["type"] == "http.response.start" and scope.get("state", {}).get("baton_deprecated"):
+                message.setdefault("headers", []).extend(DEPRECATION_HEADERS)
+            await send(message)
+
+        await self.app(scope, receive, marked_send)
+
+
 async def invoke(operation, payload, request):
     operation = ALIASES.get(operation, operation)
+    try:
+        result = await perform(operation, payload, request)
+    except BridgeError:
+        if operation in PUBLIC_OPERATIONS:
+            note_deprecated(operation, payload, None, True, request)
+        raise
+    note_deprecated(operation, payload, result, False, request)
+    return result
+
+
+async def perform(operation, payload, request):
     if operation not in PUBLIC_OPERATIONS:
         raise BridgeError("invalid", [{"field": "operation", "expected": "an operation listed by GET /v1/space/schema"}])
     if not isinstance(payload, dict):
@@ -520,7 +617,13 @@ def register_space_tool(name, operation):
         parameters.append(inspect.Parameter(key, inspect.Parameter.KEYWORD_ONLY, default=default, annotation=field.annotation))
     parameters.append(inspect.Parameter("ctx", inspect.Parameter.KEYWORD_ONLY, annotation=Context))
     tool.__signature__ = inspect.Signature(parameters, return_annotation=dict)
-    mcp.add_tool(tool, name=name, description="Baton x_ extension: " + operation + ". Actor comes from authentication; mutation retries reuse operation_id.")
+    description = "Baton x_ extension: " + operation + ". Actor comes from authentication; mutation retries reuse operation_id."
+    if operation in DEPRECATED_TOOLS:
+        description = DEPRECATION_NOTICE + (" Deprecated for non-task blocks only; task blocks (kind='task') stay supported. "
+                                            if operation in DEPRECATED_NON_TASK else " ") + description
+    elif operation == "comment":
+        description += " The selection parameter is deprecated: " + DEPRECATION_NOTICE[len("[deprecated] "):]
+    mcp.add_tool(tool, name=name, description=description)
 
 
 for tool_name in sorted(PUBLIC_OPERATIONS.keys() | ALIASES.keys()):
@@ -669,7 +772,7 @@ async def board_data(request: Request):
 
 
 app.mount("/", mcp.streamable_http_app())
-app = a2a_public.PublicDiscovery(AuthMiddleware(app, role="client"))
+app = a2a_public.PublicDiscovery(AuthMiddleware(DeprecationHeaders(app), role="client"))
 
 
 if __name__ == "__main__":

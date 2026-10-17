@@ -41,26 +41,26 @@ with urlopen(request) as response:
 - `create_space(operation_id: str, name: str)` — 写入。
 - `get_space(space_id: str)` — 读取。
 - `list_spaces()` — 读取。
-- `create_page(operation_id: str, space_id: str, title: str, parent_id: str | None = None)` — 写入。
+- `create_page(operation_id: str, space_id: str, title: str, parent_id: str | None = None)` — 写入。页面在产品上称为“channel（频道）”，是消息、评论与任务的容器；API 名称不变。
 - `get_page(page_id: str)` — 读取。
 - `list_pages(space_id: str, parent_id: str | None = None)` — 读取。
-- `create_block(operation_id: str, page_id: str, kind: str, content: Any, position: int | None = None)` — 写入。
-- `get_block(block_id: str)` — 读取。
-- `list_blocks(page_id: str)` — 读取。
-- `update_block(operation_id: str, block_id: str, expected_revision: int, content: Any)` — 写入。
-- `revert_block(operation_id: str, block_id: str, expected_revision: int, target_revision: int)` — 写入。
+- `create_block(operation_id: str, page_id: str, kind: str, content: Any, position: int | None = None)` — 写入。`kind` 不是 `task` 时已弃用；task 块通过 `create_task_block` / `submit_task` 创建。
+- `get_block(block_id: str)` — 读取。读取非 task 块时已弃用；`kind='task'` 的块永久支持。
+- `list_blocks(page_id: str)` — 读取。仍返回全部块；其中非 task 块已弃用，响应带弃用标记，`kind='task'` 的块永久支持。
+- `update_block(operation_id: str, block_id: str, expected_revision: int, content: Any)` — 写入。已弃用，见 [Deprecated](#deprecated)。
+- `revert_block(operation_id: str, block_id: str, expected_revision: int, target_revision: int)` — 写入。对非 task 块已弃用，见 [Deprecated](#deprecated)。
 - `share(operation_id: str, resource_type: str, resource_id: str, subject_type: str, subject_id: str, role: str | None)` — 写入。
 - `effective_role(resource_type: str, resource_id: str)` — 读取。
 - `create_team(operation_id: str, name: str)` — 写入。
 - `set_team_member(operation_id: str, team_id: str, account: str, member: bool)` — 写入。
-- `comment(operation_id: str, page_id: str, body: str, thread_id: str | None = None, selection: Any = None)` — 写入。
+- `comment(operation_id: str, page_id: str, body: str, thread_id: str | None = None, selection: Any = None)` — 写入。`selection` 参数已弃用，`comment` 本身保留。
 - `list_comments(page_id: str | None = None, thread_id: str | None = None, task_id: str | None = None)` — 读取。给 `page_id`（可加 `thread_id`），或只给 `task_id`：服务端解析该任务所在的页面和线程（线程 ID 等于任务 ID），做与其他读取相同的权限检查。`task_id` 不能与 `page_id`/`thread_id` 同用，两者都不给返回 `422 invalid`；看不到该任务返回 `404 not_found`。
 - `mention(operation_id: str, comment_id: str, target_type: str, target_id: str)` — 写入。
-- `proposal_create(operation_id: str, block_id: str, expected_revision: int, proposed_content: Any, selection: Any = None)` — 写入。
-- `proposal_review(operation_id: str, proposal_id: str, decision: str, content: Any = None)` — 写入。
-- `get_proposal(proposal_id: str)` — 读取。
-- `list_proposals(block_id: str)` — 读取。
-- `list_attribution(block_id: str)` — 读取。
+- `proposal_create(operation_id: str, block_id: str, expected_revision: int, proposed_content: Any, selection: Any = None)` — 写入。已弃用，见 [Deprecated](#deprecated)。
+- `proposal_review(operation_id: str, proposal_id: str, decision: str, content: Any = None)` — 写入。已弃用，见 [Deprecated](#deprecated)。
+- `get_proposal(proposal_id: str)` — 读取。已弃用，见 [Deprecated](#deprecated)。
+- `list_proposals(block_id: str)` — 读取。已弃用，见 [Deprecated](#deprecated)。
+- `list_attribution(block_id: str)` — 读取。已弃用，见 [Deprecated](#deprecated)。
 - `create_task_block(operation_id: str, page_id: str, prompt: str, reviewers: list[str], scopes: list[dict] | None = None, base_commit: str | None = None, context: Any = None, evidence: Any = None, assignee_principal: str | None = None, depends_on: list[str] | None = None, work_face: dict | None = None, require_work_face: bool = False, task_kind: str = "construction", approvals_required: int | None = None)` — 写入；`approvals_required` 为 1 或 2，见“审批关卡”。
 - `submit_task(operation_id: str, idempotency_key: str, prompt: str, page_id: str | None = None, scopes: list[dict] | None = None, assignee_principal: str | None = None, depends_on: list[str] | None = None, work_face: dict | None = None, require_work_face: bool = False, task_kind: str = "construction", approvals_required: int | None = None)` — 写入；`approvals_required` 为 1 或 2，见“审批关卡”。
 - `assign_task(operation_id: str, task_id: str, target_principal: str)` — 写入。
@@ -435,6 +435,34 @@ docker compose exec bridge python -m bridge.a2a_public init-keys
 `submit_task(idempotency_key,prompt,page_id=None,scopes=None,assignee_principal=None,depends_on=None,work_face=None,require_work_face=False,task_kind="construction",priority="normal",escalate_to=None,fallback_assignee=None)`、`get_task(task_id)`、`list_tasks()`、`fetch_inbox()` 保持既有工具入口与结果形状。兼容 submit_task 在服务端从 principal + 业务 key 派生稳定 operation_id。其他工具与上列 HTTP 同名同参数，返回包含 x_protocol 和 result 的对象；它们通过同一个 operation dispatcher 执行，MCP 工具发现提供完整 JSON Schema。
 
 旧显示字段 submission_mail_status/mail_status/mail_error 改为 submission_thread_status/thread_status/thread_error；适配器只记录经过校验的 thread_ids 等元数据，不记录正文。fetch_inbox.messages 仍提供 id/thread_id/subject/from/to/created_ts/body_md，来源是评论与提及视图。
+
+## Deprecated
+
+Owner 决定（2026-10-17）：Baton 不做文档协作，只做通信与任务协作平台。下列非 task 的文档协作能力已弃用。**本次只是标记，没有行为变化**：每个操作的参数、结果、权限和错误与弃用前完全相同；`Sunset` 日期会在使用情况调研后另行公布，目前不设。
+
+| 已弃用 | 范围 | 替代 |
+| --- | --- | --- |
+| `create_block` | `kind` 不是 `task` 时（现有可用 kind 均为非 task） | 用 `comment`、`submit_task`/`create_task_block` 的任务说明承载内容；需要引用其他资料时在评论或任务说明里放链接 |
+| `update_block`、`revert_block` | 全部 `update_block`；`revert_block` 对非 task 块 | 在页面（频道）里用 `comment` 补充；需要修改的工作用任务表达 |
+| `get_block`、`list_blocks` | 仅非 task 块；`kind='task'` 的块通过这两个读取永久受支持 | 读取任务用 `get_task`、`list_tasks`；读取讨论用 `list_comments` |
+| `proposal_create`、`proposal_review`、`get_proposal`、`list_proposals` | 全部 | 用 `comment` 与 `mention` 提出修改意见，用任务和 gate 做审批 |
+| `list_attribution` | 全部 | 评论自带作者；操作记录用 `list_audit` |
+| `comment.selection` 参数 | 仅该参数；`comment` 本身保留 | 在评论正文中引用文字或放链接 |
+
+不属于弃用范围：`create_page`/`get_page`/`list_pages`（页面在产品上称为“channel（频道）”，API 名称不变）、`share`、`effective_role`、团队操作、`comment`、`mention`、`list_comments`，以及全部任务、收件箱、webhook、委托和 A2A 操作。`create_task_block` 继续可用，推荐新代码使用 `submit_task`。
+
+**如何识别。** 弃用调用的 HTTP 与 MCP 响应带：
+
+```
+Deprecation: true
+Link: <docs/api.md#deprecated>; rel="deprecation"
+```
+
+`update_block`、`proposal_*`、`list_attribution` 的每次调用都带这两个头；`create_block` 在 `kind` 不是 `task` 时带；`get_block`、`revert_block`、`list_blocks` 仅当涉及非 task 块时带（`list_blocks` 仍返回全部块，只在响应头上标记其中含有弃用类型的项）；`comment` 仅在传入 `selection` 时带。读取失败（如 404）时无法确定块类型，`get_block`、`revert_block`、`list_blocks` 的错误响应不带这些头。task 块经 `get_block`/`list_blocks` 读取、以及所有未弃用操作的响应不带这些头。响应正文不变。
+
+**MCP 工具描述。** 已弃用工具的描述以 `[deprecated] Baton no longer develops document collaboration; use tasks, comments and links instead.` 开头（`create_block`、`get_block`、`list_blocks`、`revert_block` 的描述另注明只对非 task 块弃用）；`comment` 的描述注明 `selection` 参数已弃用。适配器（`adapters/mcp_stdio.py`）转发工具列表时同样保证该前缀。
+
+**服务端记录。** 每次弃用调用输出一行结构化日志 `{"event":"deprecated.call","operation":...,"principal":...,"kind":...}`（`kind` 为块类型，或 `proposal`/`attribution`/`selection`/`block` 等类别；只含操作名、principal 和类型，不含正文、凭据或请求值），并使计数器 `baton_deprecated_calls_total{operation}` 加一（进程内计数，日志行同时带当前累计值）。
 
 ## 错误与审计
 
