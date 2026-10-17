@@ -35,6 +35,14 @@ worker `/healthz` 位于现有 dispatcher 认证之后，仅在 cgroup v2 资源
 
 这是受信任操作者的独立实验，不是已验证的敌对多租户代码执行平台；不接生产系统、生产数据或敏感源代码。浏览器只在内存中保留 bearer，渲染使用 textContent，不保存 localStorage 或记录 Authorization。
 
+## Webhook 签名、SSRF 防护与至少一次送达
+
+Webhook 签名密钥在订阅时由服务端以 32 字节随机数生成，只在创建响应中返回一次。它以 bytea 存在 `x_webhook`，仅为签名而保存（HMAC 需要原值，数据库备份与应用角色因此都是可信边界）；不写入 operations 重放结果、审计、日志或错误体，列表接口不返回。每次投递对原始 JSON 正文计算 HMAC-SHA256，放在 `X-Baton-Signature`；接收方必须用常数时间比较，并按 `X-Baton-Delivery` 去重。负载只含标识符等元数据，不含 prompt、评论正文或结果文本，所以 webhook 接收端泄漏也不会泄漏正文；接收方凭 ID 回来读取时仍经过 Baton 的权限检查，投递前也会重新检查收件人 view 权限。
+
+订阅 URL 由用户提供，bridge 代为发起请求，因此有 SSRF 面。防护：只允许 https、禁止用户信息；订阅时与每次连接时都解析主机名，任一记录是环回、链路本地（含云元数据地址）、私有（RFC 1918、ULA）、组播、保留或其他非全局地址即拒绝；连接固定到通过检查的 IP 并复核实际对端，防止 DNS rebinding；不跟随重定向；10 秒超时，响应正文不读取、不记录。`BATON_WEBHOOK_ALLOW_HOSTS` 是运营者控制的精确主机名豁免，用于内部接收端或测试，不能由 API 调用者设置，也不放宽 https 要求。每个 principal 最多 10 个订阅，wait_inbox 并发有上限，限制资源占用。该防护不替代网络层出站控制：默认 Compose 的 bridge 没有出站路由，启用 webhook 须由运营者显式提供并限制出站网络。
+
+送达语义是至少一次：重试可能使同一通知多次到达，跨通知不保证顺序，最多 8 次后 dead-letter 并写审计。逐次尝试状态保存在 `x_webhook_attempt`，终局结果写 `x_audit`，两者都不含 URL、查询串、请求头、响应或密钥。`x_notify` 与投递记录目前没有自动清理，保留与归档由运营者负责。
+
 ## 审计与诊断
 
 业务变更及 `x_audit` 在同一 PostgreSQL 事务提交。审计只保存真实主体、操作/任务/线程标识、数据库时间、状态、版本/fence 和必要引用；不保存完整 prompt、评论正文或凭据。业务 API 只返回稳定安全错误码，不返回 SQL 或连接串。

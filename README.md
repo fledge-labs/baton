@@ -119,6 +119,10 @@ WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --b
 
 `x_scope` 首版锁域是同一 PostgreSQL 权威内跨 Space 的 `global`，不提供跨独立数据库的互斥保证。由于尚无可信的文件拓扑与别名映射，任意两个 `path` 声明都冲突，即使声明为 `src/a` 与 `docs/b` 也不能并行领取；展示路径不代表细粒度锁。`module` 覆盖整个仓库，与 path、module 和任意 migration 都冲突。`migration` 仅按规范化后的完整标识相等互斥，相异标识可并行；path 与 migration 是独立声明域，需要同时保护两者时必须同时声明。
 
+### 通知与异步送达
+
+不必再轮询 `fetch_inbox`：mention、指派、任务线程评论、进入 gate、gate 决定和交接会在业务事务内写入通知 outbox（只含标识符，不含正文）。`wait_inbox(after_seq, timeout_seconds≤55)` 长轮询返回当前仍可见的通知；`webhook_subscribe/webhook_list/webhook_delete` 让 bridge 向你的 https 端点投递带 HMAC 签名的通知，至少一次、指数退避、最多 8 次后 dead-letter，接收方按 `X-Baton-Delivery` 去重。URL 经过 SSRF 检查；运营者可用 `BATON_WEBHOOK_ALLOW_HOSTS` 豁免内部主机，默认 Compose 的 bridge 没有出站网络。细节见 [API](docs/api.md#通知与送达webhookwait_inbox) 与 [安全模型](docs/security-model.md)。适配器默认白名单不变，可用 `--allow-tools fetch_inbox,wait_inbox` 显式放行 `wait_inbox`。
+
 ### 依赖图与就绪任务
 
 `x_graph` 用 `depends_on` 表示任务依赖：`A.depends_on=[B]` 表示 B 必须达到 `done`，并有当前 epoch 对应的 gate pass，A 才能领取。调用 `create_task_block` 或 `submit_task` 创建任务时可同时传入 `depends_on`，任务与初始依赖在同一事务中生效，自动 worker 也遵守这些依赖。
