@@ -98,8 +98,8 @@ INCOMPATIBLE_SQL = (
      r'\bDROP\b(?!\s+(?:CONSTRAINT|TRIGGER|INDEX|POLICY|DEFAULT|RULE|STATISTICS)\b)'),
     ('truncates a table', r'(?:^|;)\s*TRUNCATE\b'),
     ('deletes rows', r'\bDELETE\s+FROM\b'),
-    # Data rewrites are invisible to a schema-only catalog. Trigger clauses (BEFORE UPDATE OR/OF) are not statements.
-    ('rewrites rows', r'\bUPDATE\s+(?:ONLY\s+)?(?!OR\b|OF\b)(?:[\w."]+\.)?[\w."]+'),
+    # Data rewrites are invisible to a schema-only catalog. Trigger clauses (BEFORE UPDATE ON/OR/OF) are not statements.
+    ('rewrites rows', r'\bUPDATE\s+(?:ONLY\s+)?(?!OR\b|OF\b|ON\b)(?:[\w."]+\.)?[\w."]+'),
     ('merges rows', r'\bMERGE\s+INTO\b'),
     ('renames an object', r'\bRENAME\b'),
     ('changes a column type', r'\bALTER\s+(?:COLUMN\s+)?' + IDENT + r'\s+(?:SET\s+DATA\s+)?TYPE\b'),
@@ -110,6 +110,16 @@ INCOMPATIBLE_SQL = (
     ('changes row level security',
      r'\b(?:NO\s+FORCE|ENABLE|DISABLE|FORCE)\s+ROW\s+LEVEL\s+SECURITY\b'),
     ('disables a trigger', r'\bDISABLE\s+TRIGGER\b'),
+    # Trust boundary: repository migrations are reviewed code. These are accidental hazards the catalog snapshot
+    # does not record (server settings, program side effects, anonymous blocks). Reject them here so the same file
+    # is not replayed on the live database. ON CONFLICT DO NOTHING is not a DO block.
+    ('switches role', r'\bRESET\s+ROLE\b|\bSET\s+(?:LOCAL\s+|SESSION\s+)?ROLE\b|\bSET\s+SESSION\s+AUTHORIZATION\b'),
+    ('changes server configuration', r'\bALTER\s+SYSTEM\b'),
+    ('changes database settings', r'\bALTER\s+DATABASE\b'),
+    ('changes roles', r'\b(?:ALTER|CREATE|DROP)\s+ROLE\b'),
+    ('runs a program from COPY', r'\bCOPY\b[^;]*\b(?:TO|FROM)\s+PROGRAM\b'),
+    ('creates an extension', r'\bCREATE\s+EXTENSION\b'),
+    ('contains a DO block', r"(?:^|;)\s*DO\s*(?:LANGUAGE\b|\$[A-Za-z0-9_]*\$|;|$)"),
 )
 ADD_CLAUSE = re.compile(r'\bADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?'
                         r'(?!CONSTRAINT\b|PRIMARY\b|UNIQUE\b|CHECK\b|FOREIGN\b|LIKE\b|EXCLUDE\b)([^;]*?)'
@@ -147,7 +157,7 @@ CATALOG_SQL = """SELECT json_build_object(
  'triggers', (SELECT coalesce(json_agg(json_build_object('t', n.nspname||'.'||c.relname, 'name', g.tgname,
      'def', pg_get_triggerdef(g.oid), 'enabled', g.tgenabled)), '[]'::json)
    FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
-   WHERE NOT g.tgisinternal AND %(system)s),
+   WHERE %(system)s),
  'functions', (SELECT coalesce(json_agg(json_build_object('sig', p.oid::regprocedure::text, 'def', pg_get_functiondef(p.oid))), '[]'::json)
    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.prokind IN ('f','p') AND %(system)s),
  'types', (SELECT coalesce(json_agg(json_build_object('name', n.nspname||'.'||t.typname,
@@ -715,8 +725,11 @@ def unsafe_migration_statements(sql):
 
     Comments and string literals are blanked in a single pass, so a comment marker inside one cannot hide a
     statement. A psql meta-command is reported from the raw script, because blanking strings must not hide
-    ``\\c`` that sits outside them and must not invent one that sits inside them. This is not a proof of
-    compatibility; precheck_migration() is the authoritative check.
+    ``\\c`` that sits outside them and must not invent one that sits inside them. Role switches, ``ALTER SYSTEM``,
+    ``ALTER DATABASE``, role DDL, ``COPY ... PROGRAM``, ``CREATE EXTENSION`` and ``DO`` blocks are rejected here:
+    the catalog snapshot does not record their server-side side effects, and ``deploy/migrate.py`` would replay
+    the same file on the live database. ``BEFORE UPDATE ON`` is a trigger clause, not a rewrite. This is not a
+    proof of compatibility; precheck_migration() is the authoritative check for what the catalog can see.
     """
     text = NOISE.sub(' ', sql)
     found = [label for label, pattern in INCOMPATIBLE_SQL if re.search(pattern, text, re.IGNORECASE)]
@@ -991,10 +1004,11 @@ def precheck_migration(docker, config, sql, previous, project, clock=time.monoto
     The container uses the database service's image, ``--network none``, a private superuser and a tmpfs data
     directory. It is loaded from a schema-only dump plus ``pg_dumpall --roles-only --no-role-passwords`` of the
     live database. Those two dumps are read-only. Before the backup, the migration SQL runs only inside this
-    container: it is not executed on the live database. ``COMMIT``, ``RESET ROLE``, ``ALTER ROLE``,
-    ``ALTER DATABASE`` and ``COPY ... TO PROGRAM`` therefore cannot change the live cluster or start a shell
-    in its container. The container is removed before the backup. Role and trigger-enabled changes show up in
-    the diff. Fails closed.
+    container: it is not executed on the live database. The container is removed before the backup. The text
+    rules already reject role switches, ``ALTER SYSTEM``, ``ALTER DATABASE``, role DDL, ``COPY ... PROGRAM``,
+    ``CREATE EXTENSION`` and ``DO`` blocks, because this catalog does not record those server-side side effects
+    and the same file is later applied to the live database. Role, privilege and trigger-enabled changes
+    (including internal triggers such as foreign keys) that do reach this diff are breaking. Fails closed.
     """
     name = PRECHECK_PREFIX + secrets.token_hex(6)
     report = {'database': name, 'network': 'none', 'ok': False, 'changes': [], 'error': None}

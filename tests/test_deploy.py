@@ -921,6 +921,12 @@ def test_backup_dir_is_required_unless_no_backup_is_given(files, capsys):
     "ALTER TABLE baton.t DISABLE TRIGGER ALL;",
     "ALTER TABLE baton.t DISABLE TRIGGER USER;",
     "ALTER TABLE baton.x_audit DISABLE TRIGGER audit_no_change;",
+    "RESET ROLE;", "SET ROLE baton_owner;", "SET LOCAL ROLE baton_owner;", "SET SESSION ROLE baton_owner;",
+    "SET SESSION AUTHORIZATION baton_bootstrap;", "ALTER SYSTEM SET log_statement = 'all';",
+    "ALTER DATABASE baton SET log_statement = 'all';", "CREATE ROLE extra LOGIN;", "ALTER ROLE baton_app NOLOGIN;",
+    "DROP ROLE extra;", "COPY baton.t TO PROGRAM 'id';", "COPY baton.t FROM PROGRAM 'id';",
+    "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;", "DO $$ BEGIN NULL; END $$;",
+    "DO LANGUAGE plpgsql $$ BEGIN NULL; END $$;", "DO 'BEGIN NULL; END';",
 ])
 def test_migration_lint_flags_contract_statements_a_previous_image_cannot_survive(statement):
     assert deploy.unsafe_migration_statements("CREATE TABLE IF NOT EXISTS baton.t(a int);\n" + statement + "\n")
@@ -932,8 +938,15 @@ def test_migration_lint_flags_contract_statements_a_previous_image_cannot_surviv
     "ALTER TABLE baton.t DROP CONSTRAINT IF EXISTS old_key;",
     "CREATE TRIGGER x BEFORE UPDATE OR DELETE ON baton.t FOR EACH ROW EXECUTE FUNCTION f();",
     "CREATE TRIGGER x BEFORE INSERT OR UPDATE OF parent_id ON baton.t FOR EACH ROW EXECUTE FUNCTION f();",
+    "CREATE TRIGGER x BEFORE UPDATE ON baton.t FOR EACH ROW EXECUTE FUNCTION f();",
     "CREATE TRIGGER y BEFORE TRUNCATE ON baton.t FOR EACH STATEMENT EXECUTE FUNCTION f();",
+    "INSERT INTO baton.schema_version(singleton, version) VALUES (true, 1) ON CONFLICT DO NOTHING;",
+    "COPY baton.t TO stdout;",
+    "COPY program TO stdout;",
     "-- DROP TABLE baton.commented;\n/* DELETE FROM baton.t; UPDATE baton.t SET a = 1; */ SELECT 1;",
+    "-- RESET ROLE\n/* ALTER SYSTEM SET x = 1; ALTER DATABASE baton SET y = 1; */\n"
+    "SELECT 'SET ROLE baton_owner'; SELECT 'COPY baton.t TO PROGRAM ''id''';\n"
+    "SELECT 'DO $$ BEGIN NULL; END $$';\nCREATE TABLE baton.n(id int);",
 ])
 def test_migration_lint_accepts_expand_only_statements(statement):
     assert deploy.unsafe_migration_statements(statement) == []
@@ -941,7 +954,8 @@ def test_migration_lint_accepts_expand_only_statements(statement):
 
 def test_the_shipped_migration_sql_is_expand_only_except_its_backfill_update():
     schema = ROOT / "bridge/space_schema.sql"
-    assert deploy.unsafe_migration_statements(schema.read_text(encoding="utf-8")) == ["rewrites rows"]
+    assert deploy.unsafe_migration_statements(schema.read_text(encoding="utf-8")) == [
+        "rewrites rows", "contains a DO block"]
     assert "UPDATE baton.spaces" in schema.read_text(encoding="utf-8")
 
 
@@ -1125,14 +1139,18 @@ def test_the_migration_is_applied_in_an_isolated_container_never_to_the_live_dat
 
 def test_a_role_change_is_caught_on_the_isolated_cluster_and_never_sent_to_the_live_database(files, tmp_path, monkeypatch):
     migration_file(tmp_path, monkeypatch, "RESET ROLE;\nALTER ROLE baton_app NOLOGIN;\nALTER ROLE baton_app CONNECTION LIMIT 0;\n")
-    assert deploy.unsafe_migration_statements("ALTER ROLE baton_app NOLOGIN;\n") == []
+    assert "switches role" in deploy.unsafe_migration_statements("RESET ROLE;\n")
+    assert "changes roles" in deploy.unsafe_migration_statements("ALTER ROLE baton_app NOLOGIN;\n")
     docker = FakeDocker(precheck="role")
     code, report, _ = run(files, docker, FakeGateway(docker))
-    assert code == 1 and report["status"] == "aborted"
-    assert "changes role baton_app" in report["precheck"]["changes"]
-    assert not dump_calls(docker) and not docker.ups()
-    live_sql = [s for c, s in zip(docker.calls, docker.stdins) if c[:2] == ["docker", "compose"] and "exec" in c]
-    assert live_sql == [None, None]
+    assert code == 1 and report["status"] == "aborted" and not docker.calls
+    assert "switches role" in report["rollback"]["reason"] and "changes roles" in report["rollback"]["reason"]
+    docker = FakeDocker(precheck="role")
+    code, report, _ = run(files, docker, FakeGateway(docker, good_image=NEW_APP), "--allow-incompatible-migration")
+    assert code == 0 and "changes role baton_app" in report["precheck"]["changes"]
+    live = [s for c, s in zip(docker.calls, docker.stdins)
+            if c[:2] == ["docker", "compose"] and "exec" in c and "-Fc" not in c[-1]]
+    assert live == [None, None], "the live database is only dumped, never given SQL"
     applied = next(s for c, s in zip(docker.calls, docker.stdins) if c[:2] == ["docker", "exec"] and s and "ALTER ROLE" in s)
     assert applied.index("\\restrict ") < applied.index("ALTER ROLE")
     assert report["precheck"]["network"] == "none"
@@ -1321,6 +1339,15 @@ def test_schema_diff_flags_a_changed_predicate_or_column_list_on_an_existing_ind
     assert deploy.schema_breaking_changes(before, base_snapshot()) == []
 
 
+def test_catalog_sql_keeps_internal_triggers_and_a_disabled_one_is_breaking():
+    assert "tgenabled" in deploy.CATALOG_SQL and "tgisinternal" not in deploy.CATALOG_SQL
+    firing = {"t": "baton.child", "name": "RI_ConstraintTrigger_a",
+              "def": "CREATE CONSTRAINT TRIGGER RI_ConstraintTrigger_a", "enabled": "O"}
+    before = altered(triggers=[firing])
+    assert deploy.schema_breaking_changes(before, altered(triggers=[dict(firing, enabled="D")])) == [
+        "disables trigger RI_ConstraintTrigger_a on baton.child"]
+
+
 def test_schema_diff_flags_disabling_a_trigger_even_when_its_definition_is_unchanged():
     definition = "CREATE TRIGGER audit_no_change BEFORE UPDATE ON baton.x_audit"
     firing = {"t": "baton.x_audit", "name": "audit_no_change", "def": definition, "enabled": "O"}
@@ -1364,7 +1391,7 @@ def test_comments_and_strings_do_not_count_as_privilege_changes():
     assert deploy.unsafe_migration_statements("-- GRANT SELECT ON baton.t TO PUBLIC;\nCREATE TABLE baton.n(id int);") == []
     assert deploy.unsafe_migration_statements("SELECT 'REVOKE ALL ON baton.t FROM PUBLIC';") == []
     hidden = "DO $$ BEGIN EXECUTE 'GRANT SELECT ON baton.t TO PUBLIC'; END $$;"
-    assert deploy.unsafe_migration_statements(hidden) == [], "a string hides the statement; the catalog diff is authoritative"
+    assert deploy.unsafe_migration_statements(hidden) == ["contains a DO block"]
 
 
 def test_schema_diff_accepts_purely_additive_changes():
@@ -1460,6 +1487,18 @@ def test_catalog_sql_and_diff_on_a_real_postgres_accept_the_shipped_schema_and_c
                     apply(statement)
                 changes = deploy.schema_breaking_changes(before, snapshot())
                 assert (expected in changes) if expected else changes == [], (statement, changes)
+            before = snapshot()
+            apply("CREATE TABLE baton.df18_parent (id int PRIMARY KEY)")
+            apply("CREATE TABLE baton.df18_child (parent_id int REFERENCES baton.df18_parent(id))")
+            assert deploy.schema_breaking_changes(before, snapshot()) == []
+            before = snapshot()
+            internal = [item for item in before["triggers"] if item["t"] == "baton.df18_child"]
+            assert internal and all(item["enabled"] == "O" for item in internal)
+            assert all(item["name"].startswith("RI_ConstraintTrigger_") for item in internal)
+            apply("ALTER TABLE baton.df18_child DISABLE TRIGGER ALL")
+            changes = deploy.schema_breaking_changes(before, snapshot())
+            assert changes and all(
+                change.startswith("disables trigger ") and change.endswith(" on baton.df18_child") for change in changes), changes
     finally:
         with connect(config["dbname"], autocommit=True) as admin:
             admin.execute('DROP DATABASE IF EXISTS "%s" WITH (FORCE)' % name)
@@ -1756,7 +1795,7 @@ def test_rollback_limits_are_documented_next_to_the_commands():
     for needle in ("expand", "pg_dump", "--backup-dir", "迁移", "不恢复数据库", "--allow-remove-orphans", "超时", "孤立",
                    "隔离容器", "已停止", "数据卷", "--schema-file", "保留标签", "符号链接", "互斥", "行级安全", "GRANT",
                    "元命令", "唯一性", "--network none", "角色", "UPDATE", "1 MiB",
-                   "只在这个预检容器", "tgenabled"):
+                   "只在这个预检容器", "tgenabled", "信任边界"):
         assert needle in section, needle
     assert "expand-only" in deploy.__doc__ and "backup" in deploy.__doc__ and "orphans" in deploy.__doc__
 
