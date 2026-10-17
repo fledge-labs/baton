@@ -115,7 +115,10 @@ INCOMPATIBLE_SQL = (
     # Trust boundary: repository migrations are reviewed code. These are accidental hazards the catalog snapshot
     # does not record (server settings, program side effects, anonymous blocks). Reject them here so the same file
     # is not replayed on the live database. ON CONFLICT DO NOTHING is not a DO block.
-    ('switches role', r'\bRESET\s+ROLE\b|\bSET\s+(?:LOCAL\s+|SESSION\s+)?ROLE\b|\bSET\s+SESSION\s+AUTHORIZATION\b'),
+    # Any SET/RESET whose target is the role or session authorization, with LOCAL/SESSION in either order.
+    # set_config('role'|...) is matched separately, before strings are blanked.
+    ('switches role',
+     r'(?:^|;)\s*(?:set|reset)\s+(?:(?:local|session)\s+)*?(?:role|session\s+authorization|session_authorization)\b'),
     ('changes server configuration', r'\bALTER\s+SYSTEM\b'),
     ('changes database settings', r'\bALTER\s+DATABASE\b'),
     ('changes roles', r'\b(?:ALTER|CREATE|DROP)\s+ROLE\b'),
@@ -812,12 +815,143 @@ def _do_block_at(sql, index):
     return _starts_string_literal(sql, index) or _dollar_delimiter(sql, index) is not None
 
 
+def _skip_code_atom(sql, index):
+    """Move past one comment, quote, dollar quote or character. Used inside ``BEGIN ATOMIC`` bodies."""
+    length = len(sql)
+    if index >= length:
+        return length
+    char = sql[index]
+    if char == '-' and index + 1 < length and sql[index + 1] == '-':
+        newline = sql.find('\n', index)
+        return length if newline < 0 else newline + 1
+    if char == '/' and index + 1 < length and sql[index + 1] == '*':
+        end = sql.find('*/', index + 2)
+        return length if end < 0 else end + 2
+    if char == '$':
+        delimiter = _dollar_delimiter(sql, index)
+        if delimiter:
+            end = sql.find(delimiter, index + len(delimiter))
+            return length if end < 0 else end + len(delimiter)
+    if char == '"':
+        return _skip_double_quoted(sql, index)
+    if _starts_string_literal(sql, index):
+        return _skip_string_literal(sql, index)
+    return index + 1
+
+
+def _atomic_body_end(sql, index):
+    """Index just after the ``END`` that closes a ``BEGIN ATOMIC`` body starting at index.
+
+    The body is SQL, so internal semicolons are not statement boundaries for the migration. Nested
+    ``BEGIN ATOMIC`` blocks are counted. ``END IF`` does not close the body.
+    """
+    depth = 1
+    length = len(sql)
+    while index < length and depth:
+        index = _skip_ws_comments(sql, index)
+        if index >= length:
+            return length
+        word, after = _keyword_at(sql, index)
+        if word == 'begin':
+            nxt, nxt_end = _keyword_at(sql, _skip_ws_comments(sql, after))
+            if nxt == 'atomic':
+                depth += 1
+                index = nxt_end
+                continue
+        if word == 'end':
+            nxt, _ = _keyword_at(sql, _skip_ws_comments(sql, after))
+            if nxt not in _PLPGSQL_END:
+                depth -= 1
+                if depth == 0:
+                    return after
+                index = after
+                continue
+        index = _skip_code_atom(sql, index)
+    return index
+
+
+def _begin_atomic_at(sql, index):
+    """If a ``BEGIN ATOMIC`` starts at index, return the index just after its closing ``END``. Otherwise None."""
+    if index > 0 and (sql[index - 1].isalnum() or sql[index - 1] == '_'):
+        return None
+    word, after = _keyword_at(sql, index)
+    if word != 'begin':
+        return None
+    nxt, nxt_end = _keyword_at(sql, _skip_ws_comments(sql, after))
+    if nxt != 'atomic':
+        return None
+    return _atomic_body_end(sql, nxt_end)
+
+
+def _string_literal_text(sql, index):
+    """The decoded text of a string or dollar literal at index, and the index just after it."""
+    if index >= len(sql):
+        return None, index
+    if sql[index] == '$':
+        delimiter = _dollar_delimiter(sql, index)
+        if delimiter is None:
+            return None, index
+        start = index + len(delimiter)
+        end = sql.find(delimiter, start)
+        if end < 0:
+            return sql[start:], len(sql)
+        return sql[start:end], end + len(delimiter)
+    escape = False
+    start = index
+    if sql[index] in 'eE' and index + 1 < len(sql) and sql[index + 1] == "'":
+        escape = True
+        start = index + 1
+    elif sql[index] in 'uU' and index + 2 < len(sql) and sql[index + 1] == '&' and sql[index + 2] == "'":
+        start = index + 2
+    elif sql[index] != "'":
+        return None, index
+    chars = []
+    cursor, length = start + 1, len(sql)
+    while cursor < length:
+        if escape and sql[cursor] == '\\' and cursor + 1 < length:
+            chars.append(sql[cursor + 1])
+            cursor += 2
+            continue
+        if sql[cursor] == "'":
+            if cursor + 1 < length and sql[cursor + 1] == "'":
+                chars.append("'")
+                cursor += 2
+                continue
+            return ''.join(chars), cursor + 1
+        chars.append(sql[cursor])
+        cursor += 1
+    return ''.join(chars), length
+
+
+def _set_config_switches_role(sql):
+    """True when a call passes ``role`` or ``session_authorization`` to ``set_config``.
+
+    The argument is a string literal, so this looks at the source before strings are blanked. Calls inside
+    comments, ordinary strings or dollar quotes are not calls the migration runs while it is applied.
+    """
+    index, length = 0, len(sql)
+    while index < length:
+        index = _skip_ws_comments(sql, index)
+        if index >= length:
+            return False
+        word, after = _keyword_at(sql, index)
+        if word == 'set_config' and (index == 0 or not (sql[index - 1].isalnum() or sql[index - 1] == '_')):
+            nxt = _skip_ws_comments(sql, after)
+            if nxt < length and sql[nxt] == '(':
+                text, _ = _string_literal_text(sql, _skip_ws_comments(sql, nxt + 1))
+                if text is not None and text.lower() in ('role', 'session_authorization'):
+                    return True
+        index = _skip_code_atom(sql, index)
+    return False
+
+
 def _statement_hazards(sql):
     """Top-level transaction control and ``DO`` blocks.
 
-    Dollar quotes, comments and string literals are skipped, so ``BEGIN``/``END`` inside a function body are
-    not transaction control. A ``COMMIT``/``ROLLBACK``/``END``/``ABORT`` at statement level ends ``SET LOCAL
-    ROLE``; later statements then run as the superuser. Migrations must not manage transactions.
+    Dollar quotes, comments, string literals and ``BEGIN ATOMIC`` bodies are skipped, so ``BEGIN``/``END``
+    inside a function or procedure body are not transaction control. A ``COMMIT``/``ROLLBACK``/``END``/``ABORT``
+    at statement level ends ``SET LOCAL ROLE``; later statements then run as the superuser. Migrations must
+    not manage transactions.
     """
     do_block = False
     manages = False
@@ -832,6 +966,10 @@ def _statement_hazards(sql):
             if word == 'do' and _do_block_at(sql, after):
                 do_block = True
             elif word == 'begin':
+                atomic_end = _begin_atomic_at(sql, index)
+                if atomic_end is not None:
+                    index = atomic_end
+                    continue
                 manages = True
             elif word == 'end':
                 nxt, _ = _keyword_at(sql, _skip_ws_comments(sql, after))
@@ -848,6 +986,10 @@ def _statement_hazards(sql):
             elif word in _TXN_WORDS:
                 manages = True
             at_start = False
+        atomic_end = _begin_atomic_at(sql, index)
+        if atomic_end is not None:
+            index = atomic_end
+            continue
         char = sql[index]
         if char == ';':
             at_start = True
@@ -903,6 +1045,8 @@ def unsafe_migration_statements(sql):
             break
     if psql_meta_command(sql):
         found.append('contains a psql meta-command')
+    if _set_config_switches_role(sql) and 'switches role' not in found:
+        found.append('switches role')
     found.extend(_statement_hazards(sql))
     return found
 

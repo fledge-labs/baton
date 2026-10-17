@@ -923,6 +923,14 @@ def test_backup_dir_is_required_unless_no_backup_is_given(files, capsys):
     "ALTER TABLE baton.t DISABLE TRIGGER USER;",
     "ALTER TABLE baton.x_audit DISABLE TRIGGER audit_no_change;",
     "RESET ROLE;", "SET ROLE baton_owner;", "SET LOCAL ROLE baton_owner;", "SET SESSION ROLE baton_owner;",
+    "RESET SESSION AUTHORIZATION;", "SET LOCAL SESSION AUTHORIZATION baton_owner;",
+    "SET SESSION SESSION AUTHORIZATION baton_owner;", "SET session_authorization = 'baton_owner';",
+    "SET role = baton_owner;", "SET LOCAL role TO baton_owner;", "SET SESSION LOCAL ROLE baton_owner;",
+    "SET LOCAL SESSION role TO NONE;", "RESET SESSION ROLE;",
+    "SELECT set_config('role', 'baton_owner', true);",
+    "SELECT set_config('session_authorization', 'baton_owner', false);",
+    "SELECT set_config(E'role', 'baton_owner', true);",
+    "SELECT SET_CONFIG ( 'ROLE' , 'baton_owner', true);",
     "SET SESSION AUTHORIZATION baton_bootstrap;", "ALTER SYSTEM SET log_statement = 'all';",
     "ALTER DATABASE baton SET log_statement = 'all';", "CREATE ROLE extra LOGIN;", "ALTER ROLE baton_app NOLOGIN;",
     "DROP ROLE extra;", "COPY baton.t TO PROGRAM 'id';", "COPY baton.t FROM PROGRAM 'id';",
@@ -957,6 +965,14 @@ def test_migration_lint_flags_contract_statements_a_previous_image_cannot_surviv
     "ALTER TABLE baton.child ADD COLUMN parent_id int REFERENCES baton.parent(id) ON UPDATE NO ACTION;",
     "CREATE FUNCTION baton.f() RETURNS void LANGUAGE plpgsql AS $$ BEGIN NULL; END; $$;",
     "CREATE PROCEDURE baton.p() LANGUAGE plpgsql AS $$ BEGIN COMMIT; END; $$;",
+    "CREATE FUNCTION baton.f(a int) RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT a; END;",
+    "CREATE PROCEDURE baton.p() LANGUAGE sql BEGIN ATOMIC SELECT 1; END;",
+    "CREATE FUNCTION baton.f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; SELECT 2; END;",
+    "CREATE FUNCTION baton.g() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; COMMIT; END;",
+    "SET statement_timeout = '1s';",
+    "SET session_replication_role = 'replica';",
+    "SELECT 'SET role = baton_owner; set_config(''role'', ''x'', true)';",
+    "-- SET LOCAL role TO baton_owner\nSELECT 1;",
     "SELECT 'COMMIT; BEGIN; ROLLBACK; DO E''BEGIN END'';';",
     "-- COMMIT\n/* START TRANSACTION; */ SELECT 1;",
     "-- DROP TABLE baton.commented;\n/* DELETE FROM baton.t; UPDATE baton.t SET a = 1; */ SELECT 1;",
@@ -966,6 +982,10 @@ def test_migration_lint_flags_contract_statements_a_previous_image_cannot_surviv
 ])
 def test_migration_lint_accepts_expand_only_statements(statement):
     assert deploy.unsafe_migration_statements(statement) == []
+
+
+def test_assigning_a_column_named_role_is_a_rewrite_and_not_a_role_switch():
+    assert deploy.unsafe_migration_statements("UPDATE baton.t SET role = 'x';") == ["rewrites rows"]
 
 
 def test_the_shipped_migration_sql_is_expand_only_except_its_backfill_update():
