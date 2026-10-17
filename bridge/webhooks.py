@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Webhook URL policy (SSRF guard), request signing and a pinned-address HTTPS POST.
+"""Webhook URL policy (SSRF guard), Standard Webhooks request signing and a pinned-address HTTPS POST.
 
-Nothing here logs or returns URLs, headers, response bodies or secrets. Failures are
-reduced to a small fixed vocabulary so callers can persist them without leaking data.
+Nothing here logs or persists anything. post() reduces every failure to a small fixed (outcome, status) vocabulary
+and never returns response bodies, so callers can record it without leaking data. The URL policy functions
+(parse_url, resolve, check_url) return only host, port, request target, addresses or the URL they were given.
+The signing helpers (sign, format_secret, parse_secret, standard_signature, standard_headers) necessarily take
+secrets and return secret text or signatures to their caller, which must not log or persist them.
 """
 
 import base64

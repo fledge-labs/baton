@@ -215,6 +215,8 @@ ALTER TABLE baton.x_webhook ADD COLUMN IF NOT EXISTS include_preview boolean NOT
 -- Secret rotation: the replaced secret keeps signing until previous_secret_expires_at, then is cleared.
 ALTER TABLE baton.x_webhook ADD COLUMN IF NOT EXISTS previous_secret bytea;
 ALTER TABLE baton.x_webhook ADD COLUMN IF NOT EXISTS previous_secret_expires_at timestamptz;
+-- Partial: only subscriptions inside a rotation grace period are indexed, so the periodic cleanup never scans the table.
+CREATE INDEX IF NOT EXISTS webhook_previous_secret_expiry ON baton.x_webhook(previous_secret_expires_at) WHERE previous_secret_expires_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS webhook_principal ON baton.x_webhook(principal);
 CREATE TABLE IF NOT EXISTS baton.x_webhook_delivery (
     subscription_id uuid NOT NULL REFERENCES baton.x_webhook(id) ON DELETE CASCADE,

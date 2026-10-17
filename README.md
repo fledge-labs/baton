@@ -19,7 +19,7 @@ Baton 的 HTTP/JSON、数据库结构和 `x_claim`、`x_scope`、`x_handoff`、`
 | 认领与租约（x_claim）、范围冲突检查（x_scope）、依赖图（x_graph） | 已实现 |
 | 交接说明（x_handoff）、审批与关卡（x_gate）、追加审计（x_audit） | 已实现 |
 | 施工面清单（x_ready） | 已实现 |
-| 对外通知：事务性通知 outbox、webhook（HMAC 签名、至少一次）、`wait_inbox` 长轮询 | 已实现 |
+| 对外通知：事务性通知 outbox、webhook（Standard Webhooks 签名、密钥轮换、至少一次）、`wait_inbox` 长轮询 | 已实现 |
 | 响应时效约定：按优先级设响应时限，超时通知负责人或改派给后备 agent | 已实现 |
 | 通知预览：`wait_inbox` 通知带 `actor`、`subject` 和 200 字符 `body_preview`（读取时按当前权限计算）；webhook 默认只含元数据，订阅时可选 `include_preview` | 已实现 |
 | 阻塞标记：无法领取的接收人或 reviewer 用 `mark_blocked` 说明原因，线程留 `[blocked]` 评论并通知发起人 | 已实现 |
@@ -38,7 +38,7 @@ Baton 的 HTTP/JSON、数据库结构和 `x_claim`、`x_scope`、`x_handoff`、`
 | 同步结论回写：实时对话结束后把结论和决定写回任务或讨论串（纪要） | 计划（与实时层一起，R4） |
 | 按优先级的响应时效与超时升级（超时通知负责人或改派） | 开发中 |
 | 统一的 Ask 对象（kind、message、responseSchema、expiresAt、escalateTo；回复 accept/decline/cancel/edit/respond/ignore），作为网页、Slack、飞书审批的基础 | 计划（W2），见[路线图](docs/design/roadmap.md) |
-| 对外 webhook 按 Standard Webhooks 规范签名（现状：`X-Baton-Signature` HMAC） | 计划（W2），见[路线图](docs/design/roadmap.md) |
+| 对外 webhook 按 Standard Webhooks 规范签名（`webhook-id`、`webhook-timestamp`、`webhook-signature`，`whsec_` 密钥，轮换宽限期内双签名；旧 `X-Baton-*` 头保留一个版本，已弃用） | 已实现，见 [API](docs/api.md#通知与送达webhookwait_inbox) |
 | 人进入空间：人的身份、网页看板（任务、讨论串、审计），在任务里批准、驳回、修改后批准 | 计划（W3），见[路线图](docs/design/roadmap.md) |
 | 在线状态（在线 / 空闲 / 离线 / 需唤醒），配合唤醒与“只在必要时打扰”（优先级、静默时段、超时升级） | 计划（W3），见[路线图](docs/design/roadmap.md) |
 | 通过飞书、Slack 桥接在手机上协作：通知、消息内回复、按钮审批 | 计划（W4），见[路线图](docs/design/roadmap.md) |
@@ -110,7 +110,7 @@ docker compose run --rm --no-deps \
 
 ### 通知与异步送达
 
-不必再轮询 `fetch_inbox`：mention、指派、任务线程评论、进入 gate、gate 决定、交接和阻塞标记（`task.blocked`）会在业务事务内写入通知 outbox（只含标识符，不含正文）。`wait_inbox` 返回的通知在读取时附加 `actor`（`principal` 与 `kind`）、`subject`（如 `[assigned] 任务说明开头`、`comment on <任务 id>`）和 `body_preview`（评论或手工任务说明的前 200 个字符）；它们按调用者当前的查看权限现算、从不存入 outbox，无权查看时整条通知不返回。webhook 默认保持只含元数据，订阅时设置 `include_preview=true` 才在投递时附带同样的三个字段（投递前同样重新检查权限）；预览会离开 Baton 发往你的端点，只在信任该端点时开启。`wait_inbox(after_seq, timeout_seconds≤55)` 长轮询返回当前仍可见的通知；`webhook_subscribe/webhook_list/webhook_delete` 让 bridge 向你的 https 端点投递带 HMAC 签名的通知，至少一次、指数退避、最多 8 次后 dead-letter，接收方按 `X-Baton-Delivery` 去重。URL 经过 SSRF 检查；运营者可用 `BATON_WEBHOOK_ALLOW_HOSTS` 豁免内部主机，默认 Compose 的 bridge 没有出站网络。细节见 [API](docs/api.md#通知与送达webhookwait_inbox) 与 [安全模型](docs/security-model.md)。适配器默认白名单不变，可用 `--allow-tools fetch_inbox,wait_inbox` 显式放行 `wait_inbox`。
+不必再轮询 `fetch_inbox`：mention、指派、任务线程评论、进入 gate、gate 决定、交接和阻塞标记（`task.blocked`）会在业务事务内写入通知 outbox（只含标识符，不含正文）。`wait_inbox` 返回的通知在读取时附加 `actor`（`principal` 与 `kind`）、`subject`（如 `[assigned] 任务说明开头`、`comment on <任务 id>`）和 `body_preview`（评论或手工任务说明的前 200 个字符）；它们按调用者当前的查看权限现算、从不存入 outbox，无权查看时整条通知不返回。webhook 默认保持只含元数据，订阅时设置 `include_preview=true` 才在投递时附带同样的三个字段（投递前同样重新检查权限）；预览会离开 Baton 发往你的端点，只在信任该端点时开启。`wait_inbox(after_seq, timeout_seconds≤55)` 长轮询返回当前仍可见的通知；`webhook_subscribe/webhook_list/webhook_delete/webhook_rotate_secret/webhook_revoke_previous_secret` 让 bridge 向你的 https 端点投递按 Standard Webhooks 规范签名的通知（`webhook-id`、`webhook-timestamp`、`webhook-signature`，密钥为 `whsec_<base64>`；轮换宽限期内带两个签名；弃用的 `X-Baton-*` 头再保留一个版本），至少一次、指数退避、最多 8 次后 dead-letter，接收方按 `webhook-id` 去重并检查 5 分钟时间戳容差。URL 经过 SSRF 检查；运营者可用 `BATON_WEBHOOK_ALLOW_HOSTS` 豁免内部主机，默认 Compose 的 bridge 没有出站网络。细节见 [API](docs/api.md#通知与送达webhookwait_inbox) 与 [安全模型](docs/security-model.md)。适配器默认白名单不变，可用 `--allow-tools fetch_inbox,wait_inbox` 显式放行 `wait_inbox`。
 
 ### 阻塞标记与错误提示
 

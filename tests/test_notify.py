@@ -26,7 +26,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from bridge import webhooks
-from bridge.space_store import SERVICE_ACTOR, StoreError, WEBHOOK_BACKOFF_SECONDS
+from bridge.space_store import SERVICE_ACTOR, SpaceStore, StoreError, WEBHOOK_BACKOFF_SECONDS, parse_rotation_grace
 from test_bridge import api, op, shared_page  # noqa: F401  (api is a fixture)
 
 def ip4(*octets):
@@ -263,10 +263,10 @@ def test_wait_inbox_is_a_schema_operation_and_mcp_tool(team, api):
     schema = client.get("/v1/space/schema", headers={"Authorization": "Bearer " + tokens["owner"]}).json()["operations"]
     assert schema["wait_inbox"]["mutation"] is False
     assert schema["webhook_subscribe"]["mutation"] and schema["webhook_delete"]["mutation"] and not schema["webhook_list"]["mutation"]
-    assert schema["webhook_rotate_secret"]["mutation"]
+    assert schema["webhook_rotate_secret"]["mutation"] and schema["webhook_revoke_previous_secret"]["mutation"]
     headers = {"Authorization": "Bearer " + tokens["worker"], "Host": "bridge", "Accept": "application/json, text/event-stream"}
     listing = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).json()["result"]["tools"]
-    assert {"wait_inbox", "webhook_subscribe", "webhook_list", "webhook_delete", "webhook_rotate_secret"} <= {tool["name"] for tool in listing}
+    assert {"wait_inbox", "webhook_subscribe", "webhook_list", "webhook_delete", "webhook_rotate_secret", "webhook_revoke_previous_secret"} <= {tool["name"] for tool in listing}
     make_task(call, team[1], team[3])
     response = client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
         "name": "wait_inbox", "arguments": {"after_seq": 0, "timeout_seconds": 0}}}).json()["result"]
@@ -630,11 +630,13 @@ def test_subscription_limit_is_per_principal(team, monkeypatch):
 def test_delivery_internals_are_service_only_and_timeouts_are_enforced(team, receiver, modules, pg_store):
     call, identities, space, page = team
     user = modules[1].actor_from_identity(identities["worker"])
-    for method, args in (("webhook_claim_due", ()), ("webhook_record", (str(uuid.uuid4()), str(uuid.uuid4()), 0, "delivered"))):
+    for method, args in (("webhook_claim_due", ()), ("webhook_record", (str(uuid.uuid4()), str(uuid.uuid4()), 0, "delivered")),
+                         ("webhook_signing_secrets", (str(uuid.uuid4()),))):
         with pytest.raises(StoreError) as caught:
             getattr(pg_store, method)(user, *args)
         assert caught.value.code == "forbidden"
-    assert not {"webhook_claim_due", "webhook_record", "poll_notifications"} & set(modules[1].PUBLIC_OPERATIONS)
+    assert not {"webhook_claim_due", "webhook_record", "webhook_signing_secrets", "poll_notifications"} & set(modules[1].PUBLIC_OPERATIONS)
+    assert pg_store.webhook_signing_secrets(SERVICE_ACTOR, str(uuid.uuid4())) is None
     receiver.delay = 3
     started = time.monotonic()
     assert webhooks.post(receiver.url(), b"{}", {"Content-Type": "application/json"}, timeout=1) == ("network_error", None)
@@ -711,8 +713,6 @@ def test_rotation_signs_with_both_secrets_during_the_grace_period_and_keeps_the_
     assert standard_webhooks_verify(new_secret, request["headers"], request["body"])
     with pytest.raises(InvalidWebhook):
         standard_webhooks_verify(old_secret, request["headers"], request["body"])
-    assert query(pg_store, "SELECT previous_secret,previous_secret_expires_at FROM baton.x_webhook")[0] == {
-        "previous_secret": None, "previous_secret_expires_at": None}, "an expired secret is discarded, not kept"
 
     audit = query(pg_store, "SELECT event,metadata FROM baton.x_audit WHERE event='webhook.secret_rotated'")
     assert len(audit) == 1 and audit[0]["metadata"]["grace_seconds"] == 24 * 3600
@@ -723,13 +723,14 @@ def test_rotation_signs_with_both_secrets_during_the_grace_period_and_keeps_the_
     assert new_secret not in output.out + output.err
 
 
-def test_rotating_twice_in_the_grace_period_retires_the_oldest_secret_and_the_grace_is_configurable(team, receiver, modules, pg_store, monkeypatch):
+def test_rotating_twice_in_the_grace_period_retires_the_oldest_secret_and_the_grace_is_configurable(team, receiver, modules, pg_store):
     call, identities, space, page = team
     subscription = call("worker", "webhook_subscribe", operation_id=op(), url=receiver.url(), events=["task.assigned"])
     first = subscription["signing_secret"]
-    monkeypatch.setenv("BATON_WEBHOOK_ROTATION_GRACE_SECONDS", "3600")
+    pg_store.rotation_grace_seconds = 3600
     second = call("worker", "webhook_rotate_secret", operation_id=op(), subscription_id=subscription["subscription_id"])
-    monkeypatch.delenv("BATON_WEBHOOK_ROTATION_GRACE_SECONDS")
+    assert datetime.timedelta(minutes=59) < datetime.datetime.fromisoformat(second["previous_secret_expires_at"]) - datetime.datetime.now(datetime.timezone.utc) <= datetime.timedelta(hours=1)
+    pg_store.rotation_grace_seconds = 24 * 3600
     third = call("worker", "webhook_rotate_secret", operation_id=op(), subscription_id=subscription["subscription_id"])
     ends = datetime.datetime.fromisoformat(third["previous_secret_expires_at"]) - datetime.datetime.now(datetime.timezone.utc)
     assert datetime.timedelta(hours=23) < ends <= datetime.timedelta(hours=24)
@@ -741,6 +742,136 @@ def test_rotating_twice_in_the_grace_period_retires_the_oldest_secret_and_the_gr
     assert standard_webhooks_verify(second["signing_secret"], request["headers"], request["body"])
     with pytest.raises(InvalidWebhook):
         standard_webhooks_verify(first, request["headers"], request["body"])
+
+
+def claimed_item(store):
+    items = store.webhook_claim_due(SERVICE_ACTOR)
+    assert len(items) == 1
+    return items[0]
+
+
+def test_revoking_the_previous_secret_ends_the_grace_period_at_once_even_for_deliveries_already_claimed(team, receiver, modules, pg_store):
+    call, identities, space, page = team
+    subscription = call("worker", "webhook_subscribe", operation_id=op(), url=receiver.url(), events=["task.assigned"])
+    subscription_id, old_secret = subscription["subscription_id"], subscription["signing_secret"]
+    new_secret = call("worker", "webhook_rotate_secret", operation_id=op(), subscription_id=subscription_id)["signing_secret"]
+    make_task(call, identities, page)
+    item = claimed_item(pg_store)
+    assert "secrets" not in item and "secret" not in item, "the claim carries no key material; it is read at send time"
+    assert len(pg_store.webhook_signing_secrets(SERVICE_ACTOR, subscription_id)) == 2
+
+    revoke_id = op()
+    revoked = call("worker", "webhook_revoke_previous_secret", operation_id=revoke_id, subscription_id=subscription_id)
+    assert revoked == {"subscription_id": subscription_id, "revoked": True, "replay": False}
+    assert call("worker", "webhook_revoke_previous_secret", operation_id=revoke_id, subscription_id=subscription_id)["replay"] is True
+    again = call("worker", "webhook_revoke_previous_secret", operation_id=op(), subscription_id=subscription_id)
+    assert again["revoked"] is False
+    assert pg_store.webhook_signing_secrets(SERVICE_ACTOR, subscription_id) == [key_of(new_secret)]
+    assert query(pg_store, "SELECT previous_secret,previous_secret_expires_at FROM baton.x_webhook")[0] == {
+        "previous_secret": None, "previous_secret_expires_at": None}
+
+    asyncio.run(modules[1].deliver_webhook(item, asyncio.Semaphore(1)))
+    request = receiver.requests.pop()
+    assert len(request["headers"]["webhook-signature"].split(" ")) == 1
+    assert standard_webhooks_verify(new_secret, request["headers"], request["body"])
+    with pytest.raises(InvalidWebhook):
+        standard_webhooks_verify(old_secret, request["headers"], request["body"])
+    assert query(pg_store, "SELECT state,attempts FROM baton.x_webhook_delivery")[0] == {"state": "delivered", "attempts": 1}
+
+    assert call("reviewer", "webhook_revoke_previous_secret", 404, operation_id=op(), subscription_id=subscription_id)["code"] == "not_found"
+    assert call("worker", "webhook_revoke_previous_secret", 404, operation_id=op(), subscription_id=str(uuid.uuid4()))["code"] == "not_found"
+    assert call("worker", "webhook_revoke_previous_secret", 422, operation_id=op(), subscription_id="nope")["code"] == "invalid"
+    audit = query(pg_store, "SELECT metadata FROM baton.x_audit WHERE event='webhook.previous_secret_revoked'")
+    assert len(audit) == 2 and all(set(row["metadata"]) == {"subscription_id"} for row in audit)
+    assert old_secret not in json.dumps(query(pg_store, "SELECT result::text AS t FROM baton.operations"))
+
+
+def test_a_rotation_after_the_claim_is_applied_to_the_attempt_and_a_deleted_subscription_sends_nothing(team, receiver, modules, pg_store):
+    call, identities, space, page = team
+    kept = call("worker", "webhook_subscribe", operation_id=op(), url=receiver.url("/kept"), events=["task.assigned"])
+    make_task(call, identities, page)
+    item = claimed_item(pg_store)
+    rotated = call("worker", "webhook_rotate_secret", operation_id=op(), subscription_id=kept["subscription_id"])
+    asyncio.run(modules[1].deliver_webhook(item, asyncio.Semaphore(1)))
+    request = receiver.requests.pop()
+    assert len(request["headers"]["webhook-signature"].split(" ")) == 2
+    assert standard_webhooks_verify(rotated["signing_secret"], request["headers"], request["body"])
+    assert standard_webhooks_verify(kept["signing_secret"], request["headers"], request["body"])
+
+    make_task(call, identities, page)
+    due_now(pg_store)
+    item = claimed_item(pg_store)
+    call("worker", "webhook_delete", operation_id=op(), subscription_id=kept["subscription_id"])
+    asyncio.run(modules[1].deliver_webhook(item, asyncio.Semaphore(1)))
+    assert receiver.requests == []
+
+
+@pytest.mark.parametrize("bad", ["abc", "-1", "1.5", "1e3", "86400s", "2592001", "99999999999", "٣", "0x10", "1 2", "+5"])
+def test_an_invalid_rotation_grace_setting_refuses_startup_instead_of_falling_back(bad, modules, pg_store, monkeypatch):
+    with pytest.raises(ValueError):
+        parse_rotation_grace(bad)
+    monkeypatch.setenv("BATON_WEBHOOK_ROTATION_GRACE_SECONDS", bad)
+    with pytest.raises(ValueError):
+        SpaceStore.from_env()
+    server = modules[1]
+    server._STORE = None
+    async def boot():
+        async with server.lifespan(server.app):
+            pass
+    with pytest.raises(server.BridgeError):
+        asyncio.run(boot())
+    server._STORE = pg_store
+
+
+def test_valid_rotation_grace_settings_are_parsed_exactly(monkeypatch):
+    assert parse_rotation_grace(None) == parse_rotation_grace("") == parse_rotation_grace("  ") == 24 * 3600
+    assert (parse_rotation_grace("0"), parse_rotation_grace(" 3600 "), parse_rotation_grace("2592000")) == (0, 3600, 2592000)
+    monkeypatch.setenv("BATON_WEBHOOK_ROTATION_GRACE_SECONDS", "0")
+    assert SpaceStore.from_env().rotation_grace_seconds == 0
+    monkeypatch.delenv("BATON_WEBHOOK_ROTATION_GRACE_SECONDS")
+    assert SpaceStore.from_env().rotation_grace_seconds == 24 * 3600
+
+
+def test_grace_zero_rotation_stops_the_old_secret_immediately_and_changing_the_setting_later_changes_nothing(team, receiver, modules, pg_store):
+    call, identities, space, page = team
+    subscription = call("worker", "webhook_subscribe", operation_id=op(), url=receiver.url(), events=["task.assigned"])
+    rotated = call("worker", "webhook_rotate_secret", operation_id=op(), subscription_id=subscription["subscription_id"])
+    ends = datetime.datetime.fromisoformat(rotated["previous_secret_expires_at"]) - datetime.datetime.now(datetime.timezone.utc)
+    assert datetime.timedelta(hours=23) < ends, "the default grace period stands until it is explicitly revoked"
+    pg_store.rotation_grace_seconds = 0
+    assert len(pg_store.webhook_signing_secrets(SERVICE_ACTOR, subscription["subscription_id"])) == 2
+    zero = call("worker", "webhook_rotate_secret", operation_id=op(), subscription_id=subscription["subscription_id"])
+    assert len(pg_store.webhook_signing_secrets(SERVICE_ACTOR, subscription["subscription_id"])) == 1
+    pg_store.rotation_grace_seconds = 24 * 3600
+    assert zero["signing_secret"] != rotated["signing_secret"]
+
+
+def test_expired_secret_cleanup_is_throttled_indexed_and_never_needed_for_correctness(team, receiver, modules, pg_store):
+    call, identities, space, page = team
+    subscription = call("worker", "webhook_subscribe", operation_id=op(), url=receiver.url(), events=["task.assigned"])
+    call("worker", "webhook_rotate_secret", operation_id=op(), subscription_id=subscription["subscription_id"])
+    index = query(pg_store, "SELECT indexdef FROM pg_indexes WHERE schemaname='baton' AND indexname='webhook_previous_secret_expiry'")
+    assert len(index) == 1 and "previous_secret_expires_at IS NOT NULL" in index[0]["indexdef"]
+
+    def expire():
+        execute(pg_store, "UPDATE baton.x_webhook SET previous_secret_expires_at=clock_timestamp()-interval '1 second'")
+    def stored():
+        return query(pg_store, "SELECT previous_secret IS NOT NULL AS kept FROM baton.x_webhook")[0]["kept"]
+
+    pg_store._secret_sweep_at = None
+    expire()
+    assert len(pg_store.webhook_signing_secrets(SERVICE_ACTOR, subscription["subscription_id"])) == 1, "expired secrets never sign, swept or not"
+    assert stored(), "reading and signing do not clean up"
+    assert pg_store.webhook_claim_due(SERVICE_ACTOR) == [] and not stored(), "the first claim sweeps"
+
+    call("worker", "webhook_rotate_secret", operation_id=op(), subscription_id=subscription["subscription_id"])
+    expire()
+    for _ in range(5):
+        assert pg_store.webhook_claim_due(SERVICE_ACTOR) == []
+    assert stored(), "claims inside the sweep interval do not run the cleanup"
+    pg_store._secret_sweep_at = time.monotonic() - 61
+    pg_store.webhook_claim_due(SERVICE_ACTOR)
+    assert not stored(), "the cleanup runs again once the interval has passed"
 
 
 def test_retries_keep_the_webhook_id_and_sign_each_attempt_with_a_fresh_timestamp(team, receiver, modules, pg_store, monkeypatch):

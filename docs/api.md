@@ -76,6 +76,7 @@ with urlopen(request) as response:
 - `webhook_list()` — 读取。
 - `webhook_delete(operation_id: str, subscription_id: str)` — 写入。
 - `webhook_rotate_secret(operation_id: str, subscription_id: str)` — 写入；仅此一次返回新的 `signing_secret`，旧密钥在宽限期内继续参与签名。见“密钥轮换”。
+- `webhook_revoke_previous_secret(operation_id: str, subscription_id: str)` — 写入；立即结束宽限期，旧密钥从下一次投递尝试起不再签名。见“密钥轮换”。
 - `claim(operation_id: str, task_id: str, lease_seconds: int = 300)` — 写入。
 - `renew(operation_id: str, task_id: str, epoch: int, lease_seconds: int = 300)` — 写入。
 - `submit_result(operation_id: str, task_id: str, epoch: int, result: str, evidence: Any = None)` — 写入。
@@ -249,7 +250,10 @@ def verify(signing_secret: str, headers: dict, raw_body: bytes) -> bool:
     return False
 ```
 
-**密钥轮换。** `webhook_rotate_secret(operation_id, subscription_id)` 为自己的订阅生成新密钥，返回 `{"subscription_id","signing_secret","previous_secret_expires_at","replay"}`；新的 `whsec_` 密钥只在首次成功响应中出现，不写入重放结果、审计或日志。订阅不存在或不属于调用者返回 `404`。此后每次投递同时用新旧两个密钥签名（`webhook-signature` 里两项 `v1`），直到 `previous_secret_expires_at`（默认 24 小时，运营者可用 `BATON_WEBHOOK_ROTATION_GRACE_SECONDS` 设置 0 到 30 天的秒数）；到期后旧密钥被清除，只剩一项。推荐流程：轮换，把新密钥部署到接收端（接收端可同时接受新旧两个密钥），确认新密钥通过后让旧密钥过期。宽限期内再次轮换会让最旧的密钥立即失效：任何时刻最多两个密钥签名。审计事件 `webhook.secret_rotated` 只记录订阅标识和宽限秒数。
+**密钥轮换。** `webhook_rotate_secret(operation_id, subscription_id)` 为自己的订阅生成新密钥，返回 `{"subscription_id","signing_secret","previous_secret_expires_at","replay"}`；新的 `whsec_` 密钥只在首次成功响应中出现，不写入重放结果、审计或日志。订阅不存在或不属于调用者返回 `404`。此后每次投递同时用新旧两个密钥签名（`webhook-signature` 里两项 `v1`），直到 `previous_secret_expires_at`（默认 24 小时，运营者可用 `BATON_WEBHOOK_ROTATION_GRACE_SECONDS` 设置 0 到 30 天的秒数）；到期后旧密钥不再签名，只剩一项（数据库中的旧密钥由后台约每分钟清理一次，签名时本来就忽略已过期的密钥）。`BATON_WEBHOOK_ROTATION_GRACE_SECONDS` 是 bridge **启动时**读取的默认值（必须是 0 到 2592000 的十进制整数；空值表示 24 小时，其他任何值都会让 bridge 拒绝启动，不会悄悄回退），只影响此后的轮换，不会改变已经开始的宽限期；默认 Compose 不把它传给 bridge，需要由运营者加入 bridge 服务的环境变量。推荐流程：轮换，把新密钥部署到接收端（接收端可同时接受新旧两个密钥），确认新密钥通过后让旧密钥过期，或用 `webhook_revoke_previous_secret` 提前结束宽限期。宽限期内再次轮换会让最旧的密钥立即失效：任何时刻最多两个密钥签名。
+
+**立即作废旧密钥。** `webhook_revoke_previous_secret(operation_id, subscription_id)` 清除订阅正在宽限期内的旧密钥，返回 `{"subscription_id","revoked","replay"}`（没有旧密钥时 `revoked` 为 `false`，调用仍成功）；订阅不存在或不属于调用者返回 `404`。签名密钥在每次投递尝试发出前才读取，所以此后新发出的尝试只用当前密钥签名，已经排队或重试中的投递也一样；唯一残留的窗口是读取密钥到请求发出之间的几毫秒到数秒，作废前已发出的请求不会撤回。怀疑旧密钥泄漏时：先 `webhook_rotate_secret`，再立即 `webhook_revoke_previous_secret`，并把新密钥部署到接收端；这期间接收端还在用旧密钥会验证失败并触发重试，部署新密钥后重试即可通过。审计事件 `webhook.previous_secret_revoked` 只记录订阅标识。
+审计事件 `webhook.secret_rotated` 只记录订阅标识和宽限秒数。
 
 **迁移：已弃用的 `X-Baton-*` 头。** 为兼容现有接收端，这些旧头再保留一个版本，同时与 `webhook-*` 头一起发送；它们已弃用，下个版本会被移除，请迁移到上面的 `webhook-*` 头：
 
