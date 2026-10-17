@@ -111,6 +111,11 @@ def pg_store(modules, tmp_path, monkeypatch):
             connection.execute(sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA baton TO {}").format(role))
             connection.execute(sql.SQL("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA baton TO {}").format(role))
             connection.execute(sql.SQL("REVOKE UPDATE, DELETE, TRUNCATE ON baton.x_audit FROM {}").format(role))
+            connection.execute(sql.SQL("REVOKE ALL ON baton.x_claim_holder FROM {}").format(role))
+            connection.execute(sql.SQL("GRANT SELECT, INSERT ON baton.x_claim_holder TO {}").format(role))
+            connection.execute(sql.SQL("REVOKE ALL ON baton.x_delegation FROM {}").format(role))
+            connection.execute(sql.SQL("GRANT SELECT, INSERT ON baton.x_delegation TO {}").format(role))
+            connection.execute(sql.SQL("GRANT UPDATE (revoked_at, revoked_by) ON baton.x_delegation TO {}").format(role))
         config_path = tmp_path / "database.json"
         config_path.write_text(json.dumps({**app_config, "dbname": database}))
         config_path.chmod(0o600)
@@ -176,3 +181,18 @@ def fake_codex(modules, tmp_path, monkeypatch):
             {"steps": list(steps), "result": result, "exit": exit}))
     script()
     return script
+
+
+@pytest.fixture
+def approver():
+    """Give a principal an approver delegation granted by the space owner `by`, through the API path."""
+    from bridge.space_store import Actor
+
+    def actor(who):
+        return Actor(who["agent"], who["account"], who["kind"]) if isinstance(who, dict) else who
+
+    def grant(store, delegate, by, **kwargs):
+        return store.delegation_create(actor(by), str(uuid.uuid4()), actor(delegate), space_id=kwargs.get("space_id"),
+                                       expires_at=kwargs.get("expires_at"), may_delegate=kwargs.get("may_delegate", False),
+                                       reason="DECISIONS 291")
+    return grant

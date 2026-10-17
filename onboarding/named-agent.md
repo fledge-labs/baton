@@ -41,7 +41,7 @@ adapters/launch_mcp.sh beigua "$HOME/.config/baton/beigua.token" \
 2. 对愿意处理的任务调用 `claim(task_id, operation_id, lease_seconds)`。保存返回的 `epoch`；其他身份不能抢走显式分给自己的任务。
 3. 在自己的 CLI 权限边界内执行。需要更多时间时调用 `renew(task_id, epoch, operation_id, lease_seconds)`；过期或 fence 失效后停止提交旧结果，不能绕过检查。
 4. 调用 `submit_result(task_id, epoch, result, evidence, operation_id)`。结果以实际持有人署名写入同一任务线程，任务进入 `awaiting_gate`。也可用 `comment(page_id, thread_id=task_id, body, operation_id)`补充说明。
-5. 发起人或配置的 reviewer 检查结果后调用 `gate(task_id, expected_epoch=result_epoch, decision="pass", evidence, operation_id)`，此后才成为 `done`，兼容视图为 `completed`。持有人不能自批自己的结果。
+5. 发起人或配置的 reviewer 检查结果后调用 `gate(task_id, expected_epoch=result_epoch, decision="pass", evidence, operation_id)`，此后才成为 `done`，兼容视图为 `completed`。Space owner（根）可直接批准；其他配置的 reviewer 还必须持有覆盖该任务的审批人委托（`delegation_required`），持有人和提交者不能批准自己执行的结果（根可显式带 `self_approval`）。
 
 每个有副作用的新动作使用一个稳定 UUID `operation_id`；网络重试复用它，不重新生成。MCP `submit_task` 兼容工具根据 principal 与业务键生成操作 ID；直接调用 HTTP 时需显式提供。
 

@@ -19,6 +19,20 @@ DBA 登录是 `baton_bootstrap`；它只由数据库初始化与短期迁移服�
 
 `x_audit` 的 owner 触发器拒绝 UPDATE/DELETE/TRUNCATE；应用没有这些表权限，也无法 DISABLE TRIGGER 或改变所有者。它保证应用角色下的追加约束，不抵抗 PostgreSQL 超级用户、Docker 管理员或宿主失陷。业务授权仍由服务端验证，不能以持有数据库应用密码代替用户权限模型。
 
+## 委托链与审批关卡
+
+审批关卡：只有持有审批人委托的主体（人或 agent）才能批准，任何人不能批准自己提交或执行的工作。**Space owner 是根审批人**：根是创建 Space 时记录的一个精确身份（`spaces.owner_principal` + `owner_account` + `owner_kind`，不分 kind），天然拥有审批权，不需要委托记录；共用账户不等于根（A15 的精确 principal 匹配）：同账户的其他 principal、人类账户下的 agent、同名但 kind 不同的主体都必须持有委托。没有 `owner_principal` 的 Space（旧数据无法由 `space.created` 审计事件回填）没有根，直到运维人员用 `python -m bridge.delegations set-space-owner`（要求账户等于该 Space 现有 owner 账户，写 `space.owner_set` 审计）设置；该命令改变谁是根，信任边界与运维路径相同；委托只从根向下流动。其他主体：配置的 reviewer 决定请谁审阅，覆盖该任务的有效审批人委托决定其能否批准，两者缺一不可，人类也不例外；服务自动写入的 `worker_success` gate 例外。
+
+自批：除根以外，gate 拒绝结果作者、在被审批 epoch 持有过 claim 的 principal 或 account（`x_claim_holder` 追加记录，handoff 时原持有人计入新 epoch）和执行 worker 身份；只创建请求的任务 owner 可以批准。根可以批准自己的工作，但必须在 gate 调用里显式给出 `self_approval=true`，否则被拒绝；这类批准在 `x_gate`（`self_approval`、`root`）和审计里如实标记，不会冒充别人的批准。因为按 account 判断，连接在 owner 账户上的 agent 也是根，同样受这条标志约束。
+
+委托链：根委托的授权人是该 Space 的根身份；持有该 Space 中有效 `may_delegate=true` 委托的主体可以授予子委托，`parent_id` 指向它持有的那条。被委托方永远不能超过授权人（Space 相同或更窄，过期不晚于父委托），任何祖先被撤销、过期或不满足上述约束，子委托立即失效；gate 时在同一数据库事务内重新校验整条链，包括授权人必须是父委托的被委托方、链的根授权人必须正是任务所在 Space 的根身份（principal、account、kind 全部相等，所以委托不会伸进根授权人不拥有的 Space，也不会因同账户的别的主体而成立）、链最多 3 层，重放同一请求时再校验一次。创建时拒绝会形成环的委托：不能授予自己、自己上方的根或链上已有的人（按 principal 判断）。审批人角色只授予批准权，不授予读写权限，也不会让主体成为 reviewer。每次创建、撤销和 gate 都在审计中记录完整链（从叶到根的委托 ID）。
+
+委托有两条创建路径。API 路径：Space owner 创建根委托，持有 `may_delegate` 委托的主体创建子委托，授权人就是调用者，service 一律拒绝；非 owner 且没有 `may_delegate` 委托的调用者被拒绝。运维路径：在 bridge 容器内运行 `python -m bridge.delegations`，用于 owner 尚无人类身份的阶段，记录 owner 的根委托，授权人不需要 token，但授权人必须正是所指 Space 记录的根身份，被委托方不能是授权人，且只能记录根委托，所以它受同样的规则约束。运维路径的信任边界是能进入 bridge 容器并读到应用数据库配置的人，属于已列为可信边界的 Docker 管理员；它的写入同样记入 `x_audit`，`requested_by` 是授权人，`performed_by` 是 `operator:<名称>`，名称来自命令行自报，不是认证结果。操作员能以根身份记录委托并设置根身份，这是该路径的用途，也是可信假设。被委托方必须是注册表中已连接且 account 一致的主体，防止别人事后注册同名主体继承委托。按 DECISIONS 287、291，owner 是根，南瓜持有 owner 的审批人委托。
+
+双人确认：策略 `x_approval_policy` 是运维管理的存储配置，API 不暴露，变更只经 `python -m bridge.delegations policy-*` 并写审计（应用角色对该表有普通 DML 权限，与其他业务表一样不抵抗应用数据库凭据泄露）；任务创建者能提高要求，只有创建者是 Space owner 时才能降低，所以非 owner 的 agent 不能用任务覆盖绕过策略。要求两个批准时需要两个不同账户的审批人对同一 `result_epoch` 都通过；`root_required` 时根必须是其中之一；任何有权方的 fail 把任务退回，根的 fail 也一样；旧 epoch 的批准不计数。双人确认能防止单个被盗的委托独自完成关键任务，但它不抵抗 owner 账户本身失陷（根加一个委托审批人时，根仍是单点）。
+
+`x_delegation` 只追加：触发器拒绝 DELETE 与 TRUNCATE，UPDATE 只允许对未撤销的行一次性写入 `revoked_at` 与 `revoked_by`；应用角色只有 SELECT、INSERT 和这两列的 UPDATE，`x_claim_holder` 只有 SELECT、INSERT。与 `x_audit` 相同，这不抵抗 PostgreSQL 超级用户、Docker 管理员或宿主失陷。委托和 gate 审计只记录标识、范围、Space、创建路径、链和计数，不含 reason 文本；reason 只存在于委托行。
+
 ## 网络与执行隔离
 
 默认 HTTP 仅绑定回环地址；外部访问必须启用 TLS override 与有效证书。后端没有 published ports。PostgreSQL 使用单独 internal network，仅 bridge 和 migrate 连接；worker 的 harness 通过自身 egress 调用模型，工具网络由内层沙箱禁止。页面 Host/Origin 白名单由 PUBLIC_URL 推导。

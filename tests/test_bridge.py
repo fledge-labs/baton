@@ -613,3 +613,229 @@ def test_none_scope_over_http_lets_footprintless_manual_tasks_be_claimed_togethe
     for scopes in ([{"kind": "none"}, {"kind": "path", "value": "src"}], [{"kind": "none", "value": ""}]):
         assert call("owner", "create_task_block", 422, operation_id=op(), page_id=page["id"], prompt="Bad",
                     scopes=scopes, reviewers=[reviewer])["code"] == "invalid"
+
+
+def judged_task(call, identities, page, suffix, reviewers=("replacement",), executor="worker", creator="owner", **extra):
+    """A submitted candidate, executed by `executor`, whose configured reviewers are the named identities."""
+    task = call(creator, "create_task_block", operation_id=op(), page_id=page["id"], prompt="Synthetic reviewed " + suffix,
+                scopes=[{"kind": "path", "value": "src/approver-" + suffix}], reviewers=[identities[label]["agent"] for label in reviewers], **extra)
+    claim = call(executor, "claim", operation_id=op(), task_id=task["task_id"])
+    call(executor, "submit_result", operation_id=op(), task_id=task["task_id"], epoch=claim["epoch"], result="Candidate " + suffix)
+    return task, claim
+
+
+def test_approver_gate_over_http_root_delegates_and_everyone_else_needs_a_delegation(api):
+    client, call, identities, tokens, _, _ = api
+    space, page = shared_page(call, identities)
+    agent, human = identities["replacement"]["agent"], identities["reviewer"]["agent"]
+    task, claim = judged_task(call, identities, page, "http", ("replacement", "reviewer"))
+    gate = dict(task_id=task["task_id"], expected_epoch=claim["epoch"], decision="pass")
+    for label in ("replacement", "reviewer"):
+        assert call(label, "gate", 403, operation_id=op(), **gate)["code"] == "delegation_required"
+    assert call("worker", "gate", 403, operation_id=op(), **gate)["code"] == "forbidden"
+    for label in ("replacement", "worker", "stranger", "reviewer"):
+        target = identities["stranger" if label != "stranger" else "worker"]["agent"]
+        assert call(label, "delegation_create", 403, operation_id=op(), delegate_principal=target, reason="DECISIONS 291")["code"] == "forbidden"
+    assert call("replacement", "delegation_revoke", 404, operation_id=op(), delegation_id=str(uuid.uuid4()))["code"] == "not_found"
+    for broken in (dict(delegate_principal="nobody-registered"), dict(delegate_principal=agent, scope="gate"), dict(delegate_principal=agent, delegate="x"),
+                   dict(delegate_principal=agent, may_delegate="yes"), dict(delegate_principal=identities["owner"]["agent"])):
+        assert call("owner", "delegation_create", 422, operation_id=op(), reason="DECISIONS 291", **broken)["code"] == "invalid"
+    assert call("replacement", "delegation_list") == []
+    root = call("owner", "delegation_create", operation_id=op(), delegate_principal=agent, space_id=space["id"], may_delegate=True, reason="DECISIONS 291")
+    assert root["delegate"] == agent and root["scope"] == "approve" and root["created_via"] == "api" and root["active"] is True
+    assert root["may_delegate"] is True and root["parent_id"] is None and root["chain"] == [root["id"]]
+    assert call("replacement", "delegation_revoke", 403, operation_id=op(), delegation_id=root["id"])["code"] == "forbidden"
+    child = call("replacement", "delegation_create", operation_id=op(), delegate_principal=human, space_id=space["id"], reason="DECISIONS 291")
+    assert child["parent_id"] == root["id"] and child["grantor"] == agent and child["chain"] == [child["id"], root["id"]]
+    assert call("replacement", "delegation_create", 422, operation_id=op(), delegate_principal=human, reason="wider than the parent")["code"] == "invalid"
+    assert call("replacement", "delegation_create", 422, operation_id=op(), delegate_principal=identities["owner"]["agent"],
+                space_id=space["id"], reason="to the root above")["code"] == "invalid"
+    assert {row["id"] for row in call("replacement", "delegation_list")} == {root["id"], child["id"]}
+    assert [row["id"] for row in call("reviewer", "delegation_list")] == [child["id"]]
+    assert call("worker", "delegation_list") == []
+    assert call("reviewer", "gate", operation_id=op(), **gate)["state"] == "done"
+    reviewed = [row for row in call("owner", "list_audit", task_id=task["task_id"]) if row["event"] == "gate.reviewed"]
+    assert reviewed[0]["metadata"]["chain"] == [child["id"], root["id"]] and reviewed[0]["metadata"]["grantor"] == agent
+    second, second_claim = judged_task(call, identities, page, "http-revoked", ("replacement", "reviewer"))
+    assert call("owner", "delegation_revoke", operation_id=op(), delegation_id=root["id"])["active"] is False
+    for label in ("replacement", "reviewer"):
+        again = call(label, "gate", 403, operation_id=op(), task_id=second["task_id"], expected_epoch=second_claim["epoch"], decision="pass")
+        assert again["code"] == "delegation_required"
+    third, third_claim = judged_task(call, identities, page, "http-root", ("replacement",))
+    rooted = call("owner", "gate", operation_id=op(), task_id=third["task_id"], expected_epoch=third_claim["epoch"], decision="pass")
+    assert rooted["state"] == "done"
+    audit = [row for row in call("owner", "list_audit", task_id=third["task_id"]) if row["event"] == "gate.reviewed"]
+    assert audit[0]["metadata"]["root"] is True and audit[0]["metadata"]["self_approval"] is False and audit[0]["metadata"]["chain"] == []
+    schema = client.get("/v1/space/schema", headers={"Authorization": "Bearer " + tokens["owner"]}).json()["operations"]
+    assert {"delegation_create", "delegation_revoke", "delegation_list"} <= schema.keys()
+    assert "delegate" not in schema["delegation_create"]["request"]["properties"]
+    assert "delegate_principal" in schema["delegation_create"]["request"]["required"]
+    assert "self_approval" in schema["gate"]["request"]["properties"] and "approvals_required" in schema["create_task_block"]["request"]["properties"]
+
+
+def test_root_self_approval_flag_and_non_root_refusals_over_http(api):
+    _, call, identities, _, _, _ = api
+    space, page = shared_page(call, identities)
+    owner_task, owner_claim = judged_task(call, identities, page, "self", ("reviewer",), executor="owner")
+    gate = dict(task_id=owner_task["task_id"], expected_epoch=owner_claim["epoch"], decision="pass")
+    assert call("owner", "gate", 403, operation_id=op(), **gate)["code"] == "forbidden"
+    assert call("owner", "gate", 403, operation_id=op(), self_approval=False, **gate)["code"] == "forbidden"
+    assert call("owner", "gate", 422, operation_id=op(), self_approval="yes", **gate)["code"] == "invalid"
+    assert call("owner", "gate", operation_id=op(), self_approval=True, **gate)["state"] == "done"
+    event = next(row for row in call("owner", "list_audit", task_id=owner_task["task_id"]) if row["event"] == "gate.reviewed")
+    assert event["metadata"]["self_approval"] is True and event["metadata"]["root"] is True
+    call("owner", "delegation_create", operation_id=op(), delegate_principal=identities["worker"]["agent"], reason="DECISIONS 291")
+    task, claim = judged_task(call, identities, page, "worker-self", ("worker",))
+    for flag in (False, True):
+        assert call("worker", "gate", 403, operation_id=op(), self_approval=flag, task_id=task["task_id"],
+                    expected_epoch=claim["epoch"], decision="pass")["code"] == "forbidden"
+
+
+def test_two_party_confirmation_over_http(api, pg_store):
+    _, call, identities, _, _, _ = api
+    space, page = shared_page(call, identities)
+    for label in ("replacement", "reviewer"):
+        call("owner", "delegation_create", operation_id=op(), delegate_principal=identities[label]["agent"], reason="DECISIONS 291")
+    task, claim = judged_task(call, identities, page, "two", ("replacement", "reviewer"), approvals_required=2)
+    gate = dict(task_id=task["task_id"], expected_epoch=claim["epoch"], decision="pass")
+    first = call("replacement", "gate", operation_id=op(), **gate)
+    assert first["state"] == "awaiting_gate" and first["approvals_required"] == 2 and first["approvals_passed"] == 1 and first["status"] != "completed"
+    assert call("replacement", "gate", 403, operation_id=op(), **gate)["code"] == "forbidden"
+    assert call("worker", "get_task", task_id=task["task_id"])["approvals_required"] == 2
+    assert call("reviewer", "gate", operation_id=op(), **gate)["state"] == "done"
+    assert call("owner", "create_task_block", 422, operation_id=op(), page_id=page["id"], prompt="Synthetic bad", approvals_required=3,
+                scopes=[{"kind": "path", "value": "src/bad"}], reviewers=[identities["reviewer"]["agent"]])["code"] == "invalid"
+    pg_store.set_approval_policy(space["id"], "path", "src/approver-rooted", 1, True, "operator-a")
+    rooted, rooted_claim = judged_task(call, identities, page, "rooted", ("replacement",))
+    held = call("replacement", "gate", operation_id=op(), task_id=rooted["task_id"], expected_epoch=rooted_claim["epoch"], decision="pass")
+    assert held["state"] == "awaiting_gate" and held["root_required"] is True
+    assert call("owner", "gate", operation_id=op(), task_id=rooted["task_id"], expected_epoch=rooted_claim["epoch"], decision="fail")["state"] == "queued"
+
+
+def run_delegations(*argv):
+    import subprocess
+    import sys
+    done = subprocess.run([sys.executable, "-m", "bridge.delegations", *argv], capture_output=True, text=True,
+                          cwd=Path(__file__).parents[1], timeout=60)
+    return done.returncode, done.stdout, done.stderr
+
+
+def test_operator_cli_records_the_space_owner_as_root_grantor_and_round_trips(api, modules, pg_store):
+    client, call, identities, tokens, _, _ = api
+    space, page = shared_page(call, identities)
+    judge = identities["replacement"]
+    owner_name, owner_account, operator = identities["owner"]["agent"], identities["owner"]["account"], "operator-anat"
+    base = ["--grantor", owner_name, "--grantor-account", owner_account, "--delegate", judge["agent"],
+            "--delegate-account", judge["account"], "--scope", "approve", "--reason", "DECISIONS 291", "--operator", operator]
+    for broken in (["--delegate", "unregistered-agent"], ["--delegate-account", "wrong-account"], ["--grantor", identities["worker"]["agent"]],
+                   ["--grantor", "another-person-on-the-owner-account"], ["--grantor-kind", "agent"],
+                   ["--grantor-account", identities["worker"]["account"], "--space", space["id"]], ["--space", str(uuid.uuid4())],
+                   ["--expires", "2001-01-01T00:00:00+00:00"], ["--reason", "x" * 501],
+                   ["--grantor-account", judge["account"]], ["--grantor-kind", "agent", "--grantor", identities["reviewer"]["agent"]]):
+        code, out, err = run_delegations("create", *base, *broken)
+        assert code == 1 and out == "" and json.loads(err)["error"] in {"invalid", "not_found"}, broken
+    assert run_delegations("create", *base[:-2])[0] == 2
+    assert run_delegations("create", *[a if a != "approve" else "gate" for a in base])[0] == 2
+    assert run_delegations("list")[1].strip() == "[]"
+
+    code, out, err = run_delegations("create", *base, "--space", space["id"], "--expires", "2099-01-01T00:00:00Z", "--may-delegate")
+    assert code == 0 and err == ""
+    created = json.loads(out)
+    assert created["created_via"] == "operator" and created["created_by"] == operator and created["grantor"] == owner_name
+    assert created["grantor_kind"] == "human" and created["parent_id"] is None and created["may_delegate"] is True
+    assert created["delegate"] == judge["agent"] and created["space_id"] == space["id"] and created["chain"] == [created["id"]]
+    assert created["scope"] == "approve" and created["active"] is True and created["revoked_at"] is None
+    for secret in ("password", "token", "hash", "secret"):
+        assert secret not in out.lower()
+    assert [row["id"] for row in json.loads(run_delegations("list")[1])] == [created["id"]]
+    assert [row["id"] for row in call("replacement", "delegation_list")] == [created["id"]]
+    assert json.loads(run_delegations("list", "--active")[1])[0]["id"] == created["id"]
+
+    child = call("replacement", "delegation_create", operation_id=op(), delegate_principal=identities["reviewer"]["agent"],
+                 space_id=space["id"], expires_at="2098-01-01T00:00:00Z", reason="DECISIONS 291")
+    assert child["chain"] == [child["id"], created["id"]]
+    task, claim = judged_task(call, identities, page, "operator", ("replacement", "reviewer"))
+    assert call("replacement", "gate", operation_id=op(), task_id=task["task_id"], expected_epoch=claim["epoch"], decision="pass")["state"] == "done"
+    audit = call("owner", "list_audit", space_id=space["id"], limit=1000)
+    gate = next(row for row in audit if row["event"] == "gate.reviewed" and row["task_id"] == task["task_id"])
+    assert gate["metadata"]["delegation_id"] == created["id"] and gate["metadata"]["grantor"] == owner_name and gate["metadata"]["chain"] == [created["id"]]
+    event = next(row for row in audit if row["event"] == "delegation.created" and row["metadata"]["delegation_id"] == created["id"])
+    assert event["requested_by"] == owner_name and event["performed_by"] == "operator:" + operator
+    assert event["agent"] == owner_name and event["actor_account"] == owner_account and event["actor_kind"] == "human"
+    assert event["metadata"] == {"delegation_id": created["id"], "scope": "approve", "created_via": "operator", "chain": [created["id"]]}
+
+    code, out, err = run_delegations("policy-set", "--space", space["id"], "--scope-value", "src/approver-policy", "--approvals", "2",
+                                     "--root-required", "--operator", operator)
+    assert code == 0 and json.loads(out)["root_required"] is True
+    listed = json.loads(run_delegations("policy-list", "--space", space["id"])[1])
+    assert [(row["scope_kind"], row["scope_value"], row["required_approvals"]) for row in listed] == [("path", "src/approver-policy", 2)]
+    guarded, guarded_claim = judged_task(call, identities, page, "policy", ("replacement",))
+    view = call("owner", "get_task", task_id=guarded["task_id"])
+    assert view["approvals_required"] == 2 and view["root_required"] is True
+    assert run_delegations("policy-set", "--space", space["id"], "--approvals", "3", "--operator", operator)[0] == 2
+    assert run_delegations("policy-remove", "--space", space["id"], "--scope-value", "src/approver-policy", "--operator", operator)[0] == 0
+    assert run_delegations("policy-remove", "--space", space["id"], "--scope-value", "src/approver-policy", "--operator", operator)[0] == 1
+    assert json.loads(run_delegations("policy-list")[1]) == []
+
+    second, second_claim = judged_task(call, identities, page, "operator-revoked", ("replacement", "reviewer"))
+    code, out, err = run_delegations("revoke", "--id", created["id"], "--operator", "operator-bee")
+    revoked = json.loads(out)
+    assert code == 0 and revoked["active"] is False and revoked["revoked_by"] == "operator:operator-bee"
+    assert run_delegations("revoke", "--id", created["id"], "--operator", "operator-bee")[0] == 0
+    assert json.loads(run_delegations("list", "--active")[1]) == []
+    for label in ("replacement", "reviewer"):
+        refused = call(label, "gate", 403, operation_id=op(), task_id=second["task_id"], expected_epoch=second_claim["epoch"], decision="pass")
+        assert refused["code"] == "delegation_required"
+    audit = call("owner", "list_audit", space_id=space["id"], limit=1000)
+    events = [row for row in audit if row["event"] == "delegation.revoked"]
+    assert len(events) == 1 and events[0]["performed_by"] == "operator:operator-bee" and events[0]["requested_by"] == owner_name
+    assert run_delegations("revoke", "--id", str(uuid.uuid4()), "--operator", operator)[0] == 1
+    assert run_delegations("revoke", "--id", "not-a-uuid", "--operator", operator)[0] == 1
+    assert run_delegations("revoke", "--id", created["id"])[0] == 2
+
+
+def test_operator_cli_sets_the_root_identity_of_a_space_that_has_none(api, modules, pg_store):
+    _, call, identities, _, _, _ = api
+    owner = identities["owner"]
+    space_id = str(uuid.uuid4())
+    with pg_store._transaction(write=True) as conn:
+        conn.execute("INSERT INTO baton.spaces(id,name,owner_account) VALUES (%s,'Legacy space',%s)", (space_id, owner["account"]))
+    assert call("owner", "get_space", space_id=space_id)["owner_principal"] is None
+    base = ["--space", space_id, "--operator", "operator-anat"]
+    for broken in (["--principal", identities["worker"]["agent"], "--account", owner["account"], "--kind", "agent"],
+                   ["--principal", owner["agent"], "--account", identities["reviewer"]["account"], "--kind", "human"],
+                   ["--principal", owner["agent"], "--account", owner["account"], "--kind", "agent"]):
+        code, out, err = run_delegations("set-space-owner", *base, *broken)
+        assert code == 1 and out == "" and json.loads(err)["error"] == "invalid"
+    code, out, err = run_delegations("set-space-owner", *base, "--principal", owner["agent"], "--account", owner["account"], "--kind", "human")
+    assert code == 0 and err == ""
+    updated = json.loads(out)
+    assert (updated["owner_principal"], updated["owner_account"], updated["owner_kind"]) == (owner["agent"], owner["account"], "human")
+    assert call("owner", "get_space", space_id=space_id)["owner_principal"] == owner["agent"]
+    events = [row for row in call("owner", "list_audit", space_id=space_id) if row["event"] == "space.owner_set"]
+    assert len(events) == 1 and events[0]["performed_by"] == "operator:operator-anat"
+
+
+def test_approver_validation_errors_carry_field_details_and_delegation_required_does_not(api):
+    _, call, identities, _, _, _ = api
+    space, page = shared_page(call, identities)
+    agent = identities["replacement"]["agent"]
+
+    def details(label, operation, **body):
+        error = call(label, operation, 422, operation_id=op(), **body)
+        assert error["code"] == "invalid"
+        return {(item["field"], item["expected"]) for item in error["details"]}
+
+    assert ("scope", "approve") in details("owner", "delegation_create", delegate_principal=agent, scope="gate", reason="DECISIONS 291")
+    assert any(field == "reason" for field, _ in details("owner", "delegation_create", delegate_principal=agent, reason="x" * 501))
+    assert any(field == "expires_at" for field, _ in details("owner", "delegation_create", delegate_principal=agent, reason="r", expires_at="2099-01-01T00:00:00"))
+    assert any(field == "delegate_principal" for field, _ in details("owner", "delegation_create", delegate_principal="nobody-registered", reason="r"))
+    assert any(field == "delegate_principal" for field, _ in details("owner", "delegation_create", delegate_principal=identities["owner"]["agent"], reason="r"))
+    assert any(field == "delegation_id" for field, _ in details("owner", "delegation_revoke", delegation_id="not-a-uuid"))
+    assert any(field == "approvals_required" for field, _ in details("owner", "create_task_block", page_id=page["id"], prompt="Synthetic", approvals_required=3,
+                                                                     scopes=[{"kind": "path", "value": "src/x"}], reviewers=[agent]))
+    task, claim = judged_task(call, identities, page, "details", ("replacement",))
+    assert any(field == "self_approval" for field, _ in details("owner", "gate", task_id=task["task_id"], expected_epoch=claim["epoch"],
+                                                                 decision="pass", self_approval="yes"))
+    refused = call("replacement", "gate", 403, operation_id=op(), task_id=task["task_id"], expected_epoch=claim["epoch"], decision="pass")
+    assert refused["code"] == "delegation_required" and "details" not in refused

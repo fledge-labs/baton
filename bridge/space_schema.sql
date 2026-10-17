@@ -10,6 +10,16 @@ CREATE TABLE IF NOT EXISTS baton.spaces (
     scope_repository text NOT NULL DEFAULT 'global' CHECK (scope_repository = 'global'),
     default_for text UNIQUE, created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
+-- The root approver is one exact identity: owner_principal + owner_account + owner_kind. Sharing the account does not
+-- make another principal the root. A space with NULL owner_principal has no root until an operator sets it.
+ALTER TABLE baton.spaces ADD COLUMN IF NOT EXISTS owner_principal text;
+ALTER TABLE baton.spaces ADD COLUMN IF NOT EXISTS owner_kind text;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='baton.spaces'::regclass AND conname='space_owner_identity') THEN
+        ALTER TABLE baton.spaces ADD CONSTRAINT space_owner_identity CHECK (
+            (owner_principal IS NULL) = (owner_kind IS NULL) AND (owner_kind IS NULL OR owner_kind IN ('human','agent')));
+    END IF;
+END; $$;
 CREATE TABLE IF NOT EXISTS baton.pages (
     id uuid PRIMARY KEY, space_id uuid NOT NULL REFERENCES baton.spaces(id),
     parent_id uuid REFERENCES baton.pages(id), owner_account text NOT NULL, title text NOT NULL,
@@ -212,3 +222,89 @@ CREATE TABLE IF NOT EXISTS baton.x_webhook_attempt (
     FOREIGN KEY(subscription_id,notification_id) REFERENCES baton.x_webhook_delivery(subscription_id,notification_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS webhook_attempt_delivery ON baton.x_webhook_attempt(subscription_id,notification_id,attempt);
+
+-- Approver delegations (R1 approver gate). The space owner is the root approver and needs no row. "Approver" is
+-- otherwise a role: no other principal, human or agent, may decide a gate without an active delegation covering the
+-- task. A root delegation (no parent) is granted by the space owner (any kind), through the API or recorded by an
+-- operator; a principal holding a may_delegate delegation can grant a narrower child (parent_id). Rows are
+-- append-only apart from the single transition that records revoked_at and revoked_by, enforced for every role
+-- including the schema owner.
+CREATE TABLE IF NOT EXISTS baton.x_delegation (
+    id uuid PRIMARY KEY,
+    grantor text NOT NULL, grantor_account text NOT NULL, grantor_kind text NOT NULL CHECK (grantor_kind IN ('human','agent')),
+    delegate text NOT NULL, delegate_account text NOT NULL, delegate_kind text NOT NULL,
+    scope text NOT NULL CHECK (scope IN ('approve')),
+    space_id uuid REFERENCES baton.spaces(id),
+    may_delegate boolean NOT NULL DEFAULT false,
+    parent_id uuid REFERENCES baton.x_delegation(id),
+    reason text NOT NULL CHECK (char_length(reason) BETWEEN 1 AND 500),
+    created_via text NOT NULL CHECK (created_via IN ('api','operator')),
+    created_by text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    expires_at timestamptz,
+    revoked_at timestamptz,
+    revoked_by text,
+    CHECK ((revoked_at IS NULL) = (revoked_by IS NULL)),
+    CHECK (expires_at IS NULL OR expires_at > created_at),
+    CHECK (parent_id IS NULL OR parent_id <> id)
+);
+CREATE INDEX IF NOT EXISTS delegation_delegate ON baton.x_delegation(delegate,delegate_account) WHERE revoked_at IS NULL;
+CREATE INDEX IF NOT EXISTS delegation_grantor ON baton.x_delegation(grantor,grantor_account);
+CREATE INDEX IF NOT EXISTS delegation_parent ON baton.x_delegation(parent_id) WHERE parent_id IS NOT NULL;
+-- Who held the claim for each epoch (including a previous holder when work is handed off), so nobody can approve
+-- work they executed. Append-only for the runtime role.
+CREATE TABLE IF NOT EXISTS baton.x_claim_holder (
+    task_id uuid NOT NULL REFERENCES baton.tasks(id), epoch bigint NOT NULL, holder text NOT NULL, holder_account text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(), PRIMARY KEY(task_id,epoch,holder,holder_account)
+);
+ALTER TABLE baton.x_gate ADD COLUMN IF NOT EXISTS delegation_id uuid REFERENCES baton.x_delegation(id);
+ALTER TABLE baton.x_gate ADD COLUMN IF NOT EXISTS grantor text;
+-- root: decided by the space owner without a delegation. self_approval: the decider submitted or executed the work
+-- (only the root may, and only with the explicit flag); it is never shown as someone else's approval.
+ALTER TABLE baton.x_gate ADD COLUMN IF NOT EXISTS root boolean NOT NULL DEFAULT false;
+ALTER TABLE baton.x_gate ADD COLUMN IF NOT EXISTS self_approval boolean NOT NULL DEFAULT false;
+-- Two-party confirmation. A policy matches a task through its declared scopes; the strictest match wins.
+-- A task may raise (or, when its creator is the space owner, replace) the requirement at creation.
+CREATE TABLE IF NOT EXISTS baton.x_approval_policy (
+    space_id uuid NOT NULL REFERENCES baton.spaces(id), scope_kind text NOT NULL CHECK (scope_kind IN ('path','module','migration')),
+    scope_value text NOT NULL, required_approvals integer NOT NULL CHECK (required_approvals BETWEEN 1 AND 2),
+    root_required boolean NOT NULL DEFAULT false, updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY(space_id,scope_kind,scope_value)
+);
+ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS approvals_required integer CHECK (approvals_required IN (1,2));
+ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS approvals_override_root boolean NOT NULL DEFAULT false;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='baton.x_gate'::regclass AND conname='gate_delegation_pair') THEN
+        ALTER TABLE baton.x_gate ADD CONSTRAINT gate_delegation_pair CHECK ((delegation_id IS NULL) = (grantor IS NULL));
+    END IF;
+END; $$;
+
+CREATE OR REPLACE FUNCTION baton.guard_delegation() RETURNS trigger
+LANGUAGE plpgsql AS $$ BEGIN
+    IF TG_OP <> 'UPDATE' THEN
+        RAISE EXCEPTION USING ERRCODE='42501', MESSAGE='Baton delegations are append-only';
+    END IF;
+    IF OLD.revoked_at IS NOT NULL OR NEW.revoked_at IS NULL OR NEW.revoked_by IS NULL
+       OR (to_jsonb(NEW) - 'revoked_at' - 'revoked_by') IS DISTINCT FROM (to_jsonb(OLD) - 'revoked_at' - 'revoked_by') THEN
+        RAISE EXCEPTION USING ERRCODE='42501', MESSAGE='Baton delegations are append-only';
+    END IF;
+    RETURN NEW;
+END; $$;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid='baton.x_delegation'::regclass AND tgname='delegation_guard') THEN
+        CREATE TRIGGER delegation_guard BEFORE UPDATE OR DELETE ON baton.x_delegation
+            FOR EACH ROW EXECUTE FUNCTION baton.guard_delegation();
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid='baton.x_delegation'::regclass AND tgname='delegation_no_truncate') THEN
+        CREATE TRIGGER delegation_no_truncate BEFORE TRUNCATE ON baton.x_delegation
+            FOR EACH STATEMENT EXECUTE FUNCTION baton.guard_delegation();
+    END IF;
+END; $$;
+
+-- Backfill owner_principal/owner_kind for spaces created before they were recorded, from the space.created audit event
+-- of the creating operation. Only an unambiguous event by the owning account is trusted; every other row stays NULL
+-- (no root) until an operator runs `python -m bridge.delegations set-space-owner`. Idempotent: only NULL rows change.
+UPDATE baton.spaces s SET owner_principal=a.agent, owner_kind=a.actor_kind
+FROM (SELECT space_id, min(agent) AS agent, min(actor_kind) AS actor_kind, min(actor_account) AS actor_account
+      FROM baton.x_audit WHERE event='space.created' AND space_id IS NOT NULL GROUP BY space_id HAVING count(*)=1) a
+WHERE a.space_id=s.id AND s.owner_principal IS NULL AND a.actor_account=s.owner_account AND a.actor_kind IN ('human','agent');
