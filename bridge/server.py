@@ -8,7 +8,9 @@ import inspect
 import json
 import logging
 import os
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -22,7 +24,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 
-from bridge import common
+from bridge import common, webhooks
 from bridge.common import AuthMiddleware, audit, redact, safe_id, transport_origins, uuid_id
 from bridge.failures import failure_from_a2a
 from bridge.space_store import Actor, SpaceStore, StoreError
@@ -46,6 +48,7 @@ ERRORS = {
     "dependency_blocked": (409, "Task dependencies are not complete"),
     "graph_cycle": (409, "Dependency graph contains a cycle"),
     "work_face_incomplete": (409, "Task work face is incomplete"),
+    "rate_limited": (429, "Too many requests"),
     "storage_unavailable": (503, "Storage is unavailable"),
 }
 
@@ -140,6 +143,10 @@ PUBLIC_OPERATIONS = {
     "get_task": (False, {"task_id": (str, ...)}),
     "list_tasks": (False, {"limit": (int, 50)}),
     "fetch_inbox": (False, {"limit": (int, 30)}),
+    "wait_inbox": (False, {"after_seq": (int, 0), "timeout_seconds": (int, 25), "limit": (int, 50)}),
+    "webhook_subscribe": (True, {"url": (str, ...), "events": (list[str] | None, None)}),
+    "webhook_list": (False, {}),
+    "webhook_delete": (True, {"subscription_id": (str, ...)}),
     "claim": (True, {"task_id": (str, ...), "lease_seconds": (int, 300)}),
     "renew": (True, {"task_id": (str, ...), "epoch": (int, ...), "lease_seconds": (int, 300)}),
     "submit_result": (True, {"task_id": (str, ...), "epoch": (int, ...), "result": (str, ...), "evidence": (Any, None)}),
@@ -158,11 +165,54 @@ MODELS = {
 }
 
 
+def principal_directory(principal):
+    """Resolve a principal name for notification routing; the registry is reread so revocation is immediate."""
+    try:
+        who = common.resolve_principal(principal)
+        return actor_from_identity(who) if who else None
+    except (BridgeError, ValueError, TypeError):
+        return None
+
+
 def get_store():
     global _STORE
     if _STORE is None:
-        _STORE = SpaceStore.from_env()
+        _STORE = SpaceStore.from_env(principal_directory)
     return _STORE
+
+
+class Wakeup:
+    """In-process hint that a mutation committed; waiters still re-read PostgreSQL, which stays the authority."""
+
+    def __init__(self):
+        self.event = None
+
+    def ticket(self):
+        if self.event is None:
+            self.event = asyncio.Event()
+        return self.event
+
+    def notify(self):
+        event, self.event = self.event, None
+        if event is not None:
+            event.set()
+
+    @staticmethod
+    async def wait(ticket, timeout):
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(ticket.wait(), timeout)
+
+
+WAKEUP = Wakeup()
+WAIT_MAX_SECONDS = 55
+WAIT_POLL_SECONDS = 2.0
+WAIT_SLOTS = 256
+WAIT_SLOTS_PER_PRINCIPAL = 4
+_WAITERS = {}
+WEBHOOK_BATCH = 20
+WEBHOOK_CONCURRENCY = 8
+WEBHOOK_IDLE_SECONDS = 1.0
+_WEBHOOK_POOL = ThreadPoolExecutor(max_workers=WEBHOOK_CONCURRENCY, thread_name_prefix="baton-webhook")
 
 
 def actor_from_identity(who):
@@ -181,7 +231,7 @@ def request_actor(request):
 async def store_call(method, *args, **kwargs):
     try:
         store = get_store()
-        return await asyncio.to_thread(getattr(store, method), *args, **kwargs)
+        result = await asyncio.to_thread(getattr(store, method), *args, **kwargs)
     except StoreError as exc:
         raise BridgeError(exc.code) from None
     except BridgeError:
@@ -189,6 +239,42 @@ async def store_call(method, *args, **kwargs):
     except Exception:
         # SQL, DSNs and driver diagnostics must never cross an error boundary.
         raise BridgeError("storage_unavailable") from None
+    if PUBLIC_OPERATIONS[method][0] if method in PUBLIC_OPERATIONS else method == "finish_auto":
+        WAKEUP.notify()
+    return result
+
+
+async def wait_inbox(actor, after_seq, timeout_seconds, limit):
+    """Long poll: return as soon as a visible notification exists, else wait without busy looping."""
+    if after_seq < 0 or not 0 <= timeout_seconds <= WAIT_MAX_SECONDS or not 1 <= limit <= 100:
+        raise BridgeError("invalid")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    cursor, slot = after_seq, False
+    try:
+        while True:
+            ticket = WAKEUP.ticket()
+            result = await store_call("poll_notifications", actor, after_seq=cursor, limit=limit)
+            more = result.pop("more")
+            if result["notifications"]:
+                return result
+            cursor = result["next_seq"]
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return result
+            if more:
+                continue
+            if not slot:
+                if sum(_WAITERS.values()) >= WAIT_SLOTS or _WAITERS.get(actor.principal, 0) >= WAIT_SLOTS_PER_PRINCIPAL:
+                    raise BridgeError("rate_limited")
+                _WAITERS[actor.principal] = _WAITERS.get(actor.principal, 0) + 1
+                slot = True
+            await WAKEUP.wait(ticket, min(remaining, WAIT_POLL_SECONDS))
+    finally:
+        if slot:
+            _WAITERS[actor.principal] -= 1
+            if not _WAITERS[actor.principal]:
+                del _WAITERS[actor.principal]
 
 
 def public_task(row):
@@ -234,6 +320,8 @@ async def invoke(operation, payload, request):
         if isinstance(exc, BridgeError):
             raise
         raise BridgeError("invalid") from None
+    if operation == "wait_inbox":
+        return await wait_inbox(actor, **arguments)
     result = await store_call(operation, actor, **arguments)
     if operation == "submit_task":
         audit("task.replay" if result.get("replay") else "task.submitted",
@@ -437,6 +525,40 @@ async def process_next():
     return True
 
 
+async def deliver_webhook(item, gate):
+    body = webhooks.encode(item["payload"])
+    headers = {"Content-Type": "application/json", "User-Agent": "baton-webhook/1", "X-Baton-Event": item["payload"]["event"],
+               "X-Baton-Delivery": item["notification_id"], "X-Baton-Signature": webhooks.sign(item["secret"], body)}
+    started = time.monotonic()
+    async with gate:
+        try:
+            outcome, status = await asyncio.get_running_loop().run_in_executor(_WEBHOOK_POOL, webhooks.post, item["url"], body, headers)
+        except Exception:
+            outcome, status = "network_error", None
+    try:
+        await store_call("webhook_record", SERVICE, item["subscription_id"], item["notification_id"], item["attempts"], outcome,
+                         http_status=status, duration_ms=int((time.monotonic() - started) * 1000))
+    except BridgeError as exc:
+        audit("webhook.record_unavailable", error_code=exc.code)
+
+
+async def webhook_deliver_once():
+    items = await store_call("webhook_claim_due", SERVICE, limit=WEBHOOK_BATCH)
+    gate = asyncio.Semaphore(WEBHOOK_CONCURRENCY)
+    await asyncio.gather(*(deliver_webhook(item, gate) for item in items))
+    return len(items)
+
+
+async def webhook_loop():
+    while True:
+        busy = 0
+        try:
+            busy = await webhook_deliver_once()
+        except BridgeError as exc:
+            audit("webhook.queue_unavailable", error_code=exc.code)
+        await asyncio.sleep(0.1 if busy else WEBHOOK_IDLE_SECONDS)
+
+
 async def worker_loop():
     while True:
         try:
@@ -451,13 +573,15 @@ async def lifespan(app):
     await store_call("check_schema", SERVICE)
     await recover_auto()
     async with mcp.session_manager.run():
-        worker = asyncio.create_task(worker_loop())
+        tasks = [asyncio.create_task(worker_loop()), asyncio.create_task(webhook_loop())]
         try:
             yield
         finally:
-            worker.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await worker
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
 
 app = FastAPI(lifespan=lifespan)

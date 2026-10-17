@@ -214,3 +214,10 @@ def test_set_work_face_is_a_known_tool_but_not_in_the_default_allowlist():
     assert adapter.DEFAULT_ALLOWED_TOOLS == {"submit_task", "get_task", "list_tasks", "fetch_inbox"}
     args = adapter.parse_args(["--agent-id", "beigua", "--token-file", "/synthetic/token", "--allow-tools", "claim,set_work_face"])
     assert args.allow_tools == {"claim", "set_work_face"}
+
+
+def test_wait_inbox_is_a_known_tool_but_not_in_the_default_allowlist():
+    assert "wait_inbox" in adapter.TOOLS
+    assert "wait_inbox" not in adapter.DEFAULT_ALLOWED_TOOLS
+    assert adapter.DEFAULT_ALLOWED_TOOLS == {"submit_task", "get_task", "list_tasks", "fetch_inbox"}
+    assert "wait_inbox" in adapter.parse_allow_tools("fetch_inbox,wait_inbox")

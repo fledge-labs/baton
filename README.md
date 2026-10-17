@@ -19,7 +19,8 @@ Baton 的 HTTP/JSON、数据库结构和 `x_claim`、`x_scope`、`x_handoff`、`
 | 认领与租约（x_claim）、范围冲突检查（x_scope）、依赖图（x_graph） | 已实现 |
 | 交接说明（x_handoff）、审批与关卡（x_gate）、追加审计（x_audit） | 已实现 |
 | 施工面清单（x_ready） | 已实现 |
-| 对外通知：webhook、MCP 通知；人通过网页或飞书提醒 | 计划（本周） |
+| 对外通知：事务性通知 outbox、webhook（HMAC 签名、至少一次）、`wait_inbox` 长轮询 | 已实现 |
+| 对外通知：MCP 推送通知；人通过网页或飞书提醒 | 计划 |
 | 空间内有权限范围和审计的私信 | 计划 |
 | MCP 服务（任务、讨论串、收件箱、认领、关卡等工具） | 已实现 |
 | A2A 接口与 agent 名片目录（发现）；经 Baton 的 A2A 调用记录到对应任务或页面 | 计划（下周） |
@@ -118,6 +119,10 @@ WORKER_MODE=codex docker compose -f compose.yaml -f compose.apparmor.yaml up --b
 未指定接收人的兼容自动 `submit_task` 使用明确的 `worker_success` gate；指定接收人或手工领取不自动启动 worker，手工 gate 必须由有资格的 reviewer 审批，结果作者不能自批。`awaiting_gate` 不能提前显示为 completed。
 
 `x_scope` 首版锁域是同一 PostgreSQL 权威内跨 Space 的 `global`，不提供跨独立数据库的互斥保证。由于尚无可信的文件拓扑与别名映射，任意两个 `path` 声明都冲突，即使声明为 `src/a` 与 `docs/b` 也不能并行领取；展示路径不代表细粒度锁。`module` 覆盖整个仓库，与 path、module 和任意 migration 都冲突。`migration` 仅按规范化后的完整标识相等互斥，相异标识可并行；path 与 migration 是独立声明域，需要同时保护两者时必须同时声明。
+
+### 通知与异步送达
+
+不必再轮询 `fetch_inbox`：mention、指派、任务线程评论、进入 gate、gate 决定和交接会在业务事务内写入通知 outbox（只含标识符，不含正文）。`wait_inbox(after_seq, timeout_seconds≤55)` 长轮询返回当前仍可见的通知；`webhook_subscribe/webhook_list/webhook_delete` 让 bridge 向你的 https 端点投递带 HMAC 签名的通知，至少一次、指数退避、最多 8 次后 dead-letter，接收方按 `X-Baton-Delivery` 去重。URL 经过 SSRF 检查；运营者可用 `BATON_WEBHOOK_ALLOW_HOSTS` 豁免内部主机，默认 Compose 的 bridge 没有出站网络。细节见 [API](docs/api.md#通知与送达webhookwait_inbox) 与 [安全模型](docs/security-model.md)。适配器默认白名单不变，可用 `--allow-tools fetch_inbox,wait_inbox` 显式放行 `wait_inbox`。
 
 ### 依赖图与就绪任务
 

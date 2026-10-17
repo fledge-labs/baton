@@ -105,9 +105,13 @@
 - **set_work_face。** `set_work_face(operation_id, task_id, work_face, base_commit=None)` 只允许目标任务为 queued、epoch 为 0 且无执行记录（规则与 plan 相同），否则返回 `stale_claim`（409）。调用者必须对任务所在页面有当前 edit 权限，并且是任务 owner、或在 reviewers 中（按 principal 精确匹配）、或当前持有有效租约，该租约对应的任务 `task_kind='prep'` 且目标任务 `depends_on` 它；否则返回 `forbidden`。`base_commit` 只能在当前为 null 时设置一次，重复传原值是 no-op，传别的值返回 `operation_conflict`。它使用 X6 的 `operation_id` 幂等（重放重新检查权限），审计事件为 `task.work_face_set`，元数据只含键名列表与 work_face 规范 JSON 的 sha256，不含正文。`create_task_block` 与 `submit_task` 也可在创建时给出 `work_face`、`require_work_face`、`task_kind`，三者计入幂等请求摘要。
 - **不执行。** Baton 绝不执行 `acceptance_command`；它只是给领取人与 gate 审阅人阅读的信息，通过与否仍由 X13 的 gate 决定。
 
+## 通知与异步送达
+
+**X19 · 通知 outbox、wait_inbox 与 webhook。** 通知是 Baton 自有 x_扩展，不代表 Space 的通知渠道（U2 仍待界面实测）。`baton.x_notify` 行与触发它的业务效果、审计在同一 PostgreSQL 事务写入：mention、任务指派（submit_task/assign_task/create_task_block）、任务线程中的评论（发给 owner、assignee、持有人、reviewers，不含作者）、进入 awaiting_gate（发给 reviewers）、gate 决定（发给 owner、assignee、持有人）、自动任务的确定性 worker 失败（`fail_auto` 与 `[failed]` 线程评论，发给 owner）和 handoff（发给新持有人）。收件人在插入时必须有页面 view 权限，读取与投递时重新检查；负载只含 id、seq、event、object_type、object_id、thread_id、created_at、recipient，任何通知、webhook、审计都不得包含 prompt、评论正文或结果文本。`wait_inbox(after_seq, timeout_seconds ≤ 55, limit)` 在有可见行时立即返回，否则有界等待，不忙等，并发有上限。`webhook_subscribe/list/delete` 只处理调用者自己的订阅和通知：签名密钥由服务端生成并只返回一次，投递带 HMAC-SHA256 签名，至少一次、指数退避最多 8 次后 dead-letter，终局结果审计；URL 必须通过 https 与 SSRF 检查（连接时复核，不跟随重定向），每个 principal 最多 10 个订阅。通知只提示事项，不启动执行，命名 agent 仍自愿 pull。
+
 ## 红线与验收
 
-下表中官方语义验收对应 O1–O9 的原文链接；数据库与 HTTP 验收对应 X1–X18 的 x_契约。测试必须通过公开接口或实际 PostgreSQL 事务证明，不以函数返回“成功”、单进程内存锁或 SQLite 替身代替并发与权限结论。
+下表中官方语义验收对应 O1–O9 的原文链接；数据库与 HTTP 验收对应 X1–X19 的 x_契约。测试必须通过公开接口或实际 PostgreSQL 事务证明，不以函数返回“成功”、单进程内存锁或 SQLite 替身代替并发与权限结论。
 
 | 编号 | 红线/触发 | 可执行验收结果 |
 | --- | --- | --- |
@@ -135,6 +139,7 @@
 | A22 | 派生进度及无内置 planner | 进度随有权读取的真实任务/gate 状态变化；不能通过写入独立 tracker 使图看似完成；plan/ready 不启动 planning agent、模型或远端主机进程，命名 agent 仍自愿 pull。 |
 | A23 | 创建任务时原子附加依赖 | create_task_block/submit_task 的 optional depends_on 与节点同事务提交；无权/不存在/无效引用等失败时不留下新任务。自动 submit 带未通过 gate 的依赖时，worker 不能在创建与依赖生效之间抢跑；只有依赖 done 且当前 epoch gate pass 后才可领取。 |
 | A24 | x_ready 施工面清单与门控 | 要求清单但不完整的任务，claim/claim_next 返回 work_face_incomplete 且不出现在 ready；`work_face_missing` 只含 base_commit/scopes/work_face；补全后可领取。准备任务（task_kind=prep）未 done 并通过当前 epoch gate 前，依赖它的施工任务返回 dependency_blocked，通过后才出现在 ready。set_work_face 仅限 edit 权限且是 owner、reviewer principal 或持有关联 prep 有效租约者，其他情形 403；仅 queued 且 epoch 0 可设置（否则 409 stale_claim），base_commit 只能设置一次（异值 409 operation_conflict）；同 operation_id 同输入重放、异输入冲突；格式非法返回 422；审计只含键名与 sha256；Baton 不执行 acceptance_command；不要求清单的任务行为不变。 |
+| A25 | 通知 outbox、wait_inbox 与 webhook | 每类触发（含 worker 确定性失败通知 owner）在同一事务写入收件人行，回滚与幂等重放不留行；无 view 权限的收件人不写行，撤权后读取不返回；负载与审计不含正文；wait_inbox 有行立即返回、无行按时限干净超时并遵守 after_seq 与并发上限；webhook 签名可验证、只投递调用者自己的通知，失败按退避重试并在第 8 次后 dead-letter 且只写一条终局审计；非 https 与环回/私有/链路本地/元数据地址被拒绝，allowlist 才能豁免地址检查，连接时 rebinding 被拒绝；签名密钥只返回一次，不出现在列表、重放、审计或日志；每个 principal 订阅不超过 10 个。 |
 
 验收完成前不得声称已复刻 Space 全部行为、已提供官方 Space API、已有跨独立数据库分布锁，或已完成真实账户/界面兼容测试。共享数据库上线或旧数据迁移另走 shadow → enforce → bake；本规格本身不授权迁移真实数据。[官方能力边界背景：S3](https://learn.chatgpt.com/docs/space/collaboration)、[S4](https://learn.chatgpt.com/docs/space/agents)。
 

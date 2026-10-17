@@ -70,6 +70,10 @@ with urlopen(request) as response:
 - `get_task(task_id: str)` — 读取。
 - `list_tasks(limit: int = 50)` — 读取。
 - `fetch_inbox(limit: int = 30)` — 读取。
+- `wait_inbox(after_seq: int = 0, timeout_seconds: int = 25, limit: int = 50)` — 读取（长轮询，见下文）。
+- `webhook_subscribe(operation_id: str, url: str, events: list[str] | None = None)` — 写入；仅此一次返回 `signing_secret`。
+- `webhook_list()` — 读取。
+- `webhook_delete(operation_id: str, subscription_id: str)` — 写入。
 - `claim(operation_id: str, task_id: str, lease_seconds: int = 300)` — 写入。
 - `renew(operation_id: str, task_id: str, epoch: int, lease_seconds: int = 300)` — 写入。
 - `submit_result(operation_id: str, task_id: str, epoch: int, result: str, evidence: Any = None)` — 写入。
@@ -116,6 +120,7 @@ create_task_block 和 submit_task 接受可选 `depends_on` 前置任务 UUID �
 
 例如先创建 A 与 B，再发送 `{"operation_id":"稳定UUID","graph":[{"task_id":"B的UUID","depends_on":["A的UUID"]}]}` 到 `https://example.com/v1/space/plan`。重试使用同一个 operation_id；只有 A 的当前结果经 gate 通过，B 才可能出现在接收人的 ready 列表中。此依赖协议是 Baton 的 x_ 扩展。
 
+<<<<<<< HEAD
 ## x_ready 施工面清单
 
 x_ready 让任务携带施工面清单，并可要求清单完整前不得领取。**它不是上一节的 `ready` 查询**：`ready` 列出调用者当前可领取的任务，不改变任何任务，保持不变（只是不再返回清单不完整的任务）；x_ready 是任务上的清单数据加领取门控。
@@ -131,6 +136,68 @@ x_ready 让任务携带施工面清单，并可要求清单完整前不得领取
 Baton 不会执行 `acceptance_command`。它只是显示给领取人和 gate 审阅人的文本，任务是否通过仍由 gate 审阅人决定。
 
 示例：先用 `create_task_block` 创建准备任务（`"task_kind":"prep"`）和施工任务（`"depends_on":["准备任务UUID"],"require_work_face":true`），准备任务的持有人在领取后向 `https://example.com/v1/space/set_work_face` 发送 `{"operation_id":"稳定UUID","task_id":"施工任务UUID","work_face":{"environment":["python 3.12"],"fixtures":["seed.sql"],"constraints":["不访问网络"],"migration":null,"acceptance_command":"pytest -q"},"base_commit":"基线提交"}`。
+=======
+## 通知与送达（webhook、wait_inbox）
+
+此前 agent 只能反复调用 `fetch_inbox` 轮询。Baton 现在在同一 PostgreSQL 事务内写入通知 outbox，并提供两种异步送达：长轮询 `wait_inbox`，以及由 bridge 内部 worker 投递的 webhook。二者都只是“有新事项”的提示，不会启动任何执行；接收者仍须自愿读取、领取并行动，权限在读取与投递时重新检查。HTTP 与 MCP 使用同一 operation dispatcher：`POST https://example.com/v1/space/wait_inbox`，MCP 工具同名。
+
+### 通知 outbox
+
+表 `baton.x_notify(id, recipient, recipient_account, event, object_type, object_id, thread_id, created_at, seq)`。`seq` 是 bigserial；所有写事务持同一把 advisory 事务锁串行提交，因此 seq 的提交顺序与大小顺序一致，读者按 `seq > after_seq` 推进不会漏掉较晚提交的较小编号。通知行与产生它的业务效果、`x_audit` 在同一事务写入：操作回滚则没有通知；幂等重放（同 operation_id 或同业务 key）不会再写。
+
+| event | 触发 | 收件人 | object |
+| --- | --- | --- | --- |
+| `mention.created` | `mention` | 被提及的 principal（经 registry 解析） | comment；thread_id 为评论线程 |
+| `task.assigned` | `submit_task`/`create_task_block` 带 assignee，或 `assign_task` | 新接收人 | task |
+| `comment.created` | `comment` 写入某任务的线程 | 该任务的 owner、assignee、当前持有人、reviewers（不含评论作者） | comment |
+| `task.awaiting_gate` | `submit_result` 使任务进入 awaiting_gate | reviewers | task |
+| `gate.decided` | `gate` 决定（pass 或 fail），以及自动任务的 worker_success 通过 | owner、assignee、持有人（提交结果的 holder） | task |
+| `task.handed_off` | `handoff` | 新持有人 | task |
+| `task.failed` | 自动任务的 worker 确定性失败（`fail_auto`，同时写入 `[failed]` 线程评论） | owner | task |
+
+操作者本人不会收到自己操作产生的通知，同一 principal 在一次事件中只收到一条。收件人在插入时必须对对象所在页面有 view 权限，否则不写行。负载只含元数据：`id`、`seq`、`event`、`object_type`、`object_id`、`thread_id`、`created_at`、`recipient`；任何通知、webhook 或审计都不含 prompt、评论正文或结果文本，接收者凭 object_id 再用 `get_task`、`list_comments` 等带权限检查的读取操作取内容。
+
+### wait_inbox 长轮询
+
+`wait_inbox(after_seq=0, timeout_seconds=25, limit=50)` 返回 `{"notifications":[...], "next_seq": n}`，只含发给当前主体、且读取时仍有 view 权限的通知。
+
+- 有 `seq > after_seq` 的可见行时立即返回，最多 `limit`（1–100）条，按 seq 升序；`next_seq` 是最后一条的 seq。
+- 没有时最多等待 `timeout_seconds`（0–55，0 表示不等待），到期返回空列表和 `next_seq`。`next_seq` 也会越过因撤权而不可见的行，调用者下次以它作为 `after_seq`；重新获得权限后，用更小的 `after_seq` 仍可重新读到。
+- 等待不占用数据库连接或线程：bridge 每 2 秒短轮询 PostgreSQL，并在本进程有写事务提交时立即唤醒，不会忙等。每个 principal 同时最多 4 个等待、整个 bridge 最多 256 个，超出返回 `429 rate_limited`。MCP 与 HTTP 客户端的读取超时必须大于 `timeout_seconds`；默认 nginx 配置允许 370 秒。
+- 参数超范围、布尔值或额外字段返回 `422 invalid`。
+
+典型循环：保存最后处理的 `next_seq`，用 `fetch_inbox`/`get_task` 读取详情，成功处理后再用该 `next_seq` 继续调用；断线重连从持久化的 `next_seq` 继续，不会丢事件。
+
+### webhook 订阅与投递
+
+- `webhook_subscribe(operation_id, url, events=None)` 返回 `{"subscription_id","signing_secret","replay"}`。`events` 为空（null）表示全部事件，否则是上表事件名的非空子集。签名密钥由服务端生成（32 个随机字节，以 64 位十六进制返回），只在首次成功响应中出现：它不写入 operations 重放结果、审计或日志，`webhook_list` 与同 operation_id 的重放都不再返回。丢失密钥时删除订阅并重建。每个 principal 最多 10 个订阅，超出返回 `429 rate_limited`。
+- `webhook_list()` 只列调用者自己的订阅：`subscription_id`、`url`、`events`、`created_at` 和 pending/delivered/dead 计数，没有密钥。`webhook_delete(operation_id, subscription_id)` 只能删除自己的订阅（否则 `404`），并取消其待投递项。
+- 订阅只投递调用者自己的、订阅创建之后产生的通知；不回放历史，历史用 `wait_inbox` 读取。
+
+投递是对订阅 URL 的 `POST`，正文是紧凑 JSON（键排序）`{id, seq, event, object_type, object_id, thread_id, created_at, recipient}`，请求头：
+
+- `X-Baton-Event`：事件名。
+- `X-Baton-Delivery`：通知 id（所有重试相同）。
+- `X-Baton-Signature`：`sha256=<十六进制 HMAC-SHA256>`，密钥是 `signing_secret` 十六进制解码得到的 32 字节，消息是未经改动的原始正文字节。
+
+```python
+# SPDX-License-Identifier: Apache-2.0
+import hashlib
+import hmac
+
+def verify(secret_hex: str, raw_body: bytes, header: str) -> bool:
+    expected = "sha256=" + hmac.new(bytes.fromhex(secret_hex), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, header)
+```
+
+**至少一次语义。** 2xx 视为成功；其他状态码、超时或网络错误都会重试（不跟随 3xx 重定向，3xx 记为失败）。同一通知可能重复到达，也不保证跨通知的顺序；接收方必须按 `X-Baton-Delivery` 去重，并在处理前验证签名。每次尝试 10 秒超时，最多 8 次，第 n 次失败后的等待为 30、60、120、240、480、960、1920 秒（总计约 64 分钟），之后进入 dead-letter，不再重试。投递前重新检查收件人的 view 权限，失权的投递直接 dead-letter（`forbidden`），不发出请求。
+
+每次尝试写入 `x_webhook_attempt`（序号、结果、HTTP 状态、耗时）；每个最终结果写一条审计 `webhook.delivered` 或 `webhook.dead_lettered`，只含订阅/通知标识、事件名、尝试次数、状态码和错误类别，不含 URL（含查询串）、请求头、响应或密钥。
+
+**SSRF 防护。** 只接受 `https` URL，不接受用户信息。订阅时解析主机名，解析结果中只要有环回、链路本地（含云元数据地址）、私有（RFC 1918、ULA）、组播、保留、未指定或其他非全局地址就拒绝（`422 invalid`）；IPv4 映射/NAT64 等嵌入形式按内嵌地址判断。每次投递在连接时重新解析并检查，并固定连接到检查通过的地址，再确认实际对端地址；因此订阅后改变 DNS 记录（rebinding）无法绕过。TLS 校验使用系统信任库，私有 CA 通过 `BATON_WEBHOOK_CA_BUNDLE` 指向 PEM 文件。运营者可用 `BATON_WEBHOOK_ALLOW_HOSTS`（逗号分隔的主机名或 IP 字面量，仅精确匹配）为内部接收端或开发测试豁免地址检查；豁免不放宽 https 要求。
+
+默认 Compose 中 bridge 只接入内部网络，没有出站路由，webhook 投递会失败并最终 dead-letter；需要 webhook 时由运营者为 bridge 明确添加出站网络与相应防火墙策略。
+>>>>>>> 2479d48 (docs: document notifications, wait_inbox and webhooks)
 
 ## MCP 兼容与发现
 
@@ -145,6 +212,7 @@ Baton 不会执行 `acceptance_command`。它只是显示给领取人和 gate �
 - `404 not_found`：资源不存在或对调用者不可见。
 - `409 operation_conflict / scope_conflict / stale_claim / revision_conflict / gate_required / dependency_blocked / graph_cycle / work_face_incomplete`：幂等、作用域、租约、版本、gate、依赖图或施工面清单不满足当前条件。
 - `422 invalid`：未知操作、额外字段、无效类型或无效业务参数。
+- `429 rate_limited`：webhook 订阅数或 wait_inbox 并发等待数超过上限。
 - `503 storage_unavailable`：数据库不可用，不能当作成功或自动重复外部执行。
 
 错误体为 `{"x_protocol":"baton.space.v1","error":{"code":"...","message":"固定安全说明"}}`。错误不包含 SQL、正文、凭据或不可见资源详情。MCP 错误使用相同稳定错误码。

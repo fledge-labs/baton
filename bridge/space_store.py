@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -20,6 +21,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from bridge import webhooks
 from bridge.failures import TASK_FAILURE_CODES, Failure
 
 LOCK_ID = 0x4241544F4E
@@ -31,7 +33,17 @@ MESSAGES = {
     "gate_required": "A valid gate decision is required", "storage_unavailable": "Space storage is unavailable",
     "dependency_blocked": "Task dependencies are not satisfied", "graph_cycle": "Task graph would contain a cycle",
     "work_face_incomplete": "Task work face is incomplete",
+    "rate_limited": "Too many requests",
 }
+NOTIFY_EVENTS = frozenset({"mention.created", "task.assigned", "comment.created", "task.awaiting_gate",
+                           "gate.decided", "task.handed_off", "task.failed"})
+WEBHOOK_LIMIT = 10
+WEBHOOK_MAX_ATTEMPTS = 8
+# Delay after failed attempt n (1-based); the seven delays between eight attempts total about an hour.
+WEBHOOK_BACKOFF_SECONDS = (30, 60, 120, 240, 480, 960, 1920)
+WEBHOOK_LEASE_SECONDS = 60
+NOTIFY_SCAN_BATCH = 200
+NOTIFY_SCAN_LIMIT = 1000
 
 
 class StoreError(Exception):
@@ -235,12 +247,15 @@ def _graph_entries(graph):
 
 
 class SpaceStore:
-    def __init__(self, config_path):
+    def __init__(self, config_path, directory=None):
         self.config_path = Path(config_path)
+        # directory(principal) -> Actor | None resolves principals the store only knows by name
+        # (reviewers, assignees, mention targets) so notification recipients can be permission-checked.
+        self.directory = directory
 
     @classmethod
-    def from_env(cls):
-        return cls(os.environ.get("BATON_DATABASE_CONFIG", "/run/secrets/database.json"))
+    def from_env(cls, directory=None):
+        return cls(os.environ.get("BATON_DATABASE_CONFIG", "/run/secrets/database.json"), directory)
 
     @contextmanager
     def _transaction(self, write=False):
@@ -295,12 +310,15 @@ class SpaceStore:
                     result = {**result, "replay": True}
                 return result
             result = _json(effect(conn))
+            once = {}
             if isinstance(result, dict):
                 business_replay = result.pop("_business_replay", False)
+                # Values under _once reach the first caller only and are never persisted or replayed.
+                once = result.pop("_once", {})
                 result = {**result, "replay": business_replay}
             conn.execute("INSERT INTO baton.operations(principal,operation_id,request_hash,method,result) VALUES (%s,%s,%s,%s,%s)",
                          (actor.principal, operation_id, digest, method, Jsonb(result)))
-            return result
+            return {**result, **once} if once else result
 
     @staticmethod
     def _row(conn, table, identity):
@@ -312,6 +330,11 @@ class SpaceStore:
 
     def _role(self, conn, actor, resource_type, resource_id):
         self._user(actor)
+        return self._account_role(conn, actor.account, resource_type, resource_id)
+
+    def _account_role(self, conn, account, resource_type, resource_id):
+        if account == SERVICE_ACTOR.account:
+            return None
         if resource_type == "space":
             space = self._row(conn, "spaces", resource_id)
             page_ids = []
@@ -324,13 +347,13 @@ class SpaceStore:
             ) SELECT id FROM ancestors""", (resource_id,))]
         else:
             raise StoreError("invalid")
-        if space["owner_account"] == actor.account:
+        if space["owner_account"] == account:
             return "edit"
         grants = conn.execute("""SELECT g.role FROM baton.grants g WHERE
             ((g.resource_type='space' AND g.resource_id=%s) OR (g.resource_type='page' AND g.resource_id=ANY(%s::uuid[])))
             AND ((g.subject_type='person' AND g.subject_id=%s) OR (g.subject_type='team' AND EXISTS (
                 SELECT 1 FROM baton.team_members m WHERE m.team_id::text=g.subject_id AND m.account=%s)))""",
-            (space["id"], page_ids, actor.account, actor.account)).fetchall()
+            (space["id"], page_ids, account, account)).fetchall()
         return max((row["role"] for row in grants), key=ROLES.get, default=None)
 
     def _require(self, conn, actor, resource_type, resource_id, role="view"):
@@ -351,13 +374,63 @@ class SpaceStore:
     def _audit(conn, actor, operation_id, event, space_id=None, task_id=None, requested_by=None, **metadata):
         allowed = {"page_id", "block_id", "thread_id", "epoch", "revision", "proposal_id", "team_id", "subject_type",
                    "role", "decision", "backend", "a2a_task_id", "input_sha256", "output_sha256", "error_code",
-                   "count", "target_type", "execution_mode", "old_epoch", "work_face_keys", "work_face_sha256", "stage"}
+                   "count", "target_type", "execution_mode", "old_epoch", "work_face_keys", "work_face_sha256", "stage",
+                   "subscription_id", "notification_id", "attempts", "http_status", "notify_event", "object_type"}
         if not set(metadata) <= allowed:
             raise StoreError("invalid")
         conn.execute("""INSERT INTO baton.x_audit(id,event,agent,actor_account,actor_kind,requested_by,performed_by,
             operation_id,space_id,task_id,metadata) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (uuid.uuid4(), event, actor.principal, actor.account, actor.kind, requested_by or actor.principal,
              actor.principal, operation_id, space_id, task_id, Jsonb(_json(metadata))))
+
+    def _directory_party(self, principal):
+        try:
+            who = self.directory(principal) if self.directory and principal else None
+        except Exception:
+            who = None
+        return (who.principal, who.account) if isinstance(who, Actor) and who.principal == principal else None
+
+    @staticmethod
+    def _party(actor):
+        return (actor.principal, actor.account)
+
+    def _task_parties(self, conn, task):
+        """Principals around a task with the account each is known by. Unknown names go through the directory."""
+        claim = conn.execute("""SELECT holder,holder_account FROM baton.x_claim WHERE task_id=%s
+            AND lease_expires_at>clock_timestamp()""", (task["id"],)).fetchone()
+        known = {task["owner"]: task["owner_account"]}
+        if claim:
+            known[claim["holder"]] = claim["holder_account"]
+        if task["result_author"]:
+            known[task["result_author"]] = task["result_author_account"]
+
+        def party(principal):
+            if principal is None:
+                return None
+            return (principal, known[principal]) if principal in known else self._directory_party(principal)
+        return {"owner": party(task["owner"]), "assignee": party(task["assignee"]),
+                "holder": (claim["holder"], claim["holder_account"]) if claim else None,
+                "author": party(task["result_author"]), "reviewers": [party(name) for name in task["reviewers"]]}
+
+    def _enqueue(self, conn, actor, event, object_type, object_id, page_id, parties, thread_id=None):
+        """Insert outbox rows in the caller's transaction. Metadata only; the actor is never notified of their own act."""
+        if event not in NOTIFY_EVENTS or object_type not in {"task", "page", "comment"}:
+            raise StoreError("invalid")
+        seen = {actor.principal}
+        for party in parties:
+            if party is None or party[0] in seen:
+                continue
+            seen.add(party[0])
+            principal, account = party
+            if self._account_role(conn, account, "page", str(page_id)) is None:
+                continue
+            row = conn.execute("""INSERT INTO baton.x_notify(id,recipient,recipient_account,event,object_type,object_id,thread_id)
+                VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (uuid.uuid4(), principal, account, event, object_type, object_id, thread_id)).fetchone()
+            for subscription in conn.execute("""SELECT id FROM baton.x_webhook WHERE principal=%s AND account=%s
+                AND (events IS NULL OR events @> %s)""", (principal, account, Jsonb([event]))).fetchall():
+                conn.execute("INSERT INTO baton.x_webhook_delivery(subscription_id,notification_id) VALUES (%s,%s)",
+                             (subscription["id"], row["id"]))
 
     def check_schema(self, actor):
         self._service(actor)
@@ -385,6 +458,10 @@ class SpaceStore:
                 "x_gate": "task_id epoch decision reviewer reviewer_account evidence",
                 "operations": "principal operation_id request_hash method result",
                 "x_audit": "id time event agent actor_account actor_kind requested_by performed_by operation_id space_id task_id metadata",
+                "x_notify": "id recipient recipient_account event object_type object_id thread_id created_at seq",
+                "x_webhook": "id principal account url events secret created_at",
+                "x_webhook_delivery": "subscription_id notification_id state attempts next_attempt_at created_at finished_at",
+                "x_webhook_attempt": "id subscription_id notification_id attempt outcome http_status duration_ms created_at",
             }
             columns = {}
             for column in conn.execute("SELECT table_name,column_name FROM information_schema.columns WHERE table_schema='baton'"):
@@ -576,9 +653,13 @@ class SpaceStore:
                 raise StoreError("not_found")
             row = self._comment(conn, actor, operation_id, page_id, body, thread_id, selection)
             page = self._row(conn, "pages", page_id)
-            task = conn.execute("SELECT id FROM baton.tasks WHERE id=%s AND page_id=%s", (row["thread_id"], page_id)).fetchone()
+            task = conn.execute("SELECT * FROM baton.tasks WHERE id=%s AND page_id=%s", (row["thread_id"], page_id)).fetchone()
             self._audit(conn, actor, operation_id, "comment.created", space_id=page["space_id"], task_id=task["id"] if task else None,
                         page_id=page_id, thread_id=row["thread_id"])
+            if task:
+                parties = self._task_parties(conn, task)
+                self._enqueue(conn, actor, "comment.created", "comment", row["id"], page_id,
+                              [parties["owner"], parties["assignee"], parties["holder"], *parties["reviewers"]], row["thread_id"])
             return row
         return self._mutate(actor, operation_id, "comment", {"page_id": page_id, "body": body, "thread_id": thread_id, "selection": selection},
                             lambda conn: self._require(conn, actor, "page", page_id, "comment"), effect)
@@ -612,6 +693,8 @@ class SpaceStore:
             task = conn.execute("SELECT id FROM baton.tasks WHERE id=%s AND page_id=%s", (comment["thread_id"], comment["page_id"])).fetchone()
             self._audit(conn, actor, operation_id, "mention.created", space_id=page["space_id"], task_id=task["id"] if task else None,
                         thread_id=comment["thread_id"], target_type=target_type)
+            self._enqueue(conn, actor, "mention.created", "comment", comment["id"], comment["page_id"],
+                          [self._directory_party(target_id)], comment["thread_id"])
             return row
         return self._mutate(actor, operation_id, "mention", {"comment_id": comment_id, "target_type": target_type, "target_id": target_id}, authorize, effect)
 
@@ -656,6 +739,47 @@ class SpaceStore:
                         message.update(task_id=identity, assignee=task["assignee"], state=view["state"], kind="mention",
                                        depends_on=view["depends_on"], has_hidden_dependencies=view["has_hidden_dependencies"])
             return {"agent_name": actor.principal, "messages": sorted(threads.values(), key=lambda item: item["created_ts"], reverse=True)[:limit]}
+        return self._read(actor, read)
+
+    def _notification_page(self, conn, row):
+        if row["object_type"] == "page":
+            return row["object_id"]
+        # The table name is chosen from a fixed pair, never from request input.
+        table = "tasks" if row["object_type"] == "task" else "comments"
+        owner = conn.execute(f"SELECT page_id FROM baton.{table} WHERE id=%s", (row["object_id"],)).fetchone()
+        return owner["page_id"] if owner else None
+
+    def poll_notifications(self, actor, after_seq=0, limit=50):
+        """One non-blocking pass over the caller's outbox, rechecking view permission on every row.
+
+        Rows hidden by a revoked permission are skipped but still advance next_seq so callers never rescan them.
+        """
+        _integer(after_seq, 0, 2**63 - 1)
+        _integer(limit, 1, 100)
+        self._user(actor)
+        def read(conn):
+            visible, cursor, scanned, more, roles = [], after_seq, 0, False, {}
+            while len(visible) < limit and not more:
+                rows = conn.execute("""SELECT * FROM baton.x_notify WHERE recipient=%s AND recipient_account=%s AND seq>%s
+                    ORDER BY seq LIMIT %s""", (actor.principal, actor.account, cursor, NOTIFY_SCAN_BATCH)).fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    if len(visible) == limit:
+                        break
+                    cursor = row["seq"]
+                    scanned += 1
+                    page = self._notification_page(conn, row)
+                    if page not in roles:
+                        try:
+                            roles[page] = page is not None and self._account_role(conn, actor.account, "page", str(page)) is not None
+                        except StoreError:
+                            roles[page] = False
+                    if roles[page]:
+                        visible.append({key: row[key] for key in ("id", "seq", "event", "object_type", "object_id", "thread_id", "created_at")}
+                                       | {"recipient": row["recipient"]})
+                more = scanned >= NOTIFY_SCAN_LIMIT and len(visible) < limit
+            return {"notifications": visible, "next_seq": cursor, "more": more}
         return self._read(actor, read)
 
     def list_attribution(self, actor, block_id):
@@ -1001,6 +1125,7 @@ class SpaceStore:
         self._notify_task(conn, actor, operation_id, task, "submitted", prompt, assignee.principal if assignee else None)
         if assignee:
             self._task_audit(conn, actor, operation_id, "task.assigned", task)
+            self._enqueue(conn, actor, "task.assigned", "task", task_id, page_id, [self._party(assignee)], task_id)
         return self._task_view(conn, actor, str(task_id))
 
     @staticmethod
@@ -1273,6 +1398,7 @@ class SpaceStore:
                          (uuid.uuid4(), task_id, actor.principal, target.principal, epoch, epoch + 1, base, Jsonb(contexts), Jsonb(evidence_items)))
             self._task_audit(conn, actor, operation_id, "task.handed_off", task, old_epoch=epoch, epoch=epoch + 1)
             self._notify_task(conn, actor, operation_id, task, "assigned", "Task handed off", target.principal)
+            self._enqueue(conn, actor, "task.handed_off", "task", task["id"], task["page_id"], [self._party(target)], task["id"])
             return self._task_view(conn, actor, task_id, include_prompt=True)
         def replay(conn, old):
             self._live(conn, target, task_id, epoch + 1)
@@ -1295,6 +1421,7 @@ class SpaceStore:
             conn.execute("UPDATE baton.tasks SET assignee=%s,execution_mode='manual',gate_mode='reviewer',reviewers=%s WHERE id=%s", (target.principal, Jsonb(reviewers), task_id))
             self._task_audit(conn, actor, operation_id, "task.assigned", task)
             self._notify_task(conn, actor, operation_id, task, "assigned", "Task assigned", target.principal)
+            self._enqueue(conn, actor, "task.assigned", "task", task["id"], task["page_id"], [self._party(target)], task["id"])
             return self._task_view(conn, actor, task_id)
         def replay(conn, old):
             task = self._row(conn, "tasks", task_id)
@@ -1316,6 +1443,8 @@ class SpaceStore:
             # This is the holder's reply in the original thread, explicitly a
             # candidate rather than a completed/gate-approved notification.
             self._notify_task(conn, actor, operation_id, task, "result_submitted", result)
+            self._enqueue(conn, actor, "task.awaiting_gate", "task", task["id"], task["page_id"],
+                          self._task_parties(conn, task)["reviewers"], task["id"])
             return self._task_view(conn, actor, task_id)
         def replay(conn, old):
             task = self._row(conn, "tasks", task_id)
@@ -1342,6 +1471,9 @@ class SpaceStore:
                          (uuid.uuid4(), task_id, expected_epoch, decision, actor.principal, actor.account, Jsonb(_items(evidence))))
             conn.execute("UPDATE baton.tasks SET state=%s WHERE id=%s", ("done" if decision == "pass" else "queued", task_id))
             self._task_audit(conn, actor, operation_id, "gate.reviewed", task, epoch=expected_epoch, decision=decision)
+            parties = self._task_parties(conn, task)
+            self._enqueue(conn, actor, "gate.decided", "task", task["id"], task["page_id"],
+                          [parties["owner"], parties["assignee"], parties["holder"], parties["author"]], task["id"])
             if decision == "pass":
                 self._task_audit(conn, actor, operation_id, "task.completed", task, epoch=expected_epoch)
                 self._notify_task(conn, actor, operation_id, task, "completed", task["result"])
@@ -1372,6 +1504,7 @@ class SpaceStore:
             self._task_audit(conn, actor, operation_id, "worker.completed", task, epoch=epoch, backend=backend, a2a_task_id=a2a_id, output_sha256=digest)
             self._task_audit(conn, actor, operation_id, "task.completed", task, epoch=epoch, backend=backend, a2a_task_id=a2a_id, output_sha256=digest)
             self._notify_task(conn, actor, operation_id, task, "completed", result)
+            self._enqueue(conn, actor, "gate.decided", "task", task["id"], task["page_id"], [self._task_parties(conn, task)["owner"]], task["id"])
             return self._task_view(conn, actor, task_id)
         def replay(conn, old):
             task = self._row(conn, "tasks", task_id)
@@ -1399,6 +1532,7 @@ class SpaceStore:
             self._task_audit(conn, actor, operation_id, "task.failed", task, epoch=epoch, a2a_task_id=a2a_id,
                              error_code=error_code, stage=failure.stage)
             self._notify_task(conn, actor, operation_id, task, "failed", failure.report())
+            self._enqueue(conn, actor, "task.failed", "task", task["id"], task["page_id"], [self._task_parties(conn, task)["owner"]], task["id"])
             return self._task_view(conn, actor, task_id)
         def replay(conn, old):
             task = self._row(conn, "tasks", task_id)
@@ -1457,3 +1591,120 @@ class SpaceStore:
             return conn.execute("""SELECT * FROM baton.x_audit WHERE (%s::uuid IS NULL OR task_id=%s::uuid)
                 AND (%s::uuid IS NULL OR space_id=%s::uuid) ORDER BY time,id LIMIT %s""", (task_id, task_id, space_id, space_id, limit)).fetchall()
         return self._read(actor, read)
+
+    @staticmethod
+    def _events(events):
+        if events is None:
+            return None
+        if not isinstance(events, list) or not events or len(events) > len(NOTIFY_EVENTS) \
+                or any(not isinstance(event, str) or event not in NOTIFY_EVENTS for event in events):
+            raise StoreError("invalid")
+        return sorted(set(events))
+
+    def webhook_subscribe(self, actor, operation_id, url, events=None):
+        self._user(actor)
+        events = self._events(events)
+        try:
+            # DNS happens before the transaction so a slow resolver never holds the write lock.
+            webhooks.check_url(url)
+        except webhooks.Refused:
+            raise StoreError("invalid") from None
+        def effect(conn):
+            if conn.execute("SELECT count(*) AS n FROM baton.x_webhook WHERE principal=%s", (actor.principal,)).fetchone()["n"] >= WEBHOOK_LIMIT:
+                raise StoreError("rate_limited")
+            identity, secret = uuid.uuid4(), secrets.token_bytes(32)
+            conn.execute("INSERT INTO baton.x_webhook(id,principal,account,url,events,secret) VALUES (%s,%s,%s,%s,%s,%s)",
+                         (identity, actor.principal, actor.account, url, None if events is None else Jsonb(events), secret))
+            self._audit(conn, actor, operation_id, "webhook.subscribed", subscription_id=identity)
+            return {"subscription_id": identity, "_once": {"signing_secret": secret.hex()}}
+        return self._mutate(actor, operation_id, "webhook_subscribe", {"url": url, "events": events}, lambda conn: self._user(actor), effect)
+
+    def webhook_list(self, actor):
+        self._user(actor)
+        def read(conn):
+            rows = conn.execute("""SELECT w.id,w.url,w.events,w.created_at,
+                count(*) FILTER (WHERE d.state='pending') AS pending, count(*) FILTER (WHERE d.state='delivered') AS delivered,
+                count(*) FILTER (WHERE d.state='dead') AS dead
+                FROM baton.x_webhook w LEFT JOIN baton.x_webhook_delivery d ON d.subscription_id=w.id
+                WHERE w.principal=%s AND w.account=%s GROUP BY w.id ORDER BY w.created_at,w.id""", (actor.principal, actor.account)).fetchall()
+            return [{"subscription_id": row.pop("id"), **row} for row in rows]
+        return self._read(actor, read)
+
+    def webhook_delete(self, actor, operation_id, subscription_id):
+        _uuid(subscription_id)
+        def effect(conn):
+            row = conn.execute("DELETE FROM baton.x_webhook WHERE id=%s AND principal=%s AND account=%s RETURNING id",
+                               (subscription_id, actor.principal, actor.account)).fetchone()
+            if not row:
+                raise StoreError("not_found")
+            self._audit(conn, actor, operation_id, "webhook.deleted", subscription_id=subscription_id)
+            return {"subscription_id": subscription_id, "deleted": True}
+        return self._mutate(actor, operation_id, "webhook_delete", {"subscription_id": subscription_id}, lambda conn: self._user(actor), effect)
+
+    def _settle_delivery(self, conn, delivery, outcome, http_status, duration_ms):
+        """Record one attempt and move the delivery to its next state. Only final outcomes are audited."""
+        attempt = delivery["attempts"] + 1
+        conn.execute("""INSERT INTO baton.x_webhook_attempt(id,subscription_id,notification_id,attempt,outcome,http_status,duration_ms)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)""", (uuid.uuid4(), delivery["subscription_id"], delivery["notification_id"], attempt,
+                                               outcome, http_status, max(0, min(int(duration_ms), 2**31 - 1))))
+        final = outcome in {"delivered", "forbidden"} or attempt >= WEBHOOK_MAX_ATTEMPTS
+        if not final:
+            conn.execute("""UPDATE baton.x_webhook_delivery SET attempts=%s,next_attempt_at=clock_timestamp()+%s*interval '1 second'
+                WHERE subscription_id=%s AND notification_id=%s""",
+                (attempt, WEBHOOK_BACKOFF_SECONDS[min(attempt, len(WEBHOOK_BACKOFF_SECONDS)) - 1], delivery["subscription_id"], delivery["notification_id"]))
+            return "pending"
+        state = "delivered" if outcome == "delivered" else "dead"
+        conn.execute("UPDATE baton.x_webhook_delivery SET attempts=%s,state=%s,finished_at=clock_timestamp() WHERE subscription_id=%s AND notification_id=%s",
+                     (attempt, state, delivery["subscription_id"], delivery["notification_id"]))
+        page = self._notification_page(conn, delivery)
+        space = conn.execute("SELECT space_id FROM baton.pages WHERE id=%s", (page,)).fetchone() if page else None
+        # No URL, header, secret or body is recorded: only identifiers and the final status.
+        self._audit(conn, SERVICE_ACTOR, uuid.uuid5(uuid.NAMESPACE_URL, f"baton/webhook/{delivery['subscription_id']}/{delivery['notification_id']}"),
+                    "webhook.delivered" if state == "delivered" else "webhook.dead_lettered",
+                    space_id=space["space_id"] if space else None, task_id=delivery["object_id"] if delivery["object_type"] == "task" else None,
+                    requested_by=delivery["recipient"], subscription_id=delivery["subscription_id"], notification_id=delivery["notification_id"],
+                    attempts=attempt, http_status=http_status, notify_event=delivery["event"], object_type=delivery["object_type"],
+                    **({"error_code": outcome} if state == "dead" else {}))
+        return state
+
+    def webhook_claim_due(self, actor, limit=20):
+        """Lease due deliveries to the bridge worker. Returned secrets are internal and must never be logged."""
+        self._service(actor)
+        _integer(limit, 1, 100)
+        with self._transaction(write=True) as conn:
+            rows = conn.execute("""SELECT d.subscription_id,d.notification_id,d.attempts,w.url,w.secret,w.account,n.seq,n.event,
+                n.object_type,n.object_id,n.thread_id,n.created_at,n.recipient,n.recipient_account
+                FROM baton.x_webhook_delivery d JOIN baton.x_webhook w ON w.id=d.subscription_id
+                JOIN baton.x_notify n ON n.id=d.notification_id
+                WHERE d.state='pending' AND d.next_attempt_at<=clock_timestamp()
+                ORDER BY d.next_attempt_at,n.seq LIMIT %s FOR UPDATE OF d SKIP LOCKED""", (limit,)).fetchall()
+            claimed = []
+            for row in rows:
+                page = self._notification_page(conn, row)
+                try:
+                    allowed = page is not None and self._account_role(conn, row["recipient_account"], "page", str(page)) is not None
+                except StoreError:
+                    allowed = False
+                if not allowed:
+                    self._settle_delivery(conn, row, "forbidden", None, 0)
+                    continue
+                conn.execute("""UPDATE baton.x_webhook_delivery SET next_attempt_at=clock_timestamp()+%s*interval '1 second'
+                    WHERE subscription_id=%s AND notification_id=%s""", (WEBHOOK_LEASE_SECONDS, row["subscription_id"], row["notification_id"]))
+                claimed.append({"subscription_id": str(row["subscription_id"]), "notification_id": str(row["notification_id"]),
+                                "attempts": row["attempts"], "url": row["url"], "secret": bytes(row["secret"]),
+                                "payload": _json({"id": row["notification_id"], "seq": row["seq"], "event": row["event"],
+                                                  "object_type": row["object_type"], "object_id": row["object_id"],
+                                                  "thread_id": row["thread_id"], "created_at": row["created_at"],
+                                                  "recipient": row["recipient"]})})
+            return claimed
+
+    def webhook_record(self, actor, subscription_id, notification_id, expected_attempts, outcome, http_status=None, duration_ms=0):
+        self._service(actor)
+        if outcome not in {"delivered", "http_error", "network_error", "refused"}:
+            raise StoreError("invalid")
+        with self._transaction(write=True) as conn:
+            delivery = conn.execute("""SELECT d.subscription_id,d.notification_id,d.attempts,n.event,n.object_type,n.object_id,n.recipient
+                FROM baton.x_webhook_delivery d JOIN baton.x_notify n ON n.id=d.notification_id
+                WHERE d.subscription_id=%s AND d.notification_id=%s AND d.state='pending' AND d.attempts=%s FOR UPDATE OF d""",
+                (_uuid(subscription_id), _uuid(notification_id), expected_attempts)).fetchone()
+            return self._settle_delivery(conn, delivery, outcome, http_status, duration_ms) if delivery else None

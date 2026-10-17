@@ -167,3 +167,33 @@ DO $$ BEGIN
             FOR EACH ROW EXECUTE FUNCTION baton.check_page_parent();
     END IF;
 END; $$;
+
+-- Asynchronous delivery: transactional notification outbox, webhooks and delivery ledger.
+-- Rows carry identifiers only; no prompt, comment body or result text is ever stored here.
+CREATE TABLE IF NOT EXISTS baton.x_notify (
+    id uuid PRIMARY KEY, recipient text NOT NULL, recipient_account text NOT NULL, event text NOT NULL,
+    object_type text NOT NULL CHECK (object_type IN ('task','page','comment')), object_id uuid NOT NULL,
+    thread_id uuid, created_at timestamptz NOT NULL DEFAULT clock_timestamp(), seq bigserial NOT NULL UNIQUE
+);
+CREATE INDEX IF NOT EXISTS notify_recipient ON baton.x_notify(recipient,seq);
+CREATE TABLE IF NOT EXISTS baton.x_webhook (
+    id uuid PRIMARY KEY, principal text NOT NULL, account text NOT NULL, url text NOT NULL,
+    events jsonb, secret bytea NOT NULL, created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX IF NOT EXISTS webhook_principal ON baton.x_webhook(principal);
+CREATE TABLE IF NOT EXISTS baton.x_webhook_delivery (
+    subscription_id uuid NOT NULL REFERENCES baton.x_webhook(id) ON DELETE CASCADE,
+    notification_id uuid NOT NULL REFERENCES baton.x_notify(id),
+    state text NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','delivered','dead')),
+    attempts integer NOT NULL DEFAULT 0, next_attempt_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(), finished_at timestamptz,
+    PRIMARY KEY(subscription_id,notification_id)
+);
+CREATE INDEX IF NOT EXISTS webhook_delivery_due ON baton.x_webhook_delivery(next_attempt_at) WHERE state='pending';
+CREATE TABLE IF NOT EXISTS baton.x_webhook_attempt (
+    id uuid PRIMARY KEY, subscription_id uuid NOT NULL, notification_id uuid NOT NULL, attempt integer NOT NULL,
+    outcome text NOT NULL CHECK (outcome IN ('delivered','http_error','network_error','refused','forbidden')),
+    http_status integer, duration_ms integer NOT NULL DEFAULT 0, created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    FOREIGN KEY(subscription_id,notification_id) REFERENCES baton.x_webhook_delivery(subscription_id,notification_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS webhook_attempt_delivery ON baton.x_webhook_attempt(subscription_id,notification_id,attempt);
