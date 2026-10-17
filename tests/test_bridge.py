@@ -673,6 +673,45 @@ def test_approver_gate_over_http_root_delegates_and_everyone_else_needs_a_delega
     assert "self_approval" in schema["gate"]["request"]["properties"] and "approvals_required" in schema["create_task_block"]["request"]["properties"]
 
 
+def test_gate_edit_decision_and_approver_identity_over_http(api):
+    client, call, identities, tokens, _, _ = api
+    space, page = shared_page(call, identities)
+    owner, reviewer = identities["owner"]["agent"], identities["reviewer"]["agent"]
+    task, claim = judged_task(call, identities, page, "edit-http", ("reviewer",))
+    gate = dict(task_id=task["task_id"], expected_epoch=claim["epoch"])
+    missing = call("owner", "gate", 422, operation_id=op(), decision="edit", **gate)
+    assert missing["code"] == "invalid" and missing["details"][0]["field"] == "edited_result"
+    stray = call("owner", "gate", 422, operation_id=op(), decision="pass", edited_result="Nope", **gate)
+    assert stray["code"] == "invalid" and stray["details"][0]["field"] == "edited_result"
+    assert call("owner", "gate", 422, operation_id=op(), decision="edit", edited_result=7, **gate)["code"] == "invalid"
+    assert call("owner", "gate", 422, operation_id=op(), decision="approve", **gate)["code"] == "invalid"
+    assert call("reviewer", "gate", 403, operation_id=op(), decision="edit", edited_result="Sneaky", **gate)["code"] == "delegation_required"
+    assert call("worker", "gate", 403, operation_id=op(), decision="edit", edited_result="Sneaky", **gate)["code"] == "forbidden"
+    assert call("owner", "get_task", task_id=task["task_id"])["result"] == "Candidate edit-http"
+    edit_op = op()
+    done = call("owner", "gate", operation_id=edit_op, decision="edit", edited_result="Edited by the owner", reason="Clarified", **gate)
+    assert done["state"] == "done" and done["result"] == "Edited by the owner" and done["original_result"] == "Candidate edit-http"
+    assert done["gate"]["authority"] == "root" and done["gate"]["approver"] == owner and done["gate"]["decision"] == "edit"
+    assert done["gate"]["counted_as"] == "pass" and done["gate"]["edited"] is True
+    again = call("owner", "gate", operation_id=edit_op, decision="edit", edited_result="Edited by the owner", reason="Clarified", **gate)
+    assert again["replay"] is True and again["gate"] == done["gate"]
+    event = next(row for row in call("owner", "list_audit", task_id=task["task_id"]) if row["event"] == "gate.result_overridden")
+    assert event["metadata"]["approver"] == owner and event["metadata"]["reason"] == "Clarified"
+    assert event["metadata"]["original_sha256"] != event["metadata"]["edited_sha256"]
+    assert "Edited by the owner" not in json.dumps(event) and "Candidate edit-http" not in json.dumps(event)
+
+    call("owner", "delegation_create", operation_id=op(), delegate_principal=reviewer, reason="DECISIONS 291")
+    delegated, delegated_claim = judged_task(call, identities, page, "who-http", ("reviewer",))
+    passed = call("reviewer", "gate", operation_id=op(), task_id=delegated["task_id"], expected_epoch=delegated_claim["epoch"], decision="pass")
+    grant = next(row for row in call("reviewer", "delegation_list") if row["delegate"] == reviewer)
+    assert passed["gate"]["authority"] == f"delegated by {owner} via {grant['id']}" and passed["gate"]["approver"] == reviewer
+    own, own_claim = judged_task(call, identities, page, "who-self-http", ("reviewer",), executor="owner")
+    selfie = call("owner", "gate", operation_id=op(), task_id=own["task_id"], expected_epoch=own_claim["epoch"], decision="pass", self_approval=True)
+    assert selfie["gate"]["authority"] == "root (self-approval)"
+    properties = client.get("/v1/space/schema", headers={"Authorization": "Bearer " + tokens["owner"]}).json()["operations"]["gate"]["request"]["properties"]
+    assert {"edited_result", "reason"} <= properties.keys()
+
+
 def test_root_self_approval_flag_and_non_root_refusals_over_http(api):
     _, call, identities, _, _, _ = api
     space, page = shared_page(call, identities)

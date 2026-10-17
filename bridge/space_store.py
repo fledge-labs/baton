@@ -143,6 +143,10 @@ def _payload(value, field=None):
     return value
 
 
+def _sha256(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
 def _text(value, maximum=16000, field=None):
     if not isinstance(value, str) or not value.strip() or len(value) > maximum or "\x00" in value:
         raise StoreError("invalid", field, f"non-blank string of at most {maximum} characters without NUL")
@@ -558,7 +562,7 @@ class SpaceStore:
                    "subscription_id", "notification_id", "attempts", "http_status", "notify_event", "object_type",
                    "priority", "escalate_to", "from_assignee", "to_assignee", "reason_code", "delegation_id", "grantor", "scope",
                    "created_via", "chain", "owner_kind", "self_approval", "root", "approvals", "approvals_required",
-                   "required_approvals", "root_required", "scope_kind"}
+                   "required_approvals", "root_required", "scope_kind", "approver", "reason", "original_sha256", "edited_sha256"}
         if not set(metadata) <= allowed:
             raise StoreError("invalid")
         conn.execute("""INSERT INTO baton.x_audit(id,event,agent,actor_account,actor_kind,requested_by,performed_by,
@@ -595,7 +599,7 @@ class SpaceStore:
                 "holder": (claim["holder"], claim["holder_account"]) if claim else None,
                 "author": party(task["result_author"]), "reviewers": [party(name) for name in task["reviewers"]]}
 
-    def _enqueue(self, conn, actor, event, object_type, object_id, page_id, parties, thread_id=None):
+    def _enqueue(self, conn, actor, event, object_type, object_id, page_id, parties, thread_id=None, result_epoch=None, result_author=None):
         """Insert outbox rows in the caller's transaction. Metadata only; the actor is never notified of their own act."""
         if event not in NOTIFY_EVENTS or object_type not in {"task", "page", "comment"}:
             raise StoreError("invalid")
@@ -607,10 +611,10 @@ class SpaceStore:
             principal, account = party
             if self._account_role(conn, account, "page", str(page_id)) is None:
                 continue
-            row = conn.execute("""INSERT INTO baton.x_notify(id,recipient,recipient_account,event,object_type,object_id,thread_id,actor,actor_kind)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+            row = conn.execute("""INSERT INTO baton.x_notify(id,recipient,recipient_account,event,object_type,object_id,thread_id,actor,actor_kind,
+                result_epoch,result_author) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
                 (uuid.uuid4(), principal, account, event, object_type, object_id, thread_id, actor.principal,
-                 "service" if actor == SERVICE_ACTOR else actor.kind)).fetchone()
+                 "service" if actor == SERVICE_ACTOR else actor.kind, result_epoch, result_author)).fetchone()
             for subscription in conn.execute("""SELECT id FROM baton.x_webhook WHERE principal=%s AND account=%s
                 AND (events IS NULL OR events @> %s)""", (principal, account, Jsonb([event]))).fetchall():
                 conn.execute("INSERT INTO baton.x_webhook_delivery(subscription_id,notification_id) VALUES (%s,%s)",
@@ -639,13 +643,13 @@ class SpaceStore:
                 "task_dependencies": "task_id depends_on created_at",
                 "x_claim": "task_id holder holder_account holder_kind epoch lease_expires_at scopes scope_repository",
                 "x_handoff": "task_id old_epoch new_epoch base_commit context evidence",
-                "x_gate": "task_id epoch decision reviewer reviewer_account evidence delegation_id grantor root self_approval",
+                "x_gate": "task_id epoch decision reviewer reviewer_account evidence delegation_id grantor root self_approval edited original_result edited_result reason",
                 "x_approval_policy": "space_id scope_kind scope_value required_approvals root_required updated_at",
                 "x_delegation": "id grantor grantor_account grantor_kind delegate delegate_account delegate_kind scope space_id may_delegate parent_id reason created_via created_by created_at expires_at revoked_at revoked_by",
                 "x_claim_holder": "task_id epoch holder holder_account created_at",
                 "operations": "principal operation_id request_hash method result",
                 "x_audit": "id time event agent actor_account actor_kind requested_by performed_by operation_id space_id task_id metadata",
-                "x_notify": "id recipient recipient_account event object_type object_id thread_id created_at seq actor actor_kind",
+                "x_notify": "id recipient recipient_account event object_type object_id thread_id created_at seq actor actor_kind result_epoch result_author",
                 "x_webhook": "id principal account url events secret created_at include_preview",
                 "x_webhook_delivery": "subscription_id notification_id state attempts next_attempt_at created_at finished_at",
                 "x_webhook_attempt": "id subscription_id notification_id attempt outcome http_status duration_ms created_at",
@@ -958,6 +962,13 @@ class SpaceStore:
     def _title(prompt):
         return " ".join(prompt.split())[:SUBJECT_TITLE_CHARS]
 
+    @staticmethod
+    def _notification_result(row):
+        """The result epoch and author an awaiting_gate notification was raised for; absent for every other event."""
+        if row.get("result_epoch") is None:
+            return {}
+        return {"result_epoch": row["result_epoch"], "result_author": row["result_author"]}
+
     def _notification_preview(self, conn, row):
         """Actor, subject and body preview of one notification, read from the live objects.
 
@@ -1020,7 +1031,7 @@ class SpaceStore:
                             roles[page] = False
                     if roles[page]:
                         visible.append({key: row[key] for key in ("id", "seq", "event", "object_type", "object_id", "thread_id", "created_at")}
-                                       | {"recipient": row["recipient"]} | self._notification_preview(conn, row))
+                                       | {"recipient": row["recipient"]} | self._notification_result(row) | self._notification_preview(conn, row))
                 more = scanned >= NOTIFY_SCAN_LIMIT and len(visible) < limit
             return {"notifications": visible, "next_seq": cursor, "more": more}
         return self._read(actor, read)
@@ -1128,6 +1139,15 @@ class SpaceStore:
         row.update(submission_thread_status="sent", report_status="sent" if reported else "not_ready")
         row["work_face_missing"] = self._work_face_missing(row)
         override_root = row.pop("approvals_override_root")
+        row.update(result_edits=[], original_result=None)
+        if row["execution_mode"] == "manual" and row["result_epoch"] is not None:
+            edits = conn.execute("""SELECT reviewer,reason,original_result,edited_result,created_at FROM baton.x_gate
+                WHERE task_id=%s AND epoch=%s AND edited ORDER BY created_at,id""", (task_id, row["result_epoch"])).fetchall()
+            if edits:
+                row["original_result"] = edits[0]["original_result"]
+                row["result_edits"] = [{"approver": edit["reviewer"], "reason": edit["reason"], "at": edit["created_at"],
+                                        "original_sha256": _sha256(edit["original_result"]),
+                                        "edited_sha256": _sha256(edit["edited_result"])} for edit in edits]
         if row["execution_mode"] == "manual":
             required, root_required = self._approval_requirements(conn, {**row, "approvals_override_root": override_root})
             row.update(approvals_required=required, root_required=root_required,
@@ -1891,7 +1911,7 @@ class SpaceStore:
             # candidate rather than a completed/gate-approved notification.
             self._notify_task(conn, actor, operation_id, task, "result_submitted", result)
             self._enqueue(conn, actor, "task.awaiting_gate", "task", task["id"], task["page_id"],
-                          self._task_parties(conn, task)["reviewers"], task["id"])
+                          self._task_parties(conn, task)["reviewers"], task["id"], result_epoch=epoch, result_author=actor.principal)
             return self._task_view(conn, actor, task_id)
         def replay(conn, old):
             task = self._row(conn, "tasks", task_id)
@@ -1991,12 +2011,27 @@ class SpaceStore:
         return conn.execute("""SELECT reviewer,reviewer_account,root FROM baton.x_gate WHERE task_id=%s AND epoch=%s AND decision='pass'
             ORDER BY created_at""", (task_id, epoch)).fetchall()
 
-    def gate(self, actor, operation_id, task_id, expected_epoch, decision, evidence=None, self_approval=False):
+    @staticmethod
+    def _authority(approval):
+        """How the approver came to hold authority, in the words clients show: root, a marked self-approval, or a delegation."""
+        if approval["root"]:
+            return "root (self-approval)" if approval["self_approval"] else "root"
+        leaf = approval["chain"][0]
+        return f'delegated by {leaf["grantor"]} via {leaf["id"]}'
+
+    def gate(self, actor, operation_id, task_id, expected_epoch, decision, evidence=None, self_approval=False,
+             edited_result=None, reason=None):
         _integer(expected_epoch, 1, 2**63 - 1, "expected_epoch")
-        if not isinstance(decision, str) or decision not in {"pass", "fail"}:
-            raise StoreError("invalid", "decision", "one of pass, fail")
+        if not isinstance(decision, str) or decision not in {"pass", "fail", "edit"}:
+            raise StoreError("invalid", "decision", "one of pass, fail, edit")
         if type(self_approval) is not bool:
             raise StoreError("invalid", "self_approval", "boolean")
+        if decision == "edit":
+            _text(edited_result, 32000, "edited_result")
+        elif edited_result is not None:
+            raise StoreError("invalid", "edited_result", "omitted unless decision is edit")
+        if reason is not None:
+            reason = _trimmed(reason, 1000, "reason")
         _items(evidence)
         approval = {}
         def authorize(conn):
@@ -2026,36 +2061,56 @@ class SpaceStore:
             chain = approval["chain"]
             leaf = chain[0] if chain else None
             earlier = self._passes(conn, task_id, expected_epoch)
-            if decision == "pass" and any(row["reviewer_account"] == actor.account or row["reviewer"] == actor.principal for row in earlier):
+            if decision != "fail" and any(row["reviewer_account"] == actor.account or row["reviewer"] == actor.principal for row in earlier):
                 raise StoreError("forbidden")
-            conn.execute("""INSERT INTO baton.x_gate(id,task_id,epoch,decision,reviewer,reviewer_account,evidence,delegation_id,grantor,root,self_approval)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                         (uuid.uuid4(), task_id, expected_epoch, decision, actor.principal, actor.account, Jsonb(_items(evidence)),
-                          leaf["id"] if leaf else None, leaf["grantor"] if leaf else None, approval["root"], approval["self_approval"]))
+            edited = decision == "edit"
+            original = task["result"]
+            if edited and edited_result == original:
+                raise StoreError("invalid", "edited_result", "text that differs from the submitted result")
+            recorded = "pass" if edited else decision
+            conn.execute("""INSERT INTO baton.x_gate(id,task_id,epoch,decision,reviewer,reviewer_account,evidence,delegation_id,grantor,root,self_approval,
+                edited,original_result,edited_result,reason) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                         (uuid.uuid4(), task_id, expected_epoch, recorded, actor.principal, actor.account, Jsonb(_items(evidence)),
+                          leaf["id"] if leaf else None, leaf["grantor"] if leaf else None, approval["root"], approval["self_approval"],
+                          edited, original if edited else None, edited_result if edited else None, reason))
+            if edited:
+                conn.execute("UPDATE baton.tasks SET result=%s WHERE id=%s", (edited_result, task_id))
             required, root_required = self._approval_requirements(conn, task)
             passed = self._passes(conn, task_id, expected_epoch)
             # Two-party confirmation: enough distinct approvers must pass the same result epoch, and when the root is
             # required it must be one of them. Any fail sends the task back, and a root fail is final.
-            complete = decision == "pass" and len(passed) >= required and (not root_required or any(row["root"] for row in passed))
+            complete = recorded == "pass" and len(passed) >= required and (not root_required or any(row["root"] for row in passed))
             conn.execute("UPDATE baton.tasks SET state=%s WHERE id=%s", ("queued" if decision == "fail" else "done" if complete else "awaiting_gate", task_id))
             via = {"delegation_id": leaf["id"], "grantor": leaf["grantor"]} if leaf else {}
-            self._task_audit(conn, actor, operation_id, "gate.reviewed", task, epoch=expected_epoch, decision=decision,
+            self._task_audit(conn, actor, operation_id, "gate.reviewed", task, epoch=expected_epoch, decision=recorded,
                              chain=[str(link["id"]) for link in chain], self_approval=approval["self_approval"], root=approval["root"],
                              approvals=len(passed), approvals_required=required, **via)
+            if edited:
+                self._task_audit(conn, actor, operation_id, "gate.result_overridden", task, epoch=expected_epoch, decision="edit",
+                                 approver=actor.principal, original_sha256=_sha256(original), edited_sha256=_sha256(edited_result),
+                                 **({"reason": reason} if reason else {}), self_approval=approval["self_approval"], root=approval["root"],
+                                 chain=[str(link["id"]) for link in chain], **via)
             parties = self._task_parties(conn, task)
             self._enqueue(conn, actor, "gate.decided", "task", task["id"], task["page_id"],
                           [parties["owner"], parties["assignee"], parties["holder"], parties["author"]], task["id"])
             if complete:
                 self._task_audit(conn, actor, operation_id, "task.completed", task, epoch=expected_epoch)
-                self._notify_task(conn, actor, operation_id, task, "completed", task["result"])
-            return self._task_view(conn, actor, task_id)
+                self._notify_task(conn, actor, operation_id, task, "completed", edited_result if edited else task["result"])
+            summary = {"decision": decision, "counted_as": recorded, "epoch": expected_epoch, "approver": actor.principal,
+                       "approver_account": actor.account, "approver_kind": actor.kind, "root": approval["root"],
+                       "self_approval": approval["self_approval"], "authority": self._authority(approval),
+                       "delegation_id": leaf["id"] if leaf else None, "grantor": leaf["grantor"] if leaf else None,
+                       "edited": edited, "approvals": len(passed), "approvals_required": required, "complete": complete}
+            return {**self._task_view(conn, actor, task_id), "gate": summary}
         def replay(conn, old):
             task = self._row(conn, "tasks", task_id)
             if task["epoch"] != expected_epoch or task["result_epoch"] != expected_epoch:
                 raise StoreError("stale_claim")
-            return self._task_view(conn, actor, task_id)
-        return self._mutate(actor, operation_id, "gate", {"task_id": task_id, "expected_epoch": expected_epoch, "decision": decision,
-                                                           "evidence": evidence, "self_approval": self_approval}, authorize, effect, replay)
+            return {**self._task_view(conn, actor, task_id), **({"gate": old["gate"]} if isinstance(old, dict) and "gate" in old else {})}
+        args = {"task_id": task_id, "expected_epoch": expected_epoch, "decision": decision, "evidence": evidence, "self_approval": self_approval}
+        # New fields join the request digest only when used, so a retry of an operation recorded before they existed still matches.
+        args.update({key: value for key, value in (("edited_result", edited_result), ("reason", reason)) if value is not None})
+        return self._mutate(actor, operation_id, "gate", args, authorize, effect, replay)
 
     def finish_auto(self, actor, operation_id, task_id, epoch, result, a2a_id, backend, a2a_state="completed"):
         _text(result, 32000)
@@ -2470,7 +2525,8 @@ class SpaceStore:
         _integer(limit, 1, 100)
         with self._transaction(write=True) as conn:
             rows = conn.execute("""SELECT d.subscription_id,d.notification_id,d.attempts,w.url,w.secret,w.account,w.include_preview,n.seq,n.event,
-                n.object_type,n.object_id,n.thread_id,n.created_at,n.recipient,n.recipient_account,n.actor,n.actor_kind
+                n.object_type,n.object_id,n.thread_id,n.created_at,n.recipient,n.recipient_account,n.actor,n.actor_kind,
+                n.result_epoch,n.result_author
                 FROM baton.x_webhook_delivery d JOIN baton.x_webhook w ON w.id=d.subscription_id
                 JOIN baton.x_notify n ON n.id=d.notification_id
                 WHERE d.state='pending' AND d.next_attempt_at<=clock_timestamp()
@@ -2494,7 +2550,7 @@ class SpaceStore:
                                 "payload": _json({"id": row["notification_id"], "seq": row["seq"], "event": row["event"],
                                                   "object_type": row["object_type"], "object_id": row["object_id"],
                                                   "thread_id": row["thread_id"], "created_at": row["created_at"],
-                                                  "recipient": row["recipient"], **preview})})
+                                                  "recipient": row["recipient"], **self._notification_result(row), **preview})})
             return claimed
 
     def webhook_record(self, actor, subscription_id, notification_id, expected_attempts, outcome, http_status=None, duration_ms=0):

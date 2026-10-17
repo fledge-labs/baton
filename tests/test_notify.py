@@ -105,6 +105,31 @@ def test_each_trigger_writes_metadata_only_rows_for_the_right_recipients(team, a
     assert not any(text in audit for text in PRIVATE_TEXT)
 
 
+def test_awaiting_gate_notifications_carry_the_result_epoch_and_author_so_approvers_can_gate_directly(team, pg_store, approver):
+    call, identities, space, page = team
+    approver(pg_store, identities["reviewer"], by=identities["owner"])
+    task = make_task(call, identities, page)
+    first = call("worker", "claim", operation_id=op(), task_id=task["task_id"])
+    call("worker", "submit_result", operation_id=op(), task_id=task["task_id"], epoch=first["epoch"], result=RESULT)
+    waiting = [item for item in notes(call, "reviewer")["notifications"] if item["event"] == "task.awaiting_gate"]
+    assert len(waiting) == 1
+    note = waiting[0]
+    assert note["result_epoch"] == first["epoch"] and note["result_author"] == identities["worker"]["agent"]
+    assert set(note) == PAYLOAD_KEYS | PREVIEW_KEYS | {"result_epoch", "result_author"}
+    assert RESULT not in json.dumps(note)
+    other = [item for item in notes(call, "worker")["notifications"] if item["event"] == "task.assigned"]
+    assert other and all("result_epoch" not in item for item in other)
+
+    failed = call("reviewer", "gate", operation_id=op(), task_id=task["task_id"], expected_epoch=note["result_epoch"], decision="fail")
+    assert failed["gate"]["decision"] == "fail" and failed["state"] == "queued"
+    second = call("worker", "claim", operation_id=op(), task_id=task["task_id"])
+    call("worker", "submit_result", operation_id=op(), task_id=task["task_id"], epoch=second["epoch"], result=RESULT + "-2")
+    later = [item for item in notes(call, "reviewer", after=note["seq"])["notifications"] if item["event"] == "task.awaiting_gate"]
+    assert [item["result_epoch"] for item in later] == [second["epoch"]] and second["epoch"] > first["epoch"]
+    done = call("reviewer", "gate", operation_id=op(), task_id=task["task_id"], expected_epoch=later[0]["result_epoch"], decision="pass")
+    assert done["state"] == "done"
+
+
 def test_mentions_assignment_paths_and_handoff_notify_the_target(team):
     call, identities, space, page = team
     comment = call("owner", "comment", operation_id=op(), page_id=page["id"], body=COMMENT)
@@ -351,7 +376,11 @@ def test_signed_delivery_carries_metadata_only_and_only_the_callers_notification
     for path, secret in (("/worker", worker_secret), ("/reviewer", reviewer_secret)):
         for request in by_path[path]:
             payload = json.loads(request["body"])
-            assert set(payload) == PAYLOAD_KEYS and payload["object_id"] == task["task_id"]
+            awaiting = payload["event"] == "task.awaiting_gate"
+            assert set(payload) == PAYLOAD_KEYS | ({"result_epoch", "result_author"} if awaiting else set())
+            assert payload["object_id"] == task["task_id"]
+            if awaiting:
+                assert payload["result_epoch"] == claim["epoch"] and payload["result_author"] == identities["worker"]["agent"]
             assert request["headers"]["X-Baton-Delivery"] == payload["id"]
             expected = "sha256=" + hmac.new(secret, request["body"], hashlib.sha256).hexdigest()
             assert hmac.compare_digest(request["headers"]["X-Baton-Signature"], expected)

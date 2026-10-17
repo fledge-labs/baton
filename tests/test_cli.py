@@ -837,7 +837,8 @@ def test_summary_line_goes_to_stderr_while_stdout_stays_pure_json(cli, bridge, w
     json.loads(submitted.out)
 
     decided = run_as(cli, bridge, "owner", "gate", "--task", task_id, "--epoch", str(epoch), "--decision", "pass")
-    assert decided.rc == 0 and decided.err == "task %s state=done epoch=%d\n" % (task_id, epoch)
+    owner = bridge.identities["owner"]["agent"]
+    assert decided.rc == 0 and decided.err == "task %s state=done epoch=%d gate=pass approver=%s authority=root\n" % (task_id, epoch, owner)
     assert decided.json()["state"] == "done"
 
 
@@ -1150,3 +1151,158 @@ def test_watch_rejects_a_non_positive_exec_timeout(cli, tmp_path):
     finally:
         scripted.close()
     assert process.returncode == 2 and "--exec-timeout must be positive" in err
+
+
+# --- DF-14'/DF-15: gate --decision edit, approver line, --epoch defaulting ---------------------
+
+def submitted_for_review(cli, bridge, page, prompt, *, reviewers=("owner",), result="Worker candidate"):
+    task = run_json(cli, bridge, "owner", "call", "create_task_block", "--operation-id", str(uuid.uuid4()), "--json", json.dumps({
+        "page_id": page["id"], "prompt": prompt, "scopes": [{"kind": "none"}],
+        "reviewers": [bridge.identities[label]["agent"] for label in reviewers],
+        "assignee_principal": bridge.identities["worker"]["agent"]}))
+    claim = run_json(cli, bridge, "worker", "claim", "--task", task["task_id"])
+    run_json(cli, bridge, "worker", "result", "--task", task["task_id"], "--epoch", str(claim["epoch"]), "--result", result)
+    return task["task_id"], claim["epoch"]
+
+
+def requests_to(bridge, operation, since):
+    return [record for record in bridge.requests[since:] if record["path"].endswith("/v1/space/" + operation)]
+
+
+def test_gate_without_epoch_reads_the_task_once_and_says_which_epoch_it_used(cli, bridge, workspace):
+    _, page = workspace
+    task_id, epoch = submitted_for_review(cli, bridge, page, "Default the epoch")
+    before = len(bridge.requests)
+    decided = run_as(cli, bridge, "owner", "gate", "--task", task_id, "--decision", "pass")
+    assert decided.rc == 0, decided.err
+    owner = bridge.identities["owner"]["agent"]
+    assert decided.err == ("baton_cli: gate: --epoch not given; using result_epoch=%d from get_task\n" % epoch
+                           + "task %s state=done epoch=%d gate=pass approver=%s authority=root\n" % (task_id, epoch, owner))
+    reads, writes = requests_to(bridge, "get_task", before), requests_to(bridge, "gate", before)
+    assert len(reads) == 1 and len(writes) == 1
+    assert bridge.recorder.body(reads[0]) == {"task_id": task_id}
+    assert bridge.recorder.body(writes[0])["expected_epoch"] == epoch and decided.json()["state"] == "done"
+
+
+def test_gate_with_an_explicit_epoch_makes_no_extra_read(cli, bridge, workspace):
+    _, page = workspace
+    task_id, epoch = submitted_for_review(cli, bridge, page, "Explicit epoch")
+    before = len(bridge.requests)
+    decided = run_as(cli, bridge, "owner", "gate", "--task", task_id, "--epoch", str(epoch), "--decision", "pass")
+    assert decided.rc == 0 and "--epoch not given" not in decided.err
+    assert requests_to(bridge, "get_task", before) == [] and len(requests_to(bridge, "gate", before)) == 1
+
+
+def test_gate_without_epoch_on_a_task_with_no_result_is_a_usage_error_and_never_gates(cli, bridge, workspace):
+    _, page = workspace
+    task = submit_manual(cli, bridge, page, "Nothing submitted yet", "--scope", "none")
+    before = len(bridge.requests)
+    refused = run_as(cli, bridge, "owner", "gate", "--task", task["task_id"], "--decision", "pass")
+    assert refused.rc == 2 and refused.out == ""
+    assert refused.err == "baton_cli: error: cannot default --epoch: the task has no submitted result to gate (state=queued)\n"
+    assert requests_to(bridge, "gate", before) == [] and len(requests_to(bridge, "get_task", before)) == 1
+    missing = run_as(cli, bridge, "owner", "gate", "--task", str(uuid.uuid4()), "--decision", "pass")
+    assert missing.rc == 1 and "not_found" in missing.err
+
+
+def test_gate_edit_sends_the_replacement_and_reason_and_shows_the_approver(cli, bridge, workspace, tmp_path):
+    _, page = workspace
+    task_id, epoch = submitted_for_review(cli, bridge, page, "Edit inline")
+    before = len(bridge.requests)
+    decided = run_as(cli, bridge, "owner", "gate", "--task", task_id, "--decision", "edit", "--edited-result", CHINESE,
+                     "--reason", "Fixed the wording")
+    assert decided.rc == 0, decided.err
+    sent = bridge.recorder.body(requests_to(bridge, "gate", before)[0])
+    assert sent["decision"] == "edit" and sent["edited_result"] == CHINESE and sent["reason"] == "Fixed the wording"
+    assert sent["expected_epoch"] == epoch
+    result = decided.json()
+    assert result["state"] == "done" and result["result"] == CHINESE and result["original_result"] == "Worker candidate"
+    assert result["gate"]["decision"] == "edit" and result["gate"]["authority"] == "root"
+    assert decided.err.endswith("task %s state=done epoch=%d gate=edit approver=%s authority=root\n" % (
+        task_id, epoch, bridge.identities["owner"]["agent"]))
+    event = next(row for row in run_json(cli, bridge, "owner", "audit", "--task", task_id) if row["event"] == "gate.result_overridden")
+    assert event["metadata"]["reason"] == "Fixed the wording"
+
+    second_id, _ = submitted_for_review(cli, bridge, page, "Edit from a file")
+    edited = tmp_path / "edited.md"
+    edited.write_text("# Edited\nfrom a file\n", encoding="utf-8")
+    from_file = run_as(cli, bridge, "owner", "gate", "--task", second_id, "--decision", "edit", "--edited-result-file", edited)
+    assert from_file.rc == 0 and from_file.json()["result"] == "# Edited\nfrom a file\n"
+    third_id, _ = submitted_for_review(cli, bridge, page, "Edit from stdin")
+    from_stdin = run_as(cli, bridge, "owner", "gate", "--task", third_id, "--decision", "edit", "--edited-result-file", "-",
+                        stdin="piped replacement")
+    assert from_stdin.rc == 0 and from_stdin.json()["result"] == "piped replacement"
+
+
+def test_gate_edit_flags_must_go_together(cli, bridge, workspace):
+    _, page = workspace
+    task_id, epoch = submitted_for_review(cli, bridge, page, "Bad flags")
+    before = len(bridge.requests)
+    for extra in (("--decision", "edit"), ("--decision", "pass", "--edited-result", "x"),
+                  ("--decision", "fail", "--edited-result-file", "-"), ("--decision", "approve")):
+        refused = run_as(cli, bridge, "owner", "gate", "--task", task_id, "--epoch", str(epoch), *extra, stdin="x")
+        assert refused.rc == 2 and refused.out == ""
+    both = run_as(cli, bridge, "owner", "gate", "--task", task_id, "--decision", "edit", "--edited-result", "a",
+                  "--edited-result-file", "-", stdin="b")
+    assert both.rc == 2
+    assert len(bridge.requests) == before
+    unchanged = run_as(cli, bridge, "owner", "gate", "--task", task_id, "--epoch", str(epoch), "--decision", "edit",
+                       "--edited-result", "Worker candidate")
+    assert unchanged.rc == 1 and "invalid (HTTP 422)" in unchanged.err and "edited_result" in unchanged.err
+    assert run_json(cli, bridge, "owner", "task", task_id)["state"] == "awaiting_gate"
+
+
+def test_gate_summary_names_a_delegated_approver_and_its_grantor(cli, bridge, workspace):
+    _, page = workspace
+    reviewer = bridge.identities["reviewer"]["agent"]
+    owner = bridge.identities["owner"]["agent"]
+    task_id, epoch = submitted_for_review(cli, bridge, page, "Delegated approval", reviewers=("reviewer",))
+    refused = run_as(cli, bridge, "reviewer", "gate", "--task", task_id, "--decision", "pass")
+    assert refused.rc == 1 and "delegation_required (HTTP 403)" in refused.err and "task " not in refused.err
+    delegation = run_json(cli, bridge, "owner", "call", "delegation_create", "--operation-id", str(uuid.uuid4()),
+                          "--json", json.dumps({"delegate_principal": reviewer, "reason": "DECISIONS 291"}))
+    decided = run_as(cli, bridge, "reviewer", "gate", "--task", task_id, "--decision", "edit", "--edited-result", "Delegate edit")
+    assert decided.rc == 0, decided.err
+    authority = "delegated by %s via %s" % (owner, delegation["id"])
+    assert decided.json()["gate"]["authority"] == authority
+    assert decided.err.endswith("task %s state=done epoch=%d gate=edit approver=%s authority=%s\n" % (task_id, epoch, reviewer, authority))
+
+
+def test_root_self_approval_summary_is_marked(cli, bridge, workspace):
+    _, page = workspace
+    task = run_json(cli, bridge, "owner", "call", "create_task_block", "--operation-id", str(uuid.uuid4()), "--json", json.dumps({
+        "page_id": page["id"], "prompt": "Owner does the work", "scopes": [{"kind": "none"}],
+        "reviewers": [bridge.identities["reviewer"]["agent"]]}))
+    claim = run_json(cli, bridge, "owner", "claim", "--task", task["task_id"])
+    run_json(cli, bridge, "owner", "result", "--task", task["task_id"], "--epoch", str(claim["epoch"]), "--result", "mine")
+    refused = run_as(cli, bridge, "owner", "gate", "--task", task["task_id"], "--decision", "pass")
+    assert refused.rc == 1 and "forbidden (HTTP 403)" in refused.err
+    decided = run_as(cli, bridge, "owner", "gate", "--task", task["task_id"], "--decision", "pass", "--self-approval")
+    assert decided.rc == 0
+    assert decided.err.endswith("gate=pass approver=%s authority=root (self-approval)\n" % bridge.identities["owner"]["agent"])
+
+
+def test_gate_summary_only_echoes_well_formed_fields(capsys):
+    module = load_cli_module()
+    base = {"task_id": TASK_A, "state": "done", "epoch": 2}
+    delegation = str(uuid.uuid4())
+    module.print_summary({**base, "gate": {"decision": "pass", "approver": "judge", "root": False, "self_approval": False,
+                                           "grantor": "boss", "delegation_id": delegation}})
+    module.print_summary({**base, "gate": {"decision": "edit", "approver": "boss", "root": True, "self_approval": True}})
+    module.print_summary({**base, "gate": {"decision": "pass\nforged", "approver": "x\x1b[31m", "root": False,
+                                           "grantor": "boss", "delegation_id": "not-a-uuid"}})
+    module.print_summary({**base, "gate": "root"})
+    assert capsys.readouterr().err == (
+        "task %s state=done epoch=2 gate=pass approver=judge authority=delegated by boss via %s\n" % (TASK_A, delegation)
+        + "task %s state=done epoch=2 gate=edit approver=boss authority=root (self-approval)\n" % TASK_A
+        + "task %s state=done epoch=2\n" % TASK_A + "task %s state=done epoch=2\n" % TASK_A)
+
+
+def test_watch_summary_shows_the_result_epoch_and_author_of_an_awaiting_gate_notification():
+    module = load_cli_module()
+    note = {"seq": 7, "event": "task.awaiting_gate", "object_type": "task", "object_id": TASK_A, "result_epoch": 3,
+            "result_author": "worker-1", "subject": "[awaiting_gate] x"}
+    assert module.notification_line(note) == ("notification seq=7 task.awaiting_gate task=%s result_epoch=3 result_author=worker-1 - [awaiting_gate] x" % TASK_A)
+    forged = {**note, "result_author": "x\x1b[31m", "result_epoch": True}
+    assert "result_" not in module.notification_line(forged)
+    assert "result_author" not in module.notification_line({**note, "result_author": "x\x1b[31m"})
