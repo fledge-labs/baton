@@ -120,7 +120,6 @@ create_task_block 和 submit_task 接受可选 `depends_on` 前置任务 UUID �
 
 例如先创建 A 与 B，再发送 `{"operation_id":"稳定UUID","graph":[{"task_id":"B的UUID","depends_on":["A的UUID"]}]}` 到 `https://example.com/v1/space/plan`。重试使用同一个 operation_id；只有 A 的当前结果经 gate 通过，B 才可能出现在接收人的 ready 列表中。此依赖协议是 Baton 的 x_ 扩展。
 
-<<<<<<< HEAD
 ## x_ready 施工面清单
 
 x_ready 让任务携带施工面清单，并可要求清单完整前不得领取。**它不是上一节的 `ready` 查询**：`ready` 列出调用者当前可领取的任务，不改变任何任务，保持不变（只是不再返回清单不完整的任务）；x_ready 是任务上的清单数据加领取门控。
@@ -136,7 +135,6 @@ x_ready 让任务携带施工面清单，并可要求清单完整前不得领取
 Baton 不会执行 `acceptance_command`。它只是显示给领取人和 gate 审阅人的文本，任务是否通过仍由 gate 审阅人决定。
 
 示例：先用 `create_task_block` 创建准备任务（`"task_kind":"prep"`）和施工任务（`"depends_on":["准备任务UUID"],"require_work_face":true`），准备任务的持有人在领取后向 `https://example.com/v1/space/set_work_face` 发送 `{"operation_id":"稳定UUID","task_id":"施工任务UUID","work_face":{"environment":["python 3.12"],"fixtures":["seed.sql"],"constraints":["不访问网络"],"migration":null,"acceptance_command":"pytest -q"},"base_commit":"基线提交"}`。
-=======
 ## 通知与送达（webhook、wait_inbox）
 
 此前 agent 只能反复调用 `fetch_inbox` 轮询。Baton 现在在同一 PostgreSQL 事务内写入通知 outbox，并提供两种异步送达：长轮询 `wait_inbox`，以及由 bridge 内部 worker 投递的 webhook。二者都只是“有新事项”的提示，不会启动任何执行；接收者仍须自愿读取、领取并行动，权限在读取与投递时重新检查。HTTP 与 MCP 使用同一 operation dispatcher：`POST https://example.com/v1/space/wait_inbox`，MCP 工具同名。
@@ -197,7 +195,6 @@ def verify(secret_hex: str, raw_body: bytes, header: str) -> bool:
 **SSRF 防护。** 只接受 `https` URL，不接受用户信息。订阅时解析主机名，解析结果中只要有环回、链路本地（含云元数据地址）、私有（RFC 1918、ULA）、组播、保留、未指定或其他非全局地址就拒绝（`422 invalid`）；IPv4 映射/NAT64 等嵌入形式按内嵌地址判断。每次投递在连接时重新解析并检查，并固定连接到检查通过的地址，再确认实际对端地址；因此订阅后改变 DNS 记录（rebinding）无法绕过。TLS 校验使用系统信任库，私有 CA 通过 `BATON_WEBHOOK_CA_BUNDLE` 指向 PEM 文件。运营者可用 `BATON_WEBHOOK_ALLOW_HOSTS`（逗号分隔的主机名或 IP 字面量，仅精确匹配）为内部接收端或开发测试豁免地址检查；豁免不放宽 https 要求。
 
 默认 Compose 中 bridge 只接入内部网络，没有出站路由，webhook 投递会失败并最终 dead-letter；需要 webhook 时由运营者为 bridge 明确添加出站网络与相应防火墙策略。
->>>>>>> 2479d48 (docs: document notifications, wait_inbox and webhooks)
 
 ## MCP 兼容与发现
 
