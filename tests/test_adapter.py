@@ -221,3 +221,55 @@ def test_wait_inbox_is_a_known_tool_but_not_in_the_default_allowlist():
     assert "wait_inbox" not in adapter.DEFAULT_ALLOWED_TOOLS
     assert adapter.DEFAULT_ALLOWED_TOOLS == {"submit_task", "get_task", "list_tasks", "fetch_inbox"}
     assert "wait_inbox" in adapter.parse_allow_tools("fetch_inbox,wait_inbox")
+
+
+READER = {"get_task", "list_tasks", "fetch_inbox", "wait_inbox", "list_comments", "get_page", "list_pages",
+          "list_audit", "ready"}
+ASSIGNEE = READER | {"claim", "renew", "comment", "submit_result", "mark_blocked", "handoff"}
+REVIEWER = READER | {"comment", "gate"}
+OWNER = REVIEWER | {"submit_task", "create_task_block", "assign_task", "plan", "set_work_face", "set_priority",
+                    "share", "create_space", "create_page", "delegation_create", "delegation_revoke",
+                    "delegation_list"}
+
+
+@pytest.mark.parametrize("preset,expected", [("@reader", READER), ("@assignee", ASSIGNEE),
+                                             ("@reviewer", REVIEWER), ("@owner", OWNER)])
+def test_role_presets_expand_to_the_documented_tools(preset, expected):
+    assert adapter.parse_allow_tools(preset) == expected
+    assert expected <= adapter.TOOLS
+    args = adapter.parse_args(["--agent-id", "beigua", "--token-file", "/synthetic/token", "--allow-tools", preset])
+    assert args.allow_tools == expected
+
+
+def test_role_presets_combine_with_tool_names_and_each_other():
+    assert adapter.parse_allow_tools("@reader, submit_task,claim,@reader") == READER | {"submit_task", "claim"}
+    assert adapter.parse_allow_tools("@reviewer,@assignee") == REVIEWER | ASSIGNEE
+    assert "gate" not in adapter.parse_allow_tools("@assignee")
+    assert "claim" not in adapter.parse_allow_tools("@reviewer")
+
+
+@pytest.mark.parametrize("value", ["@", "@admin", "@Reader", "@reader,@synthetic-private-unknown", "@*", "reader"])
+def test_unknown_presets_are_errors(value, capsys):
+    with pytest.raises(SystemExit) as error:
+        adapter.parse_args(["--agent-id", "beigua", "--token-file", "/synthetic/token", "--allow-tools", value])
+    assert error.value.code == 2
+    output = capsys.readouterr()
+    assert "synthetic-private-unknown" not in output.err and output.out == ""
+
+
+def test_default_allowlist_is_unchanged_by_presets():
+    assert adapter.DEFAULT_ALLOWED_TOOLS == {"submit_task", "get_task", "list_tasks", "fetch_inbox"}
+    args = adapter.parse_args(["--agent-id", "beigua", "--token-file", "/synthetic/token"])
+    assert args.allow_tools == adapter.DEFAULT_ALLOWED_TOOLS
+
+
+@pytest.mark.asyncio
+async def test_preset_allowlist_filters_discovery_and_denies_other_tools(capsys):
+    remote = SyntheticRemote([synthetic_tool(name) for name in ("get_task", "gate", "claim", "plan")])
+    server = adapter.create_proxy_server(remote, agent_id="beigua", allow_tools=adapter.parse_allow_tools("@reviewer"))
+    async with create_connected_server_and_client_session(server) as client:
+        assert {tool.name for tool in (await client.list_tools()).tools} == {"get_task", "gate"}
+        assert (await client.call_tool("gate", {})).isError is False
+        assert (await client.call_tool("plan", {})).isError is True
+    assert remote.calls == [("gate", {})]
+    capsys.readouterr()
