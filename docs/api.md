@@ -104,7 +104,7 @@ with urlopen(request) as response:
 
 手工 submit_result 只进入 awaiting_gate。gate 必须携带对应候选的 expected_epoch 和 pass/fail；只有配置 reviewer、具备当前 edit 权限且不是结果作者或持有人账户，才可通过。只有 gate 通过才会 done。
 
-Task view 包含 id/task_id/thread_id、work_face/require_work_face/task_kind/work_face_missing、page_id/block_id、owner/owner_account、execution_mode、state/status、epoch、holder/holder_account、lease_expires_at/lease_valid、scopes、base_commit、context、evidence、result/result_epoch、a2a_id/backend、gate_mode/reviewers 和错误元数据。canonical state 为 queued/claimed/awaiting_gate/done/failed/interrupted；兼容 status 将 claimed→working、done→completed。手工任务在当前 page view 权限下返回 prompt，方便接收人读取指令；自动任务的旧兼容状态视图仍省略 prompt。所有状态视图都不返回 idempotency key 或凭据。
+Task view 包含 id/task_id/thread_id、work_face/require_work_face/task_kind/work_face_missing、priority/respond_by/responded_at/escalated_at/overdue、page_id/block_id、owner/owner_account、execution_mode、state/status、epoch、holder/holder_account、lease_expires_at/lease_valid、scopes、base_commit、context、evidence、result/result_epoch、a2a_id/backend、gate_mode/reviewers 和错误元数据。canonical state 为 queued/claimed/awaiting_gate/done/failed/interrupted；兼容 status 将 claimed→working、done→completed。手工任务在当前 page view 权限下返回 prompt，方便接收人读取指令；自动任务的旧兼容状态视图仍省略 prompt。所有状态视图都不返回 idempotency key 或凭据。
 
 自动派发前先持久化 dispatch_started，并且每次结果写入检查 holder、当前 epoch 和未过期租约。网络结果不确定时进入 interrupted；自动恢复不会再次执行可能已派发的任务，旧 worker 不能覆盖新持有人。worker 明确报告失败时，任务进入 failed，`error` 只保存封闭词汇中的错误码（如 `CODEX_TIMEOUT`、`CODEX_AUTH_UNAUTHORIZED`；无法接受的诊断为 `A2A_FAILED_UNCLASSIFIED`），并在任务线程追加固定文本的 `[failed]` 评论；worker 的原始错误文本不会进入任务、线程或审计。
 
@@ -152,6 +152,7 @@ Baton 不会执行 `acceptance_command`。它只是显示给领取人和 gate �
 | `gate.decided` | `gate` 决定（pass 或 fail），以及自动任务的 worker_success 通过 | owner、assignee、持有人（提交结果的 holder） | task |
 | `task.handed_off` | `handoff` | 新持有人 | task |
 | `task.failed` | 自动任务的 worker 确定性失败（`fail_auto`，同时写入 `[failed]` 线程评论） | owner | task |
+| `task.overdue` | 后台升级循环发现任务超过 `respond_by` 仍无响应（见“响应时效与超时升级”） | `escalate_to`，与其不同时还有 owner | task |
 
 操作者本人不会收到自己操作产生的通知，同一 principal 在一次事件中只收到一条。收件人在插入时必须对对象所在页面有 view 权限，否则不写行。负载只含元数据：`id`、`seq`、`event`、`object_type`、`object_id`、`thread_id`、`created_at`、`recipient`；任何通知、webhook 或审计都不含 prompt、评论正文或结果文本，接收者凭 object_id 再用 `get_task`、`list_comments` 等带权限检查的读取操作取内容。
 
@@ -196,9 +197,55 @@ def verify(secret_hex: str, raw_body: bytes, header: str) -> bool:
 
 默认 Compose 中 bridge 只接入内部网络，没有出站路由，webhook 投递会失败并最终 dead-letter；需要 webhook 时由运营者为 bridge 明确添加出站网络与相应防火墙策略。
 
+## 响应时效与超时升级
+
+响应时效约定（设计简报“沟通原则 3”）让指派不会无人问津：每个优先级有一个响应时限，到期仍无响应时通知负责人，必要时改派。这是 Baton 的 x_ 扩展。
+
+**字段与默认值。** `submit_task` 与 `create_task_block` 接受可选 `priority`（`urgent`/`normal`/`low`，默认 `normal`）、`escalate_to`（principal，默认任务 owner）和 `fallback_assignee`（principal，可选，不能等于 assignee）；非法值返回 `422 invalid`。三者只在非默认时计入幂等请求摘要，不带它们的旧请求摘要不变；显式写默认值与省略等价。
+
+**时限策略。** 时限只适用于有 assignee 的手工路径任务。时钟在 assignee 被设置时启动：创建时带 assignee，或 `assign_task`/`handoff` 改为新的 assignee（同一 assignee 重复指派不重置），此时 `respond_by = 数据库当前时间 + 该优先级的分钟数`，同时清空 `responded_at` 与 `escalated_at`。没有 assignee 的任务（包括自动任务）没有 `respond_by`，直到被指派。分钟数是 bridge 配置，默认 `urgent=20,normal=60,low=1440`，可用环境变量覆盖：
+
+```text
+BATON_RESPONSE_MINUTES="urgent=20,normal=60,low=1440"
+```
+
+可以只写部分优先级，其余保持默认；每项是 1 到 525600 的整数，格式非法时 bridge 启动失败，而不是静默回退。
+
+**什么算响应。** assignee 领取任务（`claim`），或 assignee/当前持有人在该任务线程发表评论（`comment`）。`responded_at` 只在第一次响应时设置。其他人的评论、系统生成的线程消息都不算。
+
+**task view。** 在原有字段之外返回 `priority`、`respond_by`、`responded_at`、`escalated_at`、`escalate_to`、`fallback_assignee` 和 `overdue`。`overdue` 为 true 表示 `respond_by` 已过、尚无响应且任务未结束（done/failed）。
+
+**升级。** bridge 内的后台循环每 30 秒运行一次。每轮先以 PostgreSQL 咨询锁单飞（拿不到锁的副本直接跳过本轮），所以多个 bridge 副本不会重复升级；即使绕过咨询锁，`escalated_at` 守卫也保证同一 assignee 只升级一次。对 `respond_by` 已过、`responded_at` 与 `escalated_at` 为空、状态为 queued（含租约已失效的旧租约）的任务，在同一事务内：
+
+1. 设置 `escalated_at`，写审计 `task.escalated`；
+2. 向 `escalate_to` 写通知 `task.overdue`；`escalate_to` 与 owner 不同时 owner 也收到一条。收件人仍需页面 view 权限，否则不写行；
+3. 若设置了 `fallback_assignee`，该 principal 当前对页面有 edit 权限且任务仍未被领取，则按 `assign_task` 的规则改派：审计 `task.reassigned`，通知新 assignee `task.assigned`，并为新 assignee 重置 `respond_by`/`escalated_at`。
+
+已被领取的任务从不升级或改派；同一 assignee 不会被升级两次，新 assignee 有新的时限。改派后 fallback 已是 assignee 时，下一次超时只升级、不再改派，避免来回跳。升级和改派只发通知与改派，不替 agent 执行任何事；命名 agent 仍自愿 pull。
+
+**`set_priority(operation_id, task_id, priority)`。** 限任务 owner 与 `reviewers`（其他人 `403 forbidden`，非法优先级 `422 invalid`），同 operation_id 同输入重放，异输入 `409 operation_conflict`。尚未响应且已有 `respond_by` 时，按新优先级重算期限：窗口起点不变，只有长度换成新优先级的分钟数。已响应或已升级的任务不会因此重新打开升级。成功写审计 `task.priority_set` 并返回 task view。
+
+```python
+# SPDX-License-Identifier: Apache-2.0
+import uuid
+import httpx
+
+BASE = "https://example.com"  # 你的 Baton 地址
+HEADERS = {"Authorization": "Bearer <你的令牌>"}
+
+task = httpx.post(BASE + "/v1/space/submit_task", headers=HEADERS, json={
+    "operation_id": str(uuid.uuid4()), "idempotency_key": "release-check-1", "prompt": "核对发布清单",
+    "assignee_principal": "beigua", "priority": "urgent",
+    "escalate_to": "nangua", "fallback_assignee": "backup-agent",
+}).json()["result"]
+print(task["priority"], task["respond_by"], task["overdue"])
+```
+
+MCP 与适配器：`submit_task` 工具和 `create_task_block` 带上述三个可选参数，`set_priority` 与其他 x_ 工具一样可用；适配器已知工具含 `set_priority`，默认白名单不变，需要时用 `--allow-tools` 显式放行。通知 `task.overdue` 见上文事件表。
+
 ## MCP 兼容与发现
 
-`submit_task(idempotency_key,prompt,page_id=None,scopes=None,assignee_principal=None,depends_on=None,work_face=None,require_work_face=False,task_kind="construction")`、`get_task(task_id)`、`list_tasks()`、`fetch_inbox()` 保持既有工具入口与结果形状。兼容 submit_task 在服务端从 principal + 业务 key 派生稳定 operation_id。其他工具与上列 HTTP 同名同参数，返回包含 x_protocol 和 result 的对象；它们通过同一个 operation dispatcher 执行，MCP 工具发现提供完整 JSON Schema。
+`submit_task(idempotency_key,prompt,page_id=None,scopes=None,assignee_principal=None,depends_on=None,work_face=None,require_work_face=False,task_kind="construction",priority="normal",escalate_to=None,fallback_assignee=None)`、`get_task(task_id)`、`list_tasks()`、`fetch_inbox()` 保持既有工具入口与结果形状。兼容 submit_task 在服务端从 principal + 业务 key 派生稳定 operation_id。其他工具与上列 HTTP 同名同参数，返回包含 x_protocol 和 result 的对象；它们通过同一个 operation dispatcher 执行，MCP 工具发现提供完整 JSON Schema。
 
 旧显示字段 submission_mail_status/mail_status/mail_error 改为 submission_thread_status/thread_status/thread_error；适配器只记录经过校验的 thread_ids 等元数据，不记录正文。fetch_inbox.messages 仍提供 id/thread_id/subject/from/to/created_ts/body_md，来源是评论与提及视图。
 

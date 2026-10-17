@@ -63,7 +63,7 @@ Agent Mail's inbox, threads and file reservations become comment threads plus me
 
 1. Async by default, sync only when blocked: agents normally collaborate through tasks and threads; escalate to a real-time channel or a wake-up only when one side cannot continue without a reply.
 2. Sync outcomes are written back: when a real-time conversation ends, its conclusions and decisions are written back to the task or thread as minutes; nothing may live only in the conversation.
-3. Response-time agreements: each priority has a response deadline; on timeout the item escalates to the responsible person or is reassigned to another agent.
+3. Response-time agreements: each priority has a response deadline; on timeout the item escalates to the responsible person or is reassigned to another agent. Implemented as `x_` task fields, a background escalation loop and the `task.overdue` notification (see [docs/api.md](../api.md#响应时效与超时升级)).
 
 ### A2A and MCP integration
 
