@@ -102,7 +102,7 @@ with urlopen(request) as response:
 
 Task view 包含 id/task_id/thread_id、work_face/require_work_face/task_kind/work_face_missing、page_id/block_id、owner/owner_account、execution_mode、state/status、epoch、holder/holder_account、lease_expires_at/lease_valid、scopes、base_commit、context、evidence、result/result_epoch、a2a_id/backend、gate_mode/reviewers 和错误元数据。canonical state 为 queued/claimed/awaiting_gate/done/failed/interrupted；兼容 status 将 claimed→working、done→completed。手工任务在当前 page view 权限下返回 prompt，方便接收人读取指令；自动任务的旧兼容状态视图仍省略 prompt。所有状态视图都不返回 idempotency key 或凭据。
 
-自动派发前先持久化 dispatch_started，并且每次结果写入检查 holder、当前 epoch 和未过期租约。网络结果不确定时进入 interrupted；自动恢复不会再次执行可能已派发的任务，旧 worker 不能覆盖新持有人。
+自动派发前先持久化 dispatch_started，并且每次结果写入检查 holder、当前 epoch 和未过期租约。网络结果不确定时进入 interrupted；自动恢复不会再次执行可能已派发的任务，旧 worker 不能覆盖新持有人。worker 明确报告失败时，任务进入 failed，`error` 只保存封闭词汇中的错误码（如 `CODEX_TIMEOUT`、`CODEX_AUTH_UNAUTHORIZED`；无法接受的诊断为 `A2A_FAILED_UNCLASSIFIED`），并在任务线程追加固定文本的 `[failed]` 评论；worker 的原始错误文本不会进入任务、线程或审计。
 
 在写入 dispatch_started 前，bridge 重新读取 registry，要求提交者仍是 active client，且 principal、connected account 和 kind 与任务保存的身份一致。撤销或改变映射后，排队任务以 cancelled 停止，不向 A2A 发出请求；这一检查不承诺取消此前已经发出的执行。页面及依赖权限仍由 store 以任务保存的原提交者身份重新校验，内部 service 身份不扩大执行授权。
 

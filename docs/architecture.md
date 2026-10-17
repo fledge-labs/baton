@@ -17,6 +17,8 @@ PostgreSQL 的 `baton` schema 保存 spaces、pages、blocks、分享、归属�
 
 自动任务由 bridge 派发，经内部 gateway 的 A2A 路由送给 worker。worker 保留独立的 SQLite A2A task store 和执行去重回执；真实 Codex 与 demo backend 在结果和审计中明确区分。完成候选必须经过配置的 gate 才能成为 done；兼容视图才将 done 映射为 completed。手工领取不自动进入 worker 队列。
 
+worker 的失败由封闭词汇（`bridge/failures.py`）分类。worker 报告的失败由 bridge 以错误码写入任务 `error`、状态置为 failed，并在任务线程中以评论回报，与完成回报一致；结果不确定时仍保持 interrupted。worker 同时运行 `bridge/worker_health.py`：每 30 秒采样 cgroup v2 资源，每 15 分钟经与业务任务相同的执行路径和执行锁运行 canary，探针账本保存在 worker 的 SQLite；`/healthz` 返回快照（含最近一次 canary 的各阶段耗时）。demo backend 不调用模型，其 canary 只是合成检查，快照以 `backend` 字段标明。每次 Codex 执行的阶段耗时（spawn、首个 `--json` 事件、首个 `item.*`、turn 结束、进程退出）记录在 `executions` 与 `health_probes` 行的 `phases` 列。
+
 租约与 fence 以数据库时间和事务锁为权威；`x_scope` 首版统一 global namespace，覆盖同一 PostgreSQL 权威中的跨 Space 冲突。交接在事务内保留 base/context/evidence/thread，并使旧 fence 失效。它不提供跨独立数据库的分布式锁，也不承诺 PostgreSQL 与外部 Codex 进程的 exactly-once。
 
 ## 运维范围
