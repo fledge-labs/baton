@@ -28,6 +28,8 @@ PostgreSQL 的 `baton` schema 保存 spaces、pages、blocks、分享、归属�
 
 ## 运维范围
 
+edge 的 nginx 用 Docker 内置 DNS（`resolver 127.0.0.11 valid=10s ipv6=off`）并通过变量（`set $upstream http://gateway:3000`）做 `proxy_pass`，每次请求重新解析 `gateway`，请求路径、查询串、请求头、超时和流式（SSE）设置保持不变；因此 gateway 被重建、换了容器 IP 后无需重启 edge。edge 的健康检查要求 `/board` 为 200，且不带凭据的 `POST /mcp` 经 nginx 到达 gateway 并得到 401；502/503/504 表示 edge→gateway 不通。该 401 由 gateway 的鉴权策略在转发前产生，不经过 bridge，gateway 镜像也没有可执行探测的 shell 或客户端，所以 gateway→bridge 由 `scripts/deploy.py` 在部署后用冒烟令牌走一次完整 MCP 流程（`initialize`、`tools/list`、`fetch_inbox`）验证；失败时它恢复之前的本地镜像并重新 `up`。该脚本不回滚数据库 schema。
+
 `x_audit` 的业务记录只允许应用追加/读取，并由所有者触发器拒绝修改、删除和清空。边缘、网关与 bridge 的 JSONL 另用于连接入口 request ID 与 task ID；这些文件不提供抗管理员篡改保证。数据库超级用户和 Docker 管理员属于可信边界。
 
 本次替换只用于全新命名卷实例，不自动迁移旧 SQLite 或旧消息数据，不连接真实账户、ChatGPT Space 或既有私有部署。正式 schema 升级、备份恢复与生产迁移需要单独的版本及验收过程。

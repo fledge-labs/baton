@@ -91,6 +91,30 @@ docker compose run --rm --no-deps \
 
 令牌文件权限为 0600。用安全凭据管理方式提供给看板或适配器；不要输出到共享终端、URL、聊天、项目配置或 Git。
 
+### 重新部署、冒烟与回滚
+
+在 Docker 主机上用 [`scripts/deploy.py`](scripts/deploy.py)（仅 Python 3 标准库）重建并替换运行中的实例，而不是手工 `up`。它先记录当前运行容器的镜像 ID，并给可恢复的本地镜像加 `baton-deploy-rollback:<id>` 保留标签；然后构建，执行 `docker compose … up -d --wait --force-recreate --remove-orphans`（使用你给的 `-f` 文件和项目名，所有服务一起重建，孤立容器被清除）；最后对入口做冒烟：`GET /board` 为 200、不带凭据的 `POST /mcp` 为 401，以及用冒烟令牌完成一次真实的 MCP `initialize`、`tools/list`、`fetch_inbox`。`up` 或任一冒烟失败时，它把之前的镜像重新打回原标签，再次 `up`（回滚），复测，并以非零状态退出。标准输出是 JSON 报告，进度写到标准错误。
+
+冒烟令牌是一个普通客户端身份，只通过文件路径传入，从不打印；文件权限保持 0600，放在仓库外：
+
+```sh
+# SPDX-License-Identifier: Apache-2.0
+cd baton/deploy
+docker compose run --rm --no-deps \
+  -v "$HOME/.config/baton:/delivery" admin issue deploy-smoke \
+  --output /delivery/deploy-smoke.token --uid "$(id -u)" --gid "$(id -g)"
+python3 ../scripts/deploy.py -f compose.yaml -p baton \
+  --smoke-token-file "$HOME/.config/baton/deploy-smoke.token"
+```
+
+- 项目名与 `-f` 文件按你平时给 `docker compose` 的写法；TLS 实例加 `-f compose.tls.yaml`，并用 `--base-url https://<host>:<端口>`（私有 CA 用 `--ca-file`）。默认入口是 `http://127.0.0.1:8080`；明文 http 只允许回环地址，避免把令牌发往远端。
+- `docker compose build` 没有网络参数；构建需要宿主网络时加 `--build-network host`，脚本会为带 `build` 的服务临时生成一个只含 `build.network` 的 Compose 覆盖文件，仅用于构建。`--no-build` 跳过构建。
+- `--dry-run` 只执行只读的 docker 查询，列出将要运行的命令，不构建、不重建、不发请求。
+- 退出码：0 已部署；1 失败但旧版本在运行（已回滚，或构建失败时从未被改动）；2 用法或配置错误；3 失败且旧版本没有恢复（回滚失败，或首次部署没有可恢复的版本）。
+- 回滚只恢复本地构建或本地标签的镜像（如 `baton-app:local`）；按 digest 固定的镜像由 Compose 文件决定，不会被改写。数据库 schema 不会回滚，迁移必须与上一版应用镜像兼容。回滚也失败时保留 `baton-deploy-rollback` 标签，可按报告手工恢复。
+
+edge 的 nginx 每次请求通过 Docker 内置 DNS（`127.0.0.11`，缓存 10 秒）解析 `gateway`，所以重建 gateway 后无需重启 edge；以前 nginx 只在启动时解析上游，gateway 换了容器 IP 就会一直 502。edge 的健康检查除 `/board` 外还会对 `/mcp` 发一个不带凭据的 POST，必须得到 gateway 的 401，502/503/504 即不健康（`compose.tls.yaml` 的 edge 健康检查仍是 `nginx -t`）。注意：401 在 gateway 内部由鉴权策略直接产生，**不会**访问 bridge，所以它不能证明 gateway→bridge 链路通畅；gateway 镜像里没有 shell、wget 或 curl，也无法在它自己的容器里执行探测。gateway 到 bridge 这一段由 `deploy.py` 的带令牌 MCP 冒烟验证。
+
 ### 升级旧实例
 
 早先版本的 Compose 带一个 `codex` 服务（内置 Codex worker）。它已被移除：不再有 `WORKER_MODE`、`CODEX_*` 设置、`admin import-auth`/`import-api-key`、`compose.apparmor.yaml`、专用 seccomp/AppArmor 配置和 `scripts/sandbox_probe.py`，镜像里也不再含 Node.js、Codex CLI 与 bubblewrap。升级时：
