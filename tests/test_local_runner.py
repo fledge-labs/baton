@@ -88,6 +88,8 @@ for path in scenario.get("print_files", []):
     print(Path(path).read_text(), flush=True)
 for text in scenario.get("print", []):
     print(text, flush=True)
+for name in scenario.get("print_env", []):
+    print("%s=%s" % (name, os.environ.get(name, "")), flush=True)
 if scenario.get("flood"):
     sys.stdout.write("F" * scenario["flood"])
     sys.stdout.flush()
@@ -810,17 +812,209 @@ def test_the_documented_example_config_parses_and_keeps_the_agreed_workers(monke
     block = re.sub(r'"<([A-Z_]+)>"', lambda m: '"/s/%s"' % m.group(1), block)
     config = lr.parse_config(json.loads(block))
     workers = {w.principal: w for w in config.workers}
-    assert list(workers) == ["huanggua", "haimigua", "mugua", "sigua", "kugua", "digua", "xigua"]
+    assert list(workers) == ["huanggua", "haimigua", "mugua", "sigua", "kugua", "digua", "xianggua", "xigua"]
+    assert workers["xianggua"].command == ["dsh", "headless", "{prompt_instruction}"]
+    assert workers["xianggua"].prompt_via == "wrapper"
+    assert workers["xianggua"].env_from_keychain == {"DEEPSEEK_API_KEY": "fledge-deepseek-key"}
+    assert workers["xianggua"].sandbox.backend == "sandbox-exec"
+    assert all(not w.env_from_keychain for n, w in workers.items() if n != "xianggua")
     assert workers["xigua"].enabled is False and all(w.enabled for n, w in workers.items() if n != "xigua")
     assert workers["kugua"].implicit_auto_approve and workers["kugua"].sandbox.backend != "none"
     assert workers["huanggua"].command == ["codex", "exec", "-"] and workers["huanggua"].prompt_via == "stdin"
     assert workers["sigua"].command[:4] == ["opencode", "run", "-m", "opencode/big-pickle"]
     assert workers["digua"].command[0].endswith("/.local/bin/devin") and not workers["digua"].command[0].startswith("~")
-    assert {workers[n].prompt_via for n in ("haimigua", "mugua", "sigua", "kugua", "digua")} == {"wrapper"}
+    assert {workers[n].prompt_via for n in ("haimigua", "mugua", "sigua", "kugua", "digua", "xianggua")} == {"wrapper"}
     tokens = {os.path.dirname(w.token_file) for w in config.workers}
     assert len(tokens) == 1 and tokens.pop().endswith("/.config/baton-runner")
     for worker in config.workers:
         assert lr.refused_flags(worker.command) == []
+
+
+STUB_SECURITY = '''#!{python}
+import json, sys
+from pathlib import Path
+
+items = json.loads(Path({items!r}).read_text())
+with open({log!r}, "a") as handle:
+    handle.write(json.dumps(sys.argv[1:]) + "\\n")
+if sys.argv[1:2] != ["find-generic-password"] or sys.argv[2:3] != ["-s"] or sys.argv[4:] != ["-w"]:
+    sys.exit(2)
+service = sys.argv[3]
+if service not in items:
+    sys.stderr.write("The specified item could not be found in the keychain.\\n")
+    sys.exit(44)
+print(items[service])
+'''
+
+
+@pytest.fixture
+def keychain(tmp_path):
+    """A stub `security` binary: serves fixed items and records each invocation's argv."""
+    items, log = tmp_path / "keychain-items.json", tmp_path / "security-calls.log"
+    program = tmp_path / "bin" / "security"
+    program.parent.mkdir(exist_ok=True)
+    program.write_text(STUB_SECURITY.format(python=sys.executable, items=str(items), log=str(log)))
+    program.chmod(0o755)
+    log.write_text("")
+
+    def serve(**services):
+        items.write_text(json.dumps(services))
+    serve()
+    return type("Keychain", (), {"bin": str(program), "serve": staticmethod(serve),
+                                 "calls": staticmethod(lambda: [json.loads(line) for line in log.read_text().splitlines()])})
+
+
+KEY_VALUE = "dsk-live-0123456789abcdef"
+
+
+def start_darwin(lab, workers, keychain, **overrides):
+    """Start a runner that believes it is on macOS and resolves Keychain items through the stub."""
+    runner = lr.Runner(lr.load_config(lab.write_config(lab.config(workers, **overrides))),
+                       security_bin=keychain.bin, platform="darwin")
+    runner.start()
+    lab.runners.append(runner)
+    return runner
+
+
+def tree_bytes(root):
+    return b"".join(path.read_bytes() for path in sorted(Path(root).rglob("*")) if path.is_file())
+
+
+def test_keychain_value_reaches_only_the_target_child_and_never_leaks(lab, bridge, space, keychain, capsys, tmp_path):
+    assert shutil.which("bwrap"), "bubblewrap must be installed: the sandbox tests may not be skipped"
+    keychain.serve(**{"fledge-deepseek-key": KEY_VALUE, "unrelated-item": "unrelated-secret-value"})
+    printing = lab.scenario(print_env=["DEEPSEEK_API_KEY"])
+    mine = assign(space, bridge, "worker")
+    theirs = assign(space, bridge, "worker2")
+    target = lab.worker(scenario=printing, sandbox={"backend": "bwrap"},
+                        env_from_keychain={"DEEPSEEK_API_KEY": "fledge-deepseek-key"})
+    other = lab.worker("worker2", scenario=printing)
+    start_darwin(lab, [target, other], keychain)
+    view = wait_state(space, mine, "awaiting_gate")
+    other_view = wait_state(space, theirs, "awaiting_gate")
+
+    assert lab.report("worker", mine)["env"]["DEEPSEEK_API_KEY"] == KEY_VALUE, "the target child gets the key"
+    other_env = lab.report("worker2", theirs)["env"]
+    assert "DEEPSEEK_API_KEY" not in other_env and KEY_VALUE not in json.dumps(other_env)
+    assert keychain.calls() == [["find-generic-password", "-s", "fledge-deepseek-key", "-w"]], "argv list, one item, once"
+
+    assert "DEEPSEEK_API_KEY=[REDACTED]" in view["result"] and KEY_VALUE not in view["result"]
+    assert "DEEPSEEK_API_KEY=" in other_view["result"] and "[REDACTED]" not in other_view["result"]
+    surfaces = [json.dumps(thread_comments(space, t)) + json.dumps(task_view(space, t))
+                + json.dumps(space.owner.read("list_audit", task_id=t)) for t in (mine, theirs)]
+    lab.stop()
+    logged = capsys.readouterr()
+    for text in [*surfaces, logged.err, logged.out]:
+        assert KEY_VALUE not in text and "unrelated-secret-value" not in text
+    assert KEY_VALUE.encode() not in tree_bytes(tmp_path / "state"), "nothing about the key reaches the state dir"
+    assert KEY_VALUE.encode() not in tree_bytes(tmp_path / "config")
+
+
+def test_missing_keychain_item_blocks_the_task_without_naming_any_item(lab, bridge, space, keychain, capsys, tmp_path):
+    assert shutil.which("bwrap"), "bubblewrap must be installed: the sandbox tests may not be skipped"
+    keychain.serve(**{"present-item-name": KEY_VALUE})
+    scenario = lab.scenario(counter=str(tmp_path / "count"))
+    task_id = assign(space, bridge, "worker")
+    worker = lab.worker(scenario=scenario, sandbox={"backend": "bwrap"},
+                        env_from_keychain={"A_KEY": "present-item-name", "B_KEY": "absent-item-name"})
+    start_darwin(lab, [worker], keychain, max_failures_per_task=1)
+    wait_for(lambda: task_view(space, task_id)["blocked"], message="blocked marker")
+    assert task_view(space, task_id)["blocked"]["reason_code"] == "other"
+    comments = thread_comments(space, task_id)
+    assert any(c["body"] == "[blocked] other: keychain item missing" and c["subject"].startswith("[blocked] ") for c in comments)
+    wait_for(lambda: any("Handed back to the assigner" in c["body"] for c in thread_comments(space, task_id)),
+             message="hand back")
+    lab.stop()
+    assert not (tmp_path / "count").exists(), "the command never started"
+    everything = json.dumps(thread_comments(space, task_id)) + json.dumps(task_view(space, task_id))
+    logged = capsys.readouterr()
+    for text in (everything, logged.err):
+        for name in ("present-item-name", "absent-item-name", KEY_VALUE):
+            assert name not in text
+    assert "keychain item missing" in logged.err
+
+
+def test_env_from_keychain_is_refused_off_macos_and_without_a_sandbox(lab, bridge, keychain, capsys):
+    keychain.serve(**{"fledge-deepseek-key": KEY_VALUE})
+    worker = lab.worker(sandbox={"backend": "bwrap"}, env_from_keychain={"DEEPSEEK_API_KEY": "fledge-deepseek-key"})
+    config = lr.load_config(lab.write_config(lab.config([worker])))
+    for platform in ("linux", "win32", "freebsd"):
+        runner = lr.Runner(config, security_bin=keychain.bin, platform=platform)
+        assert runner.start() == []
+        assert runner.refusals == [(worker["principal"], "env_from_keychain is only supported on macOS")]
+    assert "refused" in capsys.readouterr().err
+    unsandboxed = lab.worker(env_from_keychain={"DEEPSEEK_API_KEY": "fledge-deepseek-key"})
+    runner = lr.Runner(lr.load_config(lab.write_config(lab.config([unsandboxed]))), security_bin=keychain.bin,
+                       platform="darwin")
+    assert runner.start() == [] and runner.refusals[0][1] == "env_from_keychain needs a sandbox backend"
+    missing_tool = lr.Runner(config, security_bin="/nonexistent/security", platform="darwin")
+    assert missing_tool.start() == [] and missing_tool.refusals[0][1] == "security tool is not executable"
+    assert keychain.calls() == [], "refusal happens before any Keychain read"
+    assert lr.Runner(config).platform == sys.platform
+
+
+def test_env_from_keychain_is_validated_at_load(tmp_path):
+    ok = {"DEEPSEEK_API_KEY": "fledge-deepseek-key", "_X1": "service with spaces and \u00e9"}
+    assert lr.parse_config(base_config(tmp_path, env_from_keychain=ok)).workers[0].env_from_keychain == ok
+    assert lr.parse_config(base_config(tmp_path)).workers[0].env_from_keychain == {}
+    for bad in ({"lower": "svc"}, {"1BAD": "svc"}, {"A-B": "svc"}, {"BATON_TOKEN": "svc"}, {"HOME": "svc"},
+                {"PATH": "svc"}, {"OK": ""}, {"OK": 5}, {"OK": "bad\nservice"}, {"OK": "bad\x00"}, {"OK": "x\x1b[0m"},
+                {"OK": "y" * 201}, {"": "svc"}, ["not", "a", "mapping"], "DEEPSEEK_API_KEY=svc"):
+        with pytest.raises(lr.ConfigError):
+            lr.parse_config(base_config(tmp_path, env_from_keychain=bad))
+    with pytest.raises(lr.ConfigError):
+        lr.parse_config(base_config(tmp_path, env_passthrough=["SAME"], env_from_keychain={"SAME": "svc"}))
+
+
+def test_read_keychain_uses_an_argv_list_and_collapses_every_failure(keychain, tmp_path):
+    keychain.serve(**{"svc; touch /tmp/pwned": "value-1", "empty": ""})
+    assert lr.read_keychain(keychain.bin, {"A": "svc; touch /tmp/pwned"}) == {"A": "value-1"}
+    assert keychain.calls() == [["find-generic-password", "-s", "svc; touch /tmp/pwned", "-w"]]
+    assert not Path("/tmp/pwned").exists()
+    for mapping, bin_path in (({"A": "nope"}, keychain.bin), ({"A": "empty"}, keychain.bin),
+                              ({"A": "svc"}, "/nonexistent/security"), ({"A": "svc"}, str(tmp_path))):
+        with pytest.raises(lr.RunnerError) as error:
+            lr.read_keychain(bin_path, mapping)
+        assert str(error.value) == "keychain item missing"
+
+
+def test_sandbox_exec_profile_denies_the_keychain_files_and_security_daemons(tmp_path):
+    keychains = [str(tmp_path / "home/Library/Keychains"), "/Library/Keychains"]
+    profile = lr.sandbox_exec_profile(make_plan(tmp_path, keychain_dirs=keychains))
+    for directory in keychains:
+        assert '(deny file-read* (subpath "%s"))' % directory in profile
+    denied = next(line for line in profile.splitlines() if line.startswith("(deny mach-lookup"))
+    assert lr.KEYCHAIN_MACH_SERVICES == ("com.apple.SecurityServer", "com.apple.securityd", "com.apple.security.agent",
+                                         "com.apple.secd", "com.apple.security.authhost")
+    for name in lr.KEYCHAIN_MACH_SERVICES:
+        assert '(global-name "%s")' % name in denied
+    assert profile.index("(allow default)") < profile.index("(deny mach-lookup")
+    plain_profile = lr.sandbox_exec_profile(make_plan(tmp_path))
+    assert "Keychains" not in plain_profile and "mach-lookup" not in plain_profile
+
+
+def test_sandbox_plan_adds_keychain_denials_only_for_workers_that_use_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    data = base_config(tmp_path, env_from_keychain={"K": "svc"}, sandbox={"backend": "sandbox-exec"})
+    data["workers"].append({**data["workers"][0], "principal": "w2", "token_file": str(tmp_path / "t2"),
+                            "workdir_root": str(tmp_path / "r2"), "env_from_keychain": {}})
+    config = lr.parse_config(data)
+    runner = type("R", (), {"config": config, "stop": threading.Event(), "secrets": []})()
+    plans = [lr.WorkerRunner(runner, w, None, None).sandbox_plan(tmp_path / "wt", tmp_path / "tmp")
+             for w in config.workers]
+    assert plans[0].keychain_dirs == [os.path.realpath(str(tmp_path / "home/Library/Keychains")),
+                                      os.path.realpath("/Library/Keychains")]
+    assert plans[1].keychain_dirs == []
+    assert "com.apple.SecurityServer" in lr.sandbox_exec_profile(plans[0])
+    assert "com.apple.SecurityServer" not in lr.sandbox_exec_profile(plans[1])
+
+
+def test_keychain_values_are_redacted_from_captured_output_boundaries():
+    sink = lr.Capped(1000)
+    sink.feed(("x" * 700 + "\n").encode())
+    sink.feed(KEY_VALUE.encode() + b" inline\n" + b"y" * 600 + KEY_VALUE[:14].encode())
+    text = sink.text([KEY_VALUE])
+    assert KEY_VALUE not in text and KEY_VALUE[:14] not in text and "[REDACTED]" in text
 
 
 def test_runner_never_strips_or_adds_flags(tmp_path):
