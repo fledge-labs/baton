@@ -52,8 +52,8 @@ Baton 提供通信、权限、审计和工作流秩序；执行属于外部 agen
 - **作用域冲突（x_scope）** — 在共用权威内按声明路径等规则互斥占用，防止并发领取重叠工作面。见 [行为规格 X9–X10](spec/space.md#x_claimx_scope-与-x_handoff) 与 [API「任务、租约与 gate」](api.md#任务租约与-gate)。
 - **安全交接（x_handoff）** — 在事务内切换持有人并提升 fence，保留上下文与证据且不扩大未检查的作用域。见 [行为规格 X11](spec/space.md#x_claimx_scope-与-x_handoff) 与 [API「任务、租约与 gate」](api.md#任务租约与-gate)。
 - **依赖图（x_graph）** — 任务经 `depends_on` 组成 DAG，前置未通过 gate 则后继不可领取。见 [行为规格 X17](spec/space.md#x_gate任务兼容层与-x_audit) 与 [API「x_graph 依赖图」](api.md#x_graph-依赖图)。
-- **审批委托链** — 仅 Space owner（根）或持有根链上有效审批人委托的主体可批准，委托不可越权、不可成环。见 [API「审批人委托（delegation）」](api.md#审批人委托delegation)。
-- **双人确认** — 任务可要求两个不同审批人对同一结果 epoch 均通过后才完成。见 [API「任务、租约与 gate」中的双人确认](api.md#任务租约与-gate)。
+- **审批委托链** — 仅 Space owner（根）或持有根链上有效审批人委托的主体可批准，委托不可越权、不可成环；**非根**还须是任务配置的审阅人（reviewer）并对任务页面具**当前 edit 权限**，且除根在显式 `self_approval` 外不得批准自己提交或执行的结果（含该 epoch 的 claim 持有人）。见 [行为规格 X13 / X25](spec/space.md#x_gate任务兼容层与-x_audit)、[API「审批关卡」与「审批人委托（delegation）」](api.md#任务租约与-gate)。
+- **双人确认** — 任务可要求**两个不同审批人**（不同 principal **且**不同 account）对同一 `result_epoch` 均通过后才完成。见 [行为规格 X25](spec/space.md#x_gate任务兼容层与-x_audit)、[API「双人确认」](api.md#任务租约与-gate)。
 - **全程审计（x_audit，只追加）** — 业务效果与审计在同一事务提交，应用角色不得改写或删除审计行。见 [行为规格 X16](spec/space.md#x_gate任务兼容层与-x_audit) 与 [API「错误与审计」](api.md#错误与审计)。
 - **多家 agent 加本地 runner** — 任意家的 agent 经 MCP、HTTP、A2A、webhook 接入；本地执行可用 [`adapters/local_runner.py`](../adapters/local_runner.py) 与 [API「MCP 兼容与发现」](api.md#mcp-兼容与发现)、[「适配器角色预设」](api.md#适配器角色预设)。
 
@@ -87,4 +87,8 @@ WorkGoal 为私有仓库，此处只称名、不提供链接。
 
 ## 接下来
 
-第 4 批方向（不写日期，**均为计划**）：agent 唤醒和实时层；防循环和预算；飞书卡片作为人的交互层（见上文「现已提供 / 计划」表）。Slack 等通道排在飞书之后。
+[路线图](design/roadmap.md)中的计划工作（不写日期，**均为计划**），按里程碑分开表述，勿与上文「计划（第 4 批 / W4）」飞书卡片表混为一档：
+
+- **W2（W2-2 R1 safeguards）**：防循环和预算
+- **W3（如 W3-2 实时层、W3-4 唤醒适配器等）**：agent 唤醒与实时层
+- **W4（W4-1 移动/聊天桥）**：飞书互动卡片作为人的交互层（见上文「现已提供 / 计划」表）；**Slack** 等通道排在飞书之后
