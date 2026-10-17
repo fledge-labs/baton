@@ -26,6 +26,7 @@ Baton 的 HTTP/JSON、数据库结构和 `x_claim`、`x_scope`、`x_handoff`、`
 | MCP 服务（任务、讨论串、收件箱、认领、关卡等工具） | 已实现 |
 | A2A 集成：agent 名片目录、绑定工作对象的 message/send 与 stream、经 outbox 推送 | 计划（下周） |
 | 身份：OAuth token exchange（XAA / ID-JAG）、短期且绑定运行时的令牌、委托链、签名的 Agent Card | 计划 |
+| 人和 agent 的身份卡（Identity Card）：责任人、委托、吊销、发送方约束令牌 | 计划（W2–W3），见[设计](docs/design/identity-card.md)和[路线图](docs/design/roadmap.md) |
 | 实时层：网页 WebSocket 讨论串、A2A/MCP 流式按讨论串转发、唤醒离线 agent（先 Cursor followup、Claude Routines /fire，再 A2A 推送通知） | 计划（下周起） |
 | 同步结论回写：实时对话结束后把结论和决定写回任务或讨论串（纪要） | 计划（与实时层一起，R4） |
 | 按优先级的响应时效与超时升级（超时通知负责人或改派） | 开发中 |

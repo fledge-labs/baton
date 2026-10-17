@@ -36,12 +36,24 @@ Acceptance criteria are written as checks that can be run or observed; each mile
 - Depends on: W2-3 for the delegation chain recorded in the audit.
 
 ### W2-3 Identity phase 1
-- Work: delegation chain in tokens and audit; short-lived tokens; signed cards; an ID-JAG and token-exchange interface only.
+- Work: delegation chain in tokens and audit; short-lived tokens; signed cards; an ID-JAG and token-exchange interface only. Identity cards are merged into this item (design: [identity-card.md](identity-card.md)):
+  - Identity Card data model and storage (one structure for humans and agents);
+  - card issuance for existing principals (backfill from today's principal, account and kind mapping);
+  - a signed public card endpoint (JWS over a JCS-canonicalized card);
+  - revocation status (status endpoint, then a status list);
+  - sender-constrained (DPoP), short-lived tokens bound to the card;
+  - Agent Card cross-reference (the Identity Card and the A2A Agent Card name each other).
 - Acceptance:
   - every token and audit entry names "agent X acting for person Y";
   - tokens expire and can be rotated; the audit records the actual client next to the token identity;
   - cards are signed (shared with W2-1);
-  - the token-exchange and ID-JAG interface is defined and documented, with no IdP integration claimed.
+  - the token-exchange and ID-JAG interface is defined and documented, with no IdP integration claimed;
+  - every existing principal has a card whose `kind` and connected account match its current token mapping, and an agent card cannot be issued without an accountable party;
+  - a card fetched by its ID from the public endpoint verifies against the issuer's published key, and a tampered card is rejected;
+  - a token copied from its client and presented from another client (no valid DPoP proof for the bound key) is refused, and a replayed DPoP proof is refused;
+  - after a card is revoked, its tokens are refused on the next Baton API request, and for consumers of the status list within the documented bound (status-list cache lifetime plus token lifetime);
+  - an agent's Identity Card and Agent Card reference each other, both signatures verify, and a mismatched pair is refused;
+  - every card issue, change and revocation appears in the audit.
 - Depends on: nothing new; unblocks W2-1 and W2-2.
 
 ### W2-4 Unified Ask object
@@ -65,9 +77,11 @@ Acceptance criteria are written as checks that can be run or observed; each mile
 ## W3
 
 ### W3-1 People in the space
-- Work: human identities and the web board (tasks, threads, audit) with approve, reject and approve-with-edits through Ask and approver delegation (DECISIONS 289 item 1). This includes owner onboarding (below).
+- Work: human identities and the web board (tasks, threads, audit) with approve, reject and approve-with-edits through Ask and approver delegation (DECISIONS 289 item 1). This includes owner onboarding (below). Human identities are human Identity Cards ([identity-card.md](identity-card.md)): OIDC binding of a human card to an external identity (Feishu first; whether Feishu issues an OIDC-conformant ID Token is not yet verified, see the card design), and card summaries in the board and in every thread message.
 - Acceptance:
   - a person signs in with a human identity and sees only what their sharing role allows;
+  - a human card is bound to an external identity by issuer and subject only; no password, token or IdP secret is stored on the card, and an unbound issuer and subject pair gets no access;
+  - every thread message and the board show the sender's card summary (human or agent, accountable party, whether an approver delegation is held), and a message sent before a card was revoked is marked as such;
   - a person approves, rejects or approves with edits inside a task; an edit is recorded as an override event with diff, reason and content hash;
   - every decision shows in the audit with the human identity and the Ask it answered.
 - Depends on: W2-3, W2-4, W2-2.
