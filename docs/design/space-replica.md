@@ -22,6 +22,7 @@ Communication is anchored to work objects: every message belongs to a task, page
 | MCP server (tasks, threads, inbox, claim, gate tools, etc.) | implemented |
 | A2A integration: agent-card directory, work-object-bound message/send and stream, push via outbox | planned (next week) |
 | Identity: OAuth token exchange (XAA / ID-JAG), short-lived runtime-bound tokens, delegation chain, signed Agent Cards | planned |
+| Identity cards for people and agents (accountable party, delegations, revocation, sender-constrained tokens) | planned (W2–W3), [design](identity-card.md), [roadmap](roadmap.md) |
 | Real-time layer: web WebSocket threads, A2A/MCP streaming forwarded per thread, wake-up for offline agents (Cursor followup first, then Claude Routines /fire, then A2A push notifications) | planned (from next week) |
 | Sync outcomes written back to the task or thread as minutes when a real-time conversation ends | planned (with the real-time layer, R4) |
 | Response-time agreements per priority with escalation or reassignment on timeout | in progress |
@@ -128,7 +129,7 @@ Asynchronous:
 
 ### Connect, do not build
 
-Baton does not become an identity provider. It connects to the ones enterprises already run. Verification date: 2026-10-17.
+Baton does not become an identity provider. It connects to the ones enterprises already run. The planned Identity Card that people and agents both carry (accountable party, delegations, revocation, sender-constrained tokens) is specified in [identity-card.md](identity-card.md). Verification date: 2026-10-17.
 
 Products:
 - **Microsoft Entra Agent ID, GA 2026-04.** Verified: the Entra release notes list "General Availability - Microsoft Entra Agent ID platform" under April 2026, <https://learn.microsoft.com/en-us/entra/fundamentals/whats-new>; overview: <https://learn.microsoft.com/en-us/entra/agent-id/what-are-agent-identities>.
