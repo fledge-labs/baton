@@ -5,7 +5,7 @@
 
 与既有文档的关系：[roadmap.md](roadmap.md) 的“Owner onboarding”写的是飞书只发提醒、没有按钮，W3-1 写的是在 web 看板上批准；owner 2026-10-17 的决定改为“人通过聊天平台与 Baton 交互，看板保持只读运维视图”。roadmap 与 space-replica 的相应改写不在本次变更的范围内，列在第 10 章的后续事项里，3b 至 3e 的 PR 各自负责自己那部分文档。
 
-核验日期：2026-10-17（北瓜调研与审查修订：2026-10-17；2026-10-18 对照 `bridge/space_store.py` 里 `_mutate` 的提交顺序修订）。官方来源（本文对飞书行为的陈述只依据这些页面；没有从官方页面确认的，文中标为“待核实”或 **NOT_PROVEN**）：
+核验日期：2026-10-17（北瓜调研与审查修订：2026-10-17；2026-10-18 对照 `bridge/space_store.py` 里 `_mutate` 的提交顺序、`_comment` 的 `thread_id` 默认值，以及回调到达顺序修订）。官方来源（本文对飞书行为的陈述只依据这些页面；没有从官方页面确认的，文中标为“待核实”或 **NOT_PROVEN**）：
 
 - 飞书服务端 SDK（Node.js）“处理回调”：<https://open.feishu.cn/document/server-side-sdk/nodejs-sdk/handling-callbacks?lang=zh-CN>
 - 飞书服务端 SDK（Python）“处理回调”（同一页面的 Python 版）：<https://open.feishu.cn/document/server-side-sdk/python--sdk/handle-callbacks>
@@ -153,7 +153,7 @@ class ActionOutcome:        # 核心交给 ack_response 的中立结果；不含
     kind: Literal["success", "denied", "unbound", "stale", "invalid", "deferred"]
     toast_type: Literal["success", "error", "warning", "info"]
     message: str
-    card: Optional["CardSpec"] = None       # 可选：同步回调里一并返回的卡片快照
+    card: Optional["CardSpec"] = None       # 飞书审批回调必须留空。共享卡片只走 upsert_card
 
 
 @dataclass(frozen=True)
@@ -262,7 +262,7 @@ class CardSpec:
 | `rejected` | 已由 {by_display_name} 于 {HH:MM} 拒绝 |
 | `changes_requested` | 已由 {by_display_name} 于 {HH:MM} 要求修改 |
 
-终态之后服务端依然对 **`event_id`** 幂等：重复到达的同一次回调得到与第一次相同的 **toast**，不会再次写 Baton。回调体不附带当时保存的卡片快照，因此也不会把共享卡片写回去（第 4.4 节）。
+终态之后服务端依然对 **`event_id`** 幂等：重复到达的同一次回调得到与第一次相同的 **toast**，不会再次写 Baton。飞书回调体里始终没有卡片，共享卡片只由核心的更新队列写入（第 4.4 节）。
 
 两个实例（示意，值为占位）：
 
@@ -366,46 +366,46 @@ CREATE TABLE seen_action (
   at INTEGER NOT NULL
 );
 CREATE TABLE pending_click (
-  event_id TEXT PRIMARY KEY,           -- 已应答飞书但 Baton 尚未提交的行；启动时用它补完，不靠飞书重投
+  event_id TEXT PRIMARY KEY,           -- 每一次 channel_act 在调用前写入；Baton 已提交但卡片未写完时也留着
   payload TEXT NOT NULL,               -- 调 channel_act 所需字段（含已核对的 expected_epoch）
   started_at INTEGER NOT NULL, tries INTEGER NOT NULL
 );
 CREATE TABLE queue (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, due INTEGER NOT NULL, tries INTEGER NOT NULL);
 ```
 
-这些是缓存与投递状态，不是事实来源。丢失本地库的后果是：旧卡片无法再被原位更新（核心会为仍待办的对象发一张新卡片），已经写入 Baton 的成功或拒绝靠 `x_channel_action` 挡住，不会按新的绑定或委托重判。授权、绑定和动作去重的权威都在 Baton（第 5 章）：拒绝和未绑定也算一次决定，不只成功。`seen_action` 只缓存 toast。`seen_event` 保留 24 小时（覆盖约 64 分钟的重试窗口），`seen_action` 保留 7 天。`pending_click` 在 toast 交给飞书之前提交。进程每次启动、在 `start` 接受新回调之前，若本地库还在，必须先把每一行 `pending_click` 用其中的 `event_id` 送进 `channel_act`（第 4.4 节）。内存里的后台队列随进程消失，不能代替这张表。
+这些是缓存与投递状态，不是事实来源。丢失本地库的后果是：旧卡片无法再被原位更新（核心会为仍待办的对象发一张新卡片），已经写入 Baton 的成功或拒绝靠 `x_channel_action` 挡住，不会按新的绑定或委托重判。授权、绑定和动作去重的权威都在 Baton（第 5 章）：拒绝和未绑定也算一次决定，不只成功。`seen_action` 只缓存 toast。`seen_event` 保留 24 小时（覆盖约 64 分钟的重试窗口），`seen_action` 保留 7 天。每一次要通过 `channel_act` 的点击，都在调用之前把 `pending_click` 提交到本地库，不只是超时那一条。行一直留到 `seen_action` 已提交，并且（这次决定会改共享卡片时）按当前任务状态的 `upsert_card` 已经成功。进程每次启动、在 `start` 接受新回调之前，若本地库还在，必须先排空这张表（第 4.4 节）。内存里的后台队列随进程消失，不能代替这张表。
 
 创建卡片时用 `uuid = hash(object_ref, version)` 作为发送去重键：核心在“已发送”和“已写映射”之间崩溃后重试，飞书的 `uuid` 去重（相同 `uuid` 一小时内至多成功发送一条）可避免重复卡片；超过一小时后重试仍可能出现一张重复卡，接受这个限度。
 
-向同一群发消息的频控是群内机器人共享的 5 QPS，更新同一条消息的频控是 5 QPS（见上述两个官方页面）；核心对每个目标与每个对象各用令牌桶，对同一对象的多次更新合并为最新一次。更新只在发送后 14 天内有效，超过则收到错误 230031：核心对仍待办的对象改发新卡片并把映射换成新消息。
+向同一群发消息的频控是群内机器人共享的 5 QPS，更新同一条消息的频控是 5 QPS（见上述两个官方页面）；核心对每个目标与每个对象各用令牌桶，对同一对象的多次更新合并为最新一次。这个合并只约束核心自己的 `upsert_card` 队列，约束不到已经返回的回调体。数据库写锁只把两次 `channel_act` 的提交排成先后，不决定两条回调谁先到达飞书。因此回调体不带卡片（第 4.4 节）。同一对象同时最多一个在途 `upsert_card`；它返回之后，队列里若有更新的 version 再发那一版，不把“1/2”和终态并发发出去。更旧的 version 入队之后不得再发，失败后也不得重试。更新只在发送后 14 天内有效，超过则收到错误 230031：核心对仍待办的对象改发新卡片并把映射换成新消息。
 
 ### 4.4 点击处理流程
 
 适配器的 `start(handler)` 把每个回调交给核心的 `handle_inbound(raw)`；总预算 2.0 秒（给飞书的 3 秒留 1 秒余量，可配置），Baton 调用本身的超时 1.5 秒。
 
 1. `adapter.parse_action(raw)`：失败抛 `BadSignature` 或 `Undecodable` → 核心写一条核心侧元数据审计 `channel.action_refused`（不含原始载荷），应答 error toast，**不调用 Baton**。
-2. 查 `seen_action[event_id]`：仅当 `baton_committed=1` 时命中，**不再调用 Baton**。命中后的回调**只有**当时保存的 toast，`card` 为空，也**不**调用 `upsert_card`。`seen_action` 不保存卡片快照。两人确认时第一次点击的应答可以带一张仍有按钮的“已通过 1/2”；终态之后飞书再投递同一个 `event_id`，若把那张快照放进回调，而回调卡片对全群生效（`update_multi`），共享卡片会被写回旧快照。所以重放不带卡片。toast 仍然与第一次相同。
+2. 查 `seen_action[event_id]`：仅当 `baton_committed=1` 时命中，**不再调用 Baton**。回调**只有**当时保存的 toast，`card` 为空。`seen_action` 不保存卡片快照。若这个 `event_id` 的 `pending_click` 还在，说明决定已经提交、共享卡片可能还没写完：把**当前**任务状态排进第 6 步的更新队列，不把这次点击当时的“1/2”或终态快照 PATCH 回去。toast 仍然与第一次相同。
 3. 校验 `value`：`v == 1`；`o` 在映射里，且 `external_message_id`、`k` 与该行的 `card_key` 一致；**`e` 与该行的 `epoch` 一致**（空的 `epoch` 视为不符）；`external_chat_id` 等于映射里的目标会话（被转发或合并转发到别处的卡片因此无效）；`event_time` 距今不超过 10 分钟。任一不符 → error toast“卡片无效或已过期”，记 `channel.action_refused`，**不调用 Baton**。通过之后，`channel_act` 的 `expected_epoch` 只使用这一行里的 `epoch`，不使用未核对的客户端 `e`。
-4. 调用 Baton 的 `channel_act`（3b，见 4.5）：`operation_id = uuid5(命名空间, "channel-act:" + event_id)`。幂等查询在 bridge **这一次写事务内部、点击者授权之前**完成。现有 `_mutate` 做不到这个顺序，核心不能先在另一个事务里查表再调用它（4.5）。飞书对**同一次**回调的重复投递携带相同 `event_id`。
-5. 按 `channel_act` 结果生成应答。下表“提交 `x_channel_action`”为“是”的结果，bridge 在返回前已经提交；核心再写 `seen_action`（`baton_committed=1`，只存 toast 与当时的 `card_version`）。本地 `seen_action` 还没落盘时，同一 `event_id` 的重投会再次进入 `channel_act`，bridge 返回**第一次**的决定，不会因为其间补上了绑定或委托而改判。
+4. **先**提交 `pending_click`（同一 `event_id`、第 3 步核对过的 `expected_epoch`，以及调用所需的其余字段），**再**调用 Baton 的 `channel_act`（3b，见 4.5）：`operation_id = uuid5(命名空间, "channel-act:" + event_id)`。幂等查询在 bridge **这一次写事务内部、点击者授权之前**完成。现有 `_mutate` 做不到这个顺序，核心不能先在另一个事务里查表再调用它（4.5）。飞书对**同一次**回调的重复投递携带相同 `event_id`。这一步对快速路径和超时路径相同，不只是预算用完的时候才落盘。
+5. 按 `channel_act` 结果生成应答。下表“提交 `x_channel_action`”为“是”的结果，bridge 在返回前已经提交；核心再写 `seen_action`（`baton_committed=1`，只存 toast 与当时的 `card_version`）。本地 `seen_action` 还没落盘时，同一 `event_id` 的重投会再次进入 `channel_act`，bridge 返回**第一次**的决定，不会因为其间补上了绑定或委托而改判。飞书回调体**一律不带卡片**。共享卡片是否变化，只由第 6 步的队列决定。
 
-| `channel_act` 结果 | 对点击者 | 卡片 | `seen_action` | 提交 `x_channel_action` |
+| `channel_act` 结果 | 对点击者 | 共享卡片 | `seen_action` | 提交 `x_channel_action` |
 | --- | --- | --- | --- | --- |
-| 首次成功 | success toast | 回调带上刚渲染的卡片：终态，或两人确认时“已通过 1/2”且仍有按钮。然后走第 6 步 | 是 | 是 |
-| 命中已有 `x_channel_action`（成功或拒绝） | 第一次的 toast | **不带卡片**，不 `upsert` 历史快照（与第 2 步相同） | 是（补写缓存） | 已有行，不新增 |
+| 首次成功 | success toast，回调无卡片 | 第 6 步按**当前**任务状态入队（终态，或两人确认时“已通过 1/2”且仍有按钮） | 是 | 是 |
+| 命中已有 `x_channel_action`（成功或拒绝） | 第一次的 toast，回调无卡片 | 不 PATCH 历史快照。`pending_click` 还在时，把**当前**任务状态入队 | 是（补写缓存） | 已有行，不新增 |
 | 未绑定 | error toast“无权放行”，附“尚未绑定，请联系空间所有者” | **不变** | 是 | 是 |
 | 无委托（`delegation_required`）或无权（`forbidden`） | error toast“无权放行” | **不变** | 是 | 是 |
-| 同一人重复 `pass`（任务仍 `awaiting_gate`） | error toast“无权放行”或“您已投过票” | **不变** | 是 | 是（`forbidden`，不是 `stale_claim`） |
-| `stale_claim`（映射中的 epoch 已与任务不符，或任务已终态） | warning toast“已有结论，已刷新” | 核心按**当前**任务状态原位刷新 | 是 | 是 |
-| 超过 2.0 秒预算（`channel_act` 尚未返回） | info toast“已收到，处理中” | 见下方 `pending_click` | **否** | **否**（还没有决定） |
+| 同一人重复 `pass`（任务仍 `awaiting_gate`） | error toast“无权放行”或“您已投过票” | **不变**。这一票**不**用来补写上一票还没写出的卡片 | 是 | 是（`forbidden`，不是 `stale_claim`） |
+| `stale_claim`（映射中的 epoch 已与任务不符，或任务已终态） | warning toast“已有结论，已刷新”，回调无卡片 | 按**当前**任务状态入队 | 是 | 是 |
+| 超过 2.0 秒预算（`channel_act` 尚未返回） | info toast“已收到，处理中”，回调无卡片 | `pending_click` 留着，后台用同一 `event_id` 补完后再入队 | **否** | **否**（还没有决定） |
 
-超时这一行的顺序是硬的：先把 `pending_click`（同一 `event_id`、调用 `channel_act` 所需的全部字段，包括第 3 步核对过的 `expected_epoch`）**提交**到本地库，再把 toast 交给飞书。后台队列用同一 `event_id` 重试。**不**假定飞书会重试（收到 toast 即视为这次投递已经结束）。进程在 Baton 提交前退出后，靠下面的启动恢复，不靠飞书再投一次。
+`pending_click` 在第 4 步已经提交，所以超时只是不再等 `channel_act` 返回：不写 `seen_action`，把 toast 交给飞书，行继续留着。**不**假定飞书会重试（收到 toast 即视为这次投递已经结束）。会改卡片的行，要等第 6 步把**当前**任务状态发送成功之后才删除；若队列已经用更新的 version 盖过这张卡，旧 version 不再发，这一行随之删除。不要求当初那张“1/2”快照自己 PATCH 成功。不改卡片的拒绝，在 `seen_action` 提交后删除。同一个人用新的 `event_id` 再点，若任务仍在 `awaiting_gate`，是 `forbidden`，卡片不变，不能靠它把上一票的卡片补上。
 
 “原位提示”的含义：owner 要求未绑定或无权的点击者得到原位的“无权放行”提示。这里把它实现为**只对点击者显示的 toast**，而不是改写共享卡片：卡片对所有群成员是同一张（`update_multi`），若把它替换成“无权放行”，群里任何一个没有权限的人都能让有权限的人看不到按钮，等于一个无成本的拒绝服务。任务不变与卡片不变是同一个意思。这是对 owner 措辞的一种解释，列在第 12 章问题 3 里等确认。
 
-6. **仅首次成功**时，核心另外调用一次 `upsert_card` 原位更新（PATCH），不依赖回调应答里的卡片是否对所有人可见；这一次写入的是刚渲染的**当前**卡片。`seen_action` 命中、或 `x_channel_action` 重放，都不走这一步，也不会把“1/2”快照 PATCH 回去。待 3d 的真机验证确认回调应答卡片确实对所有人更新后，可以去掉首次成功路径上的这一步；重放路径仍然不回写旧快照。
+6. 共享卡片**只**通过 `upsert_card` 更新。首次成功、`stale_claim`、超时补完，以及 `pending_click` 还在时的重放，都读取**此刻**的任务状态再入队，不使用该 `event_id` 首次决定时渲染过的卡片。两人确认时，先提交的那一票在自己的事务里看到的是“已通过 1/2”；后一票提交之后任务已经终态。写锁只串行这两次数据库提交（`_transaction(write=True)` 里的 `pg_advisory_xact_lock`），两条回调谁先到飞书没有保证。若回调里带着刚渲染的“1/2”，而终态更新先到，迟到的回调会把按钮写回去（`update_multi`，第 7.5 节）。所以回调不带卡片。队列按对象只保留最新 version，同一对象同时最多一个在途 PATCH：在途的那次返回之后才发送更新的 version，避免“1/2”和终态并发、后到的旧 PATCH 盖住终态。更旧的 version 不得再发，失败后也不得重试。3d 不得改成用回调体更新全群。
 
-**启动恢复。** `start` 在把回调交给 `handle_inbound` 之前，若本地库还在，先逐行处理 `pending_click`（以及队列里同一 `event_id` 的未完成项）。这一步不套用 2.0 秒的回调预算。对每一行用保存的载荷调用 `channel_act`，幂等键仍是该 `event_id`：Baton 若已有行，返回首次决定，不会第二次 gate；若还没有行，这一次才执行并提交。拿到决定后，核心写 `seen_action`，按**当前**任务状态 `upsert_card`（不使用任何历史快照），再删除 `pending_click`。删除必须晚于 `seen_action` 提交，这样再次崩溃也只会再读到同一 `event_id`。本地库丢失、并且 toast 已经发出、Baton 又还没有该行时，没有可恢复的记录，飞书也不会重投：这次点击补不回来，记为本地库丢失的残余（C16）。
+**启动恢复。** `start` 在把回调交给 `handle_inbound` 之前，若本地库还在，先逐行处理 `pending_click`（以及队列里同一 `event_id` 的未完成项）。这一步不套用 2.0 秒的回调预算。对每一行用保存的载荷调用 `channel_act`，幂等键仍是该 `event_id`：Baton 若已有行，返回首次决定，不会第二次 gate；若还没有行，这一次才执行并提交。然后写 `seen_action`。这次决定会改变共享卡片时（包括 Baton **已经**提交、但进程在 `upsert_card` 之前退出的那一行），按**当前**任务状态入队，成功之后才删除 `pending_click`。删除不得早于这次入队成功，否则再次崩溃就找不到要补的卡片。同一人的新 `event_id` 不是这条补写路径。本地库丢失、并且 toast 已经发出、Baton 又还没有该行时，没有可恢复的记录，飞书也不会重投：这次点击补不回来，记为本地库丢失的残余（C16）。
 
 ### 4.5 在点击者本人的权限下调用 Baton（3b 的 bridge 变更）
 
@@ -428,7 +428,14 @@ channel_act(operation_id, channel, instance, external_user_id, event_id, dedupe_
 2. **幂等，先于点击者授权。** 仍在这个写事务里：`SELECT response FROM baton.x_channel_action WHERE event_id = %s FOR UPDATE`。有行则返回该 JSON，结束。不再查绑定，不调用 `_approver_chain`，不读 `baton.operations`，不跑 gate 的 effect。委托在首次决定之后被撤销时，重放得到的是首次 outcome，不是 `delegation_required`。返回的 JSON 是决定（toast 语义、`result`、gate 摘要），不是要回写到共享卡片上的卡片快照；核心按 4.4 第 2 步处理重放。
 3. **任务与绑定，仍在本事务内。** 从 `object_ref` 解析任务，`space_id` 只从该任务所在页面读取，**不得**由调用方传入。用 `(channel, instance, external_user_id, space_id)` 查绑定：`revoked_at IS NULL` 且 (`expires_at IS NULL OR expires_at > now()`)。没有、已过期，或 principal/account/kind 与登记表不一致：插入 `x_channel_action`（`result` 为 `unbound` 或 `denied`，`principal` 在未绑定时为空），写审计，**返回并提交**。不写评论，不写 `x_gate`。未绑定的审计事件是 `channel.unbound_click`；身份不符是 `channel.action_denied`。
 4. **点击者授权与 gate 的前置条件，仍在写评论和 `x_gate` 之前。** 用绑定行构造点击者的 `Actor`，在本连接上做 `gate` 今天在 `authorize` 里做的检查（`_manual`、是否根、`_approver_chain`、不能自批、须是 reviewer），以及 effect 里会变成拒绝的检查（任务不在 `awaiting_gate`、epoch 不符、同一人已经 `pass`、`request_changes` 的文字为空或超过 1000 字、点击者没有 comment 权限）。`_approver_chain` 今天以 `StoreError` 抛出 `delegation_required`；3b 必须在这个 `with` 块**内部**接住它（以及上述 `forbidden` / `stale_claim` / `invalid`），插入 `x_channel_action` 后正常返回。`result` 取 `denied`（含 `delegation_required`、`forbidden`、重复 `pass`）、`stale` 或 `invalid`。审计：无委托或无权为 `channel.action_denied`。这样拒绝和未绑定的权威在 Baton，而不只在核心的 `seen_action`。同一 `event_id` 再来时走第 2 步，即使其间完成了绑定或补上了委托，也返回首次拒绝，不会变成一次新的通过。
-5. **只有第 4 步通过才写业务行。** 在同一个 `conn` 上、以点击者的身份写入。评论可以调用已有的 `_comment(conn, …)`，但**不得**调用 `comment()`。`gate` 的 effect 今天是 `gate()` 里面的嵌套函数，没有可复用的 conn 级入口；3b 要把它抽出来再在这里调用，**不得**调用 `gate()`。`request_changes` 先写评论，再在同一 `conn` 上写入与失败的 gate 相同的 `x_gate` 行（`decision=fail`，`reason` 为该文字），这是抽出来的 effect，不是对 `gate()` 的调用。权限请求同样只在这个 `conn` 上映射到 `decide_permission` 的 `allow_once` / `deny`，不得再进一次 `_mutate`（该分支合入之后；合入前不启用）。规则与现在的 `gate` 一致：委托链、不能自批、同一人不能重复 pass、两人确认等。根自批需要 `self_approval=true`，卡片不提供。然后插入 `x_channel_action`（`result=success`）。评论、`x_gate`、`x_channel_action`、审计同一次提交。这一步若抛错，整笔回滚：没有半截评论，也没有动作行。那是意外失败，不是已记录的决定，重试会重新判定。无委托的人留不下评论，因为评论只出现在本步。
+5. **只有第 4 步通过才写业务行。** 在同一个 `conn` 上、以点击者的身份写入。`gate` 的 effect 今天是 `gate()` 里面的嵌套函数，没有可复用的 conn 级入口；3b 要把它抽出来再在这里调用，**不得**调用 `gate()`。`request_changes` 先写评论，再写入与失败的 gate 相同的 `x_gate` 行（`decision=fail`，`reason` 为该文字）。意见必须落在任务线程上，调用已有的 `_comment` 时 **`thread_id` 必须是任务 id**，`page_id` 必须是任务的 `page_id`，作者和 `requested_by` 都是点击者：
+
+```python
+_comment(conn, clicker, operation_id, str(task["page_id"]), body,
+         thread_id=str(task["id"]), requested_by=clicker.principal)
+```
+
+这与 `_notify_task` 把 `thread_id` 设成 `str(task["id"])` 相同。`_comment` 在 `thread_id` 省略时执行 `thread_id = thread_id or str(identity)`，线程 id 变成这条评论自己的 id。`list_comments(task_id=…)` 用任务 id 当线程 id 去查（`page_id, thread_id = str(task["page_id"]), str(task["id"])`）。省略 `thread_id` 会写成孤立评论，C6 的任务线程上看不到意见。不得调用 `comment()`：它再进一次 `_mutate`；线程上还没有评论时，它在插入之前就抛 `not_found`。任务线程经常是空的，第一条意见只能走 `_comment`。同一 `conn` 上再写 `comment.created`：用 `_audit`，带上 `task_id` 与 `thread_id`。不要用 `_task_audit`，它把 `requested_by` 固定成任务所有者。并按 `comment()` 在找到任务之后的做法，把 `comment.created` 放进 outbox。今天 `gate()` 的 `gate.reviewed` 不把 `reason` 放进审计 metadata（只有 `gate.result_overridden` 会带 `reason`），所以修改意见以这条评论的正文为准；`x_gate.reason` 仍写同一段文字，但不能代替任务线程。权限请求同样只在这个 `conn` 上映射到 `decide_permission` 的 `allow_once` / `deny`，不得再进一次 `_mutate`（该分支合入之后；合入前不启用）。规则与现在的 `gate` 一致：委托链、不能自批、同一人不能重复 pass、两人确认等。根自批需要 `self_approval=true`，卡片不提供。然后插入 `x_channel_action`（`result=success`）。评论、`x_gate`、`x_channel_action`、审计同一次提交。这一步若抛错，整笔回滚：没有半截评论，也没有动作行。那是意外失败，不是已记录的决定，重试会重新判定。无委托的人留不下评论，因为评论只出现在本步。
 6. **不写 `baton.operations`，也不靠它重放。** `operation_id` 只放进 `x_channel_action.operation_id` 和审计，用来关联。operations 的重放发生在 `authorize` 之后，实现不了第 2 步。写锁把写事务串行化，后到的调用会在自己的第 2 步看见已提交的行；不要在一次 `_read` 里记“没有行”，再开另一次事务去插入。
 7. **审计。** 成功时除了 `gate.reviewed` 等，再写 `channel.action`（含 `event_id`、`dedupe_token`）。requested_by 为点击者，performed_by 为核心主体。今天 `_audit` 的 metadata 白名单没有 `event_id`、`dedupe_token`、`channel`、`instance`、`external_user_id`；不在白名单里的键会变成 `invalid`。3b 要把这些键加进白名单，不能假定现有 `_audit` 会收下它们。
 
@@ -566,8 +573,8 @@ https://baton.example.com/board/o/task/6f1c2d9e-0000-4000-8000-000000000001?exp=
 
 ### 7.4 三秒预算与重复投递
 
-- 处理函数只做：解析、查 `seen_action`、**一次** `channel_act`（超时 1.5 秒）、生成应答。总预算 2.0 秒。若超时：先提交 `pending_click`，再返回“已收到，处理中” toast；**后台队列**用同一 `event_id` 重试。飞书收到 toast 后**不会**再投递同一回调（见 4.4）。进程重启且本地库还在时，`start` 先把 `pending_click` 里尚未提交的 `channel_act` 跑完，再接受新回调；只靠活进程里的队列，崩溃后这次点击就丢了。慢速 `upsert_card` 亦入队，不阻塞回调线程。
-- 应答是回调的响应体：`toast`（`type` 为 `info`、`success`、`error`、`warning`；官方例子同时给出 `content` 与 `i18n`）和可选的 `card`（`type: "raw"`，`data` 为卡片 JSON 2.0）。例如：
+- 处理函数只做：解析、查 `seen_action`、提交 `pending_click`、**一次** `channel_act`（超时 1.5 秒）、生成应答。总预算 2.0 秒。`pending_click` 在调用 `channel_act` **之前**就落盘，快速路径和超时路径一样。若超时：返回“已收到，处理中” toast，不写 `seen_action`；后台队列用同一 `event_id` 重试。飞书收到 toast 后**不会**再投递同一回调（见 4.4）。进程重启且本地库还在时，`start` 先排空 `pending_click`：补完尚未提交的 `channel_act`，也对已经提交但卡片还没写上的行按当前状态 `upsert_card`。只靠活进程里的队列，崩溃后这张卡片就停在旧的待办上。慢速 `upsert_card` 亦入队，不阻塞回调线程。
+- 飞书这条回调的响应体**只有** `toast`（`type` 为 `info`、`success`、`error`、`warning`；官方例子同时给出 `content` 与 `i18n`），**没有** `card`。`ActionOutcome.card` 在这条路径上留空。共享更新走 `upsert_card`（PATCH，`update_multi`）。回调里若带上刚渲染的“1/2”，而另一票的终态 PATCH 先到，迟到的回调会把按钮写回共享卡片；数据库写锁排不了这个到达顺序。例如：
 
 ```json
 {
@@ -575,8 +582,8 @@ https://baton.example.com/board/o/task/6f1c2d9e-0000-4000-8000-000000000001?exp=
 }
 ```
 
-- 长连接下**同 `event_id`** 的重复投递会发生。SDK 去重键只能是 `event_id`（7.1）。权威是 `x_channel_action`：`channel_act` 在点击者授权之前返回已有行（4.5，新的写事务，不是 `_mutate`）。`seen_action` 只缓存 toast。重放的回调不带卡片快照。
-- **同 `event_id` 重复投递** → 与首次相同应答。**同一人两个 `event_id`** → 第二票 `forbidden`（仍 `awaiting_gate` 时），toast“无权放行/已投过票”，**不是**“已有结论”。**两人确认、两个不同 `event_id`** → 两票都计（C5b；3d 冒烟确认 SDK 不吞第二 `event_id`）。**任务已终态或 epoch 变了** → `stale_claim` + 刷新。
+- 长连接下**同 `event_id`** 的重复投递会发生。SDK 去重键只能是 `event_id`（7.1）。权威是 `x_channel_action`：`channel_act` 在点击者授权之前返回已有行（4.5，新的写事务，不是 `_mutate`）。`seen_action` 只缓存 toast。重放的回调也只有 toast。`pending_click` 还在时，补写走更新队列里的当前状态，不走回调体。
+- **同 `event_id` 重复投递** → 与首次相同的 toast，仍然没有卡片。**同一人两个 `event_id`** → 第二票 `forbidden`（仍 `awaiting_gate` 时），toast“无权放行/已投过票”，**不是**“已有结论”，也不补写卡片。**两人确认、两个不同 `event_id`** → 两票都计（C5b；3d 冒烟确认 SDK 不吞第二 `event_id`）；两条回调都只有 toast，卡片只由队列按最新 version 更新（C5c）。**任务已终态或 epoch 变了** → `stale_claim`，刷新走队列。
 
 ### 7.5 发送与更新
 
@@ -660,25 +667,26 @@ https://baton.example.com/board/o/task/6f1c2d9e-0000-4000-8000-000000000001?exp=
 | C1 | 完整审批流：提交任务并派发 → 事件到达 → 核心发出一张 `pending` 卡片 → 已绑定且有委托的批准人点 `approve` → gate 通过 → 卡片原位变为 `approved` 终态 | 同一 `external_message_id` 被更新；终态文字含批准人 display_name 与 HH:MM；`x_gate` 一行；审计里有 `channel.action`（含 `channel`、`external_user_id`、`dedupe_token`）；任务 done |
 | C2 | 未授权点击：已绑定但没有委托的人点 `approve` | toast“无权放行”；任务状态不变、没有 `x_gate` 行；卡片不变；审计 `channel.action_denied`；`x_channel_action` **提交**一行 `denied`。其后补上委托，同一 `event_id` 仍返回该拒绝 |
 | C3 | 未绑定点击 | 同上，toast 附“尚未绑定”；审计 `channel.unbound_click`；`x_channel_action` 提交一行 `unbound`。其后完成绑定，同一 `event_id` 仍返回该拒绝 |
-| C4 | 重复投递：同一 `event_id` 两次 | 只有一次 gate；两次 toast 相同；第二次回调**不带**卡片。`seen_action` 与 `x_channel_action` 各一行 |
-| C4b | 两人确认：第一票的 `event_id` 在终态之后再次投递 | toast 仍是第一票的成功提示；回调不带当时的“1/2”卡片；共享卡片保持终态，不被写回旧快照 |
+| C4 | 重复投递：同一 `event_id` 两次 | 只有一次 gate；两次都只有相同的 toast，回调都不带卡片。`seen_action` 与 `x_channel_action` 各一行 |
+| C4b | 两人确认：第一票的 `event_id` 在终态之后再次投递 | toast 仍是第一票的成功提示；回调不带卡片；共享卡片保持终态 |
 | C5 | 同一人两个不同 `event_id`（仍 `awaiting_gate`） | 第二票 `403 forbidden`；toast 不含“已有结论”；卡片仍 pending |
-| C5b | 两人确认：两位审批人并发两个 `event_id` | 两票都计入；第一票后“1/2”；第二票后终态 |
-| C6 | `request_changes`：带文字 | 线程里出现一条作者是点击者的评论；gate 记 fail，`reason` 为该文字；任务回到 `queued`；卡片终态“要求修改” |
+| C5b | 两人确认：两位审批人并发两个 `event_id` | 两票都计入；第一票后队列里的卡片是“1/2”；第二票后是终态。两条回调都只有 toast |
+| C5c | 第一票的回调晚于第二票的终态更新到达飞书 | 共享卡片保持终态，按钮不会被写回。两条回调都没有卡片。同一对象同时最多一个在途 PATCH，终态在“1/2”那次返回之后再发，不并发 |
+| C6 | `request_changes`：带文字 | 评论的 `thread_id` 等于任务 id，`list_comments(task_id=…)` 能读到，作者是点击者；不是 `thread_id` 等于评论自身 id 的孤立行。`x_gate.reason` 为该文字；`gate.reviewed` 的 metadata 不含这段文字。任务回到 `queued`；卡片终态“要求修改” |
 | C7 | `request_changes`：文字为空或超过 1000 字符 | 被拒绝（`invalid`），任务不变，不写评论；`x_channel_action` 提交该拒绝 |
 | C8 | 坏签名：`parse_action` 抛 `BadSignature` | 核心不调用 Baton；写 `channel.action_refused`；error toast |
 | C9 | 伪造的 `value`：`k` 不匹配、`e` 与 `card.epoch` 不一致（含保留旧 `k`、把 `e` 改成更新的 epoch）、对象不在映射、`external_chat_id` 不符、`event_time` 太旧 | 全部拒绝，不调用 Baton；`expected_epoch` 不会采用未核对的 `e` |
 | C10 | epoch 过期：映射里的 `epoch` 仍与点击的 `e` 一致，但任务已被重新提交 | `stale_claim` → warning toast，按当前状态刷新。映射若已经换成新的 `k` 与 `epoch`，旧按钮走 C9，不调用 Baton |
-| C11 | 两人确认：第一位批准 | 卡片进度“已通过 1/2”，仍有按钮；同一人再点被拒绝；第二位批准后进入终态 |
-| C12 | 预算：`channel_act` 慢于 2 秒 | 先提交 `pending_click`，再返回“处理中” toast；**不**写 `seen_action`，Baton 此时还没有该行；后台队列用同一 `event_id` 完成 gate 并按当前状态刷新卡片；只决定一次 |
+| C11 | 两人确认：第一位批准 | 卡片进度“已通过 1/2”来自 `upsert_card` 队列，回调无卡片；同一人再点被拒绝且不改卡片；第二位批准后队列把卡片推进终态 |
+| C12 | 预算：`channel_act` 慢于 2 秒 | `pending_click` 在调用前已经提交（不是超时才创建）；返回“处理中” toast；**不**写 `seen_action`，Baton 此时还没有该行；后台队列用同一 `event_id` 完成 gate 并按当前状态刷新卡片；只决定一次 |
 | C12b | 委托在首次成功后撤销，同 `event_id` 再次进入核心 | 仍返回首次 `x_channel_action` outcome，**不是** `delegation_required`。查询发生在 `channel_act` 自己的写事务里、点击者授权之前，不经过 `_mutate` |
 | C12c | 拒绝或未绑定尚未被核心写入 `seen_action` 时，同一 `event_id` 重投；其间绑定或委托已经补上 | 仍是首次拒绝；不会按新状态通过 |
 | C13 | 核心主体自己调用 `gate` | 被拒绝（`forbidden`），`channel_act` 是唯一路径 |
 | C14 | 绑定在点击前被撤销、或已过期 | 视为未绑定，并提交 `x_channel_action` 的 `unbound` 行 |
 | C15 | webhook 事件重复（相同 `webhook-id`）、签名坏、时间戳超出五分钟、两个密钥轮换期 | 重复只处理一次；坏签名与过期被拒；两个密钥都能通过 |
-| C16 | 核心重启后（本地库保留 / 丢失） | **保留：** 启动时、接受新回调之前，用同一 `event_id` 跑完每一条 `pending_click`（含已向飞书应答“处理中”、Baton 尚未提交的点击），再继续更新同一条消息；只决定一次。**丢失：** 待办对象得到新卡；已写入 `x_channel_action` 的成功或拒绝按 `event_id` 原样返回。残余：toast 已发出、本地库丢失、Baton 尚无该行时，这次点击无法补完 |
+| C16 | 核心重启后（本地库保留 / 丢失） | **保留：** 启动时、接受新回调之前，排空每一条 `pending_click`。含两类：已应答“处理中”、Baton 尚未提交；以及 Baton **已经**提交、`upsert_card` 还没成功。同一 `event_id` 只决定一次，卡片按**当前**任务状态补写。同一个人用新 `event_id` 再点是 `forbidden`，不会把这张卡片补上。**丢失：** 待办对象得到新卡；已写入 `x_channel_action` 的成功或拒绝按 `event_id` 原样返回。残余：toast 已发出、本地库丢失、Baton 尚无该行时，这次点击无法补完 |
 
-3b 另有桥侧测试：绑定/`bind` 撤销过期行后可重绑；`channel_act` 在**自己的**一次 `_transaction(write=True)` 里先查 `x_channel_action` 再做点击者授权（C12b），并且不调用 `_mutate`；拒绝与未绑定会**提交**动作行，异常逃出事务则该行不留（C2、C3、C12c）；`request_changes` 的评论与 gate 只在授权通过后写在同一个 `conn` 上，同提交，授权失败时两者都不写；各授权分支与 `gate` 一致；`event_id` 唯一；不写 `baton.operations`。3d：`DedupStore` 仅 `event_id` 或关闭 SDK dedup。3e：链接默认摘要（含 `/data` JSON）；仅 `Sec-Fetch-Mode: navigate` + `Sec-Fetch-Dest: document` 得全文；签名/过期/轮换/只读等同前。
+3b 另有桥侧测试：绑定/`bind` 撤销过期行后可重绑；`channel_act` 在**自己的**一次 `_transaction(write=True)` 里先查 `x_channel_action` 再做点击者授权（C12b），并且不调用 `_mutate`；拒绝与未绑定会**提交**动作行，异常逃出事务则该行不留（C2、C3、C12c）；`request_changes` 的评论与 gate 只在授权通过后写在同一个 `conn` 上，同提交，授权失败时两者都不写；`_comment` 的 `thread_id` 必须是任务 id，省略时不得依赖默认（会变成评论自身 id），也不得改调 `comment()`；各授权分支与 `gate` 一致；`event_id` 唯一；不写 `baton.operations`。3d：`DedupStore` 仅 `event_id` 或关闭 SDK dedup。3e：链接默认摘要（含 `/data` JSON）；仅 `Sec-Fetch-Mode: navigate` + `Sec-Fetch-Dest: document` 得全文；签名/过期/轮换/只读等同前。
 
 飞书适配器单元测试（3d）用官方样例载荷，不联网：
 
@@ -717,7 +725,7 @@ https://baton.example.com/board/o/task/6f1c2d9e-0000-4000-8000-000000000001?exp=
 | 威胁 | 做法 | 控制 | 覆盖与残余 |
 | --- | --- | --- | --- |
 | **伪造回调** | 攻击者直接向回调地址 POST 一个看起来像 `card.action.trigger` 的请求，冒充某人点击 | 默认 WebSocket：无入站回调；建连用 `app_id`、`app_secret`。后备 HTTPS：**必须**配置 Encrypt Key；IP 白名单 + `X-Lark-Signature`（正文绑定）+ 解密 + `app_id`/`tenant_key`；缺 Encrypt Key 的配置拒绝启动；Verification Token 仅作附加检查 | 默认路径没有可伪造的入口。残余：信任飞书与 TLS；`app_secret` 泄漏见下行 |
-| **重放** | 重放截获的回调或 webhook | **`event_id`** → `x_channel_action`（`channel_act` 的写事务在点击者授权之前返回已有行，含拒绝与未绑定）+ 只缓存 toast 的 `seen_action`；重放回调不带卡片快照；`pending_click` 在进程重启且本地库还在时于启动阶段补完；webhook Standard Webhooks | 已提交点击在委托撤销、或事后补上绑定/委托后，仍返回首次 outcome。残余：新 `event_id` 仍是新一次 gate；toast 已发出且本地库丢失、Baton 尚无该行时，慢路径补不完 |
+| **重放** | 重放截获的回调或 webhook | **`event_id`** → `x_channel_action`（`channel_act` 的写事务在点击者授权之前返回已有行，含拒绝与未绑定）+ 只缓存 toast 的 `seen_action`；飞书回调始终不带卡片，共享更新只走按 version 合并的 `upsert_card` 队列；`pending_click` 在调用 `channel_act` 前落盘，启动时补完未提交的决定，也补写已提交但尚未 PATCH 的卡片；webhook Standard Webhooks | 已提交点击在委托撤销、或事后补上绑定/委托后，仍返回首次 outcome。迟到的“1/2”回调不能把终态卡片写回。残余：新 `event_id` 仍是新一次 gate；toast 已发出且本地库丢失、Baton 尚无该行时，慢路径补不完 |
 | **点击者冒名** | 甲想以乙的权限放行；群里的人使用别人的卡片；卡片被转发 | 点击者只来自平台认证后的 `operator.open_id`，`value` 里没有身份；绑定只能由根创建、按 Space 隔离、绑定的人必须与登记表一致；新的 `event_id` 现查绑定与权限，同一 `event_id` 返回已提交的决定；`k`、`e` 与映射中的 `epoch`、`o`、会话校验挡住伪造和转发；租户校验挡住外部租户 | 覆盖“冒名”与“越权”。残余：他人使用乙已解锁的设备；根绑错了人（靠绑定审计与确认流程发现）；平台账号被盗；**核心被攻破**时可替已绑定且有权限的人伪造点击（4.5 的残余与收敛手段） |
 | **链接泄漏** | 带签名的链接被转发、被预览抓取、留在浏览器历史或访问日志里 | 默认**仅标题**（`/data` 亦同）；顶层浏览器导航才全文；15 分钟 TTL；`no-referrer`/`no-store`/`noindex`；轮换 | 未识别 UA 的预览也只会摘要。残余：导航模式下有效期内可读全文 |
 | **群聊里的卡片仿冒** | 群成员或别的机器人发一张长得一样的卡片，附上钓鱼链接，或发“已批准”的文字 | 只有我们的应用能让按钮触发我们的回调，仿冒卡片改变不了 Baton；真正的状态以 Baton 为准；卡片里的链接只指向配置的 `PUBLIC_URL`；卡片从不要求输入凭据；只有核心能更新我们的卡片；群成员与机器人由 owner 管理，群里不放其他机器人 | 仿冒不能产生任何 Baton 效果。残余：用户被外观骗去点钓鱼链接、被假文字误导；缓解靠群管理和统一的机器人名称与头像。群是否有“限制添加机器人”的设置**未核实**，3d 的群设置清单里核对 |
