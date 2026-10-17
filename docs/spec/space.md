@@ -2,7 +2,7 @@
 
 # Baton Space 行为规格
 
-状态：`SPEC_GRAPH_READY`。本版冻结已核实的产品语义和 Baton 存储/API 不变量，含命名派单、依赖图及首版保守 scope 判定，供实现与独立验收使用；不代表实现已通过，也不代表 ChatGPT Space 界面等价性已验收。核验日期：2026-10-17。
+状态：`SPEC_GRAPH_READY`。本版冻结已核实的产品语义和 Baton 存储/API 不变量，含命名派单、依赖图、施工面清单（x_ready）及首版保守 scope 判定，供实现与独立验收使用；不代表实现已通过，也不代表 ChatGPT Space 界面等价性已验收。核验日期：2026-10-17。
 
 范围：替换 Agent Mail 为 Baton 自有的空间、页面、评论、提及、任务与协作协议。采用 PostgreSQL，优先实现数据库与 HTTP 行为；不连接真实 ChatGPT 空间，不做同步、导入既有账户或协议互操作。
 
@@ -94,9 +94,20 @@
 - **ready 查询。** Baton 合同为 `ready(page_id=None, limit=50)`：page_id 可选，用于限定页面，默认最多返回 50 条；指定页面或提高 limit 不改变权限与可领取检查。它仅返回调用者当前可 edit、assignee 允许该确切 principal 领取、状态与租约允许领取、依赖全部满足且按 X10 当前无 scope 冲突的任务。依赖及任务可见性不足时不返回泄漏性条目；不把同 account 的其他 assignee 当成当前 principal。ready 和 inbox 的可领取提示只是当前快照，不预留 claim；实际 claim/claim_next 必须在原子事务中重验全部条件，两个调用者看到同一候选不意味着都能获得它。[官方背景仅为访问与分工：S3](https://learn.chatgpt.com/docs/space/collaboration#choose-an-access-level)、[S4](https://learn.chatgpt.com/docs/space/agents#work-with-others)。
 - **进度。** 图进度从有权读取的任务 canonical state 及其当前 gate 结果派生，不维护可独立写入、与任务真相分叉的第二份 tracker。状态、结果与 x_audit 仍遵循既有事务及身份规则；依赖图不改变命名 agent 自愿 pull、原线程报告、reviewer 审阅和真实原生验收边界。[官方背景仅为审阅与归属：S4](https://learn.chatgpt.com/docs/space/agents#revise-a-launch-brief)、[S2](https://learn.chatgpt.com/docs/space/pages#comment-and-collaborate)。
 
+## x_ready 施工面清单
+
+**X18 · x_ready 施工面清单与领取门控。** 任务可携带一份施工面清单，并可要求在清单完整前不得领取；这是 Baton 自有 x_协议，官方 Task 块说明不定义这些行为。**x_ready 不是 X17 的 `ready` 查询**：`ready(page_id=None, limit=50)` 只列出调用者当前可领取的任务，不改变任务；x_ready 是任务上的清单数据加领取门控，决定任务是否具备被领取的前提。`ready` 查询保持原样，只是额外不返回清单不完整的任务。[官方背景仅为任务块：S2](https://learn.chatgpt.com/docs/space/pages#add-content-with-the-insert-menu)。
+
+- **数据。** `work_face` 可为空，格式严格为 `{"environment":[str],"fixtures":[str],"constraints":[str],"migration":str|null,"acceptance_command":str}`：五个键都必须出现，不允许多余的键；三个列表各最多 20 项，每项去掉首尾空白后非空且不超过 500 字符；`acceptance_command` 去掉首尾空白后非空且不超过 2000 字符；`migration` 为 null 或非空且不超过 200 字符的字符串。校验失败返回 `invalid`（HTTP 422）。存储保留去除首尾空白后的规范形式。`require_work_face` 默认 false，`task_kind` 为 `construction`（默认）或 `prep`；已有任务按默认值处理，行为不变。
+- **完整性。** 仅当 `require_work_face=true` 时，下列三项必须同时满足才算 work face 完整：`base_commit` 非空；`scopes` 有声明（省略声明时存储的仓库根占位范围不算声明，因此至少要声明一个具体 scope）；`work_face` 非空且格式合法。task view 增加 `work_face`、`require_work_face`、`task_kind` 以及 `work_face_missing`（缺失项名称列表，取值只能是 `base_commit`、`scopes`、`work_face`；不要求清单的任务恒为空列表）。
+- **领取门控。** `claim` 与 `claim_next` 共用的领取步骤在现有依赖与 scope 检查之外，要求 `require_work_face` 为真的任务清单完整，否则返回 `work_face_incomplete`（HTTP 409）；`claim` 与 `claim_next` 的重放路径同样检查。`claim_next` 在选择候选时跳过清单不完整的任务，不让它挡住队列。`ready` 不返回清单不完整的任务。
+- **准备任务。** 准备任务门控完全复用 X17：施工任务 `depends_on` 一个 `task_kind='prep'` 的任务，该准备任务 done 且当前 epoch 有 gate pass 之前，施工任务按既有规则返回 `dependency_blocked`。不另设一套依赖逻辑。
+- **set_work_face。** `set_work_face(operation_id, task_id, work_face, base_commit=None)` 只允许目标任务为 queued、epoch 为 0 且无执行记录（规则与 plan 相同），否则返回 `stale_claim`（409）。调用者必须对任务所在页面有当前 edit 权限，并且是任务 owner、或在 reviewers 中（按 principal 精确匹配）、或当前持有有效租约，该租约对应的任务 `task_kind='prep'` 且目标任务 `depends_on` 它；否则返回 `forbidden`。`base_commit` 只能在当前为 null 时设置一次，重复传原值是 no-op，传别的值返回 `operation_conflict`。它使用 X6 的 `operation_id` 幂等（重放重新检查权限），审计事件为 `task.work_face_set`，元数据只含键名列表与 work_face 规范 JSON 的 sha256，不含正文。`create_task_block` 与 `submit_task` 也可在创建时给出 `work_face`、`require_work_face`、`task_kind`，三者计入幂等请求摘要。
+- **不执行。** Baton 绝不执行 `acceptance_command`；它只是给领取人与 gate 审阅人阅读的信息，通过与否仍由 X13 的 gate 决定。
+
 ## 红线与验收
 
-下表中官方语义验收对应 O1–O9 的原文链接；数据库与 HTTP 验收对应 X1–X17 的 x_契约。测试必须通过公开接口或实际 PostgreSQL 事务证明，不以函数返回“成功”、单进程内存锁或 SQLite 替身代替并发与权限结论。
+下表中官方语义验收对应 O1–O9 的原文链接；数据库与 HTTP 验收对应 X1–X18 的 x_契约。测试必须通过公开接口或实际 PostgreSQL 事务证明，不以函数返回“成功”、单进程内存锁或 SQLite 替身代替并发与权限结论。
 
 | 编号 | 红线/触发 | 可执行验收结果 |
 | --- | --- | --- |
@@ -123,6 +134,7 @@
 | A21 | 依赖追加可变性与 claim 竞态 | 仅当前未执行 queued 可追加；claimed（含仅 lease 过期但未恢复状态者）、awaiting_gate、done、failed、interrupted、执行过再 queued 及执行状态不确定者均拒绝。plan 不回收状态；追加与领取并发不得出现领取后才添加未完成依赖。 |
 | A22 | 派生进度及无内置 planner | 进度随有权读取的真实任务/gate 状态变化；不能通过写入独立 tracker 使图看似完成；plan/ready 不启动 planning agent、模型或远端主机进程，命名 agent 仍自愿 pull。 |
 | A23 | 创建任务时原子附加依赖 | create_task_block/submit_task 的 optional depends_on 与节点同事务提交；无权/不存在/无效引用等失败时不留下新任务。自动 submit 带未通过 gate 的依赖时，worker 不能在创建与依赖生效之间抢跑；只有依赖 done 且当前 epoch gate pass 后才可领取。 |
+| A24 | x_ready 施工面清单与门控 | 要求清单但不完整的任务，claim/claim_next 返回 work_face_incomplete 且不出现在 ready；`work_face_missing` 只含 base_commit/scopes/work_face；补全后可领取。准备任务（task_kind=prep）未 done 并通过当前 epoch gate 前，依赖它的施工任务返回 dependency_blocked，通过后才出现在 ready。set_work_face 仅限 edit 权限且是 owner、reviewer principal 或持有关联 prep 有效租约者，其他情形 403；仅 queued 且 epoch 0 可设置（否则 409 stale_claim），base_commit 只能设置一次（异值 409 operation_conflict）；同 operation_id 同输入重放、异输入冲突；格式非法返回 422；审计只含键名与 sha256；Baton 不执行 acceptance_command；不要求清单的任务行为不变。 |
 
 验收完成前不得声称已复刻 Space 全部行为、已提供官方 Space API、已有跨独立数据库分布锁，或已完成真实账户/界面兼容测试。共享数据库上线或旧数据迁移另走 shadow → enforce → bake；本规格本身不授权迁移真实数据。[官方能力边界背景：S3](https://learn.chatgpt.com/docs/space/collaboration)、[S4](https://learn.chatgpt.com/docs/space/agents)。
 
