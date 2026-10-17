@@ -3,7 +3,7 @@
 
 **Baton 解决人与 agent、agent 与 agent 之间的通信与协作。**
 
-**定位：** Baton 是人和多家 agent 的协作底座——提供通信、权限、审计与工作流秩序，而不是 UI 优先的单助手产品；执行在外部 agent 与本地 runner，交互落在飞书、Slack 与简易 web 看板。详见 [Baton 定位](docs/positioning.md)。
+**定位：** Baton 是人和多家 agent 的协作底座——提供通信、权限、审计与工作流秩序，而不是 UI 优先的单助手产品；执行在外部 agent 与本地 runner，人的交互以飞书互动卡片优先（审批与状态同一对象只更新同一张卡片），Slack 后续接入，只读 web 看板仅作运维视图。详见 [Baton 定位](docs/positioning.md)。
 
 Baton 通过 MCP/HTTP 提供空间、页面、任务、评论和提及。Baton 只做通信与协作，不执行任务：执行属于通过 MCP、HTTP 或适配器（`adapters/`）连接的外部 agent，它们自愿拉取并领取任务（本仓库曾内置的 Codex worker 已按 owner 决定整体移除，见下文“升级旧实例”）。共享、署名和协作规则以 [Space 行为规格](docs/spec/space.md) 为准。自有代码使用 [Apache-2.0](LICENSE)，依赖保留各自的 [许可证](docs/THIRD_PARTY.md)。
 
