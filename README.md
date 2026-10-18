@@ -108,7 +108,7 @@ docker compose run --rm --no-deps \
 
 既有 MCP `submit_task`、`get_task`、`list_tasks`、`fetch_inbox` 保留；协作工具包括 `claim`、`renew`、`handoff`、`comment`、`mention`、`plan`、`ready`、`set_work_face`、`mark_blocked`。具体参数、允许操作和验收以 [规格](docs/spec/space.md) 与实现返回的工具 schema 为准。HTTP 使用 `POST /v1/space/{operation}`，所有操作都是 Baton 自有协议。
 
-`submit_task` 不带接收人时不再派发到任何地方：它创建一条**手工、未指派**的任务（范围省略时为 `none`），任何对该页面有 edit 权限的主体都能在 `ready` 里看到并 `claim` 它；reviewer 默认是请求者，gate 规则不变，工具签名保持兼容。带 `assignee_principal` 时只有该主体能领取。默认页面（省略 `page_id`）是请求者私有的，要让别人领取请传共享页面的 `page_id`。手工 gate 必须由 Space owner（根）或配置的 reviewer 且持有审批人委托的主体审批（见下文“审批关卡与委托”），提交或执行结果的人不能批准（根可显式 `self_approval`）。`awaiting_gate` 不能提前显示为 completed。
+`submit_task` 不带接收人时不再派发到任何地方：它创建一条**手工、未指派**的任务（范围省略时为 `none`）。没有 `role` 时，任何对该页面有 edit 权限的主体都能在 `ready` 里看到并 `claim` 它；带 `role` 时，只有当前在该任务所在 Space 持有该角色的主体能领取，除非 Space 根或持有覆盖该 Space 的审批人委托的主体已经把任务指派给调用者（见下文“角色队列”）。reviewer 默认是请求者，gate 规则不变。`submit_task` 与 `create_task_block` 增加了可选参数 `role`，其余既有参数不变。带 `assignee_principal` 时只有该主体能领取。默认页面（省略 `page_id`）是请求者私有的，要让别人领取请传共享页面的 `page_id`。手工 gate 必须由 Space owner（根）或配置的 reviewer 且持有审批人委托的主体审批（见下文“审批关卡与委托”），提交或执行结果的人不能批准（根可显式 `self_approval`）。`awaiting_gate` 不能提前显示为 completed。
 
 `x_scope` 首版锁域是同一 PostgreSQL 权威内跨 Space 的 `global`，不提供跨独立数据库的互斥保证。两个 `path` 声明仅在规范化后相等、或其中一个是另一个在 `/` 边界上的目录前缀时冲突：`docs/design` 与 `docs/design/roadmap.md`、`docs` 冲突，与 `docs/designer`、`src` 不冲突，因此声明了互不重叠路径的任务（如 `src/a` 与 `docs/b`）可以同时领取，空路径（仓库根占位范围）与任何路径冲突。规范化为仓库相对路径、`/` 分隔、去除重复分隔符、结尾 `/` 与 `.` 段，拒绝绝对路径与 `..`；默认大小写敏感，运营者可设置 `BATON_SCOPE_CASE_INSENSITIVE=1`（默认关闭，默认 Compose 会把宿主环境中的该变量传给 bridge）以大小写不敏感比较，适用于大小写不敏感的文件系统。`claim` 和 `ready` 使用同一规则，已有 claim 不受影响。**已知限制：** Baton 不解析符号链接、硬链接或其他别名；通过不同路径指向同一批文件的声明**不会**被检测为重叠，请用真实的规范路径声明。`module` 覆盖整个仓库，与 path、module 和任意 migration 都冲突。`migration` 仅按规范化后的完整标识相等互斥，相异标识可并行；path 与 migration 是独立声明域，需要同时保护两者时必须同时声明。显式 scope `{"kind":"none"}` 表示任务不触碰任何仓库路径、模块或 migration，与任何 claim 都不冲突，不能与其他 scope 组合；因此没有文件足迹的审阅、文档、试用类任务可以同时领取。省略 `scopes` 时，所有任务（`create_task_block` 和不论是否带 assignee 的 `submit_task`）默认 `none`；显式 `[]` 仍是仓库根占位范围，旧版内置 worker 写下的历史行也保留该占位范围。已有任务不会被改写，已持久化请求的幂等摘要不变。
 
@@ -174,6 +174,10 @@ docker compose exec bridge python -m bridge.delegations policy-remove --space <s
 ```
 
 这条命令把 owner 的决定记录为由指定运维人员执行：委托行写 `created_via='operator'` 与 `created_by=<执行人>`，审计事件把授权人记为请求者、执行人记为执行者，两者都能查到；它受同样的规则约束：授权人（principal、账户、kind）必须正是所指 Space 记录的根身份，被委托方不能是 owner 自己，且只能记录根委托。被委托方必须是注册表中已连接的主体（人或 agent）；省略 `--space` 表示覆盖该根身份拥有的所有空间；`--may-delegate` 允许被委托方通过 API 再授予更窄的子委托。owner 拥有人类身份之后（计划下周），可以改用 API：Space owner 创建根委托，持有 `may_delegate` 委托的主体创建子委托：`delegation_create`、`delegation_revoke`、`delegation_list`，见 [API](docs/api.md) 与 [规格 X25](docs/spec/space.md)。
+
+### 角色队列
+
+任务可带一个 `role`（如 `review.primary`、`test.engineer`、`ops.duty`），让 agent 主动拉取同一类工作：Space 根或持有审批人委托的主体用 `assign_role`/`revoke_role` 给主体分配角色（每次都有审计，除根以外不能给自己或同一 account 的另一个 principal 分配），agent 用 `ready_for_role(role)` 查看自己能领取的队列。`claim` 无人指定的角色任务要求当前持有该角色。把带角色的任务指派给**不持有该角色**的主体，只有 Space 根或持有覆盖该 Space 的审批人委托的主体可以，授权记在任务的 `role_assign_authority` 上，领取时核对；任何主体都不能把角色任务指派给自己，除非自己持有该角色（不论当前 assignee）。先到先得仍由租约与 scope 冲突决定。角色可在 `submit_task` 时给出，由任务 owner 或根在任务排队时修改，也可由 Space 根设置的有序角色规则按 scope 路径派生（`set_role_rules`）。角色有 SLA（默认 `review.*` 30 分钟、`triage` 15 分钟，可由根用 `set_role_sla` 设置）：最久的就绪任务超时，Space 根与审批人会收到一次 `role.sla_breached` 通知（由现有升级循环发出，60 分钟内不重复）。看板新增 “Role queues” 面板，显示每个角色的队列长度、最久等待、SLA 状态与持有人。新增表与列由幂等迁移原地添加。细节见 [API](docs/api.md#角色队列role-queues) 与 [规格 X27](docs/spec/space.md)。适配器默认白名单不变，新增工具需用 `--allow-tools` 显式放行。
 
 ## 端到端验收
 

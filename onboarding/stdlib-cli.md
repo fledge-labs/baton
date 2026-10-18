@@ -90,7 +90,7 @@ openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/
 - `--prompt-file`、`--body-file`、`--result-file`、`--json-file` 传 `-` 表示读取 stdin。`--epoch` 在 `gate` 中对应 API 的 `expected_epoch`，即被审阅结果所属的 epoch；省略时见下文“审阅人流程”。`--edited-result-file` 同样可传 `-` 读取 stdin。
 - stdout 始终是纯 JSON，并以 UTF-8 输出原文（`ensure_ascii=False`），中文不会被转义成 `\uXXXX`。
 - `claim`、`renew`、`result`、`gate`、`block` 默认再向 stderr 打印一行摘要，如 `task <id> state=claimed epoch=3`；用 `--no-summary` 关闭，`submit`、`task`、`comment`、`call` 可用 `--summary` 打开。stdout 不受影响。`gate` 的摘要行还带审批人与权限来源，见下文。`watch` 的 `--summary` 含义不同，见下文。
-- 省略 scope 时，所有任务（不论是否带 `--assignee`）默认声明 `none`（不占用任何 scope，多个无文件足迹的审阅、文档任务可同时领取）。不带 `--assignee` 的 `submit` 创建未指派的手工任务，任何对该页面有 edit 权限的主体都能用 `ready` 看到并 `claim` 它；Baton 不执行任务。
+- 省略 scope 时，所有任务（不论是否带 `--assignee`）默认声明 `none`（不占用任何 scope，多个无文件足迹的审阅、文档任务可同时领取）。不带 `--assignee` 的 `submit` 创建未指派的手工任务：没有 `role` 时，任何对该页面有 edit 权限的主体都能用 `ready` 看到并 `claim` 它；带 `role` 时只有当前持有该角色的主体能领取，除非 Space 根或覆盖该 Space 的审批人已经把任务指派给调用者。Baton 不执行任务。
 - 写操作失败后，stderr 会多打一行 `operation_id=...`。网络中断后不知道操作是否生效时，用同一个 `--operation-id` 重试，服务端保证只产生一次效果；不要重新生成。
 - `submit --reviewer <principal>` 可重复，用来指定审批人；省略时审批人仍是请求者。任务总会创建。若某个审批人既不是该 Space 的根身份，也没有覆盖该任务的审批人委托，stderr 立即打印 `baton_cli: reviewer <principal> currently cannot approve (no delegation)`，stdout 的 JSON 带同样的 `warnings` 列表，退出码仍是 0。被指派的 `--assignee` 若同时列为 `--reviewer`，按同一条规则警告。委托后来补上之后，用同一个 `--operation-id` 重放会按当前委托重新计算，警告可以消失。
 - `claim --keepalive` 在领取成功后不退出：按租期在后台续租，直到进程退出（`SIGINT`/`SIGTERM`，退出码 0）或任务不再是 `claimed`。`--lease` 省略时按 300 秒续。遇到 `stale_claim` 时停止，并打印恢复命令（见下）。

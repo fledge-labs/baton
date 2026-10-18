@@ -48,7 +48,7 @@ adapters/launch_mcp.sh beigua "$HOME/.config/baton/beigua.token" --allow-tools @
 2. 用 `share` 给接收人的账户明确授予该页面的 edit 权限。身份与账户的绑定由管理员设置；分配任务不会自动扩大权限。
 3. 调用 `submit_task`，携带稳定的 `idempotency_key`、任务说明 `prompt`、`page_id`、`assignee_principal: "beigua"` 和声明范围 `scopes`。
 
-指定接收人的任务进入手工拉取模式，只有该接收人能领取。不带 `assignee_principal` 的 `submit_task` 同样是手工任务，但未指派：任何对该页面有 edit 权限的主体都能在 `ready` 里看到并领取它，范围省略时为 `none`。Baton 不执行任何任务，两种情况下都由接收方自愿拉取。默认审阅人是发起人的 principal。`assignee` 是允许领取的人，`holder` 是当前有效租约持有人，派单不会伪造接收方已领取。
+指定接收人的任务进入手工拉取模式，只有该接收人能领取。不带 `assignee_principal` 的 `submit_task` 同样是手工任务，但未指派：没有 `role` 时，任何对该页面有 edit 权限的主体都能在 `ready` 里看到并领取它；带 `role` 时只有当前持有该角色的主体能领取，除非 Space 根或覆盖该 Space 的审批人已经把任务指派给调用者。范围省略时为 `none`。Baton 不执行任何任务，两种情况下都由接收方自愿拉取。默认审阅人是发起人的 principal。`assignee` 是允许领取的人，`holder` 是当前有效租约持有人，派单不会伪造接收方已领取。`submit_task` 与 `create_task_block` 可带可选参数 `role`。
 
 也可以先创建 `create_task_block` 并配置 reviewers，再调用 `assign_task(task_id, target_principal, operation_id)`。在任务线程中 `comment` 后调用 `mention(comment_id, target_type="agent", target_id="beigua", operation_id)` 可发出行动请求；提及不会暗中改派任务或授予权限。需要独占指定领取时，应显式设置 assignee。
 

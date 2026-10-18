@@ -20,7 +20,7 @@ nginx 提供静态看板与反向代理；agentgateway 校验 bearer、只放行
 
 PostgreSQL 的 `baton` schema 保存 spaces、pages、blocks、分享、归属、评论、mentions、任务、claims、幂等记录、gate 和 `x_audit`。版本记录只读提供给应用。任务与报告线程共享 UUID；评论回报与 mentions/assignments 组成兼容 `fetch_inbox`。业务效果、幂等回放结果和审计在同一数据库事务提交。
 
-没有内置执行端。`submit_task` 不带接收人时创建一条手工、未指派的任务（范围默认 `none`，reviewer 默认是请求者）：任何对该页面有 edit 权限的主体都能在 `ready` 里看到并 `claim` 它；带接收人时只有该接收人能领取。bridge 的后台循环只做 webhook 投递和响应时限升级，不派发任务。完成候选必须经过配置的 gate 才能成为 done；兼容视图才将 done 映射为 completed。
+没有内置执行端。`submit_task` 不带接收人时创建一条手工、未指派的任务（范围默认 `none`，reviewer 默认是请求者）：没有 `role` 时，任何对该页面有 edit 权限的主体都能在 `ready` 里看到并 `claim` 它；带 `role` 时只有当前持有该角色的主体能领取，除非 Space 根或覆盖该 Space 的审批人已经把任务指派给调用者并在任务上记下该授权（见规格 X27）。带接收人时只有该接收人能领取。bridge 的后台循环只做 webhook 投递和响应时限升级，不派发任务。完成候选必须经过配置的 gate 才能成为 done；兼容视图才将 done 映射为 completed。
 
 旧版内置 worker 写下的行（`execution_mode='codex'`、`gate_mode='worker_success'`，以及 `a2a_id`、`backend`、`dispatch_started_at` 列）是历史数据：仍可读取（提示词不在视图中显示），但没有任何路径会领取、执行或批准它们；schema 的检查约束继续允许这些值，所以旧数据库可以原样迁移。对排队中且从未被派发的旧行，操作者可以用 `assign_task` 把它显式交给一个具名 agent，它随后按手工路径处理。
 
