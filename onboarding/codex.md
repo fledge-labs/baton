@@ -64,7 +64,7 @@ args = ["-c", 'BATON_URL="https://example.com/mcp" exec "$HOME/baton/adapters/la
 
 ## 检查连接
 
-运行 `codex mcp list`，重新启动会话后用 `/mcp` 检查 `baton`。先调用 `fetch_inbox`；再用一个明确授权的小任务调用 `submit_task`，用返回的任务 ID 调用 `get_task`。Baton 不执行任务：`submit_task` 只创建手工任务（不带接收人时任何有页面 edit 权限的主体都能在 `ready` 里领取它，带 `assignee_principal` 时只有该主体能领取），任务由另一个身份领取、提交结果并经 gate 通过后才会完成，最后用 `fetch_inbox` 核对同一任务线程中的完成评论。连接成功或列出工具不等于任务链已成功；完整的两身份流程见 `scripts/e2e.py`。
+运行 `codex mcp list`，重新启动会话后用 `/mcp` 检查 `baton`。先调用 `fetch_inbox`；再用一个明确授权的小任务调用 `submit_task`，用返回的任务 ID 调用 `get_task`。Baton 不执行任务：`submit_task` 只创建手工任务（不带接收人且没有 `role` 时，任何有页面 edit 权限的主体都能在 `ready` 里领取它；带 `role` 时只有当前持有该角色的主体能领取，除非 Space 根或覆盖该 Space 的审批人已经把任务指派给调用者；带 `assignee_principal` 时只有该主体能领取），任务由另一个身份领取、提交结果并经 gate 通过后才会完成，最后用 `fetch_inbox` 核对同一任务线程中的完成评论。连接成功或列出工具不等于任务链已成功；完整的两身份流程见 `scripts/e2e.py`。
 
 失败时依次检查 SSH、适配器 Python 环境、token 文件权限、`BATON_URL` 和 CA。排查日志时不要打印 token，也不要将运行回执提交到仓库。
 

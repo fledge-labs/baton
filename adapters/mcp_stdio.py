@@ -26,6 +26,7 @@ TOOLS = {"submit_task", "get_task", "list_tasks", "fetch_inbox", "wait_inbox", "
          "revert_block", "share", "effective_role", "create_team", "set_team_member", "comment", "list_comments",
          "mention", "proposal_create", "proposal_review", "get_proposal", "list_proposals", "list_attribution",
          "create_task_block", "assign_task", "plan", "set_work_face", "set_priority", "mark_blocked", "ready", "claim", "renew", "submit_result", "handoff", "gate", "get_claim", "list_claims",
+         "assign_role", "revoke_role", "ready_for_role", "list_roles", "set_task_role", "set_role_rules", "set_role_sla",
          "get_scopes", "list_audit", "delegation_create", "delegation_revoke", "delegation_list", "x_claim", "x_scope", "x_handoff", "x_gate", "x_audit"}
 DEPRECATION_NOTICE = "[deprecated] Baton no longer develops document collaboration; use tasks, comments and links instead."
 DEPRECATED_TOOLS = frozenset({"create_block", "get_block", "list_blocks", "update_block", "revert_block", "proposal_create",

@@ -257,6 +257,14 @@ def test_unknown_presets_are_errors(value, capsys):
     assert "synthetic-private-unknown" not in output.err and output.out == ""
 
 
+def test_role_queue_tools_are_allowable_and_stay_out_of_the_default_whitelist():
+    names = {"assign_role", "revoke_role", "ready_for_role", "list_roles", "set_task_role", "set_role_rules", "set_role_sla"}
+    assert names <= adapter.TOOLS
+    assert names.isdisjoint(adapter.DEFAULT_ALLOWED_TOOLS)
+    assert names.isdisjoint(adapter.parse_allow_tools("@owner"))
+    assert adapter.parse_allow_tools(",".join(sorted(names))) == names
+
+
 def test_default_allowlist_is_unchanged_by_presets():
     assert adapter.DEFAULT_ALLOWED_TOOLS == {"submit_task", "get_task", "list_tasks", "fetch_inbox"}
     args = adapter.parse_args(["--agent-id", "beigua", "--token-file", "/synthetic/token"])

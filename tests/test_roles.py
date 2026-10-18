@@ -551,28 +551,143 @@ def test_claiming_requires_the_role_in_the_tasks_own_space_and_only_while_held(t
 
 def test_a_task_assigned_to_the_caller_is_claimable_without_holding_the_role(team):
     call, identities, space, page = team
-    task_id = submit(call, page, "review.primary", assignee_principal=principal(identities, "worker"))["task_id"]
+    task = submit(call, page, "review.primary", assignee_principal=principal(identities, "worker"))
+    task_id = task["task_id"]
+    assert task["role_assign_authority"] == "root", "the owner who names the assignee is the space root"
     assert call("replacement", "claim", 403, operation_id=op(), task_id=task_id)["code"] == "forbidden"
     assert call("worker", "claim", operation_id=op(), task_id=task_id)["state"] == "claimed"
 
 
-def test_an_editor_without_the_role_cannot_take_the_queue_by_assigning_it_to_themselves(team, pg_store):
+def test_an_editor_cannot_take_a_role_task_by_assigning_it_to_another_editor_then_themselves(team, pg_store):
     call, identities, space, page = team
     task_id = submit(call, page, "review.primary")["task_id"]
     for label in ("worker", "owner"):
         refused = call(label, "assign_task", 403, operation_id=op(), task_id=task_id, target_principal=principal(identities, label))
         assert refused["code"] == "forbidden", label
+    # Naming another editor who does not hold the role is not an ordinary edit. The old hole was this
+    # step succeeding, then the first editor assigning the now-named task back to themselves.
+    named = call("worker", "assign_task", 403, operation_id=op(), task_id=task_id,
+                 target_principal=principal(identities, "replacement"))
+    assert named["code"] == "delegation_required"
     assert call("owner", "get_task", task_id=task_id)["assignee"] is None
     assert audit(pg_store, "task.assigned", task_id=task_id) == []
     assert call("worker", "claim", 403, operation_id=op(), task_id=task_id)["code"] == "forbidden"
-    # Naming someone else is still an ordinary assignment and does not require the role.
-    call("worker", "assign_task", operation_id=op(), task_id=task_id, target_principal=principal(identities, "replacement"))
-    assert call("replacement", "claim", operation_id=op(), task_id=task_id)["state"] == "claimed"
+    assert call("replacement", "claim", 403, operation_id=op(), task_id=task_id)["code"] == "forbidden"
 
+    # After the root names the other editor, the first editor still cannot take the task for themselves.
+    granted = call("owner", "assign_task", operation_id=op(), task_id=task_id,
+                   target_principal=principal(identities, "replacement"))
+    assert granted["assignee"] == principal(identities, "replacement") and granted["role_assign_authority"] == "root"
+    refused = call("worker", "assign_task", 403, operation_id=op(), task_id=task_id,
+                   target_principal=principal(identities, "worker"))
+    assert refused["code"] == "forbidden"
+    assert call("owner", "get_task", task_id=task_id)["assignee"] == principal(identities, "replacement")
+    assert call("worker", "claim", 403, operation_id=op(), task_id=task_id)["code"] == "forbidden"
+
+    # A holder may name themselves, on an unassigned task and on one already named for someone else.
     second = submit(call, page, "review.primary", scopes=path_scope("src/self-assign"))["task_id"]
     assign(call, space, "owner", principal(identities, "worker"), "review.primary")
-    assert call("worker", "assign_task", operation_id=op(), task_id=second, target_principal=principal(identities, "worker"))["assignee"] == principal(identities, "worker")
+    taken = call("worker", "assign_task", operation_id=op(), task_id=second, target_principal=principal(identities, "worker"))
+    assert taken["assignee"] == principal(identities, "worker") and taken["role_assign_authority"] is None
     assert call("worker", "claim", operation_id=op(), task_id=second)["state"] == "claimed"
+    retaken = call("worker", "assign_task", operation_id=op(), task_id=task_id, target_principal=principal(identities, "worker"))
+    assert retaken["assignee"] == principal(identities, "worker") and retaken["role_assign_authority"] is None
+
+
+def test_an_editor_cannot_hand_a_role_task_to_a_non_holder_who_then_claims(team, pg_store):
+    call, identities, space, page = team
+    task_id = submit(call, page, "review.primary")["task_id"]
+    error = call("worker", "assign_task", 403, operation_id=op(), task_id=task_id,
+                 target_principal=principal(identities, "replacement"))
+    assert error["code"] == "delegation_required"
+    assert call("replacement", "claim", 403, operation_id=op(), task_id=task_id)["code"] == "forbidden"
+    assert call("replacement", "ready_for_role", role="review.primary") == []
+    created = call("worker", "submit_task", 403, operation_id=op(), idempotency_key="role-" + uuid.uuid4().hex[:12],
+                   prompt=PROMPT, page_id=page["id"], role="review.primary",
+                   assignee_principal=principal(identities, "replacement"))
+    assert created["code"] == "delegation_required"
+    blocked = call("worker", "create_task_block", 403, operation_id=op(), page_id=page["id"], prompt=PROMPT,
+                   reviewers=[principal(identities, "owner")], role="review.primary",
+                   assignee_principal=principal(identities, "worker"))
+    assert blocked["code"] == "forbidden"
+    assert audit(pg_store, "task.assigned", task_id=task_id) == []
+    # Naming a holder is an ordinary edit and records no grant. Holding the role does not let an editor
+    # name someone who does not hold it.
+    assign(call, space, "owner", principal(identities, "worker"), "review.primary")
+    still = call("worker", "assign_task", 403, operation_id=op(), task_id=task_id,
+                 target_principal=principal(identities, "replacement"))
+    assert still["code"] == "delegation_required"
+    assign(call, space, "owner", principal(identities, "replacement"), "review.primary")
+    named = call("worker", "assign_task", operation_id=op(), task_id=task_id,
+                 target_principal=principal(identities, "replacement"))
+    assert named["role_assign_authority"] is None and named["assignee"] == principal(identities, "replacement")
+    assert call("replacement", "claim", operation_id=op(), task_id=task_id)["state"] == "claimed"
+
+
+def test_root_and_approver_assignment_lets_a_non_holder_claim(team, pg_store, approver):
+    call, identities, space, page = team
+    approver(pg_store, identities["reviewer"], by=identities["owner"])
+    root_task = submit(call, page, "review.primary", assignee_principal=principal(identities, "worker"))
+    assert root_task["role_assign_authority"] == "root"
+    assert [task["task_id"] for task in call("worker", "ready_for_role", role="review.primary")] == [root_task["task_id"]]
+    assert call("replacement", "claim", 403, operation_id=op(), task_id=root_task["task_id"])["code"] == "forbidden"
+    assert call("worker", "claim", operation_id=op(), task_id=root_task["task_id"])["state"] == "claimed"
+    assigned = audit(pg_store, "task.assigned", task_id=root_task["task_id"])
+    assert len(assigned) == 1 and assigned[0]["metadata"]["authority"] == "root"
+
+    queued = submit(call, page, "review.primary", scopes=path_scope("src/approver"))["task_id"]
+    granted = call("reviewer", "assign_task", operation_id=op(), task_id=queued,
+                   target_principal=principal(identities, "replacement"))
+    assert granted["assignee"] == principal(identities, "replacement")
+    assert granted["role_assign_authority"].startswith("delegated by " + principal(identities, "owner") + " via ")
+    assert [task["task_id"] for task in call("replacement", "ready_for_role", role="review.primary")] == [queued]
+    assert call("worker", "claim", 403, operation_id=op(), task_id=queued)["code"] == "forbidden"
+    assert call("replacement", "claim", operation_id=op(), task_id=queued)["state"] == "claimed"
+    meta = audit(pg_store, "task.assigned", task_id=queued)[0]["metadata"]
+    assert meta["authority"] == granted["role_assign_authority"]
+
+    changed = submit(call, page, "review.primary", scopes=path_scope("src/approver/role"),
+                     assignee_principal=principal(identities, "worker"))["task_id"]
+    call("owner", "set_task_role", operation_id=op(), task_id=changed, role="review.second")
+    view = call("owner", "get_task", task_id=changed)
+    assert view["role"] == "review.second" and view["role_assign_authority"] is None
+    assert call("worker", "claim", 403, operation_id=op(), task_id=changed)["code"] == "forbidden"
+    assert changed not in [task["task_id"] for task in call("worker", "ready")]
+    assert call("worker", "ready_for_role", role="review.second") == []
+
+
+def test_escalation_does_not_move_a_role_task_onto_someone_who_cannot_claim_it(team, pg_store):
+    call, identities, space, page = team
+    stuck = submit(call, page, "review.primary", assignee_principal=principal(identities, "worker"),
+                   fallback_assignee=principal(identities, "replacement"))["task_id"]
+    execute(pg_store, "UPDATE baton.tasks SET respond_by=clock_timestamp()-interval '10 minutes' WHERE id=%s", (stuck,))
+    result = sweep(pg_store)
+    assert stuck in result["escalated"] and stuck not in result["reassigned"]
+    view = call("owner", "get_task", task_id=stuck)
+    assert view["assignee"] == principal(identities, "worker") and view["role_assign_authority"] == "root"
+    assert call("worker", "claim", operation_id=op(), task_id=stuck)["state"] == "claimed"
+
+    assign(call, space, "owner", principal(identities, "replacement"), "review.primary")
+    moved = submit(call, page, "review.primary", scopes=path_scope("src/fallback"),
+                   assignee_principal=principal(identities, "worker"),
+                   fallback_assignee=principal(identities, "replacement"))["task_id"]
+    execute(pg_store, "UPDATE baton.tasks SET respond_by=clock_timestamp()-interval '10 minutes' WHERE id=%s", (moved,))
+    assert sweep(pg_store)["reassigned"] == [moved]
+    after = call("owner", "get_task", task_id=moved)
+    assert after["assignee"] == principal(identities, "replacement") and after["role_assign_authority"] is None
+    assert call("replacement", "claim", operation_id=op(), task_id=moved)["state"] == "claimed"
+
+
+def test_handoff_does_not_carry_a_privileged_role_grant_to_the_next_assignee(team, pg_store):
+    call, identities, space, page = team
+    task_id = submit(call, page, "review.primary", assignee_principal=principal(identities, "worker"))["task_id"]
+    claimed = call("worker", "claim", operation_id=op(), task_id=task_id)
+    call("worker", "handoff", operation_id=op(), task_id=task_id, epoch=claimed["epoch"],
+         target_principal=principal(identities, "replacement"))
+    view = call("owner", "get_task", task_id=task_id)
+    assert view["assignee"] == principal(identities, "replacement") and view["role_assign_authority"] is None
+    execute(pg_store, "UPDATE baton.x_claim SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE task_id=%s", (task_id,))
+    assert call("replacement", "claim", 403, operation_id=op(), task_id=task_id)["code"] == "forbidden"
 
 
 def test_assigning_a_role_task_to_a_principal_takes_it_out_of_the_queue(team):
@@ -1012,7 +1127,7 @@ def test_schema_upgrades_in_place_and_is_idempotent(team, pg_store):
         connection.execute("DROP TABLE baton.x_role_holder")
         connection.execute("DROP TABLE baton.x_role_config")
         connection.execute("DROP INDEX baton.tasks_role_queue")
-        connection.execute("ALTER TABLE baton.tasks DROP COLUMN role, DROP COLUMN role_source, DROP COLUMN role_sla_notified_at")
+        connection.execute("ALTER TABLE baton.tasks DROP COLUMN role, DROP COLUMN role_source, DROP COLUMN role_sla_notified_at, DROP COLUMN role_assign_authority")
         connection.commit()
         with pytest.raises(StoreError) as old:
             pg_store.check_schema(SERVICE_ACTOR)

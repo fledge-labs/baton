@@ -843,7 +843,7 @@ class SpaceStore:
                 "mentions": "id comment_id target_type target_id action_requested requested_by created_at",
                 "proposals": "id block_id expected_revision proposed_content status revision",
                 "proposal_revisions": "proposal_id revision content author_principal",
-                "tasks": "id page_id block_id owner owner_account owner_kind assignee idempotency_key input_hash prompt execution_mode gate_mode reviewers scopes state epoch result_epoch result result_author result_author_account base_commit context evidence a2a_id backend dispatch_started_at error work_face require_work_face task_kind priority respond_by responded_at escalated_at escalate_to fallback_assignee blocked_reason blocked_by blocked_at approvals_required approvals_override_root role role_source role_sla_notified_at",
+                "tasks": "id page_id block_id owner owner_account owner_kind assignee idempotency_key input_hash prompt execution_mode gate_mode reviewers scopes state epoch result_epoch result result_author result_author_account base_commit context evidence a2a_id backend dispatch_started_at error work_face require_work_face task_kind priority respond_by responded_at escalated_at escalate_to fallback_assignee blocked_reason blocked_by blocked_at approvals_required approvals_override_root role role_source role_sla_notified_at role_assign_authority",
                 "task_dependencies": "task_id depends_on created_at",
                 "x_claim": "task_id holder holder_account holder_kind epoch lease_expires_at scopes scope_repository",
                 "x_handoff": "task_id old_epoch new_epoch base_commit context evidence",
@@ -1502,7 +1502,10 @@ class SpaceStore:
             for task in tasks:
                 if task["assignee"] is not None and task["assignee"] != actor.principal:
                     continue
-                if task["assignee"] is None and task["role"] is not None and (task["space_id"], task["role"]) not in held:
+                # Same predicate as claim: a role task is claimable by a non-holder only when root or a
+                # covering approver named that caller, which is the recorded role_assign_authority.
+                holds = task["role"] is None or (task["space_id"], task["role"]) in held
+                if not holds and not (task["assignee"] == actor.principal and task["role_assign_authority"]):
                     continue
                 if self._role(conn, actor, "page", str(task["page_id"])) != "edit":
                     continue
@@ -1594,6 +1597,10 @@ class SpaceStore:
         if role is None:
             role = self._derived_role(conn, page_id, scopes, task_kind)
             role_source = None if role is None else "derived"
+        space_id = self._row(conn, "pages", str(page_id))["space_id"]
+        authority = None
+        if role is not None and assignee is not None:
+            authority = self._role_assignment_authority(conn, actor, space_id, role, assignee)
         task_id = uuid.uuid4()
         block_id = uuid.uuid4()
         content = {"task_id": str(task_id), "prompt": prompt, "execution_mode": mode}
@@ -1604,14 +1611,14 @@ class SpaceStore:
         conn.execute("UPDATE baton.pages SET revision=revision+1 WHERE id=%s", (page_id,))
         task = conn.execute("""INSERT INTO baton.tasks(id,page_id,block_id,owner,owner_account,owner_kind,assignee,idempotency_key,input_hash,prompt,
             execution_mode,gate_mode,reviewers,scopes,base_commit,context,evidence,work_face,require_work_face,task_kind,
-            priority,respond_by,escalate_to,fallback_assignee,approvals_required,approvals_override_root,role,role_source)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,clock_timestamp()+%s*interval '1 minute',%s,%s,%s,%s,%s,%s) RETURNING *""",
+            priority,respond_by,escalate_to,fallback_assignee,approvals_required,approvals_override_root,role,role_source,role_assign_authority)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,clock_timestamp()+%s*interval '1 minute',%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
             (task_id, page_id, block_id, actor.principal, actor.account, actor.kind, assignee.principal if assignee else None,
              idempotency_key, input_hash, prompt, mode, "reviewer", Jsonb(reviewers),
              Jsonb(scopes), base_commit, Jsonb(_items(context)), Jsonb(_items(evidence)),
              None if work_face is None else Jsonb(work_face), require_work_face, task_kind,
              priority, self.response_minutes[priority] if assignee else None, escalate_to or actor.principal, fallback_assignee,
-             approvals_required, self._root_of_page(conn, actor, page_id), role, role_source)).fetchone()
+             approvals_required, self._root_of_page(conn, actor, page_id), role, role_source, authority)).fetchone()
         dependency_count = self._add_dependencies(conn, str(task_id), depends_on or [])
         self._require_acyclic(conn, str(task_id))
         self._task_audit(conn, actor, operation_id, "task.submitted", task, input_sha256=hashlib.sha256(prompt.encode()).hexdigest(), execution_mode=mode)
@@ -1622,7 +1629,7 @@ class SpaceStore:
             self._task_audit(conn, actor, operation_id, "task.dependencies_added", task, count=dependency_count)
         self._notify_task(conn, actor, operation_id, task, "submitted", prompt, assignee.principal if assignee else None)
         if assignee:
-            self._task_audit(conn, actor, operation_id, "task.assigned", task)
+            self._task_audit(conn, actor, operation_id, "task.assigned", task, **({"authority": authority} if authority else {}))
             self._enqueue(conn, actor, "task.assigned", "task", task_id, page_id, [self._party(assignee)], task_id)
         return self._task_view(conn, actor, str(task_id))
 
@@ -1901,9 +1908,12 @@ class SpaceStore:
             self._require_dependency_access(conn, actor, task_id)
             if task["assignee"] is not None and task["assignee"] != actor.principal:
                 raise StoreError("forbidden")
-            # An unassigned role task is open only to current holders of its role in the task's space.
-            if task["assignee"] is None and task["role"] is not None and not self._holds_role(conn, actor, self._task_space(conn, task), task["role"]):
-                raise StoreError("forbidden")
+            # A role task is open to current holders of its role in the task's space. A non-holder may
+            # claim it only when they are the named assignee and a root or covering approver recorded
+            # that assignment. An empty assignee never carries that grant.
+            if task["role"] is not None and not self._holds_role(conn, actor, self._task_space(conn, task), task["role"]):
+                if task["assignee"] != actor.principal or not task["role_assign_authority"]:
+                    raise StoreError("forbidden")
         def effect(conn):
             self._expire(conn, operation_id)
             return self._take_claim(conn, actor, operation_id, self._row(conn, "tasks", task_id), lease_seconds)
@@ -1949,7 +1959,8 @@ class SpaceStore:
             contexts, evidence_items = task["context"] + _items(context), task["evidence"] + _items(evidence)
             conn.execute("""UPDATE baton.x_claim SET holder=%s,holder_account=%s,holder_kind=%s,epoch=epoch+1,
                 lease_expires_at=clock_timestamp()+%s*interval '1 second' WHERE task_id=%s""", (target.principal, target.account, target.kind, lease_seconds, task_id))
-            conn.execute("UPDATE baton.tasks SET epoch=epoch+1,assignee=%s,base_commit=%s,context=%s,evidence=%s WHERE id=%s",
+            conn.execute("""UPDATE baton.tasks SET epoch=epoch+1,assignee=%s,base_commit=%s,context=%s,evidence=%s,
+                role_assign_authority=NULL WHERE id=%s""",
                          (target.principal, base, Jsonb(contexts), Jsonb(evidence_items), task_id))
             if task["assignee"] != target.principal:
                 self._start_clock(conn, task)
@@ -1983,11 +1994,16 @@ class SpaceStore:
         if responded:
             conn.execute("UPDATE baton.tasks SET responded_at=clock_timestamp() WHERE id=%s AND responded_at IS NULL", (task["id"],))
 
-    def _assign(self, conn, actor, operation_id, task, principal, account, event="task.assigned", default_reviewer=None, body="Task assigned", **metadata):
-        """Move an unclaimed task to a manual assignee. Shared by assign_task and the escalation runner."""
+    def _assign(self, conn, actor, operation_id, task, principal, account, event="task.assigned", default_reviewer=None, body="Task assigned", role_assign_authority=None, **metadata):
+        """Move an unclaimed task to a manual assignee. Shared by assign_task and the escalation runner.
+
+        role_assign_authority is the root or approver grant that lets a non-holder claim a role task.
+        Callers that are not making that grant pass None, which clears any previous grant.
+        """
         reviewers = task["reviewers"] or [default_reviewer or actor.principal]
         conn.execute("""UPDATE baton.tasks SET assignee=%s,execution_mode='manual',gate_mode='reviewer',reviewers=%s,
-            blocked_reason=NULL,blocked_by=NULL,blocked_at=NULL WHERE id=%s""", (principal, Jsonb(reviewers), task["id"]))
+            blocked_reason=NULL,blocked_by=NULL,blocked_at=NULL,role_assign_authority=%s WHERE id=%s""",
+            (principal, Jsonb(reviewers), role_assign_authority, task["id"]))
         if task["assignee"] != principal:
             self._start_clock(conn, task)
         self._task_audit(conn, actor, operation_id, event, task, **metadata)
@@ -1997,20 +2013,20 @@ class SpaceStore:
     def assign_task(self, actor, operation_id, task_id, target):
         if not isinstance(target, Actor):
             raise StoreError("invalid")
+        grant = {}
         def authorize(conn):
             task = self._task_for(conn, actor, task_id, "edit")
             self._require(conn, target, "page", str(task["page_id"]), "edit", hidden="forbidden")
-            # Naming yourself on an unassigned role task is a claim in two steps. The role check on claim
-            # only applies while assignee is null, so it has to be repeated here or any editor can take the queue.
-            if (task["role"] is not None and task["assignee"] is None and target.principal == actor.principal
-                    and not self._holds_role(conn, actor, self._task_space(conn, task), task["role"])):
-                raise StoreError("forbidden")
+            grant["authority"] = None if task["role"] is None else self._role_assignment_authority(
+                conn, actor, self._task_space(conn, task), task["role"], target)
         def effect(conn):
             self._expire(conn, operation_id)
             task = self._row(conn, "tasks", task_id)
             if task["state"] != "queued" or task["dispatch_started_at"] is not None:
                 raise StoreError("stale_claim")
-            self._assign(conn, actor, operation_id, task, target.principal, target.account)
+            authority = grant["authority"]
+            self._assign(conn, actor, operation_id, task, target.principal, target.account,
+                         role_assign_authority=authority, **({"authority": authority} if authority else {}))
             return self._task_view(conn, actor, task_id)
         def replay(conn, old):
             task = self._row(conn, "tasks", task_id)
@@ -2210,6 +2226,12 @@ class SpaceStore:
         if conn.execute("SELECT 1 FROM baton.x_claim WHERE task_id=%s AND lease_expires_at>clock_timestamp()", (task["id"],)).fetchone():
             return
         if task["dispatch_started_at"] is not None:
+            return
+        # The service is not a root or an approver, so it must not move a role task onto someone who
+        # does not hold the role: that assignment would be unclaimable, and it must not mint a grant.
+        if task["role"] is not None and conn.execute("""SELECT 1 FROM baton.x_role_holder WHERE space_id=%s AND role=%s
+                AND holder=%s AND holder_account=%s""",
+                (self._task_space(conn, task), task["role"], party[0], party[1])).fetchone() is None:
             return
         self._assign(conn, SERVICE_ACTOR, operation_id, task, party[0], party[1], event="task.reassigned",
                      default_reviewer=task["owner"], body="Task reassigned after the response deadline passed",
@@ -2687,6 +2709,26 @@ class SpaceStore:
         return conn.execute("""SELECT 1 FROM baton.x_role_holder WHERE space_id=%s AND role=%s AND holder=%s AND holder_account=%s
             AND holder_kind=%s""", (space_id, role, actor.principal, actor.account, actor.kind)).fetchone() is not None
 
+    def _role_assignment_authority(self, conn, actor, space_id, role, target):
+        """The grant to record when naming `target` on a role task, or None when `target` already holds the role.
+
+        Any editor may name a holder; that assignment carries no grant. Naming anyone else takes the space
+        root or an approver whose delegation covers the space, and the recorded authority is what later lets
+        that assignee claim. Naming your own principal is refused unless you hold the role, including for
+        the root, and whether or not the task already names someone.
+        """
+        space_id = str(space_id)
+        if self._holds_role(conn, target, space_id, role):
+            return None
+        if target.principal == actor.principal:
+            raise StoreError("forbidden")
+        space = self._row(conn, "spaces", space_id)
+        if self._is_root(space, actor.principal, actor.account, actor.kind):
+            approval = {"root": True, "chain": [], "self_approval": False}
+        else:
+            approval = {"root": False, "chain": self._space_approver_chain(conn, actor, space_id), "self_approval": False}
+        return self._authority(approval)
+
     def _derived_role(self, conn, page_id, scopes, task_kind):
         space_id = self._row(conn, "pages", str(page_id))["space_id"]
         config = conn.execute("SELECT rules FROM baton.x_role_config WHERE space_id=%s", (space_id,)).fetchone()
@@ -2818,7 +2860,10 @@ class SpaceStore:
                 raise StoreError("stale_claim")
             source = None if role is None else "explicit"
             if (task["role"], task["role_source"]) != (role, source):
-                conn.execute("UPDATE baton.tasks SET role=%s,role_source=%s,role_sla_notified_at=NULL WHERE id=%s", (role, source, task_id))
+                # A grant was for the previous role. Changing the role name drops it; a source-only rewrite keeps it.
+                conn.execute("""UPDATE baton.tasks SET role=%s,role_source=%s,role_sla_notified_at=NULL,
+                    role_assign_authority=CASE WHEN role IS DISTINCT FROM %s THEN NULL ELSE role_assign_authority END
+                    WHERE id=%s""", (role, source, role, task_id))
                 previous = {} if task["role"] is None else {"from_role": task["role"]}
                 self._task_audit(conn, actor, operation_id, "task.role_cleared" if role is None else "task.role_set", task,
                                  **({"role": role, "role_source": source} if role else {}), **previous)

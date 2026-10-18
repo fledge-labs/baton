@@ -364,9 +364,13 @@ END; $$;
 -- zero or more roles per space; only the root or a covering approver delegation assigns them, and every change is in
 -- x_audit. The rules and the per-space SLA map live in x_role_config (NULL sla_minutes means the built-in defaults).
 -- role_sla_notified_at is the last time a role.sla_breached notification was written for the task.
+-- role_assign_authority is set only when the space root, or an approver whose delegation covers the space,
+-- names an assignee who does not hold the task's role. A non-holder may claim that task only when they are
+-- that assignee and this column is set. NULL means the assignment carries no such grant.
 ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS role text CHECK (role ~ '^[a-z][a-z0-9_.-]{0,63}$');
 ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS role_source text CHECK (role_source IN ('explicit','derived'));
 ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS role_sla_notified_at timestamptz;
+ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS role_assign_authority text;
 DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='baton.tasks'::regclass AND conname='task_role_source_pair') THEN
         ALTER TABLE baton.tasks ADD CONSTRAINT task_role_source_pair CHECK ((role IS NULL) = (role_source IS NULL));
