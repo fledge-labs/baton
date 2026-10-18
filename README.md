@@ -177,7 +177,7 @@ docker compose exec bridge python -m bridge.delegations policy-remove --space <s
 
 ### 角色队列
 
-任务可带一个 `role`（如 `review.primary`、`test.engineer`、`ops.duty`），让 agent 主动拉取同一类工作：Space 根或持有审批人委托的主体用 `assign_role`/`revoke_role` 给主体分配角色（每次都有审计，除根以外不能给自己分配），agent 用 `ready_for_role(role)` 查看自己能领取的队列，`claim` 无人指定的角色任务要求当前持有该角色，先到先得仍由租约与 scope 冲突决定。角色可在 `submit_task` 时给出，由任务 owner 或根在任务排队时修改，也可由 Space 根设置的有序角色规则按 scope 路径派生（`set_role_rules`）。角色有 SLA（默认 `review.*` 30 分钟、`triage` 15 分钟，可由根用 `set_role_sla` 设置）：最久的就绪任务超时，Space 根与审批人会收到一次 `role.sla_breached` 通知（由现有升级循环发出，60 分钟内不重复）。看板新增 “Role queues” 面板，显示每个角色的队列长度、最久等待、SLA 状态与持有人。新增表与列由幂等迁移原地添加。细节见 [API](docs/api.md#角色队列role-queues) 与 [规格 X27](docs/spec/space.md)。适配器默认白名单不变，新增工具需用 `--allow-tools` 显式放行。
+任务可带一个 `role`（如 `review.primary`、`test.engineer`、`ops.duty`），让 agent 主动拉取同一类工作：Space 根或持有审批人委托的主体用 `assign_role`/`revoke_role` 给主体分配角色（每次都有审计，除根以外不能给自己或同一 account 的另一个 principal 分配），agent 用 `ready_for_role(role)` 查看自己能领取的队列，`claim` 无人指定的角色任务要求当前持有该角色，先到先得仍由租约与 scope 冲突决定。角色可在 `submit_task` 时给出，由任务 owner 或根在任务排队时修改，也可由 Space 根设置的有序角色规则按 scope 路径派生（`set_role_rules`）。角色有 SLA（默认 `review.*` 30 分钟、`triage` 15 分钟，可由根用 `set_role_sla` 设置）：最久的就绪任务超时，Space 根与审批人会收到一次 `role.sla_breached` 通知（由现有升级循环发出，60 分钟内不重复）。看板新增 “Role queues” 面板，显示每个角色的队列长度、最久等待、SLA 状态与持有人。新增表与列由幂等迁移原地添加。细节见 [API](docs/api.md#角色队列role-queues) 与 [规格 X27](docs/spec/space.md)。适配器默认白名单不变，新增工具需用 `--allow-tools` 显式放行。
 
 ## 端到端验收
 

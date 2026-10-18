@@ -28,7 +28,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 
 from bridge import a2a_public, common, webhooks
 from bridge.common import AuthMiddleware, audit, safe_id, transport_origins, uuid_id
-from bridge.space_store import SERVICE_ACTOR, Actor, StoreError
+from bridge.space_store import LEGACY_SERVICE_PRINCIPAL, SERVICE_ACTOR, Actor, StoreError
 
 PROTOCOL = common.SPACE_PROTOCOL
 SERVICE = SERVICE_ACTOR
@@ -540,11 +540,15 @@ async def perform(operation, payload, request):
             if not who:
                 raise BridgeError("invalid", [{"field": "delegate_principal", "expected": "a principal registered in Baton"}])
             arguments["delegate"] = actor_from_identity(who)
-        if operation == "assign_role":
+        if operation in {"assign_role", "revoke_role"}:
             who = common.resolve_principal(arguments.pop("principal"))
-            if not who:
+            if (not who or who["agent"] in {SERVICE.principal, LEGACY_SERVICE_PRINCIPAL}
+                    or who["account"] == SERVICE.account):
                 raise BridgeError("invalid", [{"field": "principal", "expected": "a principal registered in Baton"}])
-            arguments["target"] = actor_from_identity(who)
+            if operation == "assign_role":
+                arguments["target"] = actor_from_identity(who)
+            else:
+                arguments["principal"] = who["agent"]
         if operation in {"handoff", "assign_task"}:
             who = common.resolve_principal(arguments.pop("target_principal"))
             if not who:

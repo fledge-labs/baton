@@ -83,8 +83,6 @@ ROLE_SLA_MAX_MINUTES = 525600
 ROLE_SLA_ENTRIES = 50
 ROLE_SLA_REPEAT_MINUTES = 60
 ROLE_RULES_MAX = 100
-ROLE_SWEEP_SCAN = 2000
-ROLE_LIST_LIMIT = 1000
 
 
 class StoreError(Exception):
@@ -2002,6 +2000,11 @@ class SpaceStore:
         def authorize(conn):
             task = self._task_for(conn, actor, task_id, "edit")
             self._require(conn, target, "page", str(task["page_id"]), "edit", hidden="forbidden")
+            # Naming yourself on an unassigned role task is a claim in two steps. The role check on claim
+            # only applies while assignee is null, so it has to be repeated here or any editor can take the queue.
+            if (task["role"] is not None and task["assignee"] is None and target.principal == actor.principal
+                    and not self._holds_role(conn, actor, self._task_space(conn, task), task["role"])):
+                raise StoreError("forbidden")
         def effect(conn):
             self._expire(conn, operation_id)
             task = self._row(conn, "tasks", task_id)
@@ -2732,7 +2735,9 @@ class SpaceStore:
         approval = {}
         def authorize(conn):
             approval.update(self._role_authority(conn, actor, space_id))
-            if not approval["root"] and target.principal == actor.principal:
+            # Same rule as gate: apart from the root, nobody grants a role to their own principal or to
+            # another principal that shares their account.
+            if not approval["root"] and (target.principal == actor.principal or target.account == actor.account):
                 raise StoreError("forbidden")
         def effect(conn):
             authority = self._authority(approval)
@@ -2753,7 +2758,9 @@ class SpaceStore:
         """Take a role from a principal. The same authority as assign_role; revoking leaves leases already held untouched."""
         _uuid(space_id, "space_id")
         role = _role_name(role)
-        _identifier(principal, "principal")
+        principal = _identifier(principal, "principal")
+        if principal in {SERVICE_ACTOR.principal, LEGACY_SERVICE_PRINCIPAL}:
+            raise StoreError("invalid", "principal", "a connected principal other than the service")
         approval = {}
         def authorize(conn):
             approval.update(self._role_authority(conn, actor, space_id))
@@ -2819,28 +2826,35 @@ class SpaceStore:
         return self._mutate(actor, operation_id, "set_task_role", {"task_id": task_id, "role": role}, authorize, effect,
                             lambda conn, old: view(conn))
 
-    def _dependencies_ready(self, conn, task, live_scopes):
-        return (self._dependencies_done(conn, task["id"]) and not self._work_face_missing(task)
-                and not any(scopes_overlap(task["scopes"], scopes) for scopes in live_scopes))
-
     def _role_queue(self, conn, space_id=None):
-        """Queued role tasks with nobody named, oldest first, as (task row, ready). Ready ignores who is asking:
-        dependencies done, work face complete, no scope conflict with a live claim."""
-        rows = conn.execute("""SELECT t.*,p.space_id,EXTRACT(EPOCH FROM clock_timestamp()-t.created_at)::float8 AS waited
+        """Queued role tasks with nobody named, oldest first, as (task row, ready).
+
+        Ready ignores who is asking: dependencies done (the same predicate as `_dependencies_done`), work face
+        complete, no scope conflict with a live claim.
+        Every matching task is read. A cap here would let older tasks that are not ready — including ones in
+        other spaces — hide the oldest task that is, so the SLA and the board would under-report it.
+        """
+        rows = conn.execute("""SELECT t.*,p.space_id,EXTRACT(EPOCH FROM clock_timestamp()-t.created_at)::float8 AS waited,
+            NOT EXISTS (
+                SELECT 1 FROM baton.task_dependencies e JOIN baton.tasks d ON d.id=e.depends_on
+                WHERE e.task_id=t.id AND (d.state<>'done' OR d.result_epoch IS DISTINCT FROM d.epoch OR NOT EXISTS (
+                    SELECT 1 FROM baton.x_gate g WHERE g.task_id=d.id AND g.epoch=d.epoch AND g.decision='pass'))
+            ) AS deps_done
             FROM baton.tasks t JOIN baton.pages p ON p.id=t.page_id
             WHERE t.execution_mode='manual' AND t.role IS NOT NULL AND t.assignee IS NULL AND t.dispatch_started_at IS NULL
             AND t.state IN ('queued','claimed') AND (%s::uuid IS NULL OR p.space_id=%s::uuid)
             AND NOT EXISTS (SELECT 1 FROM baton.x_claim c WHERE c.task_id=t.id AND c.lease_expires_at>clock_timestamp())
-            ORDER BY t.created_at,t.id LIMIT %s""", (space_id, space_id, ROLE_SWEEP_SCAN)).fetchall()
+            ORDER BY t.created_at,t.id""", (space_id, space_id)).fetchall()
         live = [row["scopes"] for row in conn.execute("SELECT scopes FROM baton.x_claim WHERE lease_expires_at>clock_timestamp()")]
-        return [(task, self._dependencies_ready(conn, task, live)) for task in rows]
+        return [(task, bool(task["deps_done"]) and not self._work_face_missing(task)
+                 and not any(scopes_overlap(task["scopes"], scopes) for scopes in live)) for task in rows]
 
     def _role_summary(self, conn, space_id):
         sla, default = self._space_sla(conn, space_id)
         config = conn.execute("SELECT rules FROM baton.x_role_config WHERE space_id=%s", (space_id,)).fetchone()
         roles = {}
-        for row in conn.execute("SELECT * FROM baton.x_role_holder WHERE space_id=%s ORDER BY role,created_at,holder LIMIT %s",
-                                (space_id, ROLE_LIST_LIMIT)):
+        for row in conn.execute("SELECT * FROM baton.x_role_holder WHERE space_id=%s ORDER BY role,created_at,holder",
+                                (space_id,)):
             roles.setdefault(row["role"], {"holders": [], "ready": [], "waiting": 0})["holders"].append(self._holder_view(row))
         for task, ready in self._role_queue(conn, space_id):
             entry = roles.setdefault(task["role"], {"holders": [], "ready": [], "waiting": 0})

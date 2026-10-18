@@ -382,6 +382,22 @@ def test_an_approver_cannot_grant_a_role_to_itself_but_root_can(team, pg_store, 
     assert held["principal"] == principal(identities, "owner") and held["authority"] == "root"
 
 
+def test_an_approver_cannot_grant_a_role_to_another_principal_on_the_same_account(team, pg_store, approver, make_context, register_identity):
+    call, identities, space, page = team
+    approver(pg_store, identities["reviewer"], by=identities["owner"])
+    twin = make_context("reviewer-twin", account=identities["reviewer"]["account"], kind="agent").request_context.request.state.identity
+    register_identity(twin)
+    assert twin["agent"] != identities["reviewer"]["agent"] and twin["account"] == identities["reviewer"]["account"]
+    refused = assign(call, space, "reviewer", twin["agent"], "review.primary", 403)
+    assert refused["code"] == "forbidden"
+    assert query(pg_store, "SELECT count(*) AS n FROM baton.x_role_holder WHERE holder=%s", (twin["agent"],))[0]["n"] == 0
+    assert audit(pg_store, "role.assigned", space["id"]) == []
+    root_twin = make_context("owner-twin", account=identities["owner"]["account"], kind="agent").request_context.request.state.identity
+    register_identity(root_twin)
+    held = assign(call, space, "owner", root_twin["agent"], "review.primary")
+    assert held["changed"] is True and held["principal"] == root_twin["agent"] and held["authority"] == "root"
+
+
 def test_delegations_that_do_not_cover_the_space_or_have_lapsed_do_not_authorize(team, pg_store, approver):
     call, identities, space, page = team
     other = call("owner", "create_space", operation_id=op(), name="Elsewhere")
@@ -420,6 +436,14 @@ def test_assign_role_needs_a_registered_principal_and_never_the_service(team, pg
         pg_store.assign_role(who(identities, "owner"), op(), space["id"], SERVICE_ACTOR, "maint")
     assert refused.value.code == "invalid"
     assert call("owner", "revoke_role", 422, operation_id=op(), space_id=space["id"], principal="bad principal", role="maint")["code"] == "invalid"
+    unregistered = "nobody-registered-" + uuid.uuid4().hex[:8]
+    for name in (unregistered, "baton-service", "codex-worker"):
+        error = call("owner", "revoke_role", 422, operation_id=op(), space_id=space["id"], principal=name, role="maint")
+        assert error["code"] == "invalid" and error["details"] == [{"field": "principal", "expected": "a principal registered in Baton"}], name
+    with pytest.raises(StoreError) as service:
+        pg_store.revoke_role(who(identities, "owner"), op(), space["id"], "baton-service", "maint")
+    assert service.value.code == "invalid"
+    assert query(pg_store, "SELECT count(*) AS n FROM baton.x_audit WHERE event='role.revoked'")[0]["n"] == 0
 
 
 # --- the role queue ---------------------------------------------------------------------------------------------------
@@ -530,6 +554,25 @@ def test_a_task_assigned_to_the_caller_is_claimable_without_holding_the_role(tea
     task_id = submit(call, page, "review.primary", assignee_principal=principal(identities, "worker"))["task_id"]
     assert call("replacement", "claim", 403, operation_id=op(), task_id=task_id)["code"] == "forbidden"
     assert call("worker", "claim", operation_id=op(), task_id=task_id)["state"] == "claimed"
+
+
+def test_an_editor_without_the_role_cannot_take_the_queue_by_assigning_it_to_themselves(team, pg_store):
+    call, identities, space, page = team
+    task_id = submit(call, page, "review.primary")["task_id"]
+    for label in ("worker", "owner"):
+        refused = call(label, "assign_task", 403, operation_id=op(), task_id=task_id, target_principal=principal(identities, label))
+        assert refused["code"] == "forbidden", label
+    assert call("owner", "get_task", task_id=task_id)["assignee"] is None
+    assert audit(pg_store, "task.assigned", task_id=task_id) == []
+    assert call("worker", "claim", 403, operation_id=op(), task_id=task_id)["code"] == "forbidden"
+    # Naming someone else is still an ordinary assignment and does not require the role.
+    call("worker", "assign_task", operation_id=op(), task_id=task_id, target_principal=principal(identities, "replacement"))
+    assert call("replacement", "claim", operation_id=op(), task_id=task_id)["state"] == "claimed"
+
+    second = submit(call, page, "review.primary", scopes=path_scope("src/self-assign"))["task_id"]
+    assign(call, space, "owner", principal(identities, "worker"), "review.primary")
+    assert call("worker", "assign_task", operation_id=op(), task_id=second, target_principal=principal(identities, "worker"))["assignee"] == principal(identities, "worker")
+    assert call("worker", "claim", operation_id=op(), task_id=second)["state"] == "claimed"
 
 
 def test_assigning_a_role_task_to_a_principal_takes_it_out_of_the_queue(team):
@@ -826,6 +869,63 @@ def test_webhook_subscriptions_know_the_new_event_name():
 
 
 # --- list_roles and the board -----------------------------------------------------------------------------------------
+
+def test_older_unready_tasks_cannot_hide_the_oldest_ready_task(team, pg_store):
+    call, identities, space, page = team
+    ready_id = submit(call, page, "review.primary", scopes=path_scope("src/window/ready"))["task_id"]
+    age(pg_store, ready_id, 40)
+    other = call("owner", "create_space", operation_id=op(), name="Crowded")
+    other_page = call("owner", "create_page", operation_id=op(), space_id=other["id"], title="Crowd")
+    prerequisite = submit(call, other_page, scopes=path_scope("docs/window/pre"))["task_id"]
+    anchor = submit(call, other_page, "review.primary", depends_on=[prerequisite])["task_id"]
+    age(pg_store, anchor, 100)
+    owner = identities["owner"]
+    execute(pg_store, """
+        WITH new_blocks AS (
+            INSERT INTO baton.blocks(id,page_id,kind,content,position,author_principal,author_account,author_kind)
+            SELECT gen_random_uuid(), %s::uuid, 'task', '{}'::jsonb, 1000 + g, %s, %s, %s
+            FROM generate_series(1, 2000) AS g
+            RETURNING id
+        )
+        INSERT INTO baton.tasks(id,page_id,block_id,owner,owner_account,owner_kind,input_hash,prompt,execution_mode,gate_mode,
+            reviewers,scopes,state,epoch,role,role_source,created_at)
+        SELECT gen_random_uuid(), %s::uuid, b.id, %s, %s, %s, 'synthetic-hash', %s, 'manual', 'reviewer',
+            '[]'::jsonb, '[{"kind":"none"}]'::jsonb, 'queued', 0, 'review.primary', 'explicit',
+            clock_timestamp() - interval '100 minutes'
+        FROM new_blocks b
+    """, (other_page["id"], owner["agent"], owner["account"], owner["kind"],
+          other_page["id"], owner["agent"], owner["account"], owner["kind"], PROMPT))
+    execute(pg_store, """
+        INSERT INTO baton.task_dependencies(task_id, depends_on)
+        SELECT id, %s::uuid FROM baton.tasks
+        WHERE page_id=%s::uuid AND role='review.primary' AND id<>%s::uuid
+        ON CONFLICT DO NOTHING
+    """, (prerequisite, other_page["id"], anchor))
+    blocked = query(pg_store, "SELECT count(*) AS n FROM baton.tasks WHERE page_id=%s AND role='review.primary'", (other_page["id"],))[0]["n"]
+    assert blocked == 2001
+    assert sweep(pg_store)["role_sla"] == [ready_id]
+    panel = call("owner", "list_roles", space_id=space["id"])["roles"]
+    assert len(panel) == 1
+    assert panel[0]["role"] == "review.primary" and panel[0]["queue_length"] == 1
+    assert panel[0]["oldest_task_id"] == ready_id and panel[0]["sla_state"] == "breached"
+    crowded = {entry["role"]: entry for entry in call("owner", "list_roles", space_id=other["id"])["roles"]}
+    assert crowded["review.primary"]["queue_length"] == 0 and crowded["review.primary"]["not_ready"] == 2001
+
+
+def test_list_roles_returns_every_holder_including_roles_past_a_thousand(team, pg_store):
+    call, identities, space, page = team
+    assign(call, space, "owner", principal(identities, "worker"), "zzz.tail")
+    owner = identities["owner"]
+    execute(pg_store, """
+        INSERT INTO baton.x_role_holder(space_id,role,holder,holder_account,holder_kind,granted_by,authority)
+        SELECT %s::uuid, 'aaa.crowd', 'holder' || lpad(g::text, 4, '0'), 'acct-' || g::text, 'agent', %s, 'root'
+        FROM generate_series(1, 1001) AS g
+    """, (space["id"], owner["agent"]))
+    by_role = {entry["role"]: entry["holders"] for entry in call("owner", "list_roles", space_id=space["id"])["roles"]}
+    assert len(by_role["aaa.crowd"]) == 1001
+    assert [holder["principal"] for holder in by_role["zzz.tail"]] == [principal(identities, "worker")]
+    assert "truncated" not in json.dumps(call("owner", "list_roles", space_id=space["id"]))
+
 
 def test_list_roles_reports_holders_queue_age_and_sla_state(team, pg_store):
     call, identities, space, page = team
