@@ -175,6 +175,10 @@ docker compose exec bridge python -m bridge.delegations policy-remove --space <s
 
 这条命令把 owner 的决定记录为由指定运维人员执行：委托行写 `created_via='operator'` 与 `created_by=<执行人>`，审计事件把授权人记为请求者、执行人记为执行者，两者都能查到；它受同样的规则约束：授权人（principal、账户、kind）必须正是所指 Space 记录的根身份，被委托方不能是 owner 自己，且只能记录根委托。被委托方必须是注册表中已连接的主体（人或 agent）；省略 `--space` 表示覆盖该根身份拥有的所有空间；`--may-delegate` 允许被委托方通过 API 再授予更窄的子委托。owner 拥有人类身份之后（计划下周），可以改用 API：Space owner 创建根委托，持有 `may_delegate` 委托的主体创建子委托：`delegation_create`、`delegation_revoke`、`delegation_list`，见 [API](docs/api.md) 与 [规格 X25](docs/spec/space.md)。
 
+### 角色队列
+
+任务可带一个 `role`（如 `review.primary`、`test.engineer`、`ops.duty`），让 agent 主动拉取同一类工作：Space 根或持有审批人委托的主体用 `assign_role`/`revoke_role` 给主体分配角色（每次都有审计，除根以外不能给自己分配），agent 用 `ready_for_role(role)` 查看自己能领取的队列，`claim` 无人指定的角色任务要求当前持有该角色，先到先得仍由租约与 scope 冲突决定。角色可在 `submit_task` 时给出，由任务 owner 或根在任务排队时修改，也可由 Space 根设置的有序角色规则按 scope 路径派生（`set_role_rules`）。角色有 SLA（默认 `review.*` 30 分钟、`triage` 15 分钟，可由根用 `set_role_sla` 设置）：最久的就绪任务超时，Space 根与审批人会收到一次 `role.sla_breached` 通知（由现有升级循环发出，60 分钟内不重复）。看板新增 “Role queues” 面板，显示每个角色的队列长度、最久等待、SLA 状态与持有人。新增表与列由幂等迁移原地添加。细节见 [API](docs/api.md#角色队列role-queues) 与 [规格 X27](docs/spec/space.md)。适配器默认白名单不变，新增工具需用 `--allow-tools` 显式放行。
+
 ## 端到端验收
 
 [`scripts/e2e.py`](scripts/e2e.py) 对运行中的栈走一遍两身份的具名 agent 流程：提交者把任务指派给一个 agent principal；agent 领取、在任务线程评论并提交结果；提交者以 Space 根的身份 gate 通过。Baton 不执行任何任务，这里的 agent 只是第二个客户端身份。先在 `deploy/` 目录为测试实例签发两个独立身份（提交者将成为它所创建 Space 的根，所以是创建 Space 的那个身份）：

@@ -155,9 +155,21 @@
 - **认证与审计。** 调用者就是 bearer token 对应的 Baton 主体（与 MCP/HTTP 相同的权限与 X7 的不可见规则）；每个 A2A 调用恰好在 `x_audit` 里追加一行，记录真实调用者（X16）：成功是 `a2a.message_sent`/`a2a.message_streamed`/`a2a.task_streamed`/`a2a.task_read`/`a2a.task_canceled`（取消与状态写入在同一事务），任何失败路径（终止任务、提交失败、无权限、不可取消、无工作对象、不可见任务、v0.3 名称、坏请求、流超限等）写 `a2a.refused`，带方法名、`reason` 与 `error_code`；`task_id` 只对调用者看得到的任务填写，不可见的任务不留任何任务标识。
 - **与规范的已知差异。** `SendMessage` 总是立即返回（等同 `returnImmediately: true`），不阻塞到终止；不支持推送通知配置、`ListTasks`、扩展 Agent Card；`A2A-Version` 头缺省按 v1.0 处理。
 
+## 角色队列
+
+**X27 · 角色队列（role queues）。** 这是 Baton 自有 x_扩展，官方 Space 文档不定义任务角色、角色持有人或角色 SLA（U2 通知时机仍待界面实测）。目的是让 agent 主动拉取一类工作而不必逐个指派；Baton 不执行任务，角色只决定谁可以 `claim`，领取、租约、epoch、scope 冲突与 gate 沿用 X5–X13，没有新的锁方案。
+
+- **任务角色。** 任务可带可选 `role`，格式 `^[a-z][a-z0-9_.-]{0,63}$`（自由字符串，不预先登记），`role_source` 为 `explicit` 或 `derived`，两者同为空或同不为空（数据库约束）。`submit_task`/`create_task_block` 创建时设置（非空才计入幂等摘要）；任务 owner（精确 principal 与账户）或 Space 根可在任务 `queued`（含租约失效）时用 `set_task_role` 设置或清除，否则 `forbidden`/`stale_claim`。审计 `task.role_set`、`task.role_cleared`、`task.role_derived`。
+- **规则派生。** 每个 Space 可保存一份有序角色规则 `[{role, match:{scope_prefix?, path_glob?, kind?}}]`，仅 Space 根可用 `set_role_rules` 整体替换（审计 `role_rules.set`，只记条数与 sha256）。创建任务时没有显式角色则取第一条匹配的规则并记 `role_source=derived`；显式角色优先；规则不回写已有任务。`match` 的键全部成立才匹配，空 `match` 匹配所有；`kind` 既可是 scope 种类也可是任务种类（取值不重叠）。格式细节见 API 文档。
+- **角色分配。** 角色持有记录是 `(space, role, principal, account, kind)` 的精确身份。`assign_role`/`revoke_role` 只允许 Space 根或持有覆盖该 Space 的审批人委托的主体：授权函数与 X25 的审批链共用（整条委托链、过期、撤销与链根必须是该 Space 的根身份），否则 `delegation_required`；调用者需对 Space 有 edit 权限；除根以外不能给自己分配（`forbidden`）。空操作不写审计，每次实际分配/撤销写 `role.assigned`/`role.revoked`，含 `authority`（`root` 或 `delegated by <授权人> via <委托 ID>`）、委托链与目标 principal。撤销不收回已持有的租约。
+- **就绪队列与领取。** `ready_for_role(role, limit)` 返回该角色的就绪任务（从旧到新，无指定接收人或指定给调用者，依赖完成、清单完整、与有效 claim 无 scope 冲突）；与 `ready` 一样只列调用者现在能领取的，所以无人指定的角色任务只对持有该角色（在任务所在 Space）的调用者出现。`claim` 无 assignee 的角色任务要求调用者当前持有该角色，否则 `forbidden`；指定给调用者的任务不要求。两个持有人同时领取，一个取得租约，另一个得到 `scope_conflict`。`task.claimed` 审计带 `role`。
+- **角色 SLA。** 每个 Space 一份映射 `{角色名 或 "<前缀>.*": 分钟}`，默认 `{"review.*":30,"triage":15}`，仅 Space 根用 `set_role_sla` 设置（`{}` 为无 SLA，`null` 恢复默认；审计 `role_sla.set`）。每个（Space，角色）的最久就绪任务（从创建时刻算起）等待超过 SLA 时，X20 的升级循环在同一事务、同一把咨询锁下向 Space 根和持有覆盖委托的审批人写一条 `role.sla_breached` 通知并写同名审计；`tasks.role_sla_notified_at` 保证同一任务在被领取（领取清除记录）或 60 分钟之前不重复，多个 bridge 副本不会重复。
+- **读取与看板。** `list_roles(space_id)` 返回每个角色的持有人、就绪队列长度、最久等待秒数与 `ok`/`breached` 状态（读取时实时计算）；`/board/data` 的 `roles` 与看板的 Role queues 面板展示同一份数据。
+- **存储与升级。** `tasks.role`、`role_source`、`role_sla_notified_at`，表 `x_role_holder`、`x_role_config`，均由幂等迁移原地添加，`check_schema` 要求它们存在；没有角色的任务与既有行为不变。
+
 ## 红线与验收
 
-下表中官方语义验收对应 O1–O9 的原文链接；数据库与 HTTP 验收对应 X1–X26 的 x_契约（A35–A37 对应 X25 的适配器预设、审批 UX 与通知 `result_epoch` 增补，A38 对应移除内置 worker 后的 `submit_task`（X12），A39 对应 X26 的 A2A 公共接口）。测试必须通过公开接口或实际 PostgreSQL 事务证明，不以函数返回“成功”、单进程内存锁或 SQLite 替身代替并发与权限结论。
+下表中官方语义验收对应 O1–O9 的原文链接；数据库与 HTTP 验收对应 X1–X27 的 x_契约（A35–A37 对应 X25 的适配器预设、审批 UX 与通知 `result_epoch` 增补，A38 对应移除内置 worker 后的 `submit_task`（X12），A39 对应 X26 的 A2A 公共接口，A40 对应 X27 的角色队列）。测试必须通过公开接口或实际 PostgreSQL 事务证明，不以函数返回“成功”、单进程内存锁或 SQLite 替身代替并发与权限结论。
 
 | 编号 | 红线/触发 | 可执行验收结果 |
 | --- | --- | --- |
@@ -200,23 +212,4 @@
 | A37 | `task.awaiting_gate` 带 `result_epoch`（DF-15） | `wait_inbox` 行与 webhook 负载中的 `task.awaiting_gate` 带 `result_epoch` 与 `result_author`（outbox 只存整数与 principal 名，不含结果文本），其他事件没有这两个字段，预览与权限复核规则不变；退回后重新提交写入带新 epoch 的新通知；审批人用通知中的 epoch 直接 gate 成功。命令行 `gate --task <id>` 省略 `--epoch` 时恰好一次 `get_task` 取当前 `result_epoch`、向 stderr 说明所用 epoch，任务没有可审结果时退出 2 且不发 gate 请求；显式 `--epoch` 不多发读取；`watch --summary` 通知行显示 `result_epoch=`、`result_author=`。 |
 | A38 | 移除内置 worker 后的 `submit_task`（X12，owner 决定） | 不带 assignee 的 `submit_task` 创建 `execution_mode=manual`、`gate_mode=reviewer`、未指派、范围 `none`、reviewer 为请求者、无 `respond_by` 的任务，HTTP 与 MCP 结果一致，同 key 重放返回同一任务；对有页面 edit 的主体出现在 `ready` 并可 `claim`（先到先得），无权者 404；gate 规则不变（根可批、领取者自批被拒）；审计只有 `task.submitted`、`task.claimed` 等手工事件，没有 `worker.*` 或 `task.dispatched`；历史 `codex`/`worker_success` 行可读（状态 interrupted/completed 照旧映射）但 `claim`、`gate`、`mark_blocked` 返回 403、不出现在 `ready`；旧注册表里的 dispatcher 记录不能认证、`init` 将其置为 inactive；`scripts/e2e.py` 的两身份具名 agent 流程对运行中的栈通过，`--mode`/`--token-file` 报错并说明原因。 |
 | A39 | A2A v1.0 公共接口（X26，W2-1） | 公开的 `/.well-known/agent-card.json` 带有效 ES256 JWS（对去默认值、RFC 8785 规范化的卡片，`kid`/`jku` 指向公开的 JWKS），用独立 JWS 实现可验证；改动名称、接口地址、技能、能力、签名、`alg`，或换用其他密钥，验证都失败；信任锚：攻击者用自己的密钥、`kid` 和 `jku` 签的卡片通过不了本实例的验证（缺失或不在可信集合里的 `jku` 一律忽略，只有验证者显式信任该 `jku` 才通过）；未执行 `init-keys` 时卡片与 JWKS 返回 503、不提供未签名卡片，密钥文件为 0600、从不出现在输出里，轮换后旧卡片仍可用保留的公钥验证；公开卡片、JWKS 与目录卡片按密钥版本只签一次（重复请求零次签名，轮换、`PUBLIC_URL` 变化或密钥权限变化立即生效），公开路径超出限流返回 429 与 `Retry-After`，不影响认证端点，nginx 配置含按地址限流。`/a2a/agents` 需要 token，只列出自己和与调用者共享页面的 agent（含 Team 授权和父页面继承，集合算法与 `effective_role` 一致），撤销共享后消失。`SendMessage` 没有工作对象（缺 `metadata.baton`、只有 `agent` 没有页面、未知键）被拒绝且不创建任务、留下无 task_id 的 `a2a.refused`；页面加 agent 创建派给该 agent 的手工任务；页面不存在、对调用者不可见、只有 view、agent 未登记、是人、是调用者自己、agent 无 edit 权限这几种失败返回逐字节相同的 `WORK_OBJECT_UNAVAILABLE`，且先于目标解析校验权限；类型错误的字段（对象、数组、数字代替字符串）一律 `-32602`；创建的任务（scope `none`、出现在其 inbox、Task id 等于 Baton task id，同一 `messageId` 重发不重复、内容不同冲突），无 edit 权限、目标不是 agent 或没有页面权限被拒；对已有任务的消息成为任务线程评论（作者是调用者、计入响应时效、按 `messageId` 幂等），终止任务拒绝。`GetTask` 对任务存储的每个状态、`mark_blocked(waiting_input)`、取消与 `rejected` 给出表中的 `TASK_STATE_*`，且 `metadata.baton.state` 逆映射回同一状态（八个状态双向一一对应，且与规范的八个 `TASK_STATE_*` 一致）；任务与卡片带有规范要求的必填字段与枚举值。v0.3 方法名与 `A2A-Version: 0.3` 返回 `-32009` 并指明 v1.0 名称，不创建任何任务。`CancelTask` 只允许提交者或 reviewer、且任务已派给已登记 agent（未指派或派给人返回 `-32002`），取消事务对任务行 `FOR UPDATE`，与 `claim/renew/handoff/submit_result/gate/assign_task` 在各自事务里的共享锁检查互斥（取消先到则这些操作 `task_canceled`，操作先到则取消随后释放其 claim，任何顺序下已取消任务都没有有效 claim），之后 `claim/renew/submit_result/gate/assign_task` 返回 `409 task_canceled`（不可见者 404）、scope 立即释放、状态表拒绝改删；已完成与自动任务不可取消。SSE 流依次推送 `task`、新评论 `message` 与 `statusUpdate`，在终止状态或进入 `input_required` 后结束，失去权限时推错误事件；每个 actor 最多 4 个、全实例最多 256 个并发流（超出 `STREAM_LIMIT_EXCEEDED`，结束后名额归还，租约到期自动回收），轮询只读比游标更新的评论、在无变化时退避、进程内提交唤醒流，历史只返回最近 200 条。每个调用恰好在 `x_audit` 记录一行真实调用者（`agent`/`actor_account`/`actor_kind`）、方法（`SendMessage` 与 `SendStreamingMessage` 可区分）、结果和 `a2a_state`、请求 id，正文不入审计；终止任务、提交失败、无权限、不可取消、无工作对象、不可见任务、v0.3 名称、坏请求、流超限等所有失败路径写 `a2a.refused`（带 `reason`、`error_code`），不可见的任务不留任务标识，`a2a.task_canceled` 含 `a2a_state` 与请求 id。网关对 `/a2a/rpc`、`/a2a/agents` 使用 client ACL，公开文档单独路由；nginx 两份配置给公开文档放行缓存头。测试：`tests/test_a2a_public.py`（PostgreSQL，`scripts/test_with_postgres.sh` 0 skipped）。 |
-
-验收完成前不得声称已复刻 Space 全部行为、已提供官方 Space API、已有跨独立数据库分布锁，或已完成真实账户/界面兼容测试。共享数据库上线或旧数据迁移另走 shadow → enforce → bake；本规格本身不授权迁移真实数据。[官方能力边界背景：S3](https://learn.chatgpt.com/docs/space/collaboration)、[S4](https://learn.chatgpt.com/docs/space/agents)。
-
-## 待界面实测与明确非目标
-
-**U1 · 待界面实测 · 冲突解决。** 官方说明可共同编辑，未定义并发覆盖、CRDT、合并或冲突 UI。先测试两个编辑者修改同一选区及祖先块，再记录观察日期、版本与边界；当前不得填入猜测。[S2](https://learn.chatgpt.com/docs/space/pages#comment-and-collaborate)。
-
-**U2 · 待界面实测 · 通知时机。** 提及请求的动作已证实；通知渠道、到达延时、去重、离线与恢复时序未建立。Baton durable inbox 的事务规则不代表 Space 通知行为。[S4](https://learn.chatgpt.com/docs/space/agents#choose-how-to-ask-for-help)。
-
-**U3 · 待界面实测 · 选区锚点。** 选区评论/Ask for change 已证实；文本变动、块移动、删除后的定位、重锚定与孤立线程处理未建立。Baton 若保存 quote/block/version，只是自己的上下文格式。[S2](https://learn.chatgpt.com/docs/space/pages#work-with-selected-text)。
-
-**U4 · 待界面实测 · 精确接受、修订与撤销。** 官方有审阅、接受、要求修改和 undo，但未明确撤销跨哪些操作、谁可撤销、多人交错和重启后的恢复语义。页面提案与任务 gate 的实现必须分别标 x_。[S2](https://learn.chatgpt.com/docs/space/pages#draft-content-with-generate)、[S4](https://learn.chatgpt.com/docs/space/agents#revise-a-launch-brief)。
-
-**U5 · 待界面实测 · Team 角色与账户差异。** Team 可能仅有 view/edit 是已证实限制；具体账户、套餐、workspace、接收者组合的可选角色矩阵仍需在获授权环境观察。不能把人员 comment 权限机械推广到所有 Team。[S3](https://learn.chatgpt.com/docs/space/collaboration#choose-an-access-level)。
-
-**U6 · 待界面实测 · 归属粒度。** Show attribution 在可用时存在；粒度、历史保留、粘贴/生成/接受提案后的署名显示未知。Baton 的 actor + revision/audit 只保证自身协议。[S2](https://learn.chatgpt.com/docs/space/pages#comment-and-collaborate)。
-
-**U7 · 待界面实测 · Agent 运行身份与审批。** 原文证明访问与可用工具相关，但不足以确定每一种 Space 提及、dot 和连接器的实际权限交集或具体审批触发条件。Baton 的 service principal 和 gate 是显式自有边界，不承诺与这些未验证行为等价。[S4](https://learn.chatgpt.com/docs/space/agents)、[S6](https://learn.chatgpt.com/docs/whats-new/devday-2026#workspace-connections)。
-
-本阶段不运行以上真实界面实验；不读取真实 Space、账户、私人聊天、记忆、凭据或个人配置；不提供 Space 同步器。后续只在另行授权的环境记录观察，未知项保持未知。
+| A40 | 角色队列（X27） | 角色名必须匹配 `^[a-z][a-z0-9_.-]{0,63}$`，否则 `422`；规则按顺序首条匹配派生角色并记 `role_source=derived`，显式角色优先；`assign_role`/`revoke_role` 只允许根或持有覆盖委托的审批人（非审批人 `delegation_required`，自授 `forbidden`，根可自授），每次都写带 `authority` 的审计；`ready_for_role` 按角色过滤、只含无指定接收人或指定给调用者的任务、排除与有效 claim 冲突的任务且从旧到新；没有该角色的主体 `claim` 返回 `forbidden`，两个持有人并发领取恰有一个成功；最久就绪任务超过 SLA 时向根和审批人各写一条 `role.sla_breached`，在领取或 60 分钟之前不重复；`list_roles` 与 `/board/data` 给出持有人、队列长度、最久等待与 SLA 状态；所有变更都有审计行。 |

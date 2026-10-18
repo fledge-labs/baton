@@ -61,13 +61,20 @@ with urlopen(request) as response:
 - `get_proposal(proposal_id: str)` — 读取。已弃用，见 [Deprecated](#deprecated)。
 - `list_proposals(block_id: str)` — 读取。已弃用，见 [Deprecated](#deprecated)。
 - `list_attribution(block_id: str)` — 读取。已弃用，见 [Deprecated](#deprecated)。
-- `create_task_block(operation_id: str, page_id: str, prompt: str, reviewers: list[str], scopes: list[dict] | None = None, base_commit: str | None = None, context: Any = None, evidence: Any = None, assignee_principal: str | None = None, depends_on: list[str] | None = None, work_face: dict | None = None, require_work_face: bool = False, task_kind: str = "construction", approvals_required: int | None = None)` — 写入；`approvals_required` 为 1 或 2，见“审批关卡”。
-- `submit_task(operation_id: str, idempotency_key: str, prompt: str, page_id: str | None = None, scopes: list[dict] | None = None, assignee_principal: str | None = None, depends_on: list[str] | None = None, work_face: dict | None = None, require_work_face: bool = False, task_kind: str = "construction", approvals_required: int | None = None, reviewers: list[str] | None = None)` — 写入；`approvals_required` 为 1 或 2，见“审批关卡”。`reviewers` 省略时仍是请求者，见下。
+- `create_task_block(operation_id: str, page_id: str, prompt: str, reviewers: list[str], scopes: list[dict] | None = None, base_commit: str | None = None, context: Any = None, evidence: Any = None, assignee_principal: str | None = None, depends_on: list[str] | None = None, work_face: dict | None = None, require_work_face: bool = False, task_kind: str = "construction", approvals_required: int | None = None, role: str | None = None)` — 写入；`approvals_required` 为 1 或 2，见“审批关卡”；`role` 见“角色队列”。
+- `submit_task(operation_id: str, idempotency_key: str, prompt: str, page_id: str | None = None, scopes: list[dict] | None = None, assignee_principal: str | None = None, depends_on: list[str] | None = None, work_face: dict | None = None, require_work_face: bool = False, task_kind: str = "construction", approvals_required: int | None = None, reviewers: list[str] | None = None, role: str | None = None)` — 写入；`approvals_required` 为 1 或 2，见“审批关卡”。`reviewers` 省略时仍是请求者，见下；`role` 见“角色队列”。
 - `assign_task(operation_id: str, task_id: str, target_principal: str)` — 写入。
 - `plan(operation_id: str, graph: list[dict])` — 写入。
 - `set_work_face(operation_id: str, task_id: str, work_face: dict, base_commit: str | None = None)` — 写入。
 - `mark_blocked(operation_id: str, task_id: str, reason_code: str, note: str | None = None)` — 写入；见下文“阻塞标记”。
 - `ready(page_id: str | None = None, limit: int = 50)` — 读取。
+- `ready_for_role(role: str, limit: int = 50)` — 读取；某个角色的就绪队列，见“角色队列”。
+- `set_task_role(operation_id: str, task_id: str, role: str | None)` — 写入；任务 owner 或 Space 根在任务仍为 `queued` 时设置或清除（`null`）角色，见“角色队列”。
+- `set_role_rules(operation_id: str, space_id: str, rules: list[dict])` — 写入；仅 Space 根，见“角色队列”。
+- `set_role_sla(operation_id: str, space_id: str, sla_minutes: dict[str, int] | None)` — 写入；仅 Space 根，`null` 恢复默认，见“角色队列”。
+- `assign_role(operation_id: str, space_id: str, principal: str, role: str)` — 写入；Space 根或持有覆盖委托的审批人，见“角色队列”。
+- `revoke_role(operation_id: str, space_id: str, principal: str, role: str)` — 写入；权限同 `assign_role`。
+- `list_roles(space_id: str)` — 读取；每个角色的持有人、队列长度、最久等待与 SLA 状态。
 - `get_task(task_id: str)` — 读取。
 - `list_tasks(limit: int = 50)` — 读取。
 - `fetch_inbox(limit: int = 30)` — 读取。
@@ -127,7 +134,7 @@ Baton 不执行任务。`submit_task` 总是创建一条手工任务（`executio
 - **响应里的审批人身份。** `gate` 的返回值是 task view 加一个 `gate` 对象：`{"decision","counted_as","epoch","approver","approver_account","approver_kind","root","self_approval","authority","delegation_id","grantor","edited","approvals","approvals_required","complete"}`。`decision` 是请求的决定（`pass`/`fail`/`edit`），`counted_as` 对 edit 为 `pass`；`authority` 说明权限如何取得，只有三种写法：`root`、`root (self-approval)`、`delegated by <grantor> via <delegation id>`。同一 `operation_id` 的重放返回最初的 `gate` 对象。命令行 `gate` 的 `--summary` 行在 `task <id> state=… epoch=…` 之后追加 `gate=<decision> approver=<principal> authority=<…>`。
 - **兼容。** 旧请求（不带 `edited_result`、`reason`）的幂等摘要不变；新增列由幂等迁移添加，`check_schema` 要求它们存在。
 
-Task view 包含 `original_result`/`result_edits`（见“审批 UX”）、`blocked`（`null`，或 `{"reason_code","by","at"}`，见“阻塞标记”）、id/task_id/thread_id、work_face/require_work_face/task_kind/work_face_missing、priority/respond_by/responded_at/escalated_at/overdue、page_id/block_id、owner/owner_account、execution_mode、state/status、epoch、holder/holder_account、lease_expires_at/lease_valid、scopes、base_commit、context、evidence、result/result_epoch、a2a_id/backend（仅旧版 worker 行有值）、gate_mode/reviewers 和错误元数据。canonical state 为 queued/claimed/awaiting_gate/done/failed/interrupted；兼容 status 将 claimed→working、done→completed。手工任务在当前 page view 权限下返回 prompt，方便接收人读取指令；旧版 worker 行的状态视图仍省略 prompt。所有状态视图都不返回 idempotency key 或凭据。
+Task view 包含 `role`/`role_source`（见“角色队列”）、`original_result`/`result_edits`（见“审批 UX”）、`blocked`（`null`，或 `{"reason_code","by","at"}`，见“阻塞标记”）、id/task_id/thread_id、work_face/require_work_face/task_kind/work_face_missing、priority/respond_by/responded_at/escalated_at/overdue、page_id/block_id、owner/owner_account、execution_mode、state/status、epoch、holder/holder_account、lease_expires_at/lease_valid、scopes、base_commit、context、evidence、result/result_epoch、a2a_id/backend（仅旧版 worker 行有值）、gate_mode/reviewers 和错误元数据。canonical state 为 queued/claimed/awaiting_gate/done/failed/interrupted；兼容 status 将 claimed→working、done→completed。手工任务在当前 page view 权限下返回 prompt，方便接收人读取指令；旧版 worker 行的状态视图仍省略 prompt。所有状态视图都不返回 idempotency key 或凭据。
 
 每次结果写入都检查 holder、当前 epoch 和未过期租约，旧持有人不能覆盖新持有人；租约到期后任务回到 `queued`，由别的主体重新 `claim`，没有自动重跑。`failed` 与 `interrupted` 状态以及 `error` 列（如旧版的 `CODEX_TIMEOUT`、`dispatch_uncertain`）只会出现在旧版 worker 留下的行上，当前代码不再写入。
 
@@ -142,6 +149,48 @@ Task view 包含 `original_result`/`result_edits`（见“审批 UX”）、`blo
 `delegation_revoke` 只允许授权人本人撤销，撤销父委托会使其下所有子委托失效；已撤销的委托再次撤销返回同一条记录，不重复审计。`delegation_list` 返回调用者作为授权人或被委托方的委托，包含已撤销和已过期的，用 `active` 区分。创建和撤销写入 `x_audit`（`delegation.created`、`delegation.revoked`），元数据只含 `delegation_id`、`scope`、`created_via`、`chain`，不含 reason。
 
 owner 尚无人类身份时，用运维命令在 bridge 容器内记录 owner 的根委托：`python -m bridge.delegations create|revoke|list`（见 README）。它记录 owner 的决定由指定运维人员执行，行里 `created_via='operator'`、`created_by` 为运维人员名称，审计的 `requested_by` 是授权人、`performed_by` 是 `operator:<名称>`；授权人必须正是所指 Space 记录的根身份，并受同样的范围、过期和环规则约束；`set-space-owner` 为没有根的 Space 记录根身份。按 DECISIONS 287、291，owner 是根，南瓜持有 owner 的审批人委托。
+
+## 角色队列（role queues）
+
+角色队列让 agent 主动拉取同一类工作，而不必由人逐个指派。这是 Baton 的 x_ 扩展，对应 spec X27。Baton 仍不执行任务：角色只决定“谁可以领取”，领取、租约、epoch、scope 冲突与 gate 全部沿用既有机制，没有新的锁方案。
+
+**角色名与任务角色。** 角色是匹配 `^[a-z][a-z0-9_.-]{0,63}$` 的字符串（例如 `review.primary`、`review.second`、`review.docs`、`test.engineer`、`impl.long`、`ops.duty`、`maint`）；不合法的值返回 `422 invalid`，`details` 为 `{"field":"role","expected":"role name matching ^[a-z][a-z0-9_.-]{0,63}$"}`。角色名是自由字符串，不需要预先登记。任务可带一个可选的 `role`：`submit_task`/`create_task_block` 创建时设置（仅在非空时计入幂等摘要，旧请求的摘要不变），或在任务仍是 `queued`（含租约已失效）时由任务 owner（principal 与账户都匹配）或 Space 根用 `set_task_role(operation_id, task_id, role)` 设置，`role=null` 清除；其他人 `403 forbidden`，看不到任务 `404`，任务已被领取或有结果 `409 stale_claim`。task view 增加 `role`（字符串或 `null`）和 `role_source`（`explicit`、`derived` 或 `null`）。每次变更写审计 `task.role_set`（`role`、`role_source`，有旧角色时带 `from_role`）、`task.role_cleared` 或 `task.role_derived`；设成同样的值不写审计。
+
+**角色规则（派生）。** 创建任务时没有给 `role`，且该 Space 定义了角色规则，则由规则派生并记录 `role_source="derived"`；显式给出的角色永远优先。规则由 `set_role_rules(operation_id, space_id, rules)` 整体替换，**只有 Space 根**可以设置（审批人也不行：`403 forbidden`），写审计 `role_rules.set`（规则条数与规范 JSON 的 sha256）。`rules` 是有序列表，**第一条匹配的规则生效**，没有匹配则任务没有角色；规则只作用于其后创建的任务，已存在的任务不改写。格式：
+
+```json
+[
+  {"role": "review.docs",     "match": {"scope_prefix": "docs"}},
+  {"role": "test.engineer",   "match": {"path_glob": "tests/**/test_*.py"}},
+  {"role": "ops.duty",        "match": {"kind": "migration"}},
+  {"role": "impl.long",       "match": {"kind": "prep"}},
+  {"role": "maint",           "match": {}}
+]
+```
+
+最多 100 条；每条恰好有 `role` 与 `match` 两个键。`match` 的三个键都可选，给出的键必须**全部**成立（空 `match` 匹配所有任务，适合放在最后兜底）：
+
+- `scope_prefix`：相对路径前缀（按 scope 规则规范化，拒绝绝对路径与 `..`，不能为空）。任务有一个 `path` 范围等于该前缀或在其下（按 `/` 边界：`docs` 匹配 `docs`、`docs/a.md`，不匹配 `docsy`；仓库根占位范围不在任何前缀之下）。
+- `path_glob`：对任务的 `path` 范围匹配的相对路径 glob，字符只允许字母、数字和 `_ . / * ? -`。`*` 与 `?` 不跨 `/`，`**` 可跨目录（`**/` 可匹配零层目录），`dir/**` 也匹配 `dir` 自身。任一 `path` 范围匹配即成立。
+- `kind`：取值是 scope 种类（`path`、`module`、`migration`、`none`，任务有该种类的范围即成立）或任务种类（`construction`、`prep`，等于 `task_kind` 即成立）；两组取值互不重叠，所以不会有歧义。
+
+任何不符合上述格式的规则返回 `422 invalid`（`field` 为 `rules`）。大小写按 scope 规则：默认敏感，`BATON_SCOPE_CASE_INSENSITIVE=1` 时不敏感。
+
+**角色分配。** 一个主体在一个 Space 里可以持有零个或多个角色。`assign_role(operation_id, space_id, principal, role)` 与 `revoke_role(...)` 只允许 Space 根，或持有覆盖该 Space 的审批人委托的主体——与 gate 完全相同的授权规则，包括整条委托链（范围 `approve`，`space_id` 为空或等于该 Space，委托方、过期、撤销与链根必须是该 Space 的根身份），否则 `403 delegation_required`；调用者还需要对该 Space 有 edit 权限（看不到 Space 是 `404`）。**除根以外，任何主体都不能把角色授予自己**（`403 forbidden`）；根可以。`principal` 必须是注册表中已连接的主体（否则 `422 invalid`，`details` 指向 `principal`），不能是 service。重复分配、撤销一个没有持有的角色都是空操作（返回 `changed:false`，不写审计）。重放同一个 `operation_id` 会重新检查授权。撤销只影响之后的领取：已经持有的租约不被收回。每次分配与撤销写审计 `role.assigned`/`role.revoked`，元数据含 `role`、`target_principal`、`authority`（`root` 或 `delegated by <授权人> via <委托 ID>`）、`root`、`chain`，非根时还有 `delegation_id` 与 `grantor`。返回值是持有记录 `{"space_id","role","principal","kind","granted_by","authority","since","changed"}`。
+
+**就绪队列。** `ready_for_role(role, limit=50)` 返回该角色的就绪任务：按创建时间从旧到新，没有指定接收人（或指定给调用者），依赖已完成、施工面清单完整、与当前有效 claim 没有 scope 冲突，且调用者对页面有 edit 权限。和 `ready` 一致，它只列出调用者**现在能领取的**任务：无人指定的角色任务只有当调用者在该任务所在 Space 持有该角色时才会列出。`ready` 也按同一规则不再列出调用者无权领取的无人指定角色任务。
+
+**按角色领取。** `claim` 一个没有 `assignee` 且带 `role` 的任务，要求调用者当前在该任务所在的 Space 持有该角色，否则 `403 forbidden`（Space 根也要先给自己分配该角色；别的 Space 的同名角色不算）。指定给调用者的角色任务不需要持有角色。先到先得完全由既有机制决定：两个持有人同时 `claim`，一个得到租约（epoch 加一），另一个得到 `409 scope_conflict`。按角色的领取在 `task.claimed` 审计里带 `role`。
+
+**角色 SLA。** 每个 Space 有一份角色 SLA 映射：键是角色名或 `<前缀>.*`（覆盖以 `<前缀>.` 开头的所有角色，不包括 `<前缀>` 本身），值是 1 到 525600 的整数分钟；完全相同的键优先，其次是最长的通配前缀，没有匹配则该角色没有 SLA。默认映射是 `{"review.*": 30, "triage": 15}`。`set_role_sla(operation_id, space_id, sla_minutes)` 整体替换映射（**仅 Space 根**，审计 `role_sla.set`）；`{}` 表示所有角色都没有 SLA，`null` 恢复默认。
+
+等待从任务创建时刻算起。每个（Space，角色）只看**最久的就绪任务**（定义同就绪队列，但与调用者无关；被 scope 冲突、未完成依赖或不完整施工面清单挡住的任务不算就绪）。它的等待超过 SLA 时，bridge 现有的响应时效升级循环（每 30 秒、同一把咨询锁，没有新的定时器）在同一事务里写一条通知 `role.sla_breached`（object 为该任务）给 Space 根和持有覆盖该 Space 的有效审批人委托的主体（收件人仍需页面 view 权限），并写审计 `role.sla_breached`（`role`、`sla_minutes`、`wait_minutes`）。同一个任务在被领取（领取会清除记录）或 60 分钟之前不会重复通知；任务仍未被领取且又过了 60 分钟则再发一次。多个 bridge 副本不会重复通知。升级循环的返回值多一个 `role_sla`（本轮通知的任务 ID）；拿不到咨询锁而跳过的一轮保持原来的 `{"skipped":true,"escalated":[],"reassigned":[]}`。
+
+**`list_roles(space_id)`。** 读取，需要 Space 的 view 权限。返回 `{"space_id","roles":[...],"rules":[...],"sla_minutes":{...},"sla_default":bool}`；`roles` 按角色名排序，包含有持有人或有排队任务的每个角色：`{"role","holders":[{"principal","kind","granted_by","authority","since"}],"queue_length"（就绪任务数）,"not_ready"（排队但被依赖、清单或 scope 冲突挡住的数量）,"oldest_task_id","oldest_waiting_seconds"（最久就绪任务已等待的秒数，没有则为 null）,"sla_minutes"（没有 SLA 为 null）,"sla_state"}`。`sla_state` 为 `ok` 或 `breached`，读取时按数据库时钟实时计算（不等升级循环），没有 SLA 的角色恒为 `ok`。
+
+**看板。** `GET /board/data` 在原有 `tasks`、`inbox` 之外返回 `roles`：调用者可见的每个有角色、规则或排队角色任务的 Space 的 `list_roles` 摘要（另有 `space_name`）。看板页的“Role queues”面板按角色显示队列长度、最久等待时间、SLA 状态与当前持有人，不引入新的前端依赖。
+
+**升级。** 新增列与表由幂等迁移添加（`tasks.role`、`role_source`、`role_sla_notified_at`，表 `x_role_holder`、`x_role_config`），已有部署原地升级，没有角色的任务保持原样；`check_schema` 要求它们存在，所以 bridge 要在迁移之后启动。
 
 ## x_graph 依赖图
 
@@ -188,6 +237,7 @@ Baton 不会执行 `acceptance_command`。它只是显示给领取人和 gate �
 | `task.overdue` | 后台升级循环发现任务超过 `respond_by` 仍无响应（见“响应时效与超时升级”） | `escalate_to`，与其不同时还有 owner | task |
 | `task.blocked` | `mark_blocked`（见“阻塞标记”） | 任务 owner（不含操作者） | task |
 | `claim.expiring` | 既有的响应时效扫描发现一条有效租约剩余不足 `max(60 秒, 租期的 20%)`，租期至少 120 秒，且该 epoch 的当前租约窗口还没有这条通知 | 当前持有人 | task |
+| `role.sla_breached` | 后台升级循环发现某角色最久的就绪任务等待超过该角色的 SLA（见“角色队列”） | Space 根与持有覆盖该 Space 的审批人委托的主体 | task |
 
 操作者本人不会收到自己操作产生的通知，同一 principal 在一次事件中只收到一条。收件人在插入时必须对对象所在页面有 view 权限，否则不写行。outbox 与 webhook 默认负载只含元数据：`id`、`seq`、`event`、`object_type`、`object_id`、`thread_id`、`created_at`、`recipient`；`task.awaiting_gate` 另带 `result_epoch`（被通知的结果所属 epoch）与 `result_author`（提交结果的 principal），见下一段；outbox、审计和日志从不存放 prompt、评论正文或结果文本，接收者凭 object_id 再用 `get_task`、`list_comments` 等带权限检查的读取操作取完整内容。
 
@@ -437,7 +487,7 @@ docker compose exec bridge python -m bridge.a2a_public init-keys
 
 ## MCP 兼容与发现
 
-`submit_task(idempotency_key,prompt,page_id=None,scopes=None,assignee_principal=None,depends_on=None,work_face=None,require_work_face=False,task_kind="construction",priority="normal",escalate_to=None,fallback_assignee=None,reviewers=None)`、`get_task(task_id)`、`list_tasks()`、`fetch_inbox()` 保持既有工具入口。`reviewers` 可选，省略时结果形状与以前相同；传入后可能多一个 `warnings` 列表。兼容 submit_task 在服务端从 principal + 业务 key 派生稳定 operation_id。其他工具与上列 HTTP 同名同参数，返回包含 x_protocol 和 result 的对象；它们通过同一个 operation dispatcher 执行，MCP 工具发现提供完整 JSON Schema。
+`submit_task(idempotency_key,prompt,page_id=None,scopes=None,assignee_principal=None,depends_on=None,work_face=None,require_work_face=False,task_kind="construction",priority="normal",escalate_to=None,fallback_assignee=None,approvals_required=None,reviewers=None,role=None)`、`get_task(task_id)`、`list_tasks()`、`fetch_inbox()` 保持既有工具入口。`reviewers` 可选，省略时结果形状与以前相同；传入后可能多一个 `warnings` 列表。`role` 可选，见“角色队列”。兼容 submit_task 在服务端从 principal + 业务 key 派生稳定 operation_id。其他工具与上列 HTTP 同名同参数，返回包含 x_protocol 和 result 的对象；它们通过同一个 operation dispatcher 执行，MCP 工具发现提供完整 JSON Schema。
 
 旧显示字段 submission_mail_status/mail_status/mail_error 改为 submission_thread_status/thread_status/thread_error；适配器只记录经过校验的 thread_ids 等元数据，不记录正文。fetch_inbox.messages 仍提供 id/thread_id/subject/from/to/created_ts/body_md，来源是评论与提及视图。
 
