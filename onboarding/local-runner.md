@@ -17,6 +17,8 @@
 5. 限量捕获 stdout/stderr，把摘要（截断，并对执行器持有的每一个令牌值做字面脱敏）发为任务线程评论，再 `submit_result`，证据列表含退出码、耗时和 `git status` 得到的改动文件。之后由审阅人照常 `gate`。
 6. 失败、超时或非零退出：缩短租约、`mark_blocked(reason_code="other", note=简短原因)` 并记一次失败；同一任务失败达到 `max_failures_per_task`（默认 2）次后不再自动重试，评论“已交还给分配人”并停止。Baton 对仍持有有效租约的任务不接受 `mark_blocked`，所以执行器先把租约续到 1 秒、等它失效，再写阻塞标记。
 
+7. 例外：worker 配了 `permissions`，且 CLI 因自己的白名单拒绝了某个命令时，不走上面的失败路径，而是发权限请求并等待批准，见“权限请求闭环”。
+
 worktree 保留在磁盘上供审阅（改动不会自动提交或推送）。重试同一任务时会先清掉旧 worktree。定期清理 `workdir_root` 下不再需要的目录（`git worktree remove` 或删除目录后 `git worktree prune`）。
 
 ## 上限
@@ -276,6 +278,7 @@ worker 字段：
 | `home_read` | 路径列表，必须在 `HOME` 之内：该 CLI 自己真正需要读取的配置/登录态目录。沙箱默认拒绝读写整个 `HOME`，只放行这里列出的路径（只读）、任务 worktree 和临时目录；见“沙箱：HOME 默认拒绝”。默认空 |
 | `allow_keychain` | 布尔值，默认 `false`。默认每个有沙箱的 worker 都被拒绝读取 macOS Keychain；设为 `true` 会关闭这项防护，并在日志里打印醒目警告 |
 | `sandbox.extra_write_paths` | 沙箱内额外可写的已存在目录（例如 CLI 把登录态或会话写在 `HOME` 下） |
+| `permissions` | 可选对象，开启权限请求闭环：`cli`、`config_file`、`approvers` 及可选的 `wait_seconds`、`poll_seconds`、`max_requests`、`rule_template`，见“权限请求闭环” |
 
 用 `python3 adapters/local_runner.py --config <CONFIG_FILE> --check` 检查配置和每个 worker，再不带 `--check` 启动。`SIGINT`/`SIGTERM` 会终止正在运行的子进程并退出。
 
@@ -321,7 +324,7 @@ worker 字段：
 键是环境变量名（必须匹配 `^[A-Z_][A-Z0-9_]*$`，不能是 `BATON_*`、固定变量或已在 `env_passthrough` 里的名字），值是 Keychain 里“通用密码”的服务名（`security add-generic-password -s fledge-deepseek-key -a <ACCOUNT> -w` 添加；服务名是普通字符串，不含控制字符）。语义：
 
 - **只在启动子进程时读取**，只给该 worker 的这一个子进程：执行器运行 `/usr/bin/security find-generic-password -s <服务名> -w`（argv 列表，不经 shell），把值放进子进程环境，之后随即丢弃。值不落盘、不写日志，不进评论、结果、证据和审计，也永远不会传给别的 worker 的进程。
-- **输出脱敏**：捕获到的子进程输出里，该值与令牌同样做字面脱敏（含截断处残留的片段），发评论和结果前处理。
+- **输出脱敏**：捕获到的子进程输出里，该值与令牌同样做字面脱敏（含截断处残留的片段）。Keychain 值放进该 worker 这次运行共用的、带锁的密钥集合（线程启动前放入令牌和 `env_passthrough`，读到 Keychain 值时追加，所有线程都 join 之后清空）。评论、结果和权限请求都用这份集合脱敏，所以这次运行里的每个线程都能盖住它。
 - **缺失处理**：任何一项读取失败（不存在、为空、Keychain 锁定或无法运行 `security`）都让该任务失败：不启动命令，`mark_blocked(reason_code="other", note="keychain item missing")`，并按 `max_failures_per_task` 计失败。消息固定，不透露任何条目（包括其他条目）的名称。
 - **平台与沙箱**：只支持 macOS。在其他平台上，带 `env_from_keychain` 的 worker 会被拒绝启动（配置错误，不会悄悄忽略）。同时必须配置 `none` 以外的沙箱后端，否则同样拒绝启动：没有沙箱时，子进程自己就能运行 `security` 读取整个 Keychain。
 - **沙箱对 Keychain 的限制**（`sandbox-exec` 配置；**默认对每个有沙箱的 worker 都生效**，不只是使用 `env_from_keychain` 的 worker）：
@@ -390,6 +393,118 @@ worker 字段：
 - `backend: "none"`：没有任何隔离。
 - macOS 的 `sandbox-exec` 规则（HOME 拒绝、再放行、元数据放行、Keychain 拒绝）由测试检查生成的配置文本，**没有在 macOS 上真实执行**；上线前请在目标机器上用一个读取 `~/.aws` 之类无害文件的任务验证。
 
+## 权限请求闭环
+
+没有这一节的配置时，headless CLI 碰到权限墙（例如 agy 拒绝白名单外的 `rg`）会拒绝并退出，任务以 `exit code N` 失败，没人知道缺什么。给 worker 加上 `permissions` 块后，执行器把这个失败变成一次可见的、需要人批准的请求（规格 X27，接口见 [API](../docs/api.md#权限请求)）。启用 `permissions` 的 worker，`sandbox.backend` 必须是 `sandbox-exec` 或 `bwrap`：`backend: "none"` 会在启动时被拒绝（与 `implicit_auto_approve`、审批绕过开关相同）。没有沙箱时，一条被绕过的白名单规则就等于在宿主机上执行命令。
+
+流程（同一任务、同一 epoch、同一租约、同一 worktree）：
+
+1. CLI 以非零退出结束（不含超时、被停止、租约丢失）。执行器在它的 stdout/stderr 里按该 CLI 的检测器表解析拒绝信息：被拒绝的程序（`tool`）、原因，以及输出里声称的目录。这个目录**只出现在检测结果里供人对照，不用于授权**：请求和写入的规则一律使用执行器自己的任务 worktree。解析不出字段，但输出里有明确的审批措辞（`requires approval`、`not in the allow list`、`denied by policy`、`no prompt available` 等）时，仍发请求，`tool` 记为 `(unparsed)`，并附带一段**有界、已脱敏**的原始输出片段（至多 1500 字符，对令牌、`env_passthrough` 值、Keychain 值做字面脱敏）。普通的操作系统 `Permission denied` 不算。
+2. 执行器发 `request_permission`：任务保持 `claimed`，视图出现 `blocked.reason_code=waiting_input`（`input required: permission`），线程出现一条以 `[input required: permission]` 开头的评论（一行说明加一段结构化 JSON），并提及 `permissions.approvers`，选项是 `allow_once`、`allow_always`、`deny`。执行器每 `poll_seconds`（默认 5）读一次 `list_permissions`，等待期间续租线程继续续租，最多等 `wait_seconds`（默认 1800）；超时、被停止或丢失租约时，执行器会 `cancel_permission` 撤回自己的请求（请求也会随 epoch 变化或 TTL 自动 `expired`），所以任务之后还能再申请；超时按普通失败处理（计一次失败）。
+3. 决定必须由 approver 通过 Baton 做出：Space 根，或持有覆盖该任务的审批人委托的主体（与 gate 的规则相同）。执行器自己的 worker 身份永远不能决定自己的请求，执行器代码里也没有任何决定调用；`approvers` 配置里不能写 worker 自己。别的人（没有委托的 reviewer、别的 agent）得到 `403`。
+4. `allow_once` / `allow_always`：执行器**不**把 `rg …` 这类参数约束写进 CLI 白名单（各家 CLI 大多按前缀或通配匹配，表达不了“禁止 `--pre`”）。它在自己的目录 `~/.local/share/baton-runner/shims/<worker>/` 里放一个只读 shim（例如 `rg`），并把**这个 shim 的绝对路径**、且只有这一条精确字符串，写进 CLI 白名单。worker 的沙箱 `PATH` 最前面是这个目录，所以 CLI 里的 `rg` 命中 shim，而不是系统里的 `rg`。shim 在**每次调用**时用写死的参数策略检查 argv（见下表），通过才用替换后的环境 `execve` 授权时解析好的真实二进制的绝对路径（不查 `PATH`，也不继承 worker 的环境）。环境只留 `PATH=/usr/bin:/bin`、`HOME`、`LANG`/`LC_*` 和 `TERM`，丢掉 `RIPGREP_CONFIG_PATH`、`GIT_*`、`LD_*`、`DYLD_*`、`PYTHON*` 以及其余变量；`rg` 总会额外带上 `--no-config`，所以指向 worktree 里参数文件的 `RIPGREP_CONFIG_PATH` 或 `~/.ripgreprc` 里的 `-z`、`--pre` 或 `--hostname-bin` 不会生效。不通过就往自己的 stderr 写一行 `baton-runner: rg <option> refused by the grant policy`，以状态 126 退出。它不写任何文件，也不从沙箱里调用 Baton。shim 自己不持有 Baton 令牌。这一行随 CLI 的 stdout/stderr 走执行器平时的结果和评论路径（已按该次运行的密钥集合脱敏），出现在任务输出里，不是单独的审计事件。授权、使用窗口和撤销仍由沙箱外的执行器审计。然后执行器向 Baton 报告 `granted`，续租，在评论里说明，并在**同一个 worktree** 里重新运行 CLI。每次重跑都有完整的 `task_timeout_seconds`；一个任务至多发 `max_requests`（默认 3）个请求。`allow_once` 没有放在沙箱可写处的计数文件，也不靠 shim 删掉自己。它的意思是：这次任务运行结束前有效，期间可以调用多次；任务结束时（成功或失败，提交结果之前）沙箱外的执行器删掉 shim（没有别的授权还需要它时）和白名单条目并报告 `revoked`。沙箱里删不掉只读 shim，也没有任何可删的计数能把这次授权延长到任务结束之后。`allow_always` 一直留到撤销命令：撤销就是删掉 shim（没有别的授权还需要它时）并撤掉白名单条目。下一次调用的工作目录必须落在这条授权记下的任务 worktree 里。
+5. `deny`：执行器评论说明，释放租约并 `mark_blocked(reason_code="other", note="permission_denied: <tool> (request <id>)")`，不再自动重试，也不记入失败次数。`permission_denied` 写在 `note` 里而不是原因码，因为 `blocked_reason` 的数据库约束只允许五个固定原因码，本功能不改 schema。
+
+配置（只示意 `permissions` 块；其余字段同上文 worker 配置）：
+
+```json
+{
+  "principal": "mugua",
+  "home": "real",
+  "home_read": ["~/.gemini/antigravity-cli"],
+  "permissions": {
+    "cli": "agy",
+    "config_file": "~/.gemini/antigravity-cli/settings.json",
+    "approvers": ["nangua"],
+    "wait_seconds": 1800,
+    "poll_seconds": 5,
+    "max_requests": 3
+  }
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `cli` | `agy`、`codex`、`grok`、`cline`、`opencode`、`dsh` 之一：选择检测器和白名单写入格式 |
+| `config_file` | 该 CLI 白名单文件的绝对路径（`~` 会展开）。必须落在**这个 worker 自己的 `home_read` 之内**（按真实路径比较，符号链接绕不过去），不能同时落在 `extra_write_paths` 里（否则 CLI 自己能改写白名单），也不能和别的 worker 共用同一个文件。这样授权只影响该 worker，且沙箱不会为此放宽：沙箱里这个文件仍是只读的，只有执行器进程（在沙箱外）写它 |
+| `approvers` | 1 到 10 个 principal，请求里会提及他们；不能包含 worker 自己。它决定提醒谁，不决定谁有权批准 |
+| `wait_seconds` / `poll_seconds` / `max_requests` | 等待上限（默认 1800 秒）、轮询间隔（默认 5 秒）、每个任务的请求数上限（默认 3） |
+| `rule_template` | 可选，只能是精确字符串 `{shim}`（也是默认值）。它被换成 shim 的绝对路径，不能再带通配、参数或目录。写成别的东西时配置直接被拒绝 |
+
+`home: "real"` 才有意义：授权写入的是操作者真实 `HOME` 下的 CLI 配置文件。用 `home: "task"`（临时 HOME）的 worker，CLI 读不到这个文件。
+
+### 各 CLI 的检测器与白名单格式
+
+**这些都是未验证的。** 本仓库没有真实运行任何一个 CLI：测试里的每一条输出样例都是**合成的**（按各 CLI 拒绝信息的大致样子手写），不是从真实程序捕获的；检测器的正则因此只是“当前最好的猜测”，真实输出可能不同。解析不到的拒绝信息会走“未解析 + 原始片段”的兜底，人看得到，但不能自动授权（批准后执行器会明说“无法识别被拒绝的工具”，需要手工加白名单后重新分派）。下表“白名单文件”需要操作者对照该 CLI 的官方文档确认，仅 agy 的 `permissions.allow` 数组（精确字符串）在本仓库的 [agy 接入页](agy.md)里有出处。写进去的永远是 shim 的绝对路径；`rule_template` 只能是 `{shim}`，不能用来改成通配。匹配方式对不上的 CLI 不要启用 `permissions`。
+
+| `cli` | 白名单位置（写入方式） | 能否授权 | 检测的拒绝信息（合成样例的形状） |
+| --- | --- | --- | --- |
+| `agy` | JSON，`permissions.allow` 数组，条目是精确字符串 | 能。写入 shim 的绝对路径 | `Permission denied: run_command "<命令>" is not in permissions.allow (cwd: <目录>)` |
+| `codex` | 文本，每行一条规则（追加/删除整行） | **不能。** 已知匹配是前缀，保证不了“只等于这一条绝对路径” | `exec` / `<命令> in <目录>` / `…requires approval…` 三行 |
+| `grok` | JSON，`permissions.allow` 数组 | **不能。** 已知匹配是通配 | `tool "bash" denied in non-interactive mode: command <命令，反引号包裹> is not allowed by permissions (cwd=<目录>)` |
+| `cline` | JSON，顶层 `allow` 数组 | **不能。** 已知匹配是通配 | `Command "<命令>" was blocked: no allow rule in CLINE_COMMAND_PERMISSIONS matches (workdir: <目录>)` |
+| `opencode` | JSON，`permission.bash` 映射（规则 → `"allow"`） | 能，按“映射的键是整条命令的精确匹配”这个**未验证假设**。写入 shim 的绝对路径 | `permission requested: bash (<命令>); auto-rejecting`（这条样例没有目录；shim 仍只在任务 worktree 里放行）；`external_directory` 等非命令权限能解析但不授权 |
+| `dsh` | JSON，`permissions.allow` 数组 | **不能。** 没有可以保证精确匹配一条绝对路径的语法 | `dsh: shell command "<命令>" denied (policy=…, headless: no prompt available); cwd=<目录>` |
+
+`codex`、`grok`、`cline`、`dsh` 的拒绝信息仍然会被解析出来给人看，但执行器**不会**为它们发可批准的请求：批准了也无法保证 CLI 只放行 shim、不放行真实二进制。只有白名单能精确匹配 shim 绝对路径，或者命令经过沙箱 `PATH`（shim 挡住同名程序）且规则写的就是这条路径的 CLI，才能授权。
+
+账本先于配置文件写入：条目先以 `pending` 状态落盘，再把规则写进 CLI 配置，最后标为 `active`；写入后会回读确认规则确实在文件里。执行器在任何一步之间崩溃，都会留下一条 `pending` 记录，下次启动时 `settle_pending` 把它可能写下的规则撤回（操作者原有的规则和仍被别的授权使用的规则除外）。每一条 pending 单独处理：一条撤不掉（例如配置文件已经不在这个 worker 的目录里）会记一条 `grant-reconcile-failed` 并保持 `pending`，其余条目照常撤回，遗留的 `allow_once` 也不会因此被跳过。撤销同样回读确认规则已不在文件里，且要求配置文件仍在这个 worker 自己的 `home_read` 内；确认不了就保持 `active` 并报告失败，不会把一条仍然存在的规则标成已撤销。账本锁最长等待 10 秒，卡住的撤销命令不会拖死执行器（超时视为失败）。
+
+同一个 `state_dir` 同一时间只允许一个执行器（`state_dir/runner.lock`）：第二个启动的执行器会被拒绝，以免它的启动清理撤掉第一个还在使用的 `allow_once` 规则。`--list-grants`、撤销命令不受此限。
+
+写入只改这一条规则：JSON 文件原样保留其余内容（用标准库解析并以缩进 2 重写，所以原文件里的注释和排版不会保留；解析不了的文件、结构不符的文件直接拒绝，不改写），保留文件权限，原子替换。操作者本来就有的同名规则永远不会被撤销命令删除；同一规则被多个未撤销的授权共用时，要最后一个撤销才会删。
+
+### 允许列表与参数约束
+
+授权不是“按程序名放行”。目前只有 `rg` 能被写入白名单，而且命令行必须落在写死的参数形态里。不在列表上的程序（shell、解释器、`mksh`、`git`、`sed`、`grep`、`cat`、`python3.11`、网络客户端、`security`、脚本文件，以及任何没写在这里的名字）一律不发可批准的请求，任务按普通失败处理。匹配时只取 basename 并转小写，**不**去掉版本后缀：`python3.11` 不是 `python`，也不是允许列表里的任何一项。再加别的程序需要单独设计，不在这次里做。
+
+| 程序 | 可以授权的形态 | 一律拒绝 |
+| --- | --- | --- |
+| `rg` | 普通搜索。`--` 后面的内容当作模式，不当作选项。`--no-pre`、`--no-search-zip` 只是关掉功能。取值选项吃掉的 `-z`（`-e -z`、`-ez`）是模式，不是解压开关 | `-z`/`--z`/`--search-zip`、`--pre`、`--pre-glob`、`--hostname-bin`，以及它们的 `=value` 和长名缩写（`--pre=`、`--pr`、`--pre-g`、`--search`）。短选项簇里真正的 `-z`（`-iz`、`-uz`、`-ze`）同样拒绝 |
+
+**`sed` 现在不授权。** `-ne` 这类组合选项在 GNU sed 里会把下一个参数当成脚本，手写的解析器会把它当成空脚本。`w` 和 `-i` 的路径也要再写一套解析。这次不实现。
+
+**`git` 现在不授权。** `status`、`log`、`diff`、`show`、`ls-files`、`rev-parse`、`blame` 这些只读子命令仍会按仓库配置执行外部程序：`diff.external`、`textconv`、`core.fsmonitor`，以及 `-p` / `pager.*` 强制打开的 `core.pager`。worktree 里的 `.git` 可写，模型可以把它改指向另一个 gitdir。`git diff --output=` 也能把输出写到 worktree 之外。沙箱挡得住写出 worktree，挡不住这些钩子在沙箱里拉起解释器（网络默认开启）。以后若要加回 `git`，必须单独做，并且只能走写死的绝对路径，强制带上 `-c core.pager=cat --no-pager --no-ext-diff --no-textconv`、`-c core.fsmonitor=false`、`GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL=/dev/null`，并且不读仓库配置。本次不实现这条路径。
+
+上表的拒绝名单写死在运行器里，不跟某一次 `rg --version` 绑定。`-z`/`--search-zip` 按 `PATH` 启动 gzip、bzip2、xz、lz4、lzma、brotli、zstd，并且优先于 `--pre`；`--pre` 对每个路径运行给出的命令；`--pre-glob` 决定哪些路径交给 `--pre`；`--hostname-bin` 无参数运行给出的命令，用它的标准输出当主机名。`--generate` 只往标准输出写 man 和补全脚本。一个字母的 `--X` 等于对应的短选项，所以 `--z` 就是 `-z`。策略仍然拒绝更长的前缀，避免以后的 rg 把缩写放行。请求时和 shim 对每一种写法（缩写、`=value`、短选项簇）都拒绝。`rg` 没安装时帮助检查跳过；安装了就只在 `rg --help` 里找这些长选项的字面量，不从帮助文本里发现新的启动器。
+
+能不能授权，只看检测器是否完整捕获了**一整行**原文。捕获在引号或括号处截断、这一行后面还有内容、拒绝信息跨了多行，或者捕获文本里有引号、反斜杠或 shell 连接符（`;`、`&`、`|`、反引号、`$`、`(`、`)`、`>`、`<`、换行），请求仍然发出给人看，但标成不可授权：批准之后什么都不写，任务按拒绝结束。`rg foo"; rm` 和第一行是 `rg`、下一行再接命令，都属于这一种。参数策略本身（`-z`、`--search-zip`、`--pre`、`--pre-glob`、`--hostname-bin`）在请求时和 shim 里对**每一次执行的完整 argv** 各查一遍，不拿裁短后的 CLI 文本当依据。
+
+这些限制由 shim 在**每一次执行**时检查，不靠 CLI 白名单的文本。写进白名单的只有 shim 的绝对路径。shim 是执行器生成的一小段标准库 Python（不用 `eval`）。解释器是授权时解析出的绝对路径，shebang 是 `#!<解释器> -IS`：`-I` 忽略 `PYTHON*` 和用户 site，`-S` 不加载 `site`，所以 `usercustomize` 不会跑。参数检查只用 `sys` 和 `os`，shim 不再导入其他模块。它放在任务 worktree 之外、worker 可写目录之外，沙箱里以只读挂载。真实程序的路径在授权时解析并写死，调用用 `execve` 和上面的环境白名单，`rg` 强制 `--no-config`。拒绝时 shim 往自己的 stderr 写一行 `baton-runner: rg <option> refused by the grant policy`，以状态 126 退出。`<option>` 是策略点名的那一个选项（例如 `--pre`、`-z`、`--search-zip`）。它不写盘，也不从沙箱里联系 Baton，所以没有 `permission.shim_refused` 这种单独的审计事件。这一行在 CLI 的输出里，执行器捕获后放进任务结果或评论，并按该 worker 这次运行共用的密钥集合做字面脱敏（含 Keychain 值）。任务运行结束时撤销 `allow_once`。进程退出时，全部线程 join 之后才清空密钥集合。调用时的工作目录必须在这条授权的 worktree 之内。
+
+### 永远不会通过这条路径授权的东西
+
+- **任何沙箱设置。** 请求只会变成 CLI 白名单里的一条命令规则。`home_read`、`sandbox.*`（含网络）、`allow_keychain`、`extra_write_paths` 和配置里的其他项执行器都不会改（测试断言授权前后 worker 配置完全相同）。`backend: "none"` 的 worker 根本不会带着 `permissions` 启动。
+- **允许列表之外的程序，以及上表拒绝的参数形态。** 不发请求，失败评论说明原因。
+- **非命令权限**（例如读写某个目录、`external_directory`）。
+- **CLI 输出里的目录。** 无论它是 `/etc`、相对路径，还是恰好写成这个任务的 worktree，执行器都不采用。请求的 `directory` 和规则里的目录都是执行器创建的那个 worktree。因此 opencode 这种检测器样例里没有目录的拒绝信息也可以授权，范围仍然是该任务的 worktree。worktree 路径写不进规则（含控制字符，或超出模板允许的字符：字母、数字和 `_ . / @ + : - 空格`）时不授权。
+- 同一个程序已经在这个 worktree 上授权过、CLI 却仍然拒绝：不再请求，按失败处理（避免循环）。
+
+### 查看与撤销授权
+
+执行器为每个 worker 在 `state_dir/<principal>.grants.json`（权限 600）记录自己加的每条规则；`<principal>.grants.lock` 让执行器和撤销命令（可能是另一个进程）互斥。撤销命令只作用于指定的 worker 自己的白名单文件，不会碰别的 worker：
+
+```sh
+# SPDX-License-Identifier: Apache-2.0
+python3 adapters/local_runner.py --config <CONFIG_FILE> --list-grants
+python3 adapters/local_runner.py --config <CONFIG_FILE> --revoke-grant <GRANT_ID>
+python3 adapters/local_runner.py --config <CONFIG_FILE> --revoke-worker <PRINCIPAL>
+```
+
+`--list-grants` 每行输出一个 JSON（`worker`、`id`、`tool`、`rule`、`option`、`status`、`task_id`、`request_id`、`created`）。撤销会从白名单文件里删除规则（除非那条规则本来就是操作者的），把授权标为 `revoked`，并用该 worker 自己的令牌向 Baton 报告 `revoked`；Baton 暂时连不上时规则照样先删，报告记在账本里，执行器下次启动（或再次运行撤销命令）时补报。退出码：0 成功，1 有授权撤销失败，2 找不到该 id 或 worker（`state_dir` 不存在时 `--list-grants` 输出为空并返回 0，撤销返回 2）。
+
+### 审计
+
+每一步都有审计，且在任务线程里可见：`permission.requested`（谁、哪个 CLI、程序、目录、原因、点名的 approvers，excerpt 只存 SHA-256）、`permission.decided`（approver、选项、根或委托链）、`permission.cancelled`（worker 或根撤回）、`permission.granted`（执行器报告已写入）、`permission.revoked`。shim 拒绝一次调用不是单独的审计事件：它只出现在任务输出里（一行 `baton-runner: rg <option> refused by the grant policy`，退出码 126）。审计的 actor 分别是 worker、approver、worker、worker、worker。无法向 Baton 报告 `granted` 的授权会被撤回并让任务失败，不会留下没有审计的规则。`granted` 的回执若在服务端已提交后丢失，对账用同一个 `operation_id` 重放；`revoked` 只有服务端确认之后才标成已报告。执行器崩溃后下次启动会撤回遗留的 `allow_once` 规则并补报未报告的事件。请求过期在读取里当场算成 `expired`；持久的 `permission.expired` 由定期扫描按任务逐个短事务写入，或在排他写锁下写入（只写一次）。shim 若会落在该 worker 的 worktree 或 `extra_write_paths` 里，这个 worker 拒绝启动。
+
+### 限制，请明确知晓
+
+- 只在 CLI 以非零退出时检测。一个拒绝了命令但仍以 0 退出的 CLI 不会触发请求。
+- 等待审批期间该任务占用 worker 的一个并发槽（`concurrency`），并且执行器进程要一直在线并持续续租；执行器重启会丢掉这次等待（租约过期后任务回到队列，旧请求变为过期，决定会得到 `409 stale_claim`）。
+- 被拒绝的程序名和参数来自 CLI 输出，而输出可能受不可信的任务文字影响。执行器只对允许列表里的程序发可批准的请求；捕获不完整或文本含引号、反斜杠、换行、shell 连接符时仍会发出，但标成不可授权，批准什么都不写。参数形态（`-z`、`--search-zip`、`--pre`、`--pre-glob`、`--hostname-bin`）在请求时和 shim 里对完整 argv 再查一遍。`directory` 一律写成任务自己的 worktree。approver 看到的就是这个程序名和这条 worktree，批准前应核对。`allow_once` 只保留到当前任务这次运行结束。`allow_always` 会留下规则，但规则指向的是写下它的那个 worktree 和写死的参数约束，不是任意参数，也不覆盖该 worker 以后其他任务的 worktree。
+- 规则模板与各 CLI 实际接受的语法是否一致未验证；写入的规则是否真被该 CLI 采纳，要靠重跑结果判断（不采纳时表现为再次被拒绝，执行器按失败处理）。
+- `mcp_stdio.py` 适配器的已知工具表没有这四个操作；approver 通过 HTTP、MCP 客户端或 `baton_cli.py call` 使用它们。
+
 ## 安全模型
 
 任务文字是不可信数据：它只写进提示词文件，永远不会被拼进 argv、shell 或环境变量；唯一的替换是把整项 `{prompt_file}` 换成文件路径，或把整项 `{prompt_instruction}` 换成只含该路径的固定指令句。
@@ -403,7 +518,8 @@ worker 字段：
   - 禁止写入：任务 worktree、该任务的临时目录以及 `extra_write_paths` 之外的所有位置。`bwrap` 下系统整体只读，用 tmpfs 盖住上述目录，再把这些 tmpfs 挂成只读。
   - 子进程在独立进程组；`bwrap` 另有独立 PID 命名空间，超时或停止时整组被杀。
 - **审批绕过开关与隐式自动批准**：`implicit_auto_approve` 为 `true` 的 worker 与下面的情形同样处理。`command` 含已知的绕过审批开关时（`--dangerously-skip-permissions`、`--dangerously-bypass-approvals-and-sandbox`、`--yolo`、`--full-auto`、`--auto`、`--auto-approve`、`-y`、`--yes`、`bypassPermissions`，不区分大小写，也匹配 `--flag=值` 形式），沙箱后端为 `none` 的 worker 会被拒绝启动并写日志。执行器不会悄悄增删任何参数；用不用这些开关由操作者决定。
-- **日志**：不打印任何密钥，日志行只含任务 ID、principal、退出码和耗时。评论、结果和证据里对每个已知令牌值（以及 `env_passthrough` 的值）做字面脱敏，包括截断处残留的令牌片段。
+- **权限请求同样要求真实沙箱。** worker 配了 `permissions` 且 `sandbox.backend` 为 `none` 时拒绝启动并写日志（`permissions need a sandbox backend`），与上面的绕过开关相同。这条路径只改 CLI 自己的命令白名单，不放宽 `home_read`、网络或 Keychain。
+- **日志**：不打印任何密钥，日志行只含任务 ID、principal、退出码和耗时。评论、结果、证据和权限请求都用该 worker 运行共用的密钥集合做字面脱敏（令牌、`env_passthrough` 和 Keychain 值，包括截断处残留的片段）。shim 拒绝写在 CLI 输出里的那一行也走这条路径。集合在线程启动前填入。全部线程 join 之后才清空。
 
 限制，请明确知晓：
 
@@ -420,7 +536,8 @@ worker 字段：
 
 ## 排错
 
-- `refused`：日志里会写原因（令牌不可读、沙箱后端不可用、绕过开关缺少沙箱、`extra_write_paths` 不是目录）。
+- `refused`：日志里会写原因（令牌不可读、沙箱后端不可用、绕过开关或 `permissions` 缺少沙箱、`extra_write_paths` 不是目录）。
 - `claim-failed`/`deferred`：另一个任务的租约占用了范围，或依赖未满足；执行器会在 `retry_delay_seconds` 后重试，最多 10 次，随后评论交还。
 - `hourly-cap-reached`：已到滚动一小时上限，会等到有空位。
-- 状态文件在 `state_dir`：`<principal>.seq`（已处理的通知序号）、`<principal>.tasks.json`（任务状态与失败次数）、`hourly.json`。被交还的任务重新指派后会收到新的 `task.assigned`，失败计数随之清零。
+- `permission-requested` / `permission-decided` / `grant-applied` / `grant-revoked` / `grant-unreported` / `grant-left-active` / `grant-reconcile-failed`：权限请求闭环的日志行（只含任务 ID、请求 ID、程序名、授权 ID，不含任何密钥）；`grant-left-active` 表示一条规则没能删掉，用 `--list-grants` 和 `--revoke-grant` 处理；`grant-reconcile-failed` 表示启动时某一条 pending 没能撤回，其他条目仍会继续处理。
+- 状态文件在 `state_dir`：`<principal>.seq`（已处理的通知序号）、`<principal>.tasks.json`（任务状态与失败次数）、`<principal>.grants.json`（权限授权账本）、`hourly.json`。被交还的任务重新指派后会收到新的 `task.assigned`，失败计数随之清零。

@@ -70,7 +70,7 @@ class BridgeError(ValueError):
 MAX_DETAILS = 20
 FIELD_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 UUID_FIELDS = frozenset({"operation_id", "space_id", "page_id", "parent_id", "block_id", "task_id", "comment_id",
-                         "proposal_id", "team_id", "thread_id", "subscription_id", "resource_id"})
+                         "proposal_id", "team_id", "thread_id", "subscription_id", "resource_id", "request_id"})
 TYPE_NAMES = {"string_type": "string", "int_type": "integer", "int_parsing": "integer", "int_from_float": "integer",
               "bool_type": "boolean", "bool_parsing": "boolean", "list_type": "array", "dict_type": "object",
               "model_type": "object", "model_attributes_type": "object", "none_required": "null",
@@ -250,6 +250,14 @@ PUBLIC_OPERATIONS = {
     "assign_task": (True, {"task_id": (str, ...), "target_principal": (str, ...)}),
     "set_priority": (True, {"task_id": (str, ...), "priority": (str, ...)}),
     "mark_blocked": (True, {"task_id": (str, ...), "reason_code": (str, ...), "note": (str | None, None)}),
+    "request_permission": (True, {"task_id": (str, ...), "epoch": (int, ...), "cli": (str, ...), "tool": (str, ...),
+                                  "directory": (str | None, None), "reason": (str | None, None), "excerpt": (str | None, None),
+                                  "approvers": (list[str] | None, None), "ttl_seconds": (int, 3600)}),
+    "decide_permission": (True, {"task_id": (str, ...), "request_id": (str, ...), "option": (str, ...), "reason": (str | None, None)}),
+    "cancel_permission": (True, {"task_id": (str, ...), "request_id": (str, ...)}),
+    "record_permission": (True, {"task_id": (str, ...), "request_id": (str, ...), "event": (str, ...),
+                                 "reason": (str | None, None)}),
+    "list_permissions": (False, {"task_id": (str, ...)}),
     "plan": (True, {"graph": (list[GraphEntry], ...)}),
     "set_work_face": (True, {"task_id": (str, ...), "work_face": (dict[str, Any], ...), "base_commit": (str | None, None)}),
     "ready": (False, {"page_id": (str | None, None), "limit": (int, 50)}),

@@ -154,6 +154,11 @@ CREATE TABLE IF NOT EXISTS baton.x_audit (
 );
 CREATE INDEX IF NOT EXISTS audit_task ON baton.x_audit(task_id,time);
 CREATE INDEX IF NOT EXISTS audit_space ON baton.x_audit(space_id,time);
+-- One expiry row per request. Reads compute expired and do not insert. The periodic sweep
+-- (one task per short transaction, ordered by task id) and exclusive writes insert it.
+CREATE UNIQUE INDEX IF NOT EXISTS audit_permission_expired_once
+    ON baton.x_audit (task_id, (metadata->>'request_id'))
+    WHERE event = 'permission.expired';
 
 CREATE OR REPLACE FUNCTION baton.reject_audit_change() RETURNS trigger
 LANGUAGE plpgsql AS $$ BEGIN

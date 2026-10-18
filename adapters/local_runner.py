@@ -13,15 +13,24 @@ worker command in a sandbox without a shell and reports the result with the work
 Task text is untrusted data. It is written to a prompt file and never interpolated into argv, a shell or the
 environment. Tokens are read only by this process; the child gets a scrubbed environment.
 
+A worker whose CLI refuses a command because its own allowlist lacks it can ask for input instead of failing: the runner
+parses the refusal, posts a permission request in the task thread and waits, holding the same claim and epoch. On approval
+by a Baton approver it allowlists a runner-owned shim for that one program (never a blanket command, and never the sandbox) and re-runs in the same worktree. The shim checks the argument policy on every later call.
+`--list-grants`, `--revoke-grant` and `--revoke-worker` list and withdraw those rules.
+
 Exit codes: 0 ok, 1 runtime error, 2 usage or configuration error.
 """
 
 import argparse
+import contextlib
+import fcntl
 import importlib.util
+import inspect
 import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -88,8 +97,9 @@ CONFIG_KEYS = frozenset({
 WORKER_KEYS = frozenset({
     "principal", "token_file", "command", "prompt_via", "workdir_root", "concurrency", "task_timeout_seconds",
     "sandbox", "env_passthrough", "home", "enabled", "implicit_auto_approve",
-    "env_from_keychain", "home_read", "allow_keychain",
+    "env_from_keychain", "home_read", "allow_keychain", "permissions",
 })
+PERMISSIONS_KEYS = frozenset({"cli", "config_file", "approvers", "wait_seconds", "poll_seconds", "max_requests", "rule_template"})
 SANDBOX_KEYS = frozenset({"backend", "allow_network", "extra_write_paths"})
 
 
@@ -132,6 +142,18 @@ class SandboxConfig:
 
 
 @dataclass
+class PermissionConfig:
+    """How one worker asks for, and receives, an allowlist entry in its own CLI's configuration."""
+    cli: str
+    config_file: str
+    approvers: list
+    wait_seconds: int = 1800
+    poll_seconds: float = 5.0
+    max_requests: int = 3
+    rule_template: str = None
+
+
+@dataclass
 class WorkerConfig:
     principal: str
     token_file: str
@@ -148,6 +170,7 @@ class WorkerConfig:
     env_from_keychain: dict = field(default_factory=dict)
     home_read: list = field(default_factory=list)
     allow_keychain: bool = False
+    permissions: PermissionConfig = None
 
 
 @dataclass
@@ -206,6 +229,27 @@ def _path(section, key, what, required=True):
 
 def _nested(first, second):
     return first == second or first.startswith(second.rstrip("/") + "/") or second.startswith(first.rstrip("/") + "/")
+
+
+def parse_permissions(raw, what, principal):
+    _check_keys(raw, PERMISSIONS_KEYS, what)
+    name = raw.get("cli")
+    if name not in CLI_PROFILES:
+        raise ConfigError(what + ".cli must be one of " + ", ".join(sorted(CLI_PROFILES)))
+    approvers = raw.get("approvers")
+    if (not isinstance(approvers, list) or not approvers or len(approvers) > 10
+            or not all(isinstance(item, str) and cli.AGENT_RE.fullmatch(item) for item in approvers)):
+        raise ConfigError(what + ".approvers must be a list of 1 to 10 principal identifiers")
+    if principal in approvers:
+        raise ConfigError(what + ".approvers may not name the worker itself")
+    template = raw.get("rule_template")
+    if template is not None and template != EXACT_TEMPLATE:
+        raise ConfigError(what + ".rule_template must be the exact string {shim}")
+    return PermissionConfig(
+        cli=name, config_file=_path(raw, "config_file", what), approvers=list(dict.fromkeys(approvers)),
+        wait_seconds=_int(raw, "wait_seconds", what, 1800, 1, 86400),
+        poll_seconds=_number(raw, "poll_seconds", what, 5, 0.05, 300), max_requests=_int(raw, "max_requests", what, 3, 1, 10),
+        rule_template=template)
 
 
 def parse_worker(raw, index):
@@ -280,13 +324,14 @@ def parse_worker(raw, index):
     enabled = raw.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ConfigError(what + ".enabled must be true or false")
+    permissions = parse_permissions(raw["permissions"], what + ".permissions", principal) if "permissions" in raw else None
     return WorkerConfig(
         principal=principal, token_file=_path(raw, "token_file", what), command=list(command), prompt_via=prompt_via,
         workdir_root=_path(raw, "workdir_root", what), concurrency=_int(raw, "concurrency", what, 1, 1, 16),
         task_timeout_seconds=_int(raw, "task_timeout_seconds", what, None, 1, MAX_LEASE_SECONDS - 1),
         sandbox=SandboxConfig(backend, allow_network, extra_paths), env_passthrough=list(passthrough), home=home,
         enabled=enabled, implicit_auto_approve=implicit,
-        env_from_keychain=dict(keychain), home_read=home_read, allow_keychain=allow_keychain)
+        env_from_keychain=dict(keychain), home_read=home_read, allow_keychain=allow_keychain, permissions=permissions)
 
 
 def _inside(path, directory):
@@ -337,6 +382,21 @@ def validate_home_access(workers, state_dir, config_path):
                     if _nested(entry, foreign):
                         raise ConfigError("workers[%d] reaches into the home paths of workers[%d]; each worker may "
                                           "only expose its own CLI's directories" % (index, other_index))
+    seen = set()
+    for index, worker in enumerate(workers):
+        if worker.permissions is None:
+            continue
+        what = "workers[%d].permissions.config_file" % index
+        real = os.path.realpath(worker.permissions.config_file)
+        if real in seen:
+            raise ConfigError(what + " is shared with another worker; a grant must only reach its own worker")
+        seen.add(real)
+        if not any(real == os.path.realpath(entry) or _inside(real, os.path.realpath(entry)) for entry in worker.home_read):
+            raise ConfigError(what + " must lie inside this worker's own home_read: the CLI's allowlist is the only thing "
+                              "a grant may change, and the sandbox is never widened to reach it")
+        if any(real == os.path.realpath(entry) or _inside(real, os.path.realpath(entry))
+               for entry in worker.sandbox.extra_write_paths):
+            raise ConfigError(what + " may not lie inside extra_write_paths: the CLI could then rewrite its own allowlist")
 
 
 def parse_config(data, path=None):
@@ -505,6 +565,7 @@ class SandboxPlan:
     keychain_dirs: list = field(default_factory=list)
     home_dirs: list = field(default_factory=list)
     home_read: list = field(default_factory=list)
+    shim_read: list = field(default_factory=list)
 
 
 def _real(path):
@@ -557,7 +618,7 @@ def bwrap_command(plan, argv):
         args += ["--tmpfs", directory]
     if plan.config_file and os.path.exists(plan.config_file):
         args += ["--ro-bind", "/dev/null", plan.config_file]
-    for path in plan.home_read:
+    for path in [*plan.home_read, *plan.shim_read]:
         if os.path.exists(path):
             args += ["--ro-bind", path, path]
     for path in [plan.worktree, plan.tmpdir, *plan.extra_write]:
@@ -587,7 +648,7 @@ def sandbox_exec_profile(plan):
         lines.append("(deny file-read* (subpath %s))" % _sbpl(directory))
     if plan.keychain_dirs:
         lines.append("(deny mach-lookup %s)" % " ".join("(global-name %s)" % _sbpl(n) for n in KEYCHAIN_MACH_SERVICES))
-    readable = [plan.worktree, plan.tmpdir, *plan.extra_write, *plan.home_read]
+    readable = [plan.worktree, plan.tmpdir, *plan.extra_write, *plan.home_read, *plan.shim_read]
     for path in readable:
         lines.append("(allow file-read* (subpath %s))" % _sbpl(path))
     for path in home_ancestors(plan, readable):
@@ -935,6 +996,1085 @@ class HourlyCap:
                 self._save()
 
 
+# --- permission requests -------------------------------------------------------------------------------
+
+PERMISSION_OPTIONS = ("allow_once", "allow_always", "deny")
+GENERIC_REASON = "the CLI refused an action in headless mode"
+EXCERPT_CHARS = 1500
+FIELD_CHARS = 300
+TOOL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}")
+UNPARSED_TOOL = "(unparsed)"
+# Only these programs can ever be written into a CLI allowlist, and only under the argument policy next to each name.
+# Everything else (shells, interpreters, mksh, network clients, package managers, a versioned python3.11, a script) is
+# never granted: there is no deny-list to forget an entry on.
+# git is not here. status/log/diff/show/ls-files/rev-parse/blame still run diff.external, textconv, core.fsmonitor and
+# core.pager from repository config (including a pager forced by -p), and the worktree's .git is writable so it can be
+# pointed at another gitdir. `git diff --output=` can also write outside the worktree. The sandbox stops a write that
+# leaves the worktree; it does not stop a program those hooks start inside it, and the network is on by default.
+# A later change could allow git only by invoking it with the real binary's absolute path plus forced
+# `-c core.pager=cat --no-pager --no-ext-diff --no-textconv -c core.fsmonitor=false`, `GIT_CONFIG_NOSYSTEM=1`,
+# `GIT_CONFIG_GLOBAL=/dev/null`, and no repository config. That is not this change.
+# sed is not here either. A cluster such as `-ne` is a script to GNU sed and an empty script to a hand-written
+# parser, and `w`/`-i` paths are another parser. More tools need their own design; this change grants only rg.
+GRANTABLE_TOOLS = frozenset({"rg"})
+# Shown in the shim's header. The CLI allowlist entry is only the shim path; this text is not a CLI rule.
+POLICY_ARGS = {
+    "rg": "[! -z ! --search-zip ! --pre ! --pre-glob ! --hostname-bin]",
+}
+# rg options that start another program. This set is the only list the request check and the shim refuse,
+# including a longer prefix and an =VALUE form. Help text is not mined for more names. `-z` and
+# `--search-zip` are the same switch. `--pre-glob` selects the paths `--pre` runs on.
+RG_LAUNCHERS = frozenset({"z", "search-zip", "pre", "pre-glob", "hostname-bin"})
+# Quotes, backslashes and shell control characters. Grantability is decided on the raw captured line, before shlex.
+UNTRUSTED_COMMAND_RE = re.compile(r"""['"\\;&|`$()><\n]""")
+
+
+def tool_basename(tool):
+    return os.path.basename(str(tool)).lower()
+
+
+def is_ungrantable(tool):
+    """True when the program is not on the allow-list. Argument shape is checked separately, against the command line."""
+    return tool_basename(tool) not in GRANTABLE_TOOLS
+
+
+def _split_command(command):
+    try:
+        return shlex.split(command, posix=True)
+    except ValueError:
+        return None
+
+
+def _inside_worktree(path, worktree):
+    """A path the child would use while its cwd is the worktree.
+
+    Each component is resolved before `..` is applied, so `link/../outside` follows `link` first and does not
+    collapse back into the worktree. A missing final component stays lexical. The filesystem root is never a
+    worktree this check will approve a write into.
+    """
+    if not isinstance(path, str) or not path or "\x00" in path or path.startswith("~") or path.startswith("-"):
+        return False
+    root = os.path.realpath(worktree)
+    if not root or root == os.sep:
+        return False
+    if os.path.isabs(path):
+        current, parts = os.sep, path.split(os.sep)[1:]
+    else:
+        current, parts = root, path.split(os.sep)
+    for part in parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if current != os.sep:
+                parent = os.path.dirname(current.rstrip(os.sep))
+                current = parent or os.sep
+            continue
+        nxt = os.sep + part if current == os.sep else os.path.join(current, part)
+        current = os.path.realpath(nxt) if os.path.lexists(nxt) else nxt
+    prefix = root.rstrip(os.sep) + os.sep
+    return current == root or current.startswith(prefix)
+
+
+def _rg_option(argv):
+    """The canonical rg option this argv uses to launch another program, or None.
+
+    `RG_LAUNCHERS` is the fixed list. A longer prefix and an `=VALUE` form name the same option (`--pr` and
+    `--pre=` are `--pre`, `--search` is `--search-zip`, `--z` is `-z`). `--no-pre` and `--no-search-zip` are not
+    launchers. A one-letter `--X` is the short flag. A short cluster is read left to right: `-iz`, `-uz` and
+    `-ze` are `-z`; `-ez` and `-e -z` are a pattern.
+    """
+    # Long options that take the next argv when written without `=`. Launcher names are listed so a value is not
+    # inspected after a refusal, and so a future edit that stops refusing one of them still skips its operand.
+    value_long = {
+        "regexp", "file", "pre", "pre-glob", "dfa-size-limit", "encoding", "engine", "max-count",
+        "regex-size-limit", "threads", "glob", "iglob", "ignore-file", "cursor-ignore", "max-depth",
+        "max-filesize", "type", "type-not", "type-add", "type-clear", "after-context", "before-context",
+        "color", "colors", "context", "context-separator", "field-context-separator", "field-match-separator",
+        "hostname-bin", "hyperlink-format", "max-columns", "path-separator", "replace", "sort", "sortr",
+        "generate",
+    }
+    value_short = set("efEmjgdtTABCMr")
+
+    def canonical(name):
+        if name == "z":
+            return "-z"
+        if name in RG_LAUNCHERS:
+            return "--" + name
+        if len(name) > 1:
+            matches = [item for item in RG_LAUNCHERS if item.startswith(name)]
+            if matches:
+                chosen = min(matches, key=len)
+                return "-z" if chosen == "z" else "--" + chosen
+        return None
+
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            break
+        if not isinstance(arg, str) or arg == "-" or not arg.startswith("-"):
+            index += 1
+            continue
+        if arg.startswith("--"):
+            body = arg[2:]
+            name, separator, _value = body.partition("=")
+            option = canonical(name)
+            if option:
+                return option
+            takes_value = separator != "=" and (name in value_long or (len(name) == 1 and name in value_short))
+            index += 2 if takes_value else 1
+            continue
+        cluster, consumed = arg[1:], False
+        for position, flag in enumerate(cluster):
+            if flag == "z":
+                return "-z"
+            if flag in value_short:
+                consumed = position == len(cluster) - 1
+                break
+        index += 2 if consumed else 1
+    return None
+
+
+def _rg_problem(argv, worktree):
+    """None when this rg argv does not launch another program.
+
+    The refusal text names the whole fixed list. `_rg_option` is the single option the shim prints.
+    """
+    if _rg_option(argv):
+        return "rg -z/--search-zip, --pre, --pre-glob and --hostname-bin run another program and are never granted"
+    return None
+
+
+def _sed_regex_end(script, i):
+    """script[i] is the delimiter. Returns the index after the closing delimiter, or None."""
+    delim, i = script[i], i + 1
+    while i < len(script):
+        if script[i] == "\\":
+            i += 2
+            continue
+        if script[i] == delim:
+            return i + 1
+        i += 1
+    return None
+
+
+def _sed_address(script, i):
+    if i >= len(script):
+        return i, False
+    if script[i].isdigit():
+        while i < len(script) and script[i].isdigit():
+            i += 1
+        return i, True
+    if script[i] == "$":
+        return i + 1, True
+    if script[i] == "\\":
+        if i + 1 >= len(script):
+            return i, False
+        end = _sed_regex_end(script, i + 1)
+        return (i, False) if end is None else (end, True)
+    if script[i] == "/":
+        end = _sed_regex_end(script, i)
+        return (i, False) if end is None else (end, True)
+    return i, False
+
+
+def _sed_line_path(script, i):
+    """The filename of a w/W/r/R command: the rest of the line, one leading blank skipped."""
+    if i < len(script) and script[i] == " ":
+        i += 1
+    end = script.find("\n", i)
+    end = len(script) if end < 0 else end
+    return script[i:end].strip(), end
+
+
+def _sed_script_problem(script, worktree):
+    """None when every command is one this runner can grant. Anything it cannot parse is refused."""
+    i, n = 0, len(script)
+    while i < n:
+        while i < n and script[i] in " \t\n;":
+            i += 1
+        if i >= n:
+            break
+        if script[i] == "#":
+            newline = script.find("\n", i)
+            i = n if newline < 0 else newline + 1
+            continue
+        start, saw = i, False
+        while True:
+            i, ok = _sed_address(script, i)
+            if not ok:
+                if saw:
+                    return "the sed script is not a form this runner can grant"
+                i = start
+                break
+            saw = True
+            if i < n and script[i] == ",":
+                i += 1
+                continue
+            break
+        if i < n and script[i] == "!":
+            i += 1
+        if i >= n:
+            return "the sed script is not a form this runner can grant"
+        command = script[i]
+        i += 1
+        if command == "e":
+            return "sed's e command runs another program and is never granted"
+        if command in "dDpPnNgGhHxlzF={}":
+            continue
+        if command in ":btT":
+            while i < n and script[i] in " \t":
+                i += 1
+            while i < n and (script[i].isalnum() or script[i] == "_"):
+                i += 1
+            continue
+        if command in "qQ":
+            while i < n and script[i].isdigit():
+                i += 1
+            continue
+        if command in "rR":
+            _, i = _sed_line_path(script, i)
+            continue
+        if command in "wW":
+            filename, i = _sed_line_path(script, i)
+            if not _inside_worktree(filename, worktree):
+                return "sed w/W would write outside the task worktree and is never granted"
+            continue
+        if command == "y":
+            if i >= n:
+                return "the sed script is not a form this runner can grant"
+            end = _sed_regex_end(script, i)
+            end = None if end is None else _sed_regex_end(script, end - 1)
+            if end is None:
+                return "the sed script is not a form this runner can grant"
+            i = end
+            continue
+        if command != "s":
+            return "the sed script is not a form this runner can grant"
+        if i >= n:
+            return "the sed script is not a form this runner can grant"
+        end = _sed_regex_end(script, i)
+        end = None if end is None else _sed_regex_end(script, end - 1)
+        if end is None:
+            return "the sed script is not a form this runner can grant"
+        i = end
+        while i < n and script[i] not in "\n;":
+            flag = script[i]
+            if flag == "e":
+                return "sed s///e runs another program and is never granted"
+            if flag in "wW":
+                filename, i = _sed_line_path(script, i + 1)
+                if not _inside_worktree(filename, worktree):
+                    return "sed w/W would write outside the task worktree and is never granted"
+                break
+            if flag.isdigit() or flag in "gpiImM":
+                i += 1
+                continue
+            return "the sed script is not a form this runner can grant"
+    return None
+
+
+def _sed_problem(argv, worktree):
+    scripts, inplace, i = [], False, 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            i += 1
+            break
+        if arg == "-" or not arg.startswith("-"):
+            break
+        if arg in ("-n", "--quiet", "--silent", "-E", "-r", "--regexp-extended", "-s", "--separate", "-u",
+                   "--unbuffered", "-z", "--null-data", "--posix", "--sandbox", "-b", "--binary", "--follow-symlinks"):
+            i += 1
+            continue
+        if arg in ("-f", "--file") or arg.startswith("--file=") or (arg.startswith("-f") and arg != "-f"):
+            return "sed -f reads a script this runner cannot check and is never granted"
+        if arg in ("-e", "--expression"):
+            if i + 1 >= len(argv):
+                return "the sed command line is not a form this runner can grant"
+            scripts.append(argv[i + 1])
+            i += 2
+            continue
+        if arg.startswith("--expression="):
+            scripts.append(arg.split("=", 1)[1])
+            i += 1
+            continue
+        if arg.startswith("-e") and len(arg) > 2:
+            scripts.append(arg[2:])
+            i += 1
+            continue
+        if arg in ("-i", "--in-place") or arg.startswith("--in-place=") or (arg.startswith("-i") and arg != "-i"):
+            inplace = True
+            i += 1
+            continue
+        if arg in ("-l", "--line-length"):
+            i += 2
+            continue
+        if arg.startswith("--line-length=") or (arg.startswith("-l") and arg != "-l"):
+            i += 1
+            continue
+        if arg.startswith("--"):
+            return "sed option %s is not a form this runner can grant" % arg
+        # A cluster of flag letters (-nE, -Es). -e, -f, -i and -l take the rest of the cluster.
+        cluster, consumed = arg[1:], False
+        for index, letter in enumerate(cluster):
+            if letter in "nErsuzb":
+                continue
+            if letter == "e":
+                scripts.append(cluster[index + 1:])
+                consumed = True
+                break
+            if letter == "f":
+                return "sed -f reads a script this runner cannot check and is never granted"
+            if letter == "i":
+                inplace = True
+                consumed = True
+                break
+            if letter == "l":
+                consumed = True
+                break
+            return "sed option -%s is not a form this runner can grant" % letter
+        if not consumed and not cluster:
+            return "the sed command line is not a form this runner can grant"
+        i += 1
+    if i < len(argv) and not scripts and argv[i] != "--":
+        scripts.append(argv[i])
+        i += 1
+    if not scripts:
+        return "sed without a visible script is never granted"
+    for script in scripts:
+        problem = _sed_script_problem(script, worktree)
+        if problem:
+            return problem
+    files = [arg for arg in argv[i:] if arg != "--"]
+    if inplace and (not files or not all(_inside_worktree(path, worktree) for path in files)):
+        return "sed -i would edit a file outside the task worktree and is never granted"
+    return None
+
+
+_GRANT_POLICIES = {"rg": _rg_problem}
+
+
+def _command_text_problem(command):
+    """Why this raw command text cannot be granted, before any parse.
+
+    A quote, backslash or shell control character means the line is not a single plain argv. The argument policy
+    itself runs on the full argv inside the shim at execution, never on a clipped copy of this text.
+    """
+    if UNTRUSTED_COMMAND_RE.search(command):
+        return "the command line contains a quote, backslash or shell control operator and is never granted"
+    return None
+
+
+def argv_problem(tool, argv, worktree):
+    """None when this argv is within the tool's fixed policy and every path it writes stays in worktree.
+
+    The generated shim calls this on every execution with the process argv, the full list, not the command text
+    clipped out of the CLI's output. `argv[0]` is the program name, not a path.
+    """
+    name = tool_basename(tool)
+    if name not in _GRANT_POLICIES:
+        return "%s is not on the allow-list and is never granted" % (name or tool)
+    if not argv or tool_basename(argv[0]) != name:
+        return "the command line does not start with %s, so it is never granted" % name
+    if not isinstance(worktree, str) or not os.path.isabs(worktree):
+        return "the task worktree is not an absolute path, so nothing is granted"
+    return _GRANT_POLICIES[name](argv, worktree)
+
+
+def argument_problem(tool, command, worktree):
+    """None when this exact command line is within the tool's fixed policy and every path it writes stays in worktree.
+
+    `command` must be the detector's full capture. A clipped copy can hide `--pre` or a shell operator past the cut.
+    """
+    name = tool_basename(tool)
+    if name not in _GRANT_POLICIES:
+        return "%s is not on the allow-list and is never granted" % (name or tool)
+    if not isinstance(command, str) or not command.strip():
+        return "%s was refused without a command line, so its arguments cannot be checked" % name
+    problem = _command_text_problem(command)
+    if problem:
+        return problem
+    argv = _split_command(command)
+    if not argv:
+        return "the command line could not be parsed, so it is never granted"
+    return argv_problem(name, argv, worktree)
+
+
+def runner_data_root():
+    """Runner-owned directory under the real HOME, outside every task worktree."""
+    return os.path.join(os.path.expanduser("~"), ".local", "share", "baton-runner")
+
+
+def _principal_dir(principal, kind):
+    if not isinstance(principal, str) or not cli.AGENT_RE.fullmatch(principal):
+        raise RunnerError("the worker name cannot name a %s directory" % kind)
+    return os.path.join(runner_data_root(), kind, principal)
+
+
+def shim_dir(principal):
+    return _principal_dir(principal, "shims")
+
+
+def shim_path(principal, tool):
+    """Absolute path of the runner-owned shim for one worker and one allow-listed program."""
+    name = tool_basename(tool)
+    if name not in GRANTABLE_TOOLS:
+        raise RunnerError("%s is not on the allow-list" % (name or tool))
+    return os.path.join(shim_dir(principal), name)
+
+
+def ensure_shim_dirs(principal):
+    """Create the shim directory (0755). The sandbox re-binds it read-only. A refusal writes nothing here."""
+    shim = shim_dir(principal)
+    os.makedirs(shim, mode=0o755, exist_ok=True)
+    os.chmod(shim, 0o755)
+    return shim
+
+
+def shim_inside_writable(worker):
+    """True when the shim would sit inside a directory this worker's CLI can write."""
+    roots = [os.path.realpath(worker.workdir_root)]
+    roots.extend(os.path.realpath(path) for path in worker.sandbox.extra_write_paths)
+    real = os.path.realpath(shim_dir(worker.principal))
+    return any(real == root or _under(real, [root]) for root in roots)
+
+
+def resolve_real_binary(name):
+    """Absolute path of the real program, never a path under the runner's own shim tree and never via a later PATH lookup."""
+    root = os.path.realpath(runner_data_root())
+    prefix = root.rstrip(os.sep) + os.sep
+    entries = []
+    for entry in os.environ.get("PATH", "/usr/bin:/bin").split(os.pathsep):
+        if not entry:
+            continue
+        real = os.path.realpath(entry)
+        if real == root or real.startswith(prefix):
+            continue
+        entries.append(entry)
+    found = shutil.which(name, path=os.pathsep.join(entries) or "/usr/bin:/bin")
+    if not found:
+        return None
+    real = os.path.realpath(found)
+    if real == root or real.startswith(prefix) or not os.path.isfile(real) or not os.access(real, os.X_OK):
+        return None
+    return real
+
+
+_SHIM_FUNCTIONS = (tool_basename, _inside_worktree, _rg_option, _rg_problem, argv_problem)
+
+# Appended to every generated shim. Standard library only; no eval; the real program is exec'd by the baked absolute path.
+SHIM_MAIN = """
+def _cwd_covers(worktree):
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        return False
+    return _inside_worktree(cwd, worktree)
+
+
+def _exec_env():
+    # The real program does not inherit the worker's environment.
+    # PATH is a fixed system value, not the sandbox PATH (that one starts with this shim). HOME, LANG, LC_* and TERM
+    # are the only other variables copied. RIPGREP_CONFIG_PATH, GIT_*, LD_*, DYLD_*, PYTHON* and everything else are dropped.
+    env = {"PATH": "/usr/bin:/bin"}
+    for key, value in os.environ.items():
+        if key in ("HOME", "TERM", "LANG") or key.startswith("LC_"):
+            env[key] = value
+    return env
+
+
+def _refuse(option):
+    # One line on this process's stderr, then 126. Nothing is written to disk and nothing is sent to Baton.
+    if not isinstance(option, str) or not option or any(ch in option for ch in " \\t\\n\\r"):
+        option = "argv"
+    try:
+        sys.stderr.write("baton-runner: rg " + option + " refused by the grant policy\\n")
+    except OSError:
+        pass
+    sys.exit(126)
+
+
+def main():
+    argv = [TOOL, *sys.argv[1:]]
+    problem = "no grant allows this command"
+    chosen = None
+    ordered = [grant for grant in GRANTS if grant.get("option") != "allow_once"]
+    ordered += [grant for grant in GRANTS if grant.get("option") == "allow_once"]
+    for grant in ordered:
+        problem = argv_problem(TOOL, argv, grant.get("worktree"))
+        if problem:
+            continue
+        if not _cwd_covers(grant.get("worktree")):
+            problem = "the command is outside the granted worktree"
+            continue
+        chosen = grant
+        break
+    if chosen is None:
+        option = _rg_option(argv) if TOOL == "rg" else None
+        if not option:
+            option = "worktree" if problem == "the command is outside the granted worktree" else "argv"
+        _refuse(option)
+    # rg reads RIPGREP_CONFIG_PATH and ~/.ripgreprc unless --no-config is set. The flag is forced here, after the
+    # argv policy, so a config file cannot put -z, --pre or --hostname-bin back. The environment is replaced, not inherited.
+    command = [REAL, "--no-config", *sys.argv[1:]] if TOOL == "rg" else [REAL, *sys.argv[1:]]
+    try:
+        os.execve(REAL, command, _exec_env())
+    except OSError:
+        _refuse("exec")
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+def shim_interpreter():
+    """Absolute python3 baked into the shim when the grant is written. -IS is applied by the shebang."""
+    for candidate in ("/usr/bin/python3", sys.executable):
+        if not isinstance(candidate, str) or not candidate or not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
+            continue
+        real = os.path.realpath(candidate)
+        if os.path.isfile(real) and os.access(real, os.X_OK) and ".." not in real.split("/"):
+            return real
+    raise RunnerError("python3 is not installed, so a shim cannot be written")
+
+
+def shim_script(tool, real, grants):
+    """A read-only standard-library program. It never imports the runner and never carries a Baton token.
+
+    The shebang is the interpreter resolved now, with -IS: isolated mode ignores PYTHON* and the user site, and -S
+    does not import site, so usercustomize cannot run. Argument checks use only os and sys. A refusal writes one
+    line to stderr and exits 126. It does not write a file and it does not call Baton.
+    """
+    interpreter = shim_interpreter()
+    rows = [{"id": grant["id"], "request_id": grant["request_id"], "task_id": grant["task_id"],
+             "worktree": grant.get("directory"), "option": grant.get("option")} for grant in grants]
+    parts = [
+        "#!%s -IS" % interpreter,
+        "# SPDX-License-Identifier: Apache-2.0",
+        "# Baton runner shim for %s. The worker can read this file and cannot write it." % tool,
+        "# Every call checks argv, then execve's the real program at the absolute path fixed when the grant was written.",
+        "# The interpreter is isolated (-IS). The environment passed to the real program is replaced",
+        "# (PATH=/usr/bin:/bin plus HOME, LANG, LC_*, TERM). rg is always passed --no-config.",
+        "# A refusal writes one stderr line and exits 126. It writes no file and does not call Baton.",
+        "# Policy: %s" % POLICY_ARGS[tool],
+        "import os, sys",
+        "TOOL = %r" % tool,
+        "REAL = %r" % real,
+        "GRANTS = %r" % (rows,),
+        "RG_LAUNCHERS = %r" % (tuple(sorted(RG_LAUNCHERS)),),
+    ]
+    parts.extend(inspect.getsource(function).rstrip() for function in _SHIM_FUNCTIONS)
+    parts.append("_GRANT_POLICIES = {%s}" % ", ".join("%r: %s" % (name, _GRANT_POLICIES[name].__name__)
+                                                       for name in sorted(_GRANT_POLICIES)))
+    parts.append(SHIM_MAIN.strip("\n"))
+    return "\n".join(parts) + "\n"
+
+
+def write_shim(path, tool, real, grants):
+    """Atomically install the shim as mode 0555. The directory stays writable by the runner and is remounted read-only for the worker."""
+    text = shim_script(tool, real, grants)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(str(path.parent), 0o755)
+    temporary = path.with_name("." + path.name + "." + uuid.uuid4().hex[:8] + ".tmp")
+    fd = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o555)
+    try:
+        os.write(fd, text.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.chmod(str(temporary), 0o555)
+    try:
+        os.replace(str(temporary), str(path))
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(str(temporary))
+        raise
+    os.chmod(str(path), 0o555)
+
+
+@dataclass(frozen=True)
+class Detector:
+    """One refusal message of one CLI. Named groups: command or tool, and optionally directory and reason."""
+    name: str
+    pattern: "re.Pattern"
+    kind: str = "command"
+    reason: str = None
+
+
+def _detector(name, pattern, kind="command", reason=None):
+    return Detector(name, re.compile(pattern, re.MULTILINE), kind, reason)
+
+
+# Output formats are the runner's best understanding of each CLI, not captured from the real programs: every sample in
+# tests/test_local_runner.py is synthetic. A message that does not match still raises a request, with a raw excerpt.
+DETECTORS = {
+    "agy": [_detector("run_command not in permissions.allow",
+                      r'Permission denied: run_command "(?P<command>[^"\n]+)" (?P<reason>is not in permissions\.allow)'
+                      r'(?: \(cwd: (?P<directory>[^)\n]+)\))?')],
+    "codex": [_detector("exec rejected by approval policy",
+                        r'^exec\n(?P<command>[^\n]+?) in (?P<directory>/[^\n]+)\n(?P<reason>[^\n]*'
+                        r'(?:requires approval|rejected|blocked by policy)[^\n]*)$')],
+    "grok": [_detector("bash denied in non-interactive mode",
+                       r'tool "bash" denied in non-interactive mode: command `(?P<command>[^`\n]+)` '
+                       r'(?P<reason>is not allowed by permissions)(?: \(cwd=(?P<directory>[^)\n]+)\))?')],
+    "cline": [_detector("command blocked by CLINE_COMMAND_PERMISSIONS",
+                        r'Command "(?P<command>[^"\n]+)" was blocked: (?P<reason>no allow rule in CLINE_COMMAND_PERMISSIONS '
+                        r'matches)(?: \(workdir: (?P<directory>[^)\n]+)\))?')],
+    "opencode": [_detector("bash permission auto-rejected",
+                           r'permission requested: bash \((?P<command>[^)\n]+)\); (?P<reason>auto-rejecting)'),
+                 _detector("non-command permission auto-rejected",
+                           r'permission requested: (?P<tool>external_directory|read|edit|write|webfetch|task) '
+                           r'\((?P<detail>[^)\n]+)\); (?P<reason>auto-rejecting)', kind="other")],
+    "dsh": [_detector("shell command denied without a prompt",
+                      r'dsh: shell command "(?P<command>[^"\n]+)" denied \((?P<reason>policy=[a-z]+, headless: no prompt '
+                      r'available)\)(?:; cwd=(?P<directory>\S+))?')],
+}
+# A refusal in a shape no detector knows. Deliberately narrow: ordinary EACCES "Permission denied" is not a policy wall.
+GENERIC_MARKER = re.compile(r"(?i)(requires? (?:user )?approval|not in the allow(?:ed)? list|denied by (?:policy|permission)"
+                            r"|permission requested[^\n]*auto-reject|no prompt available)")
+
+
+@dataclass
+class Denial:
+    cli: str
+    tool: str = None
+    command: str = None
+    command_full: str = None
+    directory: str = None
+    reason: str = None
+    kind: str = "command"
+    excerpt: str = None
+    detector: str = None
+    capture_problem: str = None
+
+
+@dataclass(frozen=True)
+class Profile:
+    """Where and how a CLI's own allowlist is written.
+
+    `exact` is true only when an entry is matched as that whole string. The runner then writes the shim's absolute
+    path and nothing else. A prefix or glob matcher cannot say "forbid --pre", so a CLI with exact=False is not grantable.
+    """
+    kind: str
+    keys: tuple
+    rule: str
+    exact: bool
+
+
+# Only agy's `permissions.allow` array of exact strings is documented in this repository (onboarding/agy.md). Opencode's
+# bash map is treated as an exact key match; that is an assumption the operator must confirm. Codex, grok, cline and dsh
+# are detected but not grantable: their documented matchers are prefix or glob, which cannot express a negative
+# constraint, and this repository does not have a syntax that is guaranteed to match one absolute path and nothing else.
+EXACT_TEMPLATE = "{shim}"
+CLI_PROFILES = {
+    "agy": Profile("json_list", ("permissions", "allow"), EXACT_TEMPLATE, True),
+    "codex": Profile("lines", (), EXACT_TEMPLATE, False),
+    "grok": Profile("json_list", ("permissions", "allow"), EXACT_TEMPLATE, False),
+    "cline": Profile("json_list", ("allow",), EXACT_TEMPLATE, False),
+    "opencode": Profile("json_map", ("permission", "bash"), EXACT_TEMPLATE, True),
+    "dsh": Profile("json_list", ("permissions", "allow"), EXACT_TEMPLATE, False),
+}
+
+
+def clip(text, limit):
+    """Cut to `limit` characters on one line (truncate() adds a newline, which the server refuses in single-line fields)."""
+    return text if len(text) <= limit else text[:max(0, limit - 3)] + "..."
+
+
+def one_line(text, limit, secrets=()):
+    text = redact(clean_text(str(text)), secrets)
+    return clip(re.sub(r"\s+", " ", text).strip(), limit)
+
+
+def program_name(command):
+    """The program of a command line, or None when the first word is not a plain program name (assignments, paths, shells)."""
+    words = command.split()
+    if not words or "=" in words[0]:
+        return None
+    name = os.path.basename(words[0].strip("\"'"))
+    return name if TOOL_RE.fullmatch(name) else None
+
+
+def excerpt_around(text, position, secrets):
+    """A bounded window of the raw output centred on the refusal, redacted. Never more than EXCERPT_CHARS."""
+    window = text[max(0, position - EXCERPT_CHARS // 3):position + EXCERPT_CHARS // 2]
+    return truncate(redact(clean_text(window), secrets).strip(), EXCERPT_CHARS) or None
+
+
+def capture_problem(text, match, command):
+    """Why this detector match is not one complete grantable line, or None.
+
+    Grantability uses only a raw line the detector consumed through the end of that line, with nothing after it.
+    A capture that stops at a quote or parenthesis leaves the rest of the line (or the next line) unchecked, so
+    `rg foo` followed by `"; rm` is posted for visibility and is not grantable. The same is true when the captured
+    command itself contains a quote, a backslash or a shell control operator.
+    """
+    if "\n" in text[match.start():match.end()]:
+        return "the refusal spans more than one line, so it is not grantable"
+    line_end = text.find("\n", match.end())
+    if line_end < 0:
+        line_end = len(text)
+    if text[match.end():line_end].strip():
+        return "the refusal line continues past the captured command, so it is not grantable"
+    if text[line_end:].strip():
+        return "the refusal spans more than one line, so it is not grantable"
+    if command and UNTRUSTED_COMMAND_RE.search(command):
+        return "the command line contains a quote, backslash or shell control operator and is not grantable"
+    return None
+
+
+def detect_denial(cli_name, text, secrets=()):
+    """Parse a CLI's refusal out of its output: the earliest detector match, else a bounded raw excerpt, else None."""
+    best = None
+    for detector in DETECTORS.get(cli_name, ()):
+        match = detector.pattern.search(text)
+        if match and (best is None or match.start() < best[1].start()):
+            best = (detector, match)
+    if best is None:
+        marker = GENERIC_MARKER.search(text)
+        if marker is None:
+            return None
+        return Denial(cli_name, reason=GENERIC_REASON, excerpt=excerpt_around(text, marker.start(), secrets))
+    detector, match = best
+    found = match.groupdict()
+    command = found.get("command") or found.get("tool") or ""
+    tool = program_name(command) if detector.kind == "command" else found.get("tool")
+    # `command` is the one-line field sent to Baton. `command_full` is the raw capture the grant check must use:
+    # clipping first would hide a `--pre` past FIELD_CHARS. `capture_problem` is set when that capture is not the
+    # whole refusal line, so an approval of it writes nothing.
+    denial = Denial(cli_name, tool=tool, command=one_line(command, FIELD_CHARS, secrets) or None,
+                    command_full=command or None, kind=detector.kind,
+                    directory=one_line(found["directory"], 4000, secrets) if found.get("directory") else None,
+                    reason=one_line(found.get("reason") or detector.reason or GENERIC_REASON, FIELD_CHARS, secrets),
+                    detector=detector.name, capture_problem=capture_problem(text, match, command))
+    if tool is None:
+        denial.excerpt = excerpt_around(text, match.start(), secrets)
+    return denial
+
+
+# An allowlist entry is this absolute path and nothing else: no glob, no space, no extra argument text.
+SHIM_RE = re.compile(r"/[A-Za-z0-9_./@+:-]{1,500}")
+
+
+def rule_template_of(permissions):
+    return permissions.rule_template or CLI_PROFILES[permissions.cli].rule
+
+
+def render_rule(permissions, shim_path):
+    """The allowlist entry for one shim: its absolute path, and only when this CLI matches that string exactly."""
+    profile = CLI_PROFILES[permissions.cli]
+    if not profile.exact or rule_template_of(permissions) != EXACT_TEMPLATE:
+        raise RunnerError("this CLI cannot be guaranteed to exact-match a shim path, so nothing is granted")
+    if (not isinstance(shim_path, str) or not SHIM_RE.fullmatch(shim_path)
+            or any(part == ".." for part in shim_path.split("/"))):
+        raise RunnerError("the shim path cannot be written as an exact allowlist entry")
+    return shim_path
+
+
+def refusal_grant_problem(permissions, principal, tool, command, worktree, active):
+    """Why this refusal cannot become a grant, or None when a request may be posted."""
+    if is_ungrantable(tool):
+        return "%s cannot be allowlisted through Baton (it is not on the allow-list)" % tool
+    problem = argument_problem(tool, command, worktree)
+    if problem:
+        return problem
+    name = tool_basename(tool)
+    if not CLI_PROFILES[permissions.cli].exact or rule_template_of(permissions) != EXACT_TEMPLATE:
+        return "this CLI cannot be guaranteed to exact-match a shim path, so nothing is granted"
+    if resolve_real_binary(name) is None:
+        return "the real %s program is not installed, so nothing is granted" % name
+    try:
+        render_rule(permissions, os.path.realpath(shim_path(principal, name)))
+    except RunnerError as error:
+        return str(error)
+    if any(record.get("tool") == name and record.get("directory") == worktree and record.get("status") == "active"
+           for record in active):
+        return "the CLI still refused %s although it is already allowlisted for this worktree" % tool
+    return None
+
+
+def replace_file(path, text):
+    """Atomic replace that keeps the existing file's mode (a new file is 0600)."""
+    path = Path(path)
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        mode = 0o600
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name("." + path.name + "." + uuid.uuid4().hex[:8] + ".tmp")
+    fd = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        os.write(fd, text.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.chmod(str(temporary), mode)
+    os.replace(str(temporary), str(path))
+
+
+def edit_rule(path, profile, rule, add, dry_run=False):
+    """Add or remove one allowlist entry in the CLI's configuration, leaving everything else as it was.
+
+    Returns whether the file changed (with dry_run: whether the rule is present, changing nothing). A file this cannot parse
+    or a structure it does not expect is refused, not rewritten.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8") if Path(path).exists() else ""
+    except (OSError, UnicodeDecodeError):
+        raise RunnerError("cannot read the CLI configuration") from None
+    if profile.kind == "lines":
+        lines = text.splitlines()
+        if dry_run:
+            return rule in lines
+        if (rule in lines) == add:
+            return False
+        lines = lines + [rule] if add else [line for line in lines if line != rule]
+        replace_file(path, "\n".join(lines) + "\n" if lines else "")
+        return True
+    try:
+        data = json.loads(text) if text.strip() else {}
+    except ValueError:
+        raise RunnerError("the CLI configuration is not plain JSON; edit it by hand") from None
+    if not isinstance(data, dict):
+        raise RunnerError("the CLI configuration has an unexpected structure")
+    node = data
+    for key in profile.keys[:-1]:
+        child = node.get(key)
+        if child is None and add and not dry_run:
+            child = node[key] = {}
+        if child is None:
+            return False
+        if not isinstance(child, dict):
+            raise RunnerError("the CLI configuration has an unexpected structure")
+        node = child
+    leaf, wanted = profile.keys[-1], list if profile.kind == "json_list" else dict
+    container = node.get(leaf)
+    if container is None and add and not dry_run:
+        container = node[leaf] = wanted()
+    if container is None:
+        return False
+    if not isinstance(container, wanted):
+        raise RunnerError("the CLI configuration has an unexpected structure")
+    present = rule in container
+    if dry_run:
+        return present
+    if present == add:
+        return False
+    if profile.kind == "json_list":
+        container.append(rule) if add else container.remove(rule)
+    elif add:
+        container[rule] = "allow"
+    else:
+        del container[rule]
+    replace_file(path, json.dumps(data, indent=2) + "\n")
+    return True
+
+
+class GrantLedger:
+    """Per-worker record of every rule the runner added, so each can be listed and withdrawn exactly.
+
+    One lock file serializes the runner and the revoke command, which may be separate processes, around both the ledger and
+    the CLI configuration they edit. The ledger is always written first: an entry is `pending` before its rule reaches the
+    CLI configuration and `active` only after, so a crash between the two leaves an entry that settle_pending() can undo.
+    """
+
+    LOCK_WAIT_SECONDS = 10.0
+
+    def __init__(self, state_dir, principal):
+        self.principal = principal
+        self.path = Path(state_dir) / (principal + ".grants.json")
+        self.lock_path = Path(state_dir) / (principal + ".grants.lock")
+        self.thread_lock = threading.Lock()
+
+    @contextlib.contextmanager
+    def locked(self):
+        """Exclusive, but never indefinitely: a stuck holder makes this fail rather than stall the runner."""
+        if not self.thread_lock.acquire(timeout=self.LOCK_WAIT_SECONDS):
+            raise RunnerError("the grant ledger is busy")
+        try:
+            fd = os.open(str(self.lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
+            try:
+                deadline = time.monotonic() + self.LOCK_WAIT_SECONDS
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise RunnerError("the grant ledger is busy") from None
+                        time.sleep(0.05)
+                yield
+            finally:
+                os.close(fd)
+        finally:
+            self.thread_lock.release()
+
+    def load(self):
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            raise RunnerError("cannot read the grant ledger") from None
+        grants = data.get("grants") if isinstance(data, dict) else None
+        return {key: value for key, value in (grants or {}).items() if isinstance(value, dict)}
+
+    def save(self, grants):
+        write_private(self.path, json.dumps({"grants": grants}, sort_keys=True) + "\n")
+
+    @staticmethod
+    def holders(grants, record):
+        """Other entries that may have put the same rule in the same file (pending ones included)."""
+        return [other for other in grants.values() if other is not record and other.get("status") in ("active", "pending")
+                and (other["config_file"], other["rule"]) == (record["config_file"], record["rule"])]
+
+    @staticmethod
+    def confined(worker, path):
+        """The file is still inside this worker's own home_read and not writable by its CLI (symlinks resolved now)."""
+        real = os.path.realpath(path)
+        def within(entries):
+            return any(real == os.path.realpath(entry) or _inside(real, os.path.realpath(entry)) for entry in entries)
+        return within(worker.home_read) and not within(worker.sandbox.extra_write_paths)
+
+    def _undo(self, grants, record, confined=True):
+        """Take the rule back out unless it was not ours or another entry still needs it; raises when it cannot."""
+        if not record["preexisting"] and not self.holders(grants, record):
+            profile = CLI_PROFILES[record["cli"]]
+            if not confined:
+                raise RunnerError("the CLI configuration moved outside the worker's directories")
+            edit_rule(record["config_file"], profile, record["rule"], False)
+            if edit_rule(record["config_file"], profile, record["rule"], False, dry_run=True):
+                raise RunnerError("the rule is still present in the CLI configuration")
+
+    def _refresh_shim(self, grants, record):
+        """Rewrite the shim from the grants that still hold it, or delete the file when none do.
+
+        Records planted without a shim path (a crash leftover from before shims) leave the file alone.
+        """
+        path, tool = record.get("shim"), record.get("tool")
+        if not path or not tool or not record.get("real"):
+            return
+        living = [other for other in grants.values() if other.get("tool") == tool and other.get("shim") and other.get("real")
+                  and other.get("status") in ("active", "pending")]
+        if not living:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path)
+            return
+        living.sort(key=lambda item: item.get("created") or 0)
+        current = living[-1]
+        write_shim(current["shim"], tool, current["real"], living)
+
+    def add(self, worker, request, tool, directory, command):
+        """Record, install the shim, then write its absolute path into the allowlist. Undo with remove().
+
+        `directory` is the runner's own task worktree, never a path taken from CLI output. The allowlist entry is
+        only that shim's absolute path. The shim, not the CLI rule, checks the argument policy on every later call.
+        """
+        permissions = worker.permissions
+        profile = CLI_PROFILES[permissions.cli]
+        name = tool_basename(tool)
+        if is_ungrantable(name):
+            raise RunnerError("%s is not on the allow-list and is never granted" % name)
+        problem = argument_problem(name, command, directory)
+        if problem:
+            raise RunnerError(problem)
+        real = resolve_real_binary(name)
+        if real is None:
+            raise RunnerError("the real %s program is not installed, so nothing is granted" % name)
+        if not profile.exact or rule_template_of(permissions) != EXACT_TEMPLATE:
+            raise RunnerError("this CLI cannot be guaranteed to exact-match a shim path, so nothing is granted")
+        ensure_shim_dirs(worker.principal)
+        if shim_inside_writable(worker):
+            raise RunnerError("permission shims would be inside a writable directory")
+        shim = os.path.realpath(shim_path(worker.principal, name))
+        rule = render_rule(permissions, shim)
+        path = os.path.realpath(permissions.config_file)
+        if not self.confined(worker, path):
+            raise RunnerError("the CLI configuration is not inside the worker's own directories")
+        with self.locked():
+            grants = self.load()
+            record = {"id": uuid.uuid4().hex, "request_id": request["request_id"], "task_id": request["task_id"],
+                      "tool": name, "directory": directory, "rule": rule, "shim": shim, "real": real,
+                      "option": request["status"], "cli": permissions.cli, "config_file": path, "status": "pending",
+                      "granted_reported": False, "revoked_reported": False, "created": time.time()}
+            holders = self.holders(grants, record)
+            # An entry that was there before the runner touched the file is the operator's: it is never removed.
+            record["preexisting"] = edit_rule(path, profile, rule, True, dry_run=True) and (
+                not holders or any(h.get("preexisting") for h in holders))
+            grants[record["id"]] = record
+            self.save(grants)
+            try:
+                self._refresh_shim(grants, record)
+                edit_rule(path, profile, rule, True)
+                if not edit_rule(path, profile, rule, True, dry_run=True):
+                    raise RunnerError("the rule did not reach the CLI configuration")
+                record["status"] = "active"
+                self.save(grants)
+            except BaseException:
+                with contextlib.suppress(RunnerError, OSError):
+                    self._undo(grants, record)
+                    record["status"] = "revoked"
+                    record["revoked_reported"] = True
+                    self._refresh_shim(grants, record)
+                    self.save(grants)
+                raise
+            return dict(record)
+
+    def remove(self, worker, grant_id):
+        """Withdraw one active grant: drop it from the shim and check the allowlist entry is really gone."""
+        with self.locked():
+            grants = self.load()
+            record = grants.get(grant_id)
+            if record is None or record.get("status") != "active":
+                return None
+            self._undo(grants, record, self.confined(worker, record["config_file"]))
+            record["status"] = "revoked"
+            self._refresh_shim(grants, record)
+            self.save(grants)
+            return dict(record)
+
+    def settle_pending(self, worker):
+        """After a crash between the ledger write and the activation: withdraw any rule such an entry may have written.
+
+        Each entry is settled on its own. One that cannot be undone stays pending and is reported back; the rest still run.
+        """
+        failed = []
+        with self.locked():
+            grants = self.load()
+            for record in list(grants.values()):
+                if record.get("status") != "pending":
+                    continue
+                try:
+                    self._undo(grants, record, self.confined(worker, record["config_file"]))
+                    record["status"] = "revoked"
+                    record["revoked_reported"] = True
+                    self._refresh_shim(grants, record)
+                    self.save(grants)
+                except (RunnerError, OSError) as error:
+                    failed.append((record.get("id"), str(error) if isinstance(error, RunnerError) else "the CLI configuration is not writable"))
+        return failed
+
+    def mark(self, grant_id, **values):
+        with self.locked():
+            grants = self.load()
+            if grant_id in grants:
+                grants[grant_id].update(values)
+                self.save(grants)
+
+    def active(self):
+        with self.locked():
+            return [dict(record) for record in self.load().values() if record.get("status") == "active"]
+
+    def unreported(self):
+        with self.locked():
+            return [dict(record) for record in self.load().values()
+                    if (record.get("status") == "revoked" and not record.get("revoked_reported"))
+                    or (record.get("status") == "active" and not record.get("granted_reported"))]
+
+
 # --- Baton access ----------------------------------------------------------------------------------
 
 class Baton:
@@ -949,7 +2089,8 @@ class Baton:
         return self.client.call(operation, arguments, read_timeout=read_timeout)
 
     def write(self, operation, arguments):
-        arguments = dict(arguments, operation_id=str(uuid.uuid4()))
+        arguments = dict(arguments)
+        arguments.setdefault("operation_id", str(uuid.uuid4()))
         for attempt in range(1, self.ATTEMPTS + 1):
             try:
                 return self.client.call(operation, arguments)
@@ -966,6 +2107,114 @@ def error_code(error):
         return error.category
     return type(error).__name__
 
+
+class GrantKeeper:
+    """Applies, reports and withdraws one worker's grants. `baton` may be None (token unreadable): withdrawal still works
+    and the report is retried later."""
+
+    def __init__(self, worker, ledger, baton, log):
+        self.worker, self.ledger, self.baton, self.log = worker, ledger, baton, log
+
+    def _bind_operation(self, record, kind):
+        """The operation id of a granted or revoked report, saved before the call so a lost response can be replayed."""
+        key = kind + "_operation_id"
+        current = record.get(key)
+        if isinstance(current, str) and current:
+            return current
+        operation = str(uuid.uuid4())
+        record[key] = operation
+        with contextlib.suppress(RunnerError, OSError):
+            self.ledger.mark(record["id"], **{key: operation})
+        return operation
+
+    def _report(self, record, kind, reason=None):
+        """True when Baton accepted the report. A Baton or network error is returned so the caller can retry.
+
+        Granted and revoked reports also mark the ledger. `revoked_reported` is set only after the server
+        acknowledges the revoke. A granted report whose response was lost keeps the same operation id and is
+        retried by reconcile instead of being treated as already revoked.
+        """
+        if self.baton is None:
+            return False
+        arguments = {"task_id": record["task_id"], "request_id": record["request_id"], "event": kind}
+        if reason:
+            arguments["reason"] = reason
+        if kind in ("granted", "revoked"):
+            arguments["operation_id"] = self._bind_operation(record, kind)
+        elif record.get("operation_id"):
+            arguments["operation_id"] = record["operation_id"]
+        try:
+            self.baton.write("record_permission", arguments)
+        except (cli.BatonError, cli.NetworkError) as error:
+            self.log(record["task_id"], "grant-unreported", event=kind, error=error_code(error))
+            return error
+        if kind in ("granted", "revoked"):
+            record[kind + "_reported"] = True
+            try:
+                self.ledger.mark(record["id"], **{kind + "_reported": True})
+            except (RunnerError, OSError):
+                self.log(record["task_id"], "grant-ledger-unwritten", event=kind)
+        return True
+
+    def grant(self, request, tool, directory, command=None):
+        """Write the approved rule into the CLI's allowlist and audit it; a grant that cannot be audited is withdrawn.
+
+        `directory` is the task worktree. `command` is the command line that was checked against the argument policy;
+        a bare program name is used when the caller already knows that is the whole command.
+        """
+        try:
+            record = self.ledger.add(self.worker, request, tool, directory, command if command is not None else tool_basename(tool))
+        except (RunnerError, OSError) as error:
+            raise RunnerError("could not apply the approved permission: " + (str(error) if isinstance(error, RunnerError)
+                                                                               else "the CLI configuration is not writable")) from None
+        if self._report(record, "granted") is not True:
+            self.revoke(record["id"])
+            raise RunnerError("the approved permission could not be recorded in Baton and was withdrawn")
+        self.log(record["task_id"], "grant-applied", tool=tool, option=record["option"], grant=record["id"])
+        return record
+
+    def revoke(self, grant_id):
+        """True when withdrawn, None when there was nothing active under that id, False when the rule could not be removed."""
+        try:
+            record = self.ledger.remove(self.worker, grant_id)
+        except (RunnerError, OSError):
+            self.log(None, "grant-revoke-failed", grant=grant_id)
+            return False
+        if record is None:
+            return None
+        if record.get("granted_reported"):
+            self._report(record, "revoked")
+        self.log(record["task_id"], "grant-revoked", tool=record["tool"], grant=grant_id)
+        return True
+
+    def reconcile(self):
+        """After a crash: undo entries that never became active, withdraw leftover allow-once grants, finish unreported
+        audits, and withdraw what cannot be audited. One entry that cannot be settled does not stop the others."""
+        try:
+            failed = self.ledger.settle_pending(self.worker)
+        except (RunnerError, OSError):
+            self.log(None, "grant-reconcile-failed", grant="ledger")
+            failed = []
+        for grant_id, reason in failed:
+            self.log(None, "grant-reconcile-failed", grant=grant_id, reason=one_line(str(reason), 200))
+        try:
+            for record in self.ledger.active():
+                if record["option"] == "allow_once":
+                    self.revoke(record["id"])
+        except (RunnerError, OSError):
+            self.log(None, "grant-reconcile-failed", grant="allow_once")
+        try:
+            for record in self.ledger.unreported():
+                if record["status"] == "revoked":
+                    # The granted call may have committed even though its response was lost. Replay that operation
+                    # before reporting the revoke, and leave both flags unset until the server answers.
+                    if not record.get("granted_reported") and self._report(record, "granted") is not True:
+                        continue
+                    self._report(record, "revoked")
+                elif self._report(record, "granted") is not True:
+                    self.revoke(record["id"])
+        except (RunnerError, OSError):
+            self.log(None, "grant-reconcile-failed", grant="unreported")
 
 def call_interruptible(stop, work):
     """Run work() in a helper thread so a stop request is noticed while a long poll is in flight."""
@@ -990,14 +2239,43 @@ def call_interruptible(stop, work):
 
 # --- worker ----------------------------------------------------------------------------------------
 
+class RedactionSecrets:
+    """Secret values of one worker run, shared by every thread of that run.
+
+    The runner fills tokens and passthrough values before any thread starts. Keychain values are added under the
+    lock when the run reads them, so a comment or result on any thread redacts the same set. Cleared at teardown
+    only after those threads have joined.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._values = []
+
+    def extend(self, values):
+        with self._lock:
+            for value in values or ():
+                if value and value not in self._values:
+                    self._values.append(value)
+
+    def snapshot(self):
+        with self._lock:
+            return tuple(self._values)
+
+    def clear(self):
+        with self._lock:
+            self._values.clear()
+
+
 class WorkerRunner:
     def __init__(self, runner, worker, baton, state):
         self.runner, self.worker, self.baton, self.state = runner, worker, baton, state
         self.config, self.stop = runner.config, runner.stop
-        self.task_local = threading.local()
+        self.redaction = RedactionSecrets()
         self.queue = queue.Queue()
         self.inflight, self.inflight_lock = set(), threading.Lock()
         self.deferrals, self.threads, self.timers = {}, [], []
+        self.keeper = (GrantKeeper(worker, GrantLedger(self.config.state_dir, worker.principal), baton, self.log)
+                       if worker.permissions else None)
 
     @property
     def principal(self):
@@ -1005,13 +2283,15 @@ class WorkerRunner:
 
     @property
     def secrets(self):
-        """Tokens and passthrough values, plus the Keychain values of the task this thread is running."""
-        return list(self.runner.secrets) + list(getattr(self.task_local, "secrets", ()))
+        """A snapshot of the secrets shared by every thread of this worker run."""
+        return list(self.redaction.snapshot())
 
     def log(self, task_id, what, **fields):
         event(self.principal, task_id, what, **fields)
 
     def start(self):
+        # Tokens and passthrough values are known before any thread of this run exists.
+        self.redaction.extend(self.runner.secrets)
         for task_id in self.state.open_tasks():
             self.schedule(task_id, 0)
         self.threads.append(threading.Thread(target=self.poll_loop, name="poll-" + self.principal, daemon=True))
@@ -1037,6 +2317,11 @@ class WorkerRunner:
     # polling
 
     def poll_loop(self):
+        if self.keeper is not None:
+            try:
+                self.keeper.reconcile()
+            except (RunnerError, OSError):
+                self.log(None, "grant-reconcile-failed")
         try:
             seq = self.state.load_seq()
             self.state.save_seq(seq)
@@ -1204,38 +2489,215 @@ class WorkerRunner:
         renewer.start()
         workdir = Path(worker.workdir_root) / task_id
         tmpdir = Path(worker.workdir_root) / ".tmp" / task_id
-        outcome, files, failure = None, None, None
-        keychain = {}
+        outcome, files, failure, denied = None, None, None, None
+        once = []
         try:
             try:
                 prompt = claimed.get("prompt") or view.get("prompt")
                 if not isinstance(prompt, str) or not prompt.strip():
                     raise RunnerError("task has no prompt")
-                if worker.env_from_keychain:
-                    keychain = read_keychain(self.runner.security_bin, worker.env_from_keychain)
-                    self.task_local.secrets = list(keychain.values())
                 commit, admin = create_worktree(config, str(workdir), claimed.get("base_commit"), claimed.get("scopes"))
                 prompt_file = self.prepare_temp(tmpdir, task_id, prompt, claimed.get("scopes"))
                 argv = self.build_argv(_real(str(prompt_file)))
                 plan = self.sandbox_plan(workdir, tmpdir, admin)
-                env = self.child_env(tmpdir, keychain)
-                try:
-                    outcome = run_child(wrap_command(plan, argv), str(workdir), env, self.stdin_bytes(prompt_file),
-                                        worker.task_timeout_seconds, config.output_cap_bytes, self.stop, lease_lost)
-                finally:
-                    env.clear()
-                    keychain.clear()
+
+                def launch():
+                    keychain = {}
+                    try:
+                        if worker.env_from_keychain:
+                            keychain = read_keychain(self.runner.security_bin, worker.env_from_keychain)
+                            # Visible to every thread of this run, not only the one that read the Keychain.
+                            self.redaction.extend(keychain.values())
+                        env = self.child_env(tmpdir, keychain)
+                        try:
+                            return run_child(wrap_command(plan, argv), str(workdir), env, self.stdin_bytes(prompt_file),
+                                             worker.task_timeout_seconds, config.output_cap_bytes, self.stop, lease_lost)
+                        finally:
+                            env.clear()
+                    finally:
+                        keychain.clear()
+
+                outcome = launch()
+                outcome, failure, denied = self.permission_loop(task_id, page_id, epoch, lease, outcome, launch, lease_lost,
+                                                                once, plan)
                 files = changed_files(admin, str(workdir))
             except RunnerError as error:
                 failure = str(error)
         finally:
             renewing.set()
             renewer.join(10)
+            # Revoke allow_once before the result is posted. The shim keeps no counter and writes no refusal file.
+            self.end_task_grants(task_id, once)
             shutil.rmtree(str(tmpdir), ignore_errors=True)
-        try:
+        if denied is not None:
+            self.permission_denied(task_id, page_id, epoch, denied)
+        else:
             self.finish_task(task_id, page_id, epoch, outcome, files, failure)
-        finally:
-            self.task_local.secrets = ()
+
+    # permission requests
+
+    def denial_of(self, outcome):
+        """The CLI's permission refusal in a failed run's output, or None (also for runs ended by timeout, stop or lease loss)."""
+        if (outcome is None or outcome.exit_code in (0, None) or outcome.timed_out or outcome.stopped or outcome.lease_lost
+                or outcome.start_error):
+            return None
+        text = outcome.stderr.text(self.secrets) + "\n" + outcome.stdout.text(self.secrets)
+        return detect_denial(self.worker.permissions.cli, text, self.secrets)
+
+    def grant_problem(self, denial, plan):
+        """Why a refusal cannot be answered with an allowlist entry, or None. Unparsed refusals are still posted, for visibility.
+
+        The directory is always this task's worktree (`plan.worktree`). A path in the CLI's output is not consulted: the
+        program under test can print whatever directory it likes, including this worktree's own path.
+        """
+        if denial.tool is None:
+            return None
+        if denial.kind != "command":
+            return "the CLI wants %s permission, which is outside the command allowlist and is never granted here" % plain(denial.tool)
+        # The clipped `command` field is only for the request text. The policy sees the raw capture.
+        return refusal_grant_problem(self.worker.permissions, self.principal, denial.tool,
+                                     denial.command_full if denial.command_full is not None else denial.command,
+                                     plan.worktree, self.keeper.ledger.active())
+
+    def post_request(self, task_id, epoch, denial, worktree):
+        permissions = self.worker.permissions
+        reason = one_line(denial.reason or GENERIC_REASON, FIELD_CHARS, self.secrets)
+        tool_text = one_line(denial.tool or UNPARSED_TOOL, 200, self.secrets)
+        if denial.capture_problem:
+            reason = clip(reason + "; not grantable: " + denial.capture_problem, FIELD_CHARS)
+        elif denial.command:
+            reason = clip(reason + "; command: " + denial.command, FIELD_CHARS)
+        arguments = {"task_id": task_id, "epoch": epoch, "cli": permissions.cli, "tool": tool_text,
+                     "reason": reason, "approvers": permissions.approvers, "ttl_seconds": min(86400, permissions.wait_seconds + 60),
+                     "directory": clip(worktree, 500)}
+        if denial.excerpt:
+            arguments["excerpt"] = redact(denial.excerpt, self.secrets)
+        try:
+            request = self.baton.write("request_permission", arguments)
+        except (cli.BatonError, cli.NetworkError) as error:
+            raise RunnerError("permission request failed (%s)" % error_code(error)) from None
+        if not isinstance(request, dict) or not UUID_RE.fullmatch(str(request.get("request_id"))):
+            raise RunnerError("permission request failed (bad response)")
+        return request
+
+    def await_decision(self, task_id, request_id, lease_lost):
+        """Poll until an approver decides; the renew thread keeps the claim alive meanwhile. Returns (kind, request)."""
+        permissions = self.worker.permissions
+        deadline = time.monotonic() + permissions.wait_seconds
+        while True:
+            if lease_lost.is_set():
+                return "lease_lost", None
+            try:
+                requests = self.baton.read("list_permissions", {"task_id": task_id})
+            except (cli.BatonError, cli.NetworkError) as error:
+                if not cli.transient(error):
+                    raise RunnerError("permission request could not be read (%s)" % error_code(error)) from None
+                requests = []
+            request = next((item for item in requests if isinstance(item, dict) and item.get("request_id") == request_id), None) \
+                if isinstance(requests, list) else None
+            if request is not None and request.get("status") in ("expired", "cancelled"):
+                raise RunnerError("permission request %s before any decision" % request["status"])
+            if request is not None and request.get("status") != "pending":
+                if request.get("status") not in PERMISSION_OPTIONS or request.get("decided_by") == self.principal:
+                    raise RunnerError("permission decision was not accepted: it did not come from an approver")
+                return "decided", request
+            if time.monotonic() >= deadline:
+                raise RunnerError("permission request was not answered within %ds" % permissions.wait_seconds)
+            if self.stop.wait(permissions.poll_seconds):
+                return "stopped", None
+
+    def cancel_request(self, task_id, request_id):
+        """Best effort: a request nobody will answer must not keep the task from asking again."""
+        try:
+            self.baton.write("cancel_permission", {"task_id": task_id, "request_id": request_id})
+        except (cli.BatonError, cli.NetworkError) as error:
+            self.log(task_id, "permission-cancel-failed", error=error_code(error))
+
+    def permission_loop(self, task_id, page_id, epoch, lease, outcome, launch, lease_lost, once, plan):
+        """After a refused run, ask for the permission and re-run in the same worktree on approval.
+
+        Returns (outcome, failure, denied request). The claim, epoch and worktree are the task's own throughout.
+        """
+        permissions, rounds = self.worker.permissions, 0
+        try:
+            while permissions is not None:
+                denial = self.denial_of(outcome)
+                if denial is None:
+                    break
+                if rounds >= permissions.max_requests:
+                    return outcome, "gave up after %d permission requests" % rounds, None
+                problem = self.grant_problem(denial, plan)
+                # An incomplete capture is still posted so a person can see it. An approval writes nothing.
+                if problem and not denial.capture_problem:
+                    return outcome, "permission needed but not requested: " + problem, None
+                rounds += 1
+                request = self.post_request(task_id, epoch, denial, plan.worktree)
+                self.log(task_id, "permission-requested", request=request["request_id"], tool=denial.tool or "unparsed")
+                try:
+                    kind, decided = self.await_decision(task_id, request["request_id"], lease_lost)
+                except RunnerError:
+                    self.cancel_request(task_id, request["request_id"])
+                    raise
+                if kind != "decided":
+                    self.cancel_request(task_id, request["request_id"])
+                    outcome.stopped, outcome.lease_lost = kind == "stopped", kind == "lease_lost"
+                    return outcome, None, None
+                self.log(task_id, "permission-decided", request=request["request_id"], decision=decided["status"],
+                         by=decided.get("decided_by"))
+                if decided["status"] == "deny":
+                    return outcome, None, decided
+                if denial.capture_problem or problem:
+                    return outcome, None, {**decided, "not_applied": denial.capture_problem or problem}
+                if denial.tool is None:
+                    raise RunnerError("permission approved, but the refused tool could not be identified; add it to the "
+                                      "CLI's allowlist by hand")
+                record = self.keeper.grant(decided, denial.tool, plan.worktree,
+                                           denial.command_full if denial.command_full is not None else denial.command)
+                if decided["status"] == "allow_once":
+                    once.append(record["id"])
+                self.baton.write("renew", {"task_id": task_id, "epoch": epoch, "lease_seconds": lease})
+                self.comment(task_id, page_id, "Permission %s granted for `%s` (request %s); resuming this task in the same "
+                                               "worktree and epoch %d." % (decided["status"], denial.tool, request["request_id"], epoch))
+                outcome = launch()
+            return outcome, None, None
+        except cli.BatonError as error:
+            if error.status == 409:
+                outcome.lease_lost = True
+                return outcome, None, None
+            return outcome, "baton call failed (%s)" % error_code(error), None
+        except cli.NetworkError as error:
+            return outcome, "baton call failed (%s)" % error_code(error), None
+        except RunnerError as error:
+            return outcome, str(error), None
+
+    def drop_once_grants(self, task_id, grant_ids):
+        for grant_id in grant_ids:
+            if self.keeper.revoke(grant_id) is False:
+                self.log(task_id, "grant-left-active", grant=grant_id)
+
+    def end_task_grants(self, task_id, once):
+        """Withdraw allow_once before the task result is posted. The shim writes no counter and no refusal file."""
+        self.drop_once_grants(task_id, once)
+
+    def permission_denied(self, task_id, page_id, epoch, request):
+        self.log(task_id, "permission-denied", request=request["request_id"])
+        tool = plain(request.get("tool"))
+        if request.get("not_applied"):
+            self.comment(task_id, page_id, "Permission %s for `%s` (request %s) was not applied: %s. Nothing was written."
+                                           % (plain(request.get("status")), tool, request["request_id"],
+                                              plain(request["not_applied"])))
+        else:
+            self.comment(task_id, page_id, "Permission denied by %s for `%s` (request %s). The task is blocked and the runner will "
+                                           "not retry it." % (plain(request.get("decided_by")), tool, request["request_id"]))
+        note = redact("permission_denied: %s (request %s)" % (tool, request["request_id"]), self.secrets)
+        if self.release_lease(task_id, epoch):
+            try:
+                self.baton.write("mark_blocked", {"task_id": task_id, "reason_code": "other", "note": note})
+            except (cli.BatonError, cli.NetworkError) as error:
+                self.log(task_id, "mark-blocked-failed", error=error_code(error))
+        else:
+            self.log(task_id, "mark-blocked-skipped")
+        self.state.update(task_id, state="handed_back")
 
     def finish_task(self, task_id, page_id, epoch, outcome, files, failure):
         if outcome is not None and outcome.stopped:
@@ -1297,6 +2759,11 @@ class WorkerRunner:
 
     def sandbox_plan(self, workdir, tmpdir, admin=None):
         workers = self.runner.config.workers
+        shim_read = []
+        if self.worker.permissions is not None:
+            shim_directory = os.path.realpath(shim_dir(self.principal))
+            if os.path.isdir(shim_directory):
+                shim_read.append(shim_directory)
         return SandboxPlan(
             backend=self.worker.sandbox.backend, allow_network=self.worker.sandbox.allow_network,
             worktree=_real(str(workdir)), tmpdir=_real(str(tmpdir)), own_root=_real(self.worker.workdir_root),
@@ -1310,11 +2777,14 @@ class WorkerRunner:
                            [_real(os.path.join(os.path.expanduser("~"), "Library", "Keychains")),
                             _real("/Library/Keychains")]),
             home_dirs=sorted({os.path.normpath(os.path.expanduser("~")), _real(os.path.expanduser("~"))}),
-            home_read=self.home_read_paths(admin))
+            home_read=self.home_read_paths(admin), shim_read=shim_read)
 
     def child_env(self, tmpdir, keychain=None):
         home = os.path.expanduser("~") if self.worker.home == "real" else str(tmpdir / "home")
-        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": home,
+        path = os.environ.get("PATH", "/usr/bin:/bin")
+        if self.worker.permissions is not None:
+            path = os.path.realpath(shim_dir(self.principal)) + os.pathsep + path
+        env = {"PATH": path, "HOME": home,
                "LANG": os.environ.get("LANG", "C.UTF-8"), "TERM": os.environ.get("TERM", "dumb"),
                "TMPDIR": str(tmpdir / "tmp")}
         for name in self.worker.env_passthrough:
@@ -1436,6 +2906,7 @@ class Runner:
         self.workers = []
         self.refusals = []
         self.cap = None
+        self.state_lock = None
 
     def refuse(self, worker, reason):
         self.refusals.append((worker.principal, reason))
@@ -1473,6 +2944,9 @@ class Runner:
             if worker.implicit_auto_approve and worker.sandbox.backend == "none":
                 self.refuse(worker, "implicit auto-approve needs a sandbox backend")
                 continue
+            if worker.permissions is not None and worker.sandbox.backend == "none":
+                self.refuse(worker, "permissions need a sandbox backend")
+                continue
             if worker.env_from_keychain:
                 if self.platform != "darwin":
                     self.refuse(worker, "env_from_keychain is only supported on macOS")
@@ -1491,6 +2965,15 @@ class Runner:
             if missing:
                 self.refuse(worker, "sandbox.extra_write_paths entry is not a directory")
                 continue
+            if worker.permissions is not None:
+                try:
+                    ensure_shim_dirs(worker.principal)
+                except (OSError, RunnerError):
+                    self.refuse(worker, "permission shim directory could not be created")
+                    continue
+                if shim_inside_writable(worker):
+                    self.refuse(worker, "permission shims would be inside a writable directory")
+                    continue
             if worker.allow_keychain and worker.sandbox.backend != "none":
                 event(worker.principal, None, "WARNING allow_keychain=true: the sandbox lets this worker's CLI "
                       "read the Keychain, so any secret stored there can be exfiltrated over the network")
@@ -1502,8 +2985,26 @@ class Runner:
             self.workers.append(WorkerRunner(self, worker, Baton(client, self.stop), state))
         return self.workers
 
+    def hold_state_dir(self):
+        """One runner per state_dir: a second one's startup cleanup would withdraw grants the first is still using."""
+        fd = os.open(str(Path(self.config.state_dir) / "runner.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            raise ConfigError("another runner is already using this state_dir") from None
+        self.state_lock = fd
+
+    def release_state_dir(self):
+        fd, self.state_lock = self.state_lock, None
+        if fd is not None:
+            os.close(fd)
+
     def start(self):
-        for worker in self.prepare():
+        workers = self.prepare()
+        if workers:
+            self.hold_state_dir()
+        for worker in workers:
             worker.start()
             event(worker.principal, None, "started", concurrency=worker.worker.concurrency,
                   sandbox=worker.worker.sandbox.backend)
@@ -1516,9 +3017,16 @@ class Runner:
 
     def join(self, timeout=15):
         deadline = time.monotonic() + timeout
+        pending = False
         for worker in self.workers:
             for thread in worker.threads:
                 thread.join(max(0.0, deadline - time.monotonic()))
+            if all(not thread.is_alive() for thread in worker.threads):
+                worker.redaction.clear()
+            else:
+                pending = True
+        if not pending:
+            self.release_state_dir()
 
 
 def build_parser():
@@ -1526,13 +3034,73 @@ def build_parser():
                                      formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False)
     parser.add_argument("--config", required=True, metavar="PATH", help="JSON config file; its mode must be 0600")
     parser.add_argument("--check", action="store_true", help="validate the config and each worker, then exit")
+    parser.add_argument("--list-grants", action="store_true",
+                        help="print the permission grants the runner added to each worker's CLI allowlist, then exit")
+    parser.add_argument("--revoke-grant", metavar="ID", help="withdraw one grant by id (see --list-grants), then exit")
+    parser.add_argument("--revoke-worker", metavar="PRINCIPAL",
+                        help="withdraw every active grant of this one worker, then exit")
     return parser
 
 
+def grant_keepers(config):
+    """One GrantKeeper per worker that has a permissions block; Baton access only where the token is readable."""
+    endpoint = cli.parse_endpoint(config.url)
+    context = cli.tls_context(config.ca_file) if endpoint.scheme == "https" else None
+    pin = cli.parse_pin(config.pin_sha256) if config.pin_sha256 else None
+    keepers = {}
+    for worker in config.workers:
+        if worker.permissions is None:
+            continue
+        baton = None
+        try:
+            client = cli.Client(endpoint, cli.read_token(worker.token_file), context, pin, config.request_timeout)
+            baton = Baton(client, threading.Event())
+        except cli.UsageError:
+            pass
+        keepers[worker.principal] = GrantKeeper(
+            worker, GrantLedger(config.state_dir, worker.principal), baton,
+            lambda task_id, what, _name=worker.principal, **fields: event(_name, task_id, what, **fields))
+    return keepers
+
+
+def grants_command(config, args):
+    if not os.path.isdir(config.state_dir):
+        if args.list_grants:
+            return EXIT_OK
+        log("error: no state directory, so no grants")
+        return EXIT_USAGE
+    keepers = grant_keepers(config)
+    if args.list_grants:
+        for principal, keeper in sorted(keepers.items()):
+            with keeper.ledger.locked():
+                records = keeper.ledger.load()
+            for record in sorted(records.values(), key=lambda item: item.get("created", 0)):
+                print(json.dumps({"worker": principal, **{key: record.get(key) for key in (
+                    "id", "tool", "rule", "option", "status", "task_id", "request_id", "created")}}, sort_keys=True))
+        return EXIT_OK
+    if args.revoke_worker:
+        keeper = keepers.get(args.revoke_worker)
+        if keeper is None:
+            log("error: no worker with that principal has a permissions block")
+            return EXIT_USAGE
+        results = [keeper.revoke(record["id"]) for record in keeper.ledger.active()]
+        return EXIT_ERROR if any(result is False for result in results) else EXIT_OK
+    for keeper in keepers.values():
+        if any(record["id"] == args.revoke_grant for record in keeper.ledger.active()):
+            return EXIT_OK if keeper.revoke(args.revoke_grant) else EXIT_ERROR
+    log("error: no active grant with that id")
+    return EXIT_USAGE
+
+
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if sum(bool(value) for value in (args.check, args.list_grants, args.revoke_grant, args.revoke_worker)) > 1:
+        parser.error("--check, --list-grants, --revoke-grant and --revoke-worker cannot be combined")
     try:
         config = load_config(args.config)
+        if args.list_grants or args.revoke_grant or args.revoke_worker:
+            return grants_command(config, args)
         runner = Runner(config)
         if args.check:
             workers = runner.prepare()

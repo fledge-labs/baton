@@ -10,6 +10,7 @@ Rows written by the removed built-in worker stay readable: ``execution_mode='cod
 columns are legacy values that nothing writes any more.
 """
 
+import contextvars
 import hashlib
 import json
 import os
@@ -19,7 +20,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import psycopg
@@ -29,6 +30,10 @@ from psycopg.types.json import Jsonb
 from bridge import webhooks
 
 LOCK_ID = 0x4241544F4E
+# Set only around an exclusive write transaction, or one short sweep transaction. Reads leave it false.
+_PERSIST_EXPIRY = contextvars.ContextVar("baton_persist_permission_expiry", default=False)
+# (worker, requested_at) when this call expired the request that set waiting_input, else None.
+_EXPIRY_CLEAR = contextvars.ContextVar("baton_permission_expiry_clear", default=None)
 ROLES = {None: 0, "view": 1, "comment": 2, "edit": 3}
 MESSAGES = {
     "invalid": "Invalid request", "not_found": "Resource not found", "forbidden": "Operation not permitted",
@@ -57,6 +62,16 @@ CLAIM_EXPIRING_MIN_LEASE = 120
 # _integer caps a lease at 3600s, so a warning is never further out than 20% of that. The scan's index range stops there.
 CLAIM_EXPIRING_HORIZON_SECONDS = int(3600 * CLAIM_EXPIRING_FRACTION)
 BLOCK_REASONS = ("scope_conflict", "lease_held", "dependency_blocked", "waiting_input", "other")
+PERMISSION_OPTIONS = ("allow_once", "allow_always", "deny")
+PERMISSION_EVENTS = ("permission.requested", "permission.decided", "permission.granted", "permission.revoked",
+                     "permission.cancelled", "permission.expired")
+PERMISSION_DEFAULT_TTL = 3600
+PERMISSION_MAX_TTL = 86400
+PERMISSION_GRANT_EVENTS = ("granted", "revoked")
+# shim_refused is repeatable audit only. It is not folded into the grant view (that would mark the grant revoked).
+PERMISSION_REPORT_EVENTS = PERMISSION_GRANT_EVENTS + ("shim_refused",)
+PERMISSION_MAX_PER_EPOCH = 10
+PERMISSION_CLI = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 WEBHOOK_LIMIT = 10
 WEBHOOK_MAX_ATTEMPTS = 8
 # Delay after failed attempt n (1-based); the seven delays between eight attempts total about an hour.
@@ -194,6 +209,13 @@ def _text(value, maximum=16000, field=None):
 def _integer(value, minimum=1, maximum=3600, field=None):
     if type(value) is not int or not minimum <= value <= maximum:
         raise StoreError("invalid", field, f"integer between {minimum} and {maximum}")
+    return value
+
+
+def _one_line(value, maximum, field):
+    if (not isinstance(value, str) or not value.strip() or len(value) > maximum
+            or re.search(r"[\x00-\x1f\x7f]", value)):
+        raise StoreError("invalid", field, f"non-blank single-line string of at most {maximum} characters")
     return value
 
 
@@ -674,31 +696,35 @@ class SpaceStore:
             raise StoreError("forbidden")
         operation_id = _uuid(operation_id)
         digest = hashlib.sha256(_canonical([asdict(actor), method, args]).encode()).hexdigest()
-        with self._transaction(write=True) as conn:
-            authorize(conn)
-            old = conn.execute("SELECT request_hash,result FROM baton.operations WHERE principal=%s AND operation_id=%s",
-                               (actor.principal, operation_id)).fetchone()
-            if old:
-                if old["request_hash"] != digest:
-                    raise StoreError("operation_conflict")
-                result = old["result"]
-                if replay_guard:
-                    current = replay_guard(conn, result)
-                    if current is not None:
-                        result = _json(current)
+        token = _PERSIST_EXPIRY.set(True)
+        try:
+            with self._transaction(write=True) as conn:
+                authorize(conn)
+                old = conn.execute("SELECT request_hash,result FROM baton.operations WHERE principal=%s AND operation_id=%s",
+                                   (actor.principal, operation_id)).fetchone()
+                if old:
+                    if old["request_hash"] != digest:
+                        raise StoreError("operation_conflict")
+                    result = old["result"]
+                    if replay_guard:
+                        current = replay_guard(conn, result)
+                        if current is not None:
+                            result = _json(current)
+                    if isinstance(result, dict):
+                        result = {**result, "replay": True}
+                    return result
+                result = _json(effect(conn))
+                once = {}
                 if isinstance(result, dict):
-                    result = {**result, "replay": True}
-                return result
-            result = _json(effect(conn))
-            once = {}
-            if isinstance(result, dict):
-                business_replay = result.pop("_business_replay", False)
-                # Values under _once reach the first caller only and are never persisted or replayed.
-                once = result.pop("_once", {})
-                result = {**result, "replay": business_replay}
-            conn.execute("INSERT INTO baton.operations(principal,operation_id,request_hash,method,result) VALUES (%s,%s,%s,%s,%s)",
-                         (actor.principal, operation_id, digest, method, Jsonb(result)))
-            return {**result, **once} if once else result
+                    business_replay = result.pop("_business_replay", False)
+                    # Values under _once reach the first caller only and are never persisted or replayed.
+                    once = result.pop("_once", {})
+                    result = {**result, "replay": business_replay}
+                conn.execute("INSERT INTO baton.operations(principal,operation_id,request_hash,method,result) VALUES (%s,%s,%s,%s,%s)",
+                             (actor.principal, operation_id, digest, method, Jsonb(result)))
+                return {**result, **once} if once else result
+        finally:
+            _PERSIST_EXPIRY.reset(token)
 
     @staticmethod
     def _row(conn, table, identity):
@@ -757,7 +783,8 @@ class SpaceStore:
         return task
 
     @staticmethod
-    def _audit(conn, actor, operation_id, event, space_id=None, task_id=None, requested_by=None, performed_by=None, **metadata):
+    def _audit(conn, actor, operation_id, event, space_id=None, task_id=None, requested_by=None, performed_by=None,
+               once=False, **metadata):
         allowed = {"page_id", "block_id", "thread_id", "epoch", "revision", "proposal_id", "team_id", "subject_type",
                    "role", "decision", "input_sha256", "output_sha256", "error_code",
                    "count", "target_type", "execution_mode", "old_epoch", "work_face_keys", "work_face_sha256",
@@ -766,11 +793,15 @@ class SpaceStore:
                    "created_via", "chain", "owner_kind", "self_approval", "root", "approvals", "approvals_required",
                    "required_approvals", "root_required", "scope_kind", "approver", "reason", "original_sha256", "edited_sha256",
                    "grace_seconds", "lease_seconds", "authority", "target_principal", "role_source", "from_role",
-                   "sla_minutes", "wait_minutes"}
+                   "sla_minutes", "wait_minutes", "request_id", "permission"}
         if not set(metadata) <= allowed:
             raise StoreError("invalid")
-        conn.execute("""INSERT INTO baton.x_audit(id,event,agent,actor_account,actor_kind,requested_by,performed_by,
-            operation_id,space_id,task_id,metadata) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+        statement = """INSERT INTO baton.x_audit(id,event,agent,actor_account,actor_kind,requested_by,performed_by,
+            operation_id,space_id,task_id,metadata) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"""
+        if once:
+            # Matches audit_permission_expired_once. A second sweep or exclusive write inserts nothing.
+            statement += " ON CONFLICT (task_id, (metadata->>'request_id')) WHERE event = 'permission.expired' DO NOTHING"
+        conn.execute(statement,
             (uuid.uuid4(), event, actor.principal, actor.account, actor.kind, requested_by or actor.principal,
              performed_by or actor.principal, operation_id, space_id, task_id, Jsonb(_json(metadata))))
 
@@ -1330,6 +1361,13 @@ class SpaceStore:
         row.pop("idempotency_key")
         row.pop("role_sla_notified_at")
         reason, blocker, blocked_at = (row.pop(key) for key in ("blocked_reason", "blocked_by", "blocked_at"))
+        if reason == "waiting_input":
+            # Reads derive expiry and hide a marker this request set. They do not write. The row is updated only
+            # under the exclusive write lock, or by the periodic sweep, one task at a time.
+            self._permission_views(conn, task_id)
+            clear = _EXPIRY_CLEAR.get()
+            if clear is not None and blocker == clear[0] and blocked_at is not None and blocked_at <= clear[1]:
+                reason, blocker, blocked_at = None, None, None
         row["blocked"] = {"reason_code": reason, "by": blocker, "at": blocked_at} if reason else None
         if not include_prompt and row["execution_mode"] != "manual":
             row.pop("prompt")
@@ -1560,10 +1598,10 @@ class SpaceStore:
         return self._mutate(actor, operation_id, "set_work_face", {"task_id": task_id, "work_face": face, "base_commit": base_commit},
                             authorize, effect, lambda conn, old: view(conn))
 
-    def _task_audit(self, conn, actor, operation_id, event, task, **metadata):
+    def _task_audit(self, conn, actor, operation_id, event, task, *, once=False, **metadata):
         page = self._row(conn, "pages", str(task["page_id"]))
         self._audit(conn, actor, operation_id, event, space_id=page["space_id"], task_id=task["id"],
-                    requested_by=task["owner"], thread_id=task["id"], **metadata)
+                    requested_by=task["owner"], thread_id=task["id"], once=once, **metadata)
 
     def _notify_task(self, conn, actor, operation_id, task, phase, body, recipient=None):
         row = self._comment(conn, actor, operation_id, str(task["page_id"]), body, str(task["id"]),
@@ -2065,6 +2103,274 @@ class SpaceStore:
         return self._mutate(actor, operation_id, "mark_blocked", {"task_id": task_id, "reason_code": reason_code, "note": note},
                             authorize, effect, lambda conn, old: view(conn))
 
+    def _permission_views(self, conn, task_id):
+        """Permission requests of a task, folded from its append-only audit events (request, decision, grant, revoke)."""
+        views = {}
+        rows = conn.execute("SELECT * FROM baton.x_audit WHERE task_id=%s AND event=ANY(%s) ORDER BY time,id",
+                            (task_id, list(PERMISSION_EVENTS))).fetchall()
+        for row in rows:
+            meta = row["metadata"]
+            view = views.get(meta.get("request_id"))
+            if row["event"] == "permission.requested":
+                views[meta["request_id"]] = {
+                    "request_id": meta["request_id"], "task_id": str(task_id), "epoch": meta["epoch"], "worker": row["agent"],
+                    "worker_account": row["actor_account"], **meta["permission"], "options": list(PERMISSION_OPTIONS),
+                    "status": "pending", "requested_at": row["time"],
+                    "expires_at": row["time"] + timedelta(seconds=meta["permission"]["ttl_seconds"]), "decided_by": None, "decided_at": None,
+                    "authority": None, "grant": None, "granted_at": None, "revoked_at": None}
+            elif view is None:
+                continue
+            elif row["event"] == "permission.decided":
+                authority = "root" if meta.get("root") else f'delegated by {meta["grantor"]} via {meta["delegation_id"]}'
+                view.update(status=meta["decision"], decided_by=row["agent"], decided_at=row["time"], authority=authority)
+            elif row["event"] == "permission.cancelled":
+                if view["status"] == "pending":
+                    view.update(status="cancelled", decided_by=row["agent"], decided_at=row["time"])
+            elif row["event"] == "permission.expired":
+                if view["status"] == "pending":
+                    view["status"] = "expired"
+            elif row["event"] == "permission.granted":
+                view.update(grant="granted", granted_at=row["time"])
+            elif row["event"] == "permission.revoked":
+                view.update(grant="revoked", revoked_at=row["time"])
+        self._expire_requests(conn, task_id, views)
+        return views
+
+    def _expire_requests(self, conn, task_id, views):
+        """A pending request is only live while the claim it was made under is: it expires when the epoch moves on, the
+        holder's lease is gone, or its own time-to-live passes.
+
+        Every caller computes that in the view. A read does not insert or update: two shared-lock transactions
+        touching two tasks in opposite order must not take row locks. The persistent `permission.expired` row, and
+        the clear of a `waiting_input` marker this request set, happen only when `_PERSIST_EXPIRY` is set. That is
+        an exclusive write, or one short transaction of the periodic sweep. A unique index keeps the audit row to
+        one. A later `mark_blocked` by the same worker stays. Cancel of an already-expired request stays `stale_claim`.
+        """
+        _EXPIRY_CLEAR.set(None)
+        pending = [view for view in views.values() if view["status"] == "pending"]
+        if not pending:
+            return
+        task = conn.execute("SELECT * FROM baton.tasks WHERE id=%s", (task_id,)).fetchone()
+        if task is None:
+            return
+        claim = conn.execute("SELECT holder,epoch FROM baton.x_claim WHERE task_id=%s AND lease_expires_at>clock_timestamp()",
+                             (task_id,)).fetchone()
+        now = conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
+        persist = _PERSIST_EXPIRY.get()
+        for view in pending:
+            if not (task["state"] != "claimed" or task["epoch"] != view["epoch"] or claim is None
+                    or (claim["holder"], claim["epoch"]) != (view["worker"], view["epoch"]) or view["expires_at"] <= now):
+                continue
+            view["status"] = "expired"
+            if persist:
+                actor = Actor(view["worker"], view["worker_account"], "agent")
+                operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "baton/permission-expired/" + view["request_id"]))
+                self._task_audit(conn, actor, operation_id, "permission.expired", task, once=True, epoch=view["epoch"],
+                                 request_id=view["request_id"])
+            if any(other["status"] == "pending" for other in views.values()):
+                continue
+            _EXPIRY_CLEAR.set((view["worker"], view["requested_at"]))
+            if persist:
+                conn.execute("""UPDATE baton.tasks SET blocked_reason=NULL,blocked_by=NULL,blocked_at=NULL
+                    WHERE id=%s AND blocked_reason='waiting_input' AND blocked_by=%s AND blocked_at<=%s""",
+                             (task_id, view["worker"], view["requested_at"]))
+
+    def _permission_request(self, conn, task_id, request_id):
+        view = self._permission_views(conn, task_id).get(_uuid(request_id, "request_id"))
+        if view is None:
+            raise StoreError("not_found")
+        return view
+
+    def request_permission(self, actor, operation_id, task_id, epoch, cli, tool, directory=None, reason=None, excerpt=None,
+                           approvers=None, ttl_seconds=PERMISSION_DEFAULT_TTL):
+        """The live holder asks for input: its CLI hit a permission wall. The task keeps its claim and epoch.
+
+        Marks the task `waiting_input` (the state a reader sees), writes a thread comment with the structured request and
+        mentions the named approvers. The request itself lives in the append-only audit, so no schema change is needed.
+        """
+        _integer(epoch, 1, 2**63 - 1, "epoch")
+        _integer(ttl_seconds, 1, PERMISSION_MAX_TTL, "ttl_seconds")
+        if not isinstance(cli, str) or not PERMISSION_CLI.fullmatch(cli):
+            raise StoreError("invalid", "cli", "lowercase CLI name of at most 32 characters")
+        _one_line(tool, 200, "tool")
+        if directory is not None:
+            _one_line(directory, 500, "directory")
+        if reason is not None:
+            _one_line(reason, 300, "reason")
+        if excerpt is not None:
+            _text(excerpt, 2000, field="excerpt")
+        if approvers is None:
+            approvers = []
+        if not isinstance(approvers, list) or len(approvers) > 10:
+            raise StoreError("invalid", "approvers", "array of at most 10 principal identifiers")
+        approvers = sorted({_identifier(name, "approvers") for name in approvers})
+        def effect(conn):
+            self._live(conn, actor, task_id, epoch)
+            task = self._row(conn, "tasks", task_id)
+            views = self._permission_views(conn, task_id).values()
+            if any(view["status"] == "pending" for view in views):
+                raise StoreError("operation_conflict")
+            if sum(view["epoch"] == epoch for view in views) >= PERMISSION_MAX_PER_EPOCH:
+                raise StoreError("rate_limited")
+            request_id = str(uuid.uuid4())
+            permission = {"cli": cli, "tool": tool, "directory": directory, "reason": reason, "approvers": approvers,
+                          "ttl_seconds": ttl_seconds, "excerpt_sha256": _sha256(excerpt) if excerpt else None}
+            # The marker is stamped before the audit row, so blocked_at is not after requested_at. Expiry clears
+            # only a marker that old; a later mark_blocked stays.
+            conn.execute("UPDATE baton.tasks SET blocked_reason='waiting_input',blocked_by=%s,blocked_at=clock_timestamp() WHERE id=%s",
+                         (actor.principal, task_id))
+            self._task_audit(conn, actor, operation_id, "permission.requested", task, epoch=epoch, request_id=request_id,
+                             permission=permission)
+            structured = {"kind": "permission_request", "request_id": request_id, "task_id": task_id, "epoch": epoch,
+                          "worker": actor.principal, "cli": cli, "tool": tool, "directory": directory, "reason": reason,
+                          "approvers": approvers, "options": list(PERMISSION_OPTIONS), "excerpt": excerpt}
+            body = (f"[input required: permission] {actor.principal} needs `{tool}` allowed in its {cli} configuration "
+                    f"(request {request_id}). Approvers: {', '.join('@' + name for name in approvers) or 'none named'}. "
+                    "Decide with decide_permission: allow_once, allow_always or deny.\n"
+                    + json.dumps(structured, indent=2, sort_keys=True))
+            comment = self._comment(conn, actor, operation_id, str(task["page_id"]), body, task_id,
+                                    subject=f"[input required: permission] {task_id}", requested_by=task["owner"])
+            parties = [(task["owner"], task["owner_account"])]
+            targets = {task["owner"]: ("agent", False)}
+            for name in approvers:
+                who = self._directory_actor(name)
+                if who is not None:
+                    parties.append((who.principal, who.account))
+                    targets[who.principal] = ("person" if who.kind == "human" else "agent", True)
+            for target, (kind, action) in targets.items():
+                conn.execute("""INSERT INTO baton.mentions(id,comment_id,target_type,target_id,action_requested,requested_by)
+                    VALUES (%s,%s,%s,%s,%s,%s)""", (uuid.uuid4(), comment["id"], kind, target, action, actor.principal))
+            self._enqueue(conn, actor, "task.blocked", "task", task["id"], task["page_id"], parties, task_id)
+            return self._permission_views(conn, task_id)[request_id]
+        args = {"task_id": task_id, "epoch": epoch, "cli": cli, "tool": tool, "directory": directory, "reason": reason,
+                "excerpt": excerpt, "approvers": approvers, **({"ttl_seconds": ttl_seconds} if ttl_seconds != PERMISSION_DEFAULT_TTL else {})}
+        return self._mutate(actor, operation_id, "request_permission", args,
+                            lambda conn: self._manual(conn, actor, task_id, "comment"), effect,
+                            lambda conn, old: self._permission_request(conn, task_id, old["request_id"]))
+
+    def _directory_actor(self, principal):
+        try:
+            who = self.directory(principal) if self.directory else None
+        except Exception:
+            return None
+        return who if isinstance(who, Actor) and who.principal == principal else None
+
+    def decide_permission(self, actor, operation_id, task_id, request_id, option, reason=None):
+        """An approver answers a pending permission request: the space root, or a principal holding a covering approver
+        delegation (the gate's authority). The requesting worker, anyone who held the claim this epoch and, unless root,
+        anyone sharing their account can never decide."""
+        _uuid(request_id, "request_id")
+        if not isinstance(option, str) or option not in PERMISSION_OPTIONS:
+            raise StoreError("invalid", "option", "one of " + ", ".join(PERMISSION_OPTIONS))
+        if reason is not None:
+            reason = _trimmed(reason, 500, "reason")
+        approval = {}
+        def authorize(conn):
+            task = self._manual(conn, actor, task_id)
+            request = self._permission_request(conn, task_id, request_id)
+            page = self._row(conn, "pages", str(task["page_id"]))
+            root = self._is_root(self._row(conn, "spaces", str(page["space_id"])), actor.principal, actor.account, actor.kind)
+            principals, accounts = self._executors(conn, task, request["epoch"])
+            principals.add(request["worker"])
+            accounts.add(request["worker_account"])
+            if actor.principal in principals or (not root and actor.account in accounts):
+                raise StoreError("forbidden")
+            approval.update(root=root, self_approval=False, chain=[] if root else self._approver_chain(conn, actor, task))
+        def effect(conn):
+            task = self._row(conn, "tasks", task_id)
+            request = self._permission_request(conn, task_id, request_id)
+            claim = conn.execute("SELECT holder FROM baton.x_claim WHERE task_id=%s AND lease_expires_at>clock_timestamp()", (task_id,)).fetchone()
+            if (request["status"] != "pending" or task["state"] != "claimed" or task["epoch"] != request["epoch"]
+                    or not claim or claim["holder"] != request["worker"]):
+                raise StoreError("stale_claim")
+            chain = approval["chain"]
+            leaf = chain[0] if chain else None
+            via = {"delegation_id": leaf["id"], "grantor": leaf["grantor"]} if leaf else {}
+            self._task_audit(conn, actor, operation_id, "permission.decided", task, epoch=request["epoch"], request_id=request_id,
+                             decision=option, approver=actor.principal, root=approval["root"],
+                             chain=[str(link["id"]) for link in chain], **({"reason": reason} if reason else {}), **via)
+            conn.execute("""UPDATE baton.tasks SET blocked_reason=NULL,blocked_by=NULL,blocked_at=NULL
+                WHERE id=%s AND blocked_reason='waiting_input' AND blocked_by=%s""", (task_id, request["worker"]))
+            body = (f"[permission decision] {option} for `{request['tool']}` (request {request_id}) by {actor.principal}; "
+                    f"authority: {self._authority(approval)}" + (f"; reason: {reason}" if reason else ""))
+            comment = self._comment(conn, actor, operation_id, str(task["page_id"]), body, task_id,
+                                    subject=f"[permission decision] {task_id}", requested_by=task["owner"])
+            parties = self._task_parties(conn, task)
+            self._enqueue(conn, actor, "comment.created", "comment", comment["id"], task["page_id"],
+                          [parties["owner"], parties["holder"], parties["assignee"]], task_id)
+            return self._permission_request(conn, task_id, request_id)
+        args = {"task_id": task_id, "request_id": request_id, "option": option, **({"reason": reason} if reason else {})}
+        return self._mutate(actor, operation_id, "decide_permission", args, authorize, effect,
+                            lambda conn, old: self._permission_request(conn, task_id, request_id))
+
+    def record_permission(self, actor, operation_id, task_id, request_id, event, reason=None):
+        """The requesting worker reports that it applied or removed an approved permission, or that its shim refused a call.
+
+        `shim_refused` is repeatable and does not change the grant view. `reason` is part of the request digest only
+        for that event, so a retry of a grant recorded before the field existed still matches.
+        """
+        _uuid(request_id, "request_id")
+        if not isinstance(event, str) or event not in PERMISSION_REPORT_EVENTS:
+            raise StoreError("invalid", "event", "one of " + ", ".join(PERMISSION_REPORT_EVENTS))
+        if event == "shim_refused":
+            reason = _one_line(reason, 300, "reason")
+        elif reason not in (None, ""):
+            raise StoreError("invalid", "reason", "only a shim refusal takes a reason")
+        def authorize(conn):
+            self._manual(conn, actor, task_id, "comment")
+            request = self._permission_request(conn, task_id, request_id)
+            if (actor.principal, actor.account) != (request["worker"], request["worker_account"]):
+                raise StoreError("forbidden")
+        def effect(conn):
+            task = self._row(conn, "tasks", task_id)
+            request = self._permission_request(conn, task_id, request_id)
+            approved = request["status"] in ("allow_once", "allow_always")
+            if event == "shim_refused":
+                if not approved:
+                    raise StoreError("stale_claim")
+                self._task_audit(conn, actor, operation_id, "permission.shim_refused", task, epoch=request["epoch"],
+                                 request_id=request_id, reason=reason)
+                return self._permission_request(conn, task_id, request_id)
+            wanted = {"granted": (approved and request["grant"] is None), "revoked": request["grant"] == "granted"}[event]
+            if not wanted:
+                raise StoreError("stale_claim")
+            self._task_audit(conn, actor, operation_id, "permission." + event, task, epoch=request["epoch"], request_id=request_id,
+                             decision=request["status"])
+            return self._permission_request(conn, task_id, request_id)
+        args = {"task_id": task_id, "request_id": request_id, "event": event}
+        if event == "shim_refused":
+            args["reason"] = reason
+        return self._mutate(actor, operation_id, "record_permission", args, authorize, effect,
+                            lambda conn, old: self._permission_request(conn, task_id, request_id))
+
+    def cancel_permission(self, actor, operation_id, task_id, request_id):
+        """Withdraw a pending request: the requesting worker, or the space root. Frees the task to ask again."""
+        _uuid(request_id, "request_id")
+        def authorize(conn):
+            task = self._manual(conn, actor, task_id, "comment")
+            request = self._permission_request(conn, task_id, request_id)
+            page = self._row(conn, "pages", str(task["page_id"]))
+            root = self._is_root(self._row(conn, "spaces", str(page["space_id"])), actor.principal, actor.account, actor.kind)
+            if not root and (actor.principal, actor.account) != (request["worker"], request["worker_account"]):
+                raise StoreError("forbidden")
+        def effect(conn):
+            task = self._row(conn, "tasks", task_id)
+            request = self._permission_request(conn, task_id, request_id)
+            if request["status"] != "pending":
+                raise StoreError("stale_claim")
+            self._task_audit(conn, actor, operation_id, "permission.cancelled", task, epoch=request["epoch"], request_id=request_id)
+            conn.execute("""UPDATE baton.tasks SET blocked_reason=NULL,blocked_by=NULL,blocked_at=NULL
+                WHERE id=%s AND blocked_reason='waiting_input' AND blocked_by=%s""", (task_id, request["worker"]))
+            return self._permission_request(conn, task_id, request_id)
+        return self._mutate(actor, operation_id, "cancel_permission", {"task_id": task_id, "request_id": request_id},
+                            authorize, effect, lambda conn, old: self._permission_request(conn, task_id, request_id))
+
+    def list_permissions(self, actor, task_id):
+        def read(conn):
+            self._task_for(conn, actor, task_id)
+            return list(self._permission_views(conn, _uuid(task_id, "task_id")).values())
+        return self._read(actor, read)
+
     def set_priority(self, actor, operation_id, task_id, priority):
         priority = _priority(priority)
         def authorize(conn):
@@ -2127,7 +2433,31 @@ class SpaceStore:
             return {"skipped": True, "escalated": [], "reassigned": []}
         # Audit reads for expiring leases stay outside LOCK_ID so a renew is not stuck behind this scan.
         self._notify_expiring_claims(limit)
+        self._persist_permission_expirations()
         return {"skipped": False, "escalated": escalated, "reassigned": reassigned, "role_sla": role_sla}
+
+    def _persist_permission_expirations(self):
+        """Write permission.expired for tasks that still have an open request. One task per short transaction, task id order.
+
+        The candidate read takes the shared lock and writes nothing. Each follow-up takes the exclusive lock only
+        for that task, so two sweeps cannot lock task rows in opposite orders.
+        """
+        with self._transaction() as conn:
+            rows = conn.execute("""SELECT DISTINCT a.task_id FROM baton.x_audit a
+                WHERE a.event='permission.requested'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM baton.x_audit b
+                    WHERE b.task_id=a.task_id
+                      AND b.metadata->>'request_id'=a.metadata->>'request_id'
+                      AND b.event IN ('permission.decided','permission.cancelled','permission.expired'))
+                ORDER BY a.task_id""").fetchall()
+        for row in rows:
+            token = _PERSIST_EXPIRY.set(True)
+            try:
+                with self._transaction(write=True) as conn:
+                    self._permission_views(conn, row["task_id"])
+            finally:
+                _PERSIST_EXPIRY.reset(token)
 
     def _notify_expiring_claims(self, limit):
         """One claim.expiring per lease window, for at most `limit` claims, without the global advisory lock.
