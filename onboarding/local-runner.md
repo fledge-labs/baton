@@ -466,7 +466,7 @@ worker 字段：
 
 **`git` 现在不授权。** `status`、`log`、`diff`、`show`、`ls-files`、`rev-parse`、`blame` 这些只读子命令仍会按仓库配置执行外部程序：`diff.external`、`textconv`、`core.fsmonitor`，以及 `-p` / `pager.*` 强制打开的 `core.pager`。worktree 里的 `.git` 可写，模型可以把它改指向另一个 gitdir。`git diff --output=` 也能把输出写到 worktree 之外。沙箱挡得住写出 worktree，挡不住这些钩子在沙箱里拉起解释器（网络默认开启）。以后若要加回 `git`，必须单独做，并且只能走写死的绝对路径，强制带上 `-c core.pager=cat --no-pager --no-ext-diff --no-textconv`、`-c core.fsmonitor=false`、`GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL=/dev/null`，并且不读仓库配置。本次不实现这条路径。
 
-上表的 `rg` 选项是对照构建镜像上的 ripgrep 15.1.0-cursor5（rev c3e3c2f7ec）的 `--help` 列的。这份帮助里会指定或启动另一个可执行文件的只有这四项：`-z`/`--search-zip` 按 `PATH` 启动 gzip、bzip2、xz、lz4、lzma、brotli、zstd，并且优先于 `--pre`；`--pre` 对每个路径运行给出的命令；`--pre-glob` 决定哪些路径交给 `--pre`；`--hostname-bin` 无参数运行给出的命令，用它的标准输出当主机名。`--generate` 只往标准输出写 man 和补全脚本。这个版本不接受非精确的长选项缩写（一个字母的 `--X` 等于对应的短选项，所以 `--z` 就是 `-z`），策略仍然拒绝更长的唯一前缀，避免以后的 rg 把缩写放行。
+上表的拒绝名单写死在运行器里，不跟某一次 `rg --version` 绑定。`-z`/`--search-zip` 按 `PATH` 启动 gzip、bzip2、xz、lz4、lzma、brotli、zstd，并且优先于 `--pre`；`--pre` 对每个路径运行给出的命令；`--pre-glob` 决定哪些路径交给 `--pre`；`--hostname-bin` 无参数运行给出的命令，用它的标准输出当主机名。`--generate` 只往标准输出写 man 和补全脚本。一个字母的 `--X` 等于对应的短选项，所以 `--z` 就是 `-z`。策略仍然拒绝更长的前缀，避免以后的 rg 把缩写放行。测试解析当前安装的 `rg --help`：帮助里把某个选项描述成会运行外部命令、可执行文件或解压程序时，那个选项必须已经在这份名单里，否则测试失败。
 
 能不能授权，只看检测器是否完整捕获了**一整行**原文。捕获在引号或括号处截断、这一行后面还有内容、拒绝信息跨了多行，或者捕获文本里有引号、反斜杠或 shell 连接符（`;`、`&`、`|`、反引号、`$`、`(`、`)`、`>`、`<`、换行），请求仍然发出给人看，但标成不可授权：批准之后什么都不写，任务按拒绝结束。`rg foo"; rm` 和第一行是 `rg`、下一行再接命令，都属于这一种。参数策略本身（`-z`、`--search-zip`、`--pre`、`--pre-glob`、`--hostname-bin`）在请求时和 shim 里对**每一次执行的完整 argv** 各查一遍，不拿裁短后的 CLI 文本当依据。
 

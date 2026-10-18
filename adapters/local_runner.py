@@ -1025,6 +1025,10 @@ GRANTABLE_TOOLS = frozenset({"rg"})
 POLICY_ARGS = {
     "rg": "[! -z ! --search-zip ! --pre ! --pre-glob ! --hostname-bin]",
 }
+# rg options that start another program. This set is the source of truth: the test parses the installed
+# `rg --help` and fails when that help describes a launcher that is not listed here. `-z` and `--search-zip`
+# are the same switch. `--pre-glob` selects the paths `--pre` runs on.
+RG_LAUNCHERS = frozenset({"z", "search-zip", "pre", "pre-glob", "hostname-bin"})
 # Quotes, backslashes and shell control characters. Grantability is decided on the raw captured line, before shlex.
 UNTRUSTED_COMMAND_RE = re.compile(r"""['"\\;&|`$()><\n]""")
 
@@ -1078,25 +1082,17 @@ def _inside_worktree(path, worktree):
 def _rg_problem(argv, worktree):
     """None when this rg argv does not launch another program.
 
-    Audited against `rg --help` of ripgrep 15.1.0-cursor5 (rev c3e3c2f7ec) on the build image. The only options
-    in that help that name or start an executable are:
-
-    - `-z` / `--search-zip`, which runs gzip, bzip2, xz, lz4, lzma, brotli or zstd from `PATH` and overrides `--pre`
-    - `--pre` / `--pre=COMMAND`, which runs COMMAND for each path
-    - `--pre-glob` / `--pre-glob=GLOB`, which selects the paths `--pre` runs on
-    - `--hostname-bin` / `--hostname-bin=COMMAND`, which runs COMMAND with no arguments and uses its stdout
-
-    `--generate` writes man pages and shell completions to stdout. `--engine`, `--hyperlink-format`, `--glob` and
-    the ignore-file options do not name an executable. `--no-pre` and `--no-search-zip` only disable the feature.
-    This build rejects a long name that is not exact, except a one-letter `--X`, which is the short flag (`--z` is
-    `-z`, `--p` is pretty). A longer prefix of a launcher name is still refused, including `--pr`, `--pre-g` and
-    `--search`, so a later rg that accepts abbreviations cannot run them. The same name with `=VALUE` is refused
-    even when this rg rejects the value (`--search-zip=1`, `--pre=`).
+    `RG_LAUNCHERS` is the fixed list. It covers the options ripgrep's help describes as running another program:
+    `-z` / `--search-zip` (gzip, bzip2, xz, lz4, lzma, brotli or zstd from `PATH`; this overrides `--pre`),
+    `--pre` / `--pre=COMMAND`, `--pre-glob`, and `--hostname-bin` / `--hostname-bin=COMMAND`. The installed
+    `rg --help` is checked by a test, which fails if that help describes a launcher missing from the set.
+    `--generate` writes man pages and shell completions to stdout. `--no-pre` and `--no-search-zip` only disable
+    the feature. A one-letter `--X` is the short flag (`--z` is `-z`). A longer prefix of a launcher name is still
+    refused, including `--pr`, `--pre-g` and `--search`, and so is `=VALUE` (`--search-zip=1`, `--pre=`).
 
     A short cluster is read left to right. `z` refuses unless a value-taking short option already consumed the rest
     of the cluster or the next argument: `-iz`, `-uz` and `-ze` are search-zip; `-ez` and `-e -z` are a pattern.
     """
-    launchers = ("search-zip", "pre-glob", "pre", "hostname-bin")
     # Long options that take the next argv when written without `=`. Launcher names are listed so a value is not
     # inspected after a refusal, and so a future edit that stops refusing one of them still skips its operand.
     value_long = {
@@ -1111,9 +1107,9 @@ def _rg_problem(argv, worktree):
     reason = "rg -z/--search-zip, --pre, --pre-glob and --hostname-bin run another program and are never granted"
 
     def launches(name):
-        if name == "z" or name in launchers:
+        if name in RG_LAUNCHERS:
             return True
-        return len(name) > 1 and any(item.startswith(name) for item in launchers)
+        return len(name) > 1 and any(item.startswith(name) for item in RG_LAUNCHERS)
 
     index = 1
     while index < len(argv):
@@ -1573,6 +1569,7 @@ def shim_script(tool, real, spool, grants):
         "REAL = %r" % real,
         "SPOOL = %r" % spool,
         "GRANTS = %r" % (rows,),
+        "RG_LAUNCHERS = %r" % (tuple(sorted(RG_LAUNCHERS)),),
     ]
     parts.extend(inspect.getsource(function).rstrip() for function in _SHIM_FUNCTIONS)
     parts.append("_GRANT_POLICIES = {%s}" % ", ".join("%r: %s" % (name, _GRANT_POLICIES[name].__name__)
