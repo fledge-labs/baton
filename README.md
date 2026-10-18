@@ -91,6 +91,60 @@ docker compose run --rm --no-deps \
 
 令牌文件权限为 0600。用安全凭据管理方式提供给看板或适配器；不要输出到共享终端、URL、聊天、项目配置或 Git。
 
+### 重新部署、冒烟与回滚
+
+在 Docker 主机上用 [`scripts/deploy.py`](scripts/deploy.py)（仅 Python 3 标准库）重建并替换运行中的实例，而不是手工 `up`。每一步都有硬超时，超时按失败处理并进入回滚。顺序是：
+
+1. 预检：读取待部署的迁移 SQL（默认 `bridge/space_schema.sql`，用 `--schema-file` 指向要构建的镜像实际执行的那份；找不到或为空就报错退出，不会当作通过）并做一次文本快速检查。若这次会构建，还检查工作区：每个会送进构建上下文的已跟踪路径必须对其它用户可读（文件含 o+r，目录含 o+rx），否则拒绝并逐条列出，不运行任何 docker 命令。`.dockerignore` 排除的文件不会进镜像，可以保持私有，包括 `deploy/.env`、令牌、密钥和 `secrets/`；若存在 `deploy/Dockerfile.dockerignore`，则只用它。镜像在全部 `COPY` 之后执行 `chmod -R a+rX /app`（只加读权限；执行位只加在目录和本来就可执行的文件上，不加写），因此即使检出时 umask 把源文件收成 0600，`migrate`（uid 999）也能读到 `bridge/space_schema.sql`。Compose 文件不再声明的服务（孤立服务）必须用 `--allow-remove-orphans` 确认。任一不满足就在改动任何东西之前中止。
+2. 对这个项目加排他文件锁（`flock`）并一直持有到本次进程返回，包括回滚时的 `docker tag`。同一项目不能有两个 `deploy.py` 交错打标签、转储或 `up`；等锁的时间由 `--lock-timeout` 限制，超时就中止，不打标签、不转储、不重建。锁目录 0700、锁文件 0600，符号链接一律拒绝。
+3. 记录项目里**所有**容器（含已退出、已崩溃的）的镜像 ID，并**按服务**给每个本地镜像加 `baton-deploy-rollback:<服务>-<id>` 保留标签，防止被垃圾回收（共用同一镜像引用的服务各自保留自己的镜像，崩溃的 bridge 原来的旧镜像也不会丢）。
+4. 数据库保护：只要项目的数据卷（`postgres-data`）存在，就确保数据库可连接——应用容器全部停止甚至已被删除时，用 `compose up -d --no-deps --no-recreate --wait database` 直接启动数据库容器（不重建已有容器）；启动不了就中止。然后做两件事：
+   - **迁移预检**：另起一个临时 Postgres 容器，镜像与数据库服务相同，`--network none`，自带超级用户 `precheck`（本地 trust，没有真实库密码），数据目录在 tmpfs 上。先对真实库做只读的 `pg_dump --schema-only` 和 `pg_dumpall --roles-only --no-role-passwords`，装进这个容器，再按 `migrate.py` 的方式应用迁移（`SET LOCAL ROLE baton_owner`，执行 SQL，`RESET ROLE`）。备份之前，待部署的迁移 SQL 只在这个预检容器里执行，不会在真实数据库上执行。容器在备份之前就删掉。文本检查会先拒绝 `role`、`reset`、`database`、`system`、`program` 这些单词（因此 `RESET ROLE`、`SET ROLE`、`ALTER DATABASE`、`ALTER SYSTEM`、`COPY ... PROGRAM` 都会被拒绝），避免同一份 SQL 在正式迁移里重放；见下面的信任边界。psql 先发 `\restrict <随机密钥>`，文本检查仍拒绝未加引号的反斜杠。对比的目录除了表、列、类型、默认值、NOT NULL、约束、索引（唯一性、列、谓词，含同名删了重建）、触发器（含 `tgenabled`，含外键等内部触发器，停用已有触发器视为破坏性）、函数、类型、权限、策略和行级安全，还包括 `pg_roles` 和 `pg_auth_members`。角色属性、口令、连接数或成员关系一旦变化就视为破坏性：这种变更在临时集群里提交，删掉容器就没了，不会落到真实集群，`pg_dump` 也不含角色。预检任何一步失败或结果读不出来也按破坏性处理（fail closed）。只有 `--allow-breaking-catalog` 可以越过这次预检失败，结果仍写入报告。`--allow-incompatible-migration` 只放行粗记号，不能越过预检失败。备份仍在真正的迁移之前。
+   - **备份**：用 `pg_dump`（custom 格式）把数据库直接从数据库容器转储到 `--backup-dir`（目录 0700、文件 0600，密码只在数据库容器内读取，不出现在命令行）。目录若是符号链接就拒绝，不跟随；已有目录也会收成 0700。文件用 `O_EXCL|O_NOFOLLOW` 新建再 `fchmod` 成 0600，文件名在秒级时间戳之外还有随机后缀，已存在的文件或符号链接不会被截断、跟随或删除。备份失败、超时或文件头无效则中止。没有数据卷（首次部署）时两者都跳过。
+5. 构建（可用 `--build-network host`），然后 `docker compose … up -d --wait --force-recreate --remove-orphans`（此时迁移已执行并提交）。
+6. 对入口做冒烟：`GET /board` 为 200、不带凭据的 `POST /mcp` 为 401，以及用冒烟令牌完成一次真实的 MCP `initialize`、`tools/list`、`fetch_inbox`。
+
+`up` 或冒烟失败（含超时）时，脚本把之前的镜像重新打回原标签，再次 `up`，逐个服务核对是否都回到了之前的镜像 ID，并复测冒烟；只有核对和冒烟都通过才报告 `rolled_back`。重打标签或回滚 `up` 失败不会提前返回：其余镜像照常恢复，仍会执行 `up`，`up` 失败再做一次尽力恢复（`up -d --wait --wait-timeout … --remove-orphans`，同样带硬超时），最后在报告里给出逐服务的手工恢复命令并保留保留标签。标准输出是 JSON 报告，进度写到标准错误。
+
+冒烟令牌是一个普通客户端身份，只通过文件路径传入，从不打印；文件权限保持 0600，放在仓库外：
+
+```sh
+# SPDX-License-Identifier: Apache-2.0
+cd baton/deploy
+docker compose run --rm --no-deps \
+  -v "$HOME/.config/baton:/delivery" admin issue deploy-smoke \
+  --output /delivery/deploy-smoke.token --uid "$(id -u)" --gid "$(id -g)"
+python3 ../scripts/deploy.py -f compose.yaml -p baton \
+  --smoke-token-file "$HOME/.config/baton/deploy-smoke.token" \
+  --backup-dir "$HOME/baton-backups"
+```
+
+- 项目名与 `-f` 文件按你平时给 `docker compose` 的写法；TLS 实例加 `-f compose.tls.yaml`，并用 `--base-url https://<host>:<端口>`（私有 CA 用 `--ca-file`）。默认入口是 `http://127.0.0.1:8080`；明文 http 只允许回环地址，避免把令牌发往远端。
+- 超时：`--wait-timeout`（默认 300 秒，传给 `up --wait-timeout`，脚本在其后 120 秒强杀 `up` 的整个进程组）、`--build-timeout`（1800）、`--backup-timeout`（900）、`--precheck-timeout`（迁移预检的每一步，300）、`--command-timeout`（其余 docker 命令，120）、`--lock-timeout`（等另一个部署释放互斥锁；默认是构建、备份、预检、up、冒烟和普通命令预算之和）。冒烟由 `--smoke-timeout` 和 `--request-timeout` 限定：截止时间在读取响应期间就生效（到点关闭套接字），响应正文超过 1 MiB 也判失败，对方持续缓慢发送或塞入超大正文都不能把部署或回滚拖过截止时间。回滚的 `up` 和尽力恢复的 `up` 同样有超时；强杀之后的等待也有上限，逃出进程组仍占着管道的子进程不会让部署一直卡住。
+- `docker compose build` 没有网络参数；构建需要宿主网络时加 `--build-network host`，脚本会为带 `build` 的服务临时生成一个只含 `build.network` 的 Compose 覆盖文件，仅用于构建。`--no-build` 跳过构建，也跳过工作区可读性检查。
+- 孤立服务：`up --remove-orphans` 会删除 `-f` 文件集合之外的服务容器，回滚不会重建它们（只恢复镜像）。脚本在预检时列出这些服务（报告里的 `orphans`），没有 `--allow-remove-orphans` 就中止；先确认没有漏传某个 `-f` 文件。这正是移除某个 Compose 服务后需要加该参数的场景。
+- `--dry-run` 只执行只读的 docker 查询，列出将要运行的命令，不备份、不构建、不重建、不发请求；工作区可读性检查仍会执行（它不需要 Docker）。`--no-backup` 只放弃备份（写入报告），不放弃迁移预检；只有 `--no-backup` 加 `--allow-incompatible-migration` 同时给出时，数据库启动不了才允许继续。
+- 退出码：0 已部署；1 失败但旧版本在运行（已回滚并核对，或预检、备份、构建阶段中止时从未被改动）；2 用法或配置错误（含工作区文件对其它用户不可读，或迁移文件缺失）；3 失败且旧版本没有核对通过（回滚失败或不完整，或首次部署没有可恢复的版本）。
+
+**回滚的边界（务必先读）。** 回滚只恢复镜像：不恢复数据库，不恢复 Compose 拓扑，也不撤销已经提交的 `GRANT`/`REVOKE`、行级安全或策略。冒烟时迁移已经提交，所以旧镜像必须能在新 schema 上运行，即迁移必须向后兼容（expand/contract）：一个版本里只增加可空或带默认值的列和新表，不删除、重命名、改类型，也不对已有列加 `NOT NULL`，不改已有对象的权限，不对已有表启用行级安全或加策略；收缩（contract）放到再下一个版本，等旧镜像不再需要回滚之后。上面的隔离容器预检对着真实 schema 校验这一点；迁移里的数据语句在空的 schema 副本上看不出效果，由同一套原文记号兜底：`UPDATE`、`DELETE`、`TRUNCATE`、`MERGE`，以及 `DROP`、`RENAME`、改类型、`SET NOT NULL`、无默认值的 `NOT NULL` 列、`GRANT`/`REVOKE`、策略、行级安全和 psql 反斜杠元命令。注释和字符串都不去掉。当前 `bridge/space_schema.sql` 与已部署修订相同时，重新应用不需要覆盖参数。看不到已部署修订时，或者新增或删除的行里出现引号或注释分界时，整份文件当作新增，补数据的 `UPDATE`、`DO`、`ON DELETE` 和列名 `role` 会被报出来。目录对比仍兜住文本里没有这些词、但目录变了的情况。这仍不是兼容性证明。`deploy/migrate.py` 里的授权不在这份迁移 SQL 中，预检看不到。若仍然破坏了兼容，应先停止服务，再用备份手工恢复，例如（在 `deploy/` 目录，密码在容器内读取）：
+
+```sh
+# SPDX-License-Identifier: Apache-2.0
+docker compose exec -T database sh -c \
+  'PGPASSWORD="$(cat /run/secrets/database-admin/postgres.password)" exec pg_restore -U baton_bootstrap -d baton --clean --if-exists' \
+  < "$HOME/baton-backups/<备份文件>.dump"
+```
+
+**信任边界。** 这段检查故意写得很粗（crude on purpose）。迁移是经过审查的仓库代码。预检失败即关闭（fail closed），从不尝试解析 SQL。默认只扫描相对当前已部署修订新增的行。已部署文本来自正在运行的应用镜像标签 `org.baton.deployed-schema`，否则来自记录下来的部署状态；用 difflib 对原文做差异，相等的行留空，行号仍对得上新文件。只要有一行新增或删除的文本里出现引号或注释分界（`$`、`'`、`"`、`/*`、`*/`、`--`），差异捷径就关掉，整份新 schema 按原文扫描。报告写明用的是 `whole-file` 还是 `added-lines`，以及原因。操作者核对之后，若报出的是已经部署过的已知记号，再用 `--allow-incompatible-migration`。两者都没有、标签读不出来或几份镜像不一致时，同样整份文件当作新增，并在报告里写明。整份文件扫描时，注释里已经存在的目录形词（例如 `GRANT`）仍要 `--allow-breaking-catalog`。不删注释，也不删字符串，大小写不敏感，按词边界匹配；注释或字符串里的记号同样算。只有这一套扫描，不另做去掉注释或字符串的第二遍。记号都是单个词，避免被注释拆开：`extension`、`program`、`system`、`database`、`role`、`session_authorization`、`set_config`、`authorization`、`commit`、`rollback`、`abort`、`savepoint`、`release`、`reset`、`update`、`delete`、`truncate`、`merge`、`prepare`、`transaction`，以及单词 `do`。唯一的例外是短语 `on conflict do nothing`：`do` 只有出现在这句原样短语里才不算，中间夹注释、`E'...'`、`U&'...'` 或别的语句都算。`INSERT ... SELECT` 不单列。`END` 不是记号，所以 `CASE ... END` 和 `BEGIN ATOMIC` 可以通过。`BEGIN;` 可以通过；`BEGIN TRANSACTION` 含有 `transaction`，会报出来。报告写出扫描模式、原因、记号和行号。`--allow-incompatible-migration` 只放行这些记号，不能越过目录预检失败。`DROP`、`GRANT`/`REVOKE`、改类型、`SET NOT NULL`、策略、行级安全、停用触发器和 psql 元命令也在同一份原文上匹配，和目录对比一样，只有 `--allow-breaking-catalog` 能越过。已经部署且未改动的 schema 文本不会再次被标出。`BEFORE UPDATE` 和 `ON DELETE` 因为含有 `update`/`delete` 这两个词，出现在新增行里也会被标出；误报接受。目录对比包含已有内部触发器的 `tgenabled`；新外键在已有表上新增的内部触发器不算破坏。不为服务器端副作用再增加目录对比。
+
+**容器已停止或已删除但数据卷还在。** 这种情况脚本照样先启动数据库、做迁移预检和转储（见上面第 4 步），不会因为没有运行中的容器而跳过；转储失败就中止。区别只在回滚：已停止的容器（包括崩溃的 bridge）的镜像会被记录并保护，可以恢复；如果所有容器都已被删除，就没有"上一版镜像"可恢复，失败时报告 `failed`（退出码 3），数据库仍可用转储恢复。
+
+按 digest 固定的镜像（如 `edge`、`gateway`、`database`）由 Compose 文件决定，不会被重新打标签；回滚到这些镜像要部署文件的上一个版本。若新版本改动了这些固定值，回滚核对会发现服务没有回到之前的镜像 ID，并报告 `rollback_failed`，而不是冒充成功。
+
+edge 的 nginx 每次请求通过 Docker 内置 DNS（`127.0.0.11`，缓存 10 秒）解析 `gateway`，所以重建 gateway 后无需重启 edge；以前 nginx 只在启动时解析上游，gateway 换了容器 IP 就会一直 502。`proxy_pass $upstream$request_uri` 把客户端发来的原始 URI 原样转发，和原先静态 `proxy_pass http://gateway:3000;`（不带 URI）的行为一致，没有额外规范化。
+
+健康检查：bridge 容器内用 `GET http://127.0.0.1:9000/healthz`，它会读取数据库里的 schema 版本，数据库不可达或缺迁移时 bridge 即不健康（只有容器内回环地址的这一条 GET 免令牌，其他容器包括 gateway 仍需令牌）。edge 除 `/board` 外还会对 `/mcp` 发一个不带凭据的 POST，必须得到 gateway 的 401，502/503/504 即不健康；TLS 实例的 edge 检查同样的两个请求，经 `https://127.0.0.1:8443`，因此同时验证端口在监听、证书能完成握手（回环探测不校验证书链）、上游可达。注意：这个 401 在 gateway 内部由鉴权策略直接产生，**不会**访问 bridge，gateway 镜像里也没有 shell、wget 或 curl，无法在它自己的容器里探测；bridge 由它自己的 `/healthz` 保证（gateway `depends_on` bridge healthy），gateway 到 bridge 这一段由 `deploy.py` 的带令牌 MCP 冒烟验证。
+
 ### 升级旧实例
 
 早先版本的 Compose 带一个 `codex` 服务（内置 Codex worker）。它已被移除：不再有 `WORKER_MODE`、`CODEX_*` 设置、`admin import-auth`/`import-api-key`、`compose.apparmor.yaml`、专用 seccomp/AppArmor 配置和 `scripts/sandbox_probe.py`，镜像里也不再含 Node.js、Codex CLI 与 bubblewrap。升级时：

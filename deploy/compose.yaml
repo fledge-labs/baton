@@ -61,7 +61,13 @@ services:
     depends_on:
       gateway: {condition: service_started}
     healthcheck:
-      test: [CMD, wget, -q, --spider, http://127.0.0.1:8080/board]
+      # Static board, then the full edge -> gateway route: an unauthenticated MCP POST must be
+      # rejected with 401 by the gateway; 502/503/504 (stale or unresolvable upstream) is unhealthy.
+      test:
+        - CMD-SHELL
+        - >-
+          wget -q --spider http://127.0.0.1:8080/board &&
+          wget -S -O /dev/null --post-data '' http://127.0.0.1:8080/mcp 2>&1 | grep -q 'HTTP/1\.[01] 401'
       interval: 10s
       timeout: 3s
       retries: 12
@@ -91,7 +97,9 @@ services:
       initialize: {condition: service_completed_successfully}
       migrate: {condition: service_completed_successfully}
     healthcheck:
-      test: [CMD, python, -c, "import socket; socket.create_connection(('localhost',9000),2).close()"]
+      # /healthz makes the bridge read the schema version from PostgreSQL, so an unreachable
+      # database or a missing migration makes the bridge unhealthy (a bare TCP connect would not).
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/healthz', timeout=2).read()"]
       interval: 5s
       timeout: 3s
       retries: 15

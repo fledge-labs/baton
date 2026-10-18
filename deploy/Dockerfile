@@ -8,7 +8,11 @@ COPY bridge /app/bridge
 COPY scripts /app/scripts
 COPY deploy/gateway.template.json /app/deploy/gateway.template.json
 COPY deploy/migrate.py /app/deploy/migrate.py
-RUN mkdir -p /data && chown -R agent:agent /data /home/agent
+# A restrictive checkout umask leaves these files mode 0600, and COPY keeps that mode.
+# migrate runs as uid 999 and must read them (bridge/space_schema.sql in particular).
+# a+rX adds read for every user, and execute only on directories and files that are
+# already executable. It does not add write.
+RUN chmod -R a+rX /app && mkdir -p /data && chown -R agent:agent /data /home/agent
 USER 10001:10001
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 HOME=/home/agent
 CMD ["python", "-m", "bridge.server"]

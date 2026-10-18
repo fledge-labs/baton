@@ -205,7 +205,7 @@ def test_gateway_routes_http_api_through_client_acl():
     assert api_routes[0]["policies"]["authorization"]["rules"] == ["apiKey.role == 'client'"]
     for filename in ("nginx.conf", "nginx.tls.conf"):
         config = (root / "deploy" / filename).read_text()
-        assert "proxy_pass http://gateway:3000;" in config
+        assert "set $upstream http://gateway:3000;" in config and "proxy_pass $upstream$request_uri;" in config
         assert "$request_body" not in config and "$http_authorization" not in config
 
 
