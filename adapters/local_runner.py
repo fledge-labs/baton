@@ -566,7 +566,6 @@ class SandboxPlan:
     home_dirs: list = field(default_factory=list)
     home_read: list = field(default_factory=list)
     shim_read: list = field(default_factory=list)
-    spool_write: list = field(default_factory=list)
 
 
 def _real(path):
@@ -624,9 +623,6 @@ def bwrap_command(plan, argv):
             args += ["--ro-bind", path, path]
     for path in [plan.worktree, plan.tmpdir, *plan.extra_write]:
         args += ["--bind", path, path]
-    for path in plan.spool_write:
-        if os.path.isdir(path):
-            args += ["--bind", path, path]
     for directory in masked:
         args += ["--remount-ro", directory]  # the empty tmpfs stays empty; the binds above remain separate mounts
     return args + ["--chdir", plan.worktree, "--"] + list(argv)
@@ -652,13 +648,13 @@ def sandbox_exec_profile(plan):
         lines.append("(deny file-read* (subpath %s))" % _sbpl(directory))
     if plan.keychain_dirs:
         lines.append("(deny mach-lookup %s)" % " ".join("(global-name %s)" % _sbpl(n) for n in KEYCHAIN_MACH_SERVICES))
-    readable = [plan.worktree, plan.tmpdir, *plan.extra_write, *plan.home_read, *plan.shim_read, *plan.spool_write]
+    readable = [plan.worktree, plan.tmpdir, *plan.extra_write, *plan.home_read, *plan.shim_read]
     for path in readable:
         lines.append("(allow file-read* (subpath %s))" % _sbpl(path))
     for path in home_ancestors(plan, readable):
         lines.append("(allow file-read-metadata (literal %s))" % _sbpl(path))
     lines.append("(deny file-write*)")
-    writable = [plan.worktree, plan.tmpdir, *plan.extra_write, *plan.spool_write]
+    writable = [plan.worktree, plan.tmpdir, *plan.extra_write]
     lines.append("(allow file-write* %s (literal \"/dev/null\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/tty\"))"
                  % " ".join("(subpath %s)" % _sbpl(path) for path in writable))
     if not plan.allow_network:
@@ -1079,16 +1075,13 @@ def _inside_worktree(path, worktree):
     return current == root or current.startswith(prefix)
 
 
-def _rg_problem(argv, worktree):
-    """None when this rg argv does not launch another program.
+def _rg_option(argv):
+    """The canonical rg option this argv uses to launch another program, or None.
 
-    `RG_LAUNCHERS` is the fixed list: `-z` / `--search-zip` (gzip, bzip2, xz, lz4, lzma, brotli or zstd from
-    `PATH`; this overrides `--pre`), `--pre` / `--pre=COMMAND`, `--pre-glob`, and `--hostname-bin`. A longer
-    prefix and `=VALUE` are refused too (`--pr`, `--pre-g`, `--search`, `--search-zip=1`, `--pre=`). `--no-pre`
-    and `--no-search-zip` only disable the feature. A one-letter `--X` is the short flag (`--z` is `-z`).
-
-    A short cluster is read left to right. `z` refuses unless a value-taking short option already consumed the rest
-    of the cluster or the next argument: `-iz`, `-uz` and `-ze` are search-zip; `-ez` and `-e -z` are a pattern.
+    `RG_LAUNCHERS` is the fixed list. A longer prefix and an `=VALUE` form name the same option (`--pr` and
+    `--pre=` are `--pre`, `--search` is `--search-zip`, `--z` is `-z`). `--no-pre` and `--no-search-zip` are not
+    launchers. A one-letter `--X` is the short flag. A short cluster is read left to right: `-iz`, `-uz` and
+    `-ze` are `-z`; `-ez` and `-e -z` are a pattern.
     """
     # Long options that take the next argv when written without `=`. Launcher names are listed so a value is not
     # inspected after a refusal, and so a future edit that stops refusing one of them still skips its operand.
@@ -1101,12 +1094,18 @@ def _rg_problem(argv, worktree):
         "generate",
     }
     value_short = set("efEmjgdtTABCMr")
-    reason = "rg -z/--search-zip, --pre, --pre-glob and --hostname-bin run another program and are never granted"
 
-    def launches(name):
+    def canonical(name):
+        if name == "z":
+            return "-z"
         if name in RG_LAUNCHERS:
-            return True
-        return len(name) > 1 and any(item.startswith(name) for item in RG_LAUNCHERS)
+            return "--" + name
+        if len(name) > 1:
+            matches = [item for item in RG_LAUNCHERS if item.startswith(name)]
+            if matches:
+                chosen = min(matches, key=len)
+                return "-z" if chosen == "z" else "--" + chosen
+        return None
 
     index = 1
     while index < len(argv):
@@ -1119,19 +1118,30 @@ def _rg_problem(argv, worktree):
         if arg.startswith("--"):
             body = arg[2:]
             name, separator, _value = body.partition("=")
-            if launches(name):
-                return reason
+            option = canonical(name)
+            if option:
+                return option
             takes_value = separator != "=" and (name in value_long or (len(name) == 1 and name in value_short))
             index += 2 if takes_value else 1
             continue
         cluster, consumed = arg[1:], False
         for position, flag in enumerate(cluster):
             if flag == "z":
-                return reason
+                return "-z"
             if flag in value_short:
                 consumed = position == len(cluster) - 1
                 break
         index += 2 if consumed else 1
+    return None
+
+
+def _rg_problem(argv, worktree):
+    """None when this rg argv does not launch another program.
+
+    The refusal text names the whole fixed list. `_rg_option` is the single option the shim prints.
+    """
+    if _rg_option(argv):
+        return "rg -z/--search-zip, --pre, --pre-glob and --hostname-bin run another program and are never granted"
     return None
 
 
@@ -1406,10 +1416,6 @@ def shim_dir(principal):
     return _principal_dir(principal, "shims")
 
 
-def spool_dir(principal):
-    return _principal_dir(principal, "spool")
-
-
 def shim_path(principal, tool):
     """Absolute path of the runner-owned shim for one worker and one allow-listed program."""
     name = tool_basename(tool)
@@ -1419,24 +1425,19 @@ def shim_path(principal, tool):
 
 
 def ensure_shim_dirs(principal):
-    """Create the shim directory (0755) and the refusal spool (0700). The sandbox re-binds them."""
-    shim, spool = shim_dir(principal), spool_dir(principal)
+    """Create the shim directory (0755). The sandbox re-binds it read-only. A refusal writes nothing here."""
+    shim = shim_dir(principal)
     os.makedirs(shim, mode=0o755, exist_ok=True)
     os.chmod(shim, 0o755)
-    os.makedirs(spool, mode=0o700, exist_ok=True)
-    os.chmod(spool, 0o700)
-    return shim, spool
+    return shim
 
 
 def shim_inside_writable(worker):
-    """True when the shim or its spool would sit inside a directory this worker's CLI can write."""
+    """True when the shim would sit inside a directory this worker's CLI can write."""
     roots = [os.path.realpath(worker.workdir_root)]
     roots.extend(os.path.realpath(path) for path in worker.sandbox.extra_write_paths)
-    for path in (shim_dir(worker.principal), spool_dir(worker.principal)):
-        real = os.path.realpath(path)
-        if any(real == root or _under(real, [root]) for root in roots):
-            return True
-    return False
+    real = os.path.realpath(shim_dir(worker.principal))
+    return any(real == root or _under(real, [root]) for root in roots)
 
 
 def resolve_real_binary(name):
@@ -1460,7 +1461,7 @@ def resolve_real_binary(name):
     return real
 
 
-_SHIM_FUNCTIONS = (tool_basename, _inside_worktree, _rg_problem, argv_problem)
+_SHIM_FUNCTIONS = (tool_basename, _inside_worktree, _rg_option, _rg_problem, argv_problem)
 
 # Appended to every generated shim. Standard library only; no eval; the real program is exec'd by the baked absolute path.
 SHIM_MAIN = """
@@ -1483,22 +1484,15 @@ def _exec_env():
     return env
 
 
-def _note(grant, reason):
-    # json and time are imported only after the argv check has already refused the call.
-    import json, time
-    record = {"grant_id": grant.get("id"), "request_id": grant.get("request_id"), "task_id": grant.get("task_id"),
-              "tool": TOOL, "reason": reason, "argv": sys.argv[1:][:40], "time": time.time()}
-    name = "%d-%d-%s.json" % (time.time_ns(), os.getpid(), os.urandom(4).hex())
+def _refuse(option):
+    # One line on this process's stderr, then 126. Nothing is written to disk and nothing is sent to Baton.
+    if not isinstance(option, str) or not option or any(ch in option for ch in " \\t\\n\\r"):
+        option = "argv"
     try:
-        fd = os.open(os.path.join(SPOOL, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            os.write(fd, json.dumps(record).encode("utf-8"))
-        finally:
-            os.close(fd)
+        sys.stderr.write("baton-runner: rg " + option + " refused by the grant policy\\n")
     except OSError:
         pass
-    sys.stderr.write("baton shim: %s\\n" % reason)
-    return 1
+    sys.exit(126)
 
 
 def main():
@@ -1517,14 +1511,17 @@ def main():
         chosen = grant
         break
     if chosen is None:
-        sys.exit(_note(GRANTS[0] if GRANTS else {}, problem or "refused"))
+        option = _rg_option(argv) if TOOL == "rg" else None
+        if not option:
+            option = "worktree" if problem == "the command is outside the granted worktree" else "argv"
+        _refuse(option)
     # rg reads RIPGREP_CONFIG_PATH and ~/.ripgreprc unless --no-config is set. The flag is forced here, after the
     # argv policy, so a config file cannot put -z, --pre or --hostname-bin back. The environment is replaced, not inherited.
     command = [REAL, "--no-config", *sys.argv[1:]] if TOOL == "rg" else [REAL, *sys.argv[1:]]
     try:
         os.execve(REAL, command, _exec_env())
     except OSError:
-        sys.exit(_note(chosen, "the real program could not be started"))
+        _refuse("exec")
 
 
 if __name__ == "__main__":
@@ -1543,12 +1540,12 @@ def shim_interpreter():
     raise RunnerError("python3 is not installed, so a shim cannot be written")
 
 
-def shim_script(tool, real, spool, grants):
+def shim_script(tool, real, grants):
     """A read-only standard-library program. It never imports the runner and never carries a Baton token.
 
     The shebang is the interpreter resolved now, with -IS: isolated mode ignores PYTHON* and the user site, and -S
-    does not import site, so usercustomize cannot run. Argument checks use only os and sys. json and time are
-    imported later, and only when a call has already been refused.
+    does not import site, so usercustomize cannot run. Argument checks use only os and sys. A refusal writes one
+    line to stderr and exits 126. It does not write a file and it does not call Baton.
     """
     interpreter = shim_interpreter()
     rows = [{"id": grant["id"], "request_id": grant["request_id"], "task_id": grant["task_id"],
@@ -1560,11 +1557,11 @@ def shim_script(tool, real, spool, grants):
         "# Every call checks argv, then execve's the real program at the absolute path fixed when the grant was written.",
         "# The interpreter is isolated (-IS). The environment passed to the real program is replaced",
         "# (PATH=/usr/bin:/bin plus HOME, LANG, LC_*, TERM). rg is always passed --no-config.",
+        "# A refusal writes one stderr line and exits 126. It writes no file and does not call Baton.",
         "# Policy: %s" % POLICY_ARGS[tool],
         "import os, sys",
         "TOOL = %r" % tool,
         "REAL = %r" % real,
-        "SPOOL = %r" % spool,
         "GRANTS = %r" % (rows,),
         "RG_LAUNCHERS = %r" % (tuple(sorted(RG_LAUNCHERS)),),
     ]
@@ -1575,9 +1572,9 @@ def shim_script(tool, real, spool, grants):
     return "\n".join(parts) + "\n"
 
 
-def write_shim(path, tool, real, spool, grants):
+def write_shim(path, tool, real, grants):
     """Atomically install the shim as mode 0555. The directory stays writable by the runner and is remounted read-only for the worker."""
-    text = shim_script(tool, real, spool, grants)
+    text = shim_script(tool, real, grants)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(str(path.parent), 0o755)
@@ -1968,7 +1965,7 @@ class GrantLedger:
             return
         living.sort(key=lambda item: item.get("created") or 0)
         current = living[-1]
-        write_shim(current["shim"], tool, current["real"], spool_dir(self.principal), living)
+        write_shim(current["shim"], tool, current["real"], living)
 
     def add(self, worker, request, tool, directory, command):
         """Record, install the shim, then write its absolute path into the allowlist. Undo with remove().
@@ -2111,119 +2108,12 @@ def error_code(error):
     return type(error).__name__
 
 
-# The refusal spool is worker-writable. A drain never reads more than this, never forwards faster than the window,
-# and never runs longer than SPOOL_DRAIN_SECONDS. The directory scan itself stops after SPOOL_SCAN_ENTRIES names or
-# the deadline, whichever comes first, and overflow deletion spends that same budget. Past that, leftover files
-# wait for a later drain.
-SPOOL_DRAIN_FILES = 32
-SPOOL_SCAN_ENTRIES = 64
-SPOOL_MAX_BYTES = 4096
-SPOOL_FORWARD_LIMIT = 8
-SPOOL_FORWARD_WINDOW = 60.0
-SPOOL_DRAIN_SECONDS = 2.0
-
-
-def _drop_spool_entry(path, kind):
-    """Delete one spool entry that is not a regular *.json record. None when it is gone, else a discard reason.
-
-    unlink never follows a symlink. A directory is removed only with rmdir, so a non-empty one stays and is
-    reported as 'directory'.
-    """
-    if kind == "dir":
-        try:
-            os.rmdir(path)
-        except OSError:
-            return "directory"
-        return None
-    if kind is None:
-        return None
-    try:
-        os.unlink(path)
-    except OSError:
-        return "nonregular"
-    return "junk" if kind == "file" else "nonregular"
-
-
-def _spool_kind(path):
-    """'file', 'dir', 'other', or None. Does not follow symlinks and does not raise."""
-    try:
-        mode = os.lstat(path).st_mode
-    except OSError:
-        return None
-    if stat.S_ISREG(mode):
-        return "file"
-    if stat.S_ISDIR(mode):
-        return "dir"
-    return "other"
-
-
-def _spool_payload(path):
-    """('ok', object) or (discard reason, None). Reads at most SPOOL_MAX_BYTES and does not raise.
-
-    The type check is fstat of the descriptor this open returned, not a prior lstat. A fifo or a symlink swapped
-    in after a directory listing cannot block this thread or be followed to a device: the open is non-blocking and
-    does not follow links, and anything that is not a regular file is closed without a read.
-    """
-    try:
-        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-    except AttributeError:
-        return "malformed", None
-    try:
-        fd = os.open(path, flags)
-    except OSError:
-        return "malformed", None
-    try:
-        try:
-            st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode):
-                return "nonregular", None
-            if st.st_size > SPOOL_MAX_BYTES:
-                return "oversized", None
-            raw = os.read(fd, SPOOL_MAX_BYTES + 1)
-        except OSError:
-            return "malformed", None
-    finally:
-        os.close(fd)
-    if len(raw) > SPOOL_MAX_BYTES:
-        return "oversized", None
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeError, ValueError):
-        return "malformed", None
-    if not isinstance(payload, dict):
-        return "malformed", None
-    return "ok", payload
-
-
 class GrantKeeper:
     """Applies, reports and withdraws one worker's grants. `baton` may be None (token unreadable): withdrawal still works
     and the report is retried later."""
 
-    def __init__(self, worker, ledger, baton, log, secrets=()):
+    def __init__(self, worker, ledger, baton, log):
         self.worker, self.ledger, self.baton, self.log = worker, ledger, baton, log
-        self._secrets = secrets
-        self._spool_forwarded = []
-        self._spool_noted = 0.0
-        self._spool_abort = threading.Event()
-        self._spool_abort_ack = threading.Event()
-
-    def request_spool_abort(self):
-        """Ask every in-flight drain to stop sending. The drain acknowledges when it has observed this."""
-        self._spool_abort.set()
-
-    def spool_abort_acknowledged(self):
-        return self._spool_abort.is_set() and self._spool_abort_ack.is_set()
-
-    def _spool_send_blocked(self):
-        """True when teardown has aborted forwarding. Acknowledges the flag and must not be followed by a send."""
-        if not self._spool_abort.is_set():
-            return False
-        self._spool_abort_ack.set()
-        return True
-
-    def _secret_values(self):
-        values = self._secrets() if callable(self._secrets) else self._secrets
-        return tuple(value for value in (values or ()) if value)
 
     def _bind_operation(self, record, kind):
         """The operation id of a granted or revoked report, saved before the call so a lost response can be replayed."""
@@ -2238,11 +2128,11 @@ class GrantKeeper:
         return operation
 
     def _report(self, record, kind, reason=None):
-        """True when Baton accepted the report. A Baton or network error is returned so a spool drain can tell a
-        permanent rejection from a retry. Granted and revoked reports also mark the ledger; a shim refusal does not.
+        """True when Baton accepted the report. A Baton or network error is returned so the caller can retry.
 
-        `revoked_reported` is set only after the server acknowledges the revoke. A granted report whose response was
-        lost keeps the same operation id and is retried by reconcile instead of being treated as already revoked.
+        Granted and revoked reports also mark the ledger. `revoked_reported` is set only after the server
+        acknowledges the revoke. A granted report whose response was lost keeps the same operation id and is
+        retried by reconcile instead of being treated as already revoked.
         """
         if self.baton is None:
             return False
@@ -2326,109 +2216,6 @@ class GrantKeeper:
         except (RunnerError, OSError):
             self.log(None, "grant-reconcile-failed", grant="unreported")
 
-    def drain_spool(self):
-        """Forward a bounded number of shim refusals. The shim writes a file; this process holds the token.
-
-        The spool is writable by the worker, so every record is untrusted. One drain walks the directory with
-        scandir and stops after SPOOL_SCAN_ENTRIES entries or SPOOL_DRAIN_SECONDS. It never lists or sorts the
-        whole directory. Anything that is not a regular *.json file is deleted inside that same budget: unlink
-        does not follow links, and a directory is removed only when empty. A directory that is not empty is
-        counted once per drain and left in place. Each json candidate is opened with O_RDONLY|O_NOFOLLOW|O_NONBLOCK
-        and kept only when fstat says it is a regular file within the byte cap. Oversized, malformed and unknown
-        files are deleted and counted. lstat is only used to decide that cleanup; it is not the open. Once
-        SPOOL_DRAIN_FILES regular files are kept, further regular files seen before the scan stops are deleted as
-        overflow, inside the same budget. Forwarding is rate-limited. A record read after the spool abort flag is
-        set is not sent. Files left by the limit or the deadline wait for a later drain instead of flooding audit.
-        """
-        if self.baton is None:
-            return
-        deadline = time.monotonic() + SPOOL_DRAIN_SECONDS
-        spool = spool_dir(self.worker.principal)
-        if not os.path.isdir(spool):
-            return
-        discarded = {"nonregular": 0, "oversized": 0, "malformed": 0, "unknown": 0, "overflow": 0,
-                     "junk": 0, "directory": 0}
-        files = []
-        seen = 0
-        try:
-            entries = os.scandir(spool)
-        except OSError:
-            return
-        with entries:
-            for entry in entries:
-                if seen >= SPOOL_SCAN_ENTRIES or time.monotonic() >= deadline:
-                    break
-                seen += 1
-                name = entry.name
-                if name in (".", "..") or os.sep in name or (os.altsep and os.altsep in name):
-                    continue
-                path = os.path.join(spool, name)
-                kind = _spool_kind(path)
-                if kind == "file" and name.endswith(".json") and len(name) <= 200:
-                    if len(files) >= SPOOL_DRAIN_FILES:
-                        with contextlib.suppress(OSError):
-                            os.unlink(path)
-                        discarded["overflow"] += 1
-                    else:
-                        files.append(name)
-                    continue
-                reason = _drop_spool_entry(path, kind)
-                if reason:
-                    discarded[reason] += 1
-        now = time.monotonic()
-        self._spool_forwarded = [stamp for stamp in self._spool_forwarded if now - stamp < SPOOL_FORWARD_WINDOW]
-        with self.ledger.locked():
-            grants = self.ledger.load()
-        for name in files:
-            if time.monotonic() >= deadline:
-                break
-            path = os.path.join(spool, name)
-            outcome = _spool_payload(path)
-            if outcome[0] != "ok":
-                discarded[outcome[0]] += 1
-                with contextlib.suppress(OSError):
-                    os.unlink(path)
-                continue
-            if self._spool_send_blocked():
-                continue
-            payload = outcome[1]
-            secrets = self._secret_values()
-
-            def field(value, limit):
-                if not isinstance(value, str) or not value:
-                    return None
-                return one_line(value, limit, secrets)
-
-            grant_id = field(payload.get("grant_id"), 80)
-            request_id = field(payload.get("request_id"), 80)
-            known = grants.get(grant_id) if grant_id else None
-            if not isinstance(known, dict) or field(known.get("request_id"), 80) != request_id:
-                discarded["unknown"] += 1
-                with contextlib.suppress(OSError):
-                    os.unlink(path)
-                continue
-            # The rate limit stops new audit rows. Files already chosen are still classified, and a valid one
-            # past the limit stays for a later drain. That does not look at any further directory entries.
-            if len(self._spool_forwarded) >= SPOOL_FORWARD_LIMIT:
-                continue
-            reason = field(payload.get("reason"), 300) or "refused"
-            # After the text is redacted, and before the send. A record read once abort is set is never sent.
-            if self._spool_send_blocked():
-                continue
-            reported = self._report(
-                {"id": known["id"], "task_id": known["task_id"], "request_id": known["request_id"],
-                 "operation_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "baton/shim-refusal/" + name))},
-                "shim_refused", reason)
-            if reported is True or (isinstance(reported, cli.BatonError) and not cli.transient(reported)):
-                with contextlib.suppress(OSError):
-                    os.unlink(path)
-            if reported is True:
-                self._spool_forwarded.append(time.monotonic())
-        if any(discarded.values()) and time.monotonic() - self._spool_noted >= 10:
-            self._spool_noted = time.monotonic()
-            self.log(None, "spool-discarded", **{key: value for key, value in discarded.items() if value})
-
-
 def call_interruptible(stop, work):
     """Run work() in a helper thread so a stop request is noticed while a long poll is in flight."""
     box = {}
@@ -2456,9 +2243,8 @@ class RedactionSecrets:
     """Secret values of one worker run, shared by every thread of that run.
 
     The runner fills tokens and passthrough values before any thread starts. Keychain values are added under the
-    lock when the run reads them, so the watchdog and the end-of-run spool drain see the same set as the thread
-    that launched the task. Cleared at teardown only after those threads have joined and any drain still running
-    has exited or acknowledged the abort and will not send.
+    lock when the run reads them, so a comment or result on any thread redacts the same set. Cleared at teardown
+    only after those threads have joined.
     """
 
     def __init__(self):
@@ -2488,9 +2274,8 @@ class WorkerRunner:
         self.queue = queue.Queue()
         self.inflight, self.inflight_lock = set(), threading.Lock()
         self.deferrals, self.threads, self.timers = {}, [], []
-        self._drain_lock, self._drain_threads = threading.Lock(), []
-        self.keeper = (GrantKeeper(worker, GrantLedger(self.config.state_dir, worker.principal), baton, self.log,
-                                   secrets=lambda: self.secrets) if worker.permissions else None)
+        self.keeper = (GrantKeeper(worker, GrantLedger(self.config.state_dir, worker.principal), baton, self.log)
+                       if worker.permissions else None)
 
     @property
     def principal(self):
@@ -2513,16 +2298,8 @@ class WorkerRunner:
         for index in range(self.worker.concurrency):
             self.threads.append(threading.Thread(target=self.exec_loop, name="exec-%s-%d" % (self.principal, index),
                                                  daemon=True))
-        if self.keeper is not None:
-            self.threads.append(threading.Thread(target=self.shim_watch_loop, name="shim-" + self.principal, daemon=True))
         for thread in self.threads:
             thread.start()
-
-    def shim_watch_loop(self):
-        """Forward refusal records the shim left in the spool. allow_once is withdrawn when the task run ends."""
-        while not self.stop.wait(0.2):
-            with contextlib.suppress(RunnerError, OSError, cli.BatonError, cli.NetworkError):
-                self.keeper.drain_spool()
 
     def schedule(self, task_id, delay):
         if delay <= 0:
@@ -2729,7 +2506,7 @@ class WorkerRunner:
                     try:
                         if worker.env_from_keychain:
                             keychain = read_keychain(self.runner.security_bin, worker.env_from_keychain)
-                            # Visible to the watchdog and the end-of-run drain, not only this thread.
+                            # Visible to every thread of this run, not only the one that read the Keychain.
                             self.redaction.extend(keychain.values())
                         env = self.child_env(tmpdir, keychain)
                         try:
@@ -2749,7 +2526,7 @@ class WorkerRunner:
         finally:
             renewing.set()
             renewer.join(10)
-            # Revoke first. A stuck or malicious spool must not keep an allow_once grant alive.
+            # Revoke allow_once before the result is posted. The shim keeps no counter and writes no refusal file.
             self.end_task_grants(task_id, once)
             shutil.rmtree(str(tmpdir), ignore_errors=True)
         if denied is not None:
@@ -2898,78 +2675,9 @@ class WorkerRunner:
             if self.keeper.revoke(grant_id) is False:
                 self.log(task_id, "grant-left-active", grant=grant_id)
 
-    def _remember_drain(self, thread):
-        lock = getattr(self, "_drain_lock", None)
-        if lock is None:
-            lock = threading.Lock()
-            self._drain_lock = lock
-            self._drain_threads = []
-        with lock:
-            self._drain_threads.append(thread)
-
-    def _forget_drain(self, thread):
-        lock = getattr(self, "_drain_lock", None)
-        if lock is None:
-            return
-        with lock:
-            self._drain_threads = [item for item in self._drain_threads if item is not thread]
-
-    def join_spool_drains(self, timeout):
-        """Set the abort flag and join end-of-task drains for at most `timeout` seconds.
-
-        True when every such drain has exited, or the flag is set and a drain has acknowledged it and will not send.
-        """
-        keeper = getattr(self, "keeper", None)
-        if keeper is not None:
-            keeper.request_spool_abort()
-        lock = getattr(self, "_drain_lock", None)
-        threads = []
-        if lock is not None:
-            with lock:
-                threads = list(self._drain_threads)
-        deadline = time.monotonic() + max(0.0, timeout)
-        for thread in threads:
-            remaining = deadline - time.monotonic()
-            if remaining > 0:
-                thread.join(remaining)
-        if lock is not None:
-            with lock:
-                self._drain_threads = [thread for thread in self._drain_threads if thread.is_alive()]
-                alive = list(self._drain_threads)
-        else:
-            alive = [thread for thread in threads if thread.is_alive()]
-        if not alive:
-            return True
-        return keeper is not None and keeper.spool_abort_acknowledged()
-
     def end_task_grants(self, task_id, once):
-        """Withdraw allow_once, then drain the spool. The drain cannot postpone or skip the withdrawal.
-
-        The drain runs on a daemon thread and is abandoned after SPOOL_DRAIN_SECONDS. A raise inside it is logged.
-        The watcher keeps draining during the run; this only covers records still there when the task ends.
-        A drain that is still running stays registered so teardown can abort it before clearing redaction secrets.
-        """
+        """Withdraw allow_once before the task result is posted. The shim writes no counter and no refusal file."""
         self.drop_once_grants(task_id, once)
-        if self.keeper is None:
-            return
-        box = {}
-
-        def run():
-            try:
-                self.keeper.drain_spool()
-            except (RunnerError, OSError, cli.BatonError, cli.NetworkError) as error:
-                box["error"] = error
-
-        thread = threading.Thread(target=run, name="spool-drain-" + str(task_id), daemon=True)
-        self._remember_drain(thread)
-        thread.start()
-        thread.join(SPOOL_DRAIN_SECONDS)
-        if thread.is_alive():
-            self.log(task_id, "spool-drain-timeout")
-        else:
-            self._forget_drain(thread)
-            if "error" in box:
-                self.log(task_id, "spool-drain-failed", error=error_code(box["error"]))
 
     def permission_denied(self, task_id, page_id, epoch, request):
         self.log(task_id, "permission-denied", request=request["request_id"])
@@ -3051,13 +2759,11 @@ class WorkerRunner:
 
     def sandbox_plan(self, workdir, tmpdir, admin=None):
         workers = self.runner.config.workers
-        shim_read, spool_write = [], []
+        shim_read = []
         if self.worker.permissions is not None:
-            shim_directory, spool_directory = os.path.realpath(shim_dir(self.principal)), os.path.realpath(spool_dir(self.principal))
+            shim_directory = os.path.realpath(shim_dir(self.principal))
             if os.path.isdir(shim_directory):
                 shim_read.append(shim_directory)
-            if os.path.isdir(spool_directory):
-                spool_write.append(spool_directory)
         return SandboxPlan(
             backend=self.worker.sandbox.backend, allow_network=self.worker.sandbox.allow_network,
             worktree=_real(str(workdir)), tmpdir=_real(str(tmpdir)), own_root=_real(self.worker.workdir_root),
@@ -3071,7 +2777,7 @@ class WorkerRunner:
                            [_real(os.path.join(os.path.expanduser("~"), "Library", "Keychains")),
                             _real("/Library/Keychains")]),
             home_dirs=sorted({os.path.normpath(os.path.expanduser("~")), _real(os.path.expanduser("~"))}),
-            home_read=self.home_read_paths(admin), shim_read=shim_read, spool_write=spool_write)
+            home_read=self.home_read_paths(admin), shim_read=shim_read)
 
     def child_env(self, tmpdir, keychain=None):
         home = os.path.expanduser("~") if self.worker.home == "real" else str(tmpdir / "home")
@@ -3311,19 +3017,11 @@ class Runner:
 
     def join(self, timeout=15):
         deadline = time.monotonic() + timeout
-        for worker in self.workers:
-            keeper = getattr(worker, "keeper", None)
-            if keeper is not None:
-                keeper.request_spool_abort()
         pending = False
         for worker in self.workers:
             for thread in worker.threads:
                 thread.join(max(0.0, deadline - time.monotonic()))
-            # The end-of-task drain is not one of worker.threads. Abort it, join it within the time left, and
-            # clear secrets only after it has exited or acknowledged the abort and will not send.
-            settled = worker.join_spool_drains(max(0.0, deadline - time.monotonic()))
-            threads_done = all(not thread.is_alive() for thread in worker.threads)
-            if threads_done and settled:
+            if all(not thread.is_alive() for thread in worker.threads):
                 worker.redaction.clear()
             else:
                 pending = True

@@ -2370,12 +2370,11 @@ def test_an_approved_rg_shim_rejects_pre_and_the_real_binary_is_not_allowlisted(
     assert shim in agy.allow() and real not in agy.allow()
     report = lab.report("worker", task_id)
     probes = report["probes"]
-    assert probes["shim_pre_rc"] != 0 and "--pre" in probes["shim_pre_err"]
+    assert probes["shim_pre_rc"] == 126
+    assert probes["shim_pre_err"].strip() == "baton-runner: rg --pre refused by the grant policy"
     assert probes["direct_allowlisted"] is False and probes["shim_writable"] is False
     assert report["env"]["PATH"].split(os.pathsep)[0] == os.path.dirname(shim)
-    audit = next(row for row in space.owner.read("list_audit", task_id=task_id) if row["event"] == "permission.shim_refused")
-    assert audit["agent"] == worker_name and "--pre" in audit["metadata"]["reason"]
-    assert audit["metadata"]["request_id"] == request["request_id"]
+    assert not any(row["event"] == "permission.shim_refused" for row in space.owner.read("list_audit", task_id=task_id))
     assert permissions_of(space, task_id)[0]["grant"] == "granted"
 
 
@@ -2700,11 +2699,11 @@ def test_the_shim_refuses_every_rg_launcher_spelling(tmp_path, monkeypatch, comm
     shim_text = Path(record["shim"]).read_text(encoding="utf-8")
     assert "--no-config" in shim_text and "RG_LAUNCHERS" in shim_text
     refused = subprocess.run([record["shim"], *argv], cwd=work, capture_output=True, text=True)
-    assert refused.returncode != 0 and fragment in refused.stderr and "baton shim:" in refused.stderr, command
-    assert refused.stdout == ""
-    keeper.drain_spool()
-    refusal = next(call for call in recorder.calls if call[1]["event"] == "shim_refused")
-    assert fragment in refusal[1]["reason"]
+    option = lr._rg_option(["rg", *argv])
+    assert refused.returncode == 126 and refused.stdout == "", command
+    assert refused.stderr == "baton-runner: rg %s refused by the grant policy\n" % option
+    assert fragment in refused.stderr
+    assert not any(call[1].get("event") == "shim_refused" for call in recorder.calls)
 
 
 def test_the_shim_still_runs_rg_when_z_is_only_a_pattern(tmp_path, monkeypatch):
@@ -2714,9 +2713,9 @@ def test_the_shim_still_runs_rg_when_z_is_only_a_pattern(tmp_path, monkeypatch):
     (work / "hello.txt").write_text("hello\n", encoding="utf-8")
     record = keeper.grant(request_view("r-plain"), "rg", str(work))
     allowed = subprocess.run([record["shim"], "-n", "hello", "hello.txt"], cwd=work, capture_output=True, text=True)
-    assert allowed.returncode == 0 and "hello" in allowed.stdout and "baton shim:" not in allowed.stderr
+    assert allowed.returncode == 0 and "hello" in allowed.stdout and "baton-runner:" not in allowed.stderr
     pattern = subprocess.run([record["shim"], "-e", "-z", "hello.txt"], cwd=work, capture_output=True, text=True)
-    assert pattern.returncode == 1 and "baton shim:" not in pattern.stderr
+    assert pattern.returncode == 1 and "baton-runner:" not in pattern.stderr
 
 
 def test_the_shim_rejects_rg_pre_and_allow_once_lasts_until_the_runner_revokes_it(tmp_path, monkeypatch):
@@ -2728,11 +2727,9 @@ def test_the_shim_rejects_rg_pre_and_allow_once_lasts_until_the_runner_revokes_i
     assert "os.execve" in shim_text and "--no-config" in shim_text
     assert "_once_path" not in shim_text and ".once" not in shim_text
     refused = subprocess.run([always["shim"], "--pre=sh"], cwd=work, capture_output=True, text=True)
-    assert refused.returncode != 0 and "--pre" in refused.stderr and "baton shim:" in refused.stderr
-    assert not list(Path(lr.spool_dir("w1")).glob("*.once"))
-    keeper.drain_spool()
-    refusal = next(call for call in recorder.calls if call[1]["event"] == "shim_refused")
-    assert "--pre" in refusal[1]["reason"] and refusal[1]["request_id"] == "r-always" and refusal[1]["operation_id"]
+    assert refused.returncode == 126
+    assert refused.stderr == "baton-runner: rg --pre refused by the grant policy\n"
+    assert not any(call[1].get("event") == "shim_refused" for call in recorder.calls)
     assert always["real"] not in json.loads(settings.read_text())["permissions"]["allow"]
     direct = subprocess.run([always["real"], "--version"], cwd=work, capture_output=True, text=True)
     assert direct.returncode == 0, "the real binary still runs; the allowlist, not this process, is what blocks it"
@@ -2740,7 +2737,6 @@ def test_the_shim_rejects_rg_pre_and_allow_once_lasts_until_the_runner_revokes_i
     for _ in range(2):
         ran = subprocess.run([once["shim"], "--version"], cwd=work, capture_output=True, text=True)
         assert ran.returncode == 0 and os.path.exists(once["shim"])
-    assert not list(Path(lr.spool_dir("w1")).glob("*.once"))
     assert keeper.revoke(always["id"]) is True and os.path.exists(once["shim"]), "allow_once still holds the shim"
     again = subprocess.run([once["shim"], "--version"], cwd=work, capture_output=True, text=True)
     assert again.returncode == 0
@@ -2780,8 +2776,8 @@ def test_the_shim_does_not_run_python_startup_hooks(tmp_path, monkeypatch):
     shebang, body = text.split("\n", 1)
     interpreter, flag = shebang[2:].rsplit(" ", 1)
     assert flag == "-IS" and interpreter.startswith("/") and os.path.isfile(interpreter)
-    assert "import os, sys" in body.split("def _note", 1)[0]
-    assert "import json" not in body.split("def _note", 1)[0]
+    assert "import os, sys" in body
+    assert "import json" not in body and "SPOOL" not in text and "os.open" not in text
     home = tmp_path / "home"
     marker = tmp_path / "ran"
     site = subprocess.run([interpreter, "-c", "import site; print(site.getusersitepackages())"],
@@ -2805,307 +2801,40 @@ def test_the_shim_does_not_run_python_startup_hooks(tmp_path, monkeypatch):
     assert ran.returncode == 0 and "hello" in ran.stdout and not marker.exists()
 
 
-def test_a_fifo_swapped_in_after_lstat_and_a_device_symlink_are_not_read(tmp_path, monkeypatch):
+def test_a_refused_shim_call_leaves_no_files_and_exits_126(tmp_path, monkeypatch):
     _, keeper, recorder = keeper_for(tmp_path, monkeypatch)
-    keeper.grant(request_view("r-race"), "rg", "/work/w1")
-    spool = Path(lr.spool_dir("w1"))
-    os.mkfifo(spool / "race.json")
-    os.symlink("/dev/zero", spool / "zero.json")
-    real_lstat, real_open = os.lstat, os.open
-    opened = []
+    work = tmp_path / "work"
+    work.mkdir()
+    record = keeper.grant(request_view("r-refuse"), "rg", str(work))
+    data = Path(lr.runner_data_root())
+    shim_text = Path(record["shim"]).read_text(encoding="utf-8")
+    assert "SPOOL" not in shim_text and "import json" not in shim_text and "os.open" not in shim_text
 
-    def stale(path):
-        info = real_lstat(path)
-        if os.path.basename(path) in ("race.json", "zero.json"):
-            return os.stat_result((stat.S_IFREG | 0o644,) + info[1:])
-        return info
+    def names(root):
+        root = Path(root)
+        if not root.exists():
+            return []
+        return sorted(str(path.relative_to(root)) for path in root.rglob("*"))
 
-    def spy(path, flags, *args, **kwargs):
-        opened.append((os.path.basename(path), flags))
-        return real_open(path, flags, *args, **kwargs)
-
-    monkeypatch.setattr(os, "lstat", stale)
-    monkeypatch.setattr(os, "open", spy)
-    started = time.monotonic()
-    keeper.drain_spool()
-    assert time.monotonic() - started < 2, "drain blocked after lstat on a fifo or a device symlink"
-    want = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-    seen = {name: flags for name, flags in opened}
-    for name in ("race.json", "zero.json"):
-        flags = seen[name]
-        assert flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK and (flags & os.O_ACCMODE) == os.O_RDONLY
-        assert flags & want == want
-    assert not (spool / "race.json").exists() and not (spool / "zero.json").exists()
+    before_data, before_work = names(data), names(work)
+    refused = subprocess.run([record["shim"], "--pre", "sh"], cwd=work, capture_output=True, text=True)
+    assert refused.returncode == 126
+    assert refused.stdout == ""
+    assert refused.stderr == "baton-runner: rg --pre refused by the grant policy\n"
+    assert names(data) == before_data and names(work) == before_work
+    assert not (data / "spool").exists()
     assert not any(call[1].get("event") == "shim_refused" for call in recorder.calls)
 
 
-def test_allow_once_is_revoked_before_a_spool_drain_that_fails_or_hangs(tmp_path, monkeypatch):
+def test_allow_once_is_revoked_at_the_end_of_the_task(tmp_path, monkeypatch):
     settings, keeper, _ = keeper_for(tmp_path, monkeypatch)
     record = keeper.grant(request_view("r-once", "allow_once"), "rg", "/work/w1")
     runner = lr.WorkerRunner.__new__(lr.WorkerRunner)
     runner.keeper = keeper
     runner.log = lambda *args, **kwargs: None
-    events = []
-    real_revoke = keeper.revoke
-
-    def revoke(grant_id):
-        events.append("revoke")
-        return real_revoke(grant_id)
-
-    def fail():
-        events.append("drain")
-        raise lr.RunnerError("spool drain failed")
-
-    keeper.revoke = revoke
-    keeper.drain_spool = fail
     runner.end_task_grants(record["task_id"], [record["id"]])
-    assert events == ["revoke", "drain"]
     assert json.loads(settings.read_text())["permissions"]["allow"] == []
     assert keeper.ledger.active() == []
-
-    again = keeper.grant(request_view("r-hang", "allow_once", "t-hang"), "rg", "/work/w1")
-    monkeypatch.setattr(lr, "SPOOL_DRAIN_SECONDS", 0.2)
-
-    def hang():
-        events.append("hang")
-        time.sleep(30)
-
-    keeper.drain_spool = hang
-    started = time.monotonic()
-    runner.end_task_grants(again["task_id"], [again["id"]])
-    assert time.monotonic() - started < 2
-    assert events[-2:] == ["revoke", "hang"]
-    assert json.loads(settings.read_text())["permissions"]["allow"] == []
-    assert keeper.ledger.active() == []
-
-
-def test_a_spool_fifo_and_a_dev_zero_symlink_do_not_block_the_drain(tmp_path, monkeypatch):
-    _, keeper, recorder = keeper_for(tmp_path, monkeypatch)
-    keeper.grant(request_view("r-spool"), "rg", "/work/w1")
-    spool = Path(lr.spool_dir("w1"))
-    os.mkfifo(spool / "pipe.json")
-    os.symlink("/dev/zero", spool / "zero.json")
-    done = threading.Event()
-
-    def run():
-        keeper.drain_spool()
-        done.set()
-
-    thread = threading.Thread(target=run)
-    thread.start()
-    assert done.wait(2), "drain_spool blocked on a fifo or a symlink"
-    thread.join(1)
-    assert not thread.is_alive()
-    assert not (spool / "pipe.json").exists() and not (spool / "zero.json").exists()
-    assert not any(call[1].get("event") == "shim_refused" for call in recorder.calls)
-
-
-def test_another_thread_redacts_a_keychain_secret_while_draining_the_spool(tmp_path, monkeypatch):
-    _, keeper, recorder = keeper_for(tmp_path, monkeypatch)
-    record = keeper.grant(request_view("r-kc", "allow_always", "t-kc"), "rg", "/work/w1")
-    secret = "keychain-sourced-secret-value"
-    worker = lr.WorkerRunner.__new__(lr.WorkerRunner)
-    worker.redaction = lr.RedactionSecrets()
-    worker.runner = type("RunnerSecrets", (), {"secrets": ["runner-token-value1"]})()
-    worker.redaction.extend(worker.runner.secrets)
-    worker.redaction.extend([secret])
-    keeper._secrets = lambda: worker.secrets
-    spool = Path(lr.spool_dir("w1"))
-    (spool / "kc.json").write_text(json.dumps({
-        "grant_id": record["id"], "request_id": "r-kc", "reason": "refused " + secret,
-    }), encoding="utf-8")
-    seen = {}
-
-    def drain():
-        seen["from-thread"] = tuple(worker.secrets)
-        keeper.drain_spool()
-
-    thread = threading.Thread(target=drain)
-    thread.start()
-    thread.join(5)
-    assert not thread.is_alive()
-    assert secret in seen["from-thread"] and "runner-token-value1" in seen["from-thread"]
-    forwarded = [call for call in recorder.calls if call[1].get("event") == "shim_refused"]
-    assert len(forwarded) == 1
-    assert secret not in forwarded[0][1]["reason"] and lr.REDACTED in forwarded[0][1]["reason"]
-    assert secret not in lr.one_line("need " + secret, 300, worker.secrets)
-    assert secret not in lr.redact("result " + secret, worker.secrets)
-    worker.redaction.clear()
-    assert secret not in worker.secrets
-
-
-def test_non_json_spool_names_are_deleted_inside_the_scan_budget(tmp_path, monkeypatch):
-    _, keeper, recorder = keeper_for(tmp_path, monkeypatch)
-    record = keeper.grant(request_view("r-junk", "allow_always", "t-junk"), "rg", "/work/w1")
-    spool = Path(lr.spool_dir("w1"))
-    notes = []
-    keeper.log = lambda task, what, **fields: notes.append((what, fields))
-    target = tmp_path / "kept-target.txt"
-    target.write_text("kept", encoding="utf-8")
-    os.symlink(target, spool / "link-out")
-    payload = {"grant_id": record["id"], "request_id": "r-junk", "reason": "refused"}
-    for index in range(12):
-        (spool / ("j%02d" % index)).write_text("junk", encoding="utf-8")
-    (spool / "good.json").write_text(json.dumps(payload), encoding="utf-8")
-    monkeypatch.setattr(lr, "SPOOL_SCAN_ENTRIES", 4)
-    keeper.drain_spool()
-    left = [path.name for path in spool.iterdir() if path.name.startswith("j")]
-    assert 8 <= len(left) <= 10, "one pass deletes only the non-json names it actually visited"
-    for _ in range(8):
-        keeper.drain_spool()
-    assert [path.name for path in spool.iterdir() if path.name.startswith("j")] == []
-    assert not (spool / "link-out").exists()
-    assert target.read_text(encoding="utf-8") == "kept"
-    assert not (spool / "good.json").exists()
-    forwarded = [call for call in recorder.calls if call[1].get("event") == "shim_refused"]
-    assert len(forwarded) == 1 and forwarded[0][1]["request_id"] == "r-junk"
-    for index in range(3):
-        nested = spool / ("full%d" % index)
-        nested.mkdir()
-        (nested / "inside").write_text("x", encoding="utf-8")
-    (spool / "empty-one").mkdir()
-    keeper._spool_noted = 0.0
-    notes.clear()
-    monkeypatch.setattr(lr, "SPOOL_SCAN_ENTRIES", 64)
-    keeper.drain_spool()
-    assert not (spool / "empty-one").exists()
-    assert all((spool / ("full%d" % index)).is_dir() for index in range(3))
-    reports = [fields for what, fields in notes if what == "spool-discarded"]
-    assert reports == [{"directory": 3}]
-
-
-def test_teardown_discards_a_keychain_secret_read_by_a_drain_that_is_still_running(tmp_path, monkeypatch):
-    _, keeper, recorder = keeper_for(tmp_path, monkeypatch)
-    record = keeper.grant(request_view("r-stop", "allow_always", "t-stop"), "rg", "/work/w1")
-    secret = "keychain-sourced-secret-value"
-    worker = lr.WorkerRunner.__new__(lr.WorkerRunner)
-    worker.redaction = lr.RedactionSecrets()
-    worker.runner = type("RunnerSecrets", (), {"secrets": ["runner-token-value1"]})()
-    worker.redaction.extend(worker.runner.secrets)
-    worker.redaction.extend([secret])
-    worker.threads = []
-    worker.log = lambda *args, **kwargs: None
-    worker.keeper = keeper
-    keeper._secrets = lambda: worker.secrets
-    spool = Path(lr.spool_dir("w1"))
-    (spool / "kc.json").write_text(json.dumps({
-        "grant_id": record["id"], "request_id": "r-stop", "reason": "refused " + secret,
-    }), encoding="utf-8")
-    entered, release = threading.Event(), threading.Event()
-    real_payload = lr._spool_payload
-
-    def blocked(path):
-        outcome = real_payload(path)
-        if os.path.basename(path) == "kc.json":
-            entered.set()
-            assert release.wait(5)
-        return outcome
-
-    monkeypatch.setattr(lr, "_spool_payload", blocked)
-    runner = lr.Runner.__new__(lr.Runner)
-    runner.workers = [worker]
-    runner.state_lock = None
-    outer = threading.Thread(target=lambda: worker.end_task_grants("t-stop", []))
-    outer.start()
-    assert entered.wait(2)
-    started = time.monotonic()
-    runner.join(0.4)
-    assert time.monotonic() - started < 2
-    assert secret in worker.secrets, "secrets stay until the drain exits or acknowledges the abort"
-    assert not keeper.spool_abort_acknowledged()
-    release.set()
-    outer.join(3)
-    assert not outer.is_alive()
-    runner.join(1)
-    assert secret not in worker.secrets
-    assert not any(call[1].get("event") == "shim_refused" for call in recorder.calls)
-    assert all(secret not in json.dumps(call[1]) for call in recorder.calls)
-    assert (spool / "kc.json").is_file()
-
-
-def test_the_spool_scan_stops_without_listing_the_whole_directory(tmp_path, monkeypatch):
-    _, keeper, recorder = keeper_for(tmp_path, monkeypatch)
-    record = keeper.grant(request_view("r-scan", "allow_always", "t-scan"), "rg", "/work/w1")
-    spool = Path(lr.spool_dir("w1"))
-    notes = []
-    keeper.log = lambda task, what, **fields: notes.append((what, fields))
-    total = 12
-    payload = {"grant_id": record["id"], "request_id": "r-scan", "reason": "refused"}
-    for index in range(total):
-        (spool / ("s%02d.json" % index)).write_text(json.dumps(payload), encoding="utf-8")
-    listed = []
-    real_listdir = os.listdir
-
-    def spy_listdir(path):
-        listed.append(path)
-        return real_listdir(path)
-
-    monkeypatch.setattr(os, "listdir", spy_listdir)
-    monkeypatch.setattr(lr, "SPOOL_SCAN_ENTRIES", 4)
-    monkeypatch.setattr(lr, "SPOOL_DRAIN_FILES", 2)
-    keeper.drain_spool()
-    assert listed == []
-    remaining = list(spool.glob("s*.json"))
-    assert len(remaining) == total - 4
-    forwarded = [call for call in recorder.calls if call[1].get("event") == "shim_refused"]
-    assert len(forwarded) == 2
-    assert any(fields.get("overflow") for what, fields in notes if what == "spool-discarded")
-
-
-def test_the_refusal_spool_is_bounded_and_untrusted(tmp_path, monkeypatch):
-    _, keeper, recorder = keeper_for(tmp_path, monkeypatch)
-    record = keeper.grant(request_view("r-spool", "allow_always", "t-spool"), "rg", "/work/w1")
-    spool = Path(lr.spool_dir("w1"))
-    notes = []
-    keeper.log = lambda task, what, **fields: notes.append((what, fields))
-
-    def plant(name, payload):
-        path = spool / name
-        if isinstance(payload, bytes):
-            path.write_bytes(payload)
-        else:
-            path.write_text(payload if isinstance(payload, str) else json.dumps(payload), encoding="utf-8")
-
-    (spool / "dir.json").mkdir()
-    nested = spool / "nested.json"
-    nested.mkdir()
-    (nested / "inside").write_text("x", encoding="utf-8")
-    os.symlink("/etc/passwd", spool / "link.json")
-    plant("big.json", b"x" * (lr.SPOOL_MAX_BYTES + 1))
-    plant("bad.json", "{")
-    plant("list.json", "[1]")
-    plant("unk.json", {"grant_id": "no-such", "request_id": "r-spool", "reason": "forged"})
-    secret = "super-secret-token-value"
-    keeper._secrets = (secret,)
-    valid = {"grant_id": record["id"], "request_id": "r-spool", "task_id": "other-task",
-             "reason": "refused\nline " + secret}
-    extra = lr.SPOOL_FORWARD_LIMIT + 3
-    for index in range(extra):
-        plant("v%02d.json" % index, valid)
-    limit, window = lr.SPOOL_FORWARD_LIMIT, lr.SPOOL_FORWARD_WINDOW
-    try:
-        lr.SPOOL_FORWARD_LIMIT = 2
-        keeper.drain_spool()
-        forwarded = [call for call in recorder.calls if call[1]["event"] == "shim_refused"]
-        assert len(forwarded) == 2
-        assert all(call[1]["task_id"] == "t-spool" and call[1]["request_id"] == "r-spool" for call in forwarded)
-        assert all("\n" not in call[1]["reason"] and secret not in call[1]["reason"] and lr.REDACTED in call[1]["reason"]
-                   for call in forwarded)
-        assert not (spool / "dir.json").exists() and not (spool / "link.json").exists()
-        assert not (spool / "big.json").exists() and not (spool / "bad.json").exists() and not (spool / "list.json").exists()
-        assert not (spool / "unk.json").exists()
-        assert nested.is_dir(), "a non-empty directory is left alone instead of raising"
-        remaining = sorted(path.name for path in spool.glob("v*.json"))
-        assert len(remaining) == extra - 2
-        keeper.drain_spool()
-        assert len([call for call in recorder.calls if call[1]["event"] == "shim_refused"]) == 2
-        lr.SPOOL_FORWARD_WINDOW = 0
-        keeper.drain_spool()
-        assert len([call for call in recorder.calls if call[1]["event"] == "shim_refused"]) == 4
-        assert any(what == "spool-discarded" for what, _fields in notes)
-    finally:
-        lr.SPOOL_FORWARD_LIMIT = limit
-        lr.SPOOL_FORWARD_WINDOW = window
 
 
 def test_a_cli_that_cannot_exact_match_the_shim_is_never_granted(tmp_path, monkeypatch):
