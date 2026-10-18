@@ -1611,63 +1611,45 @@ def test_only_rg_is_a_grantable_program(tool):
     assert not lr.is_ungrantable(tool)
 
 
-def _rg_help_launchers(help_text):
-    """Option names whose `rg --help` block says they run another program.
-
-    A header that takes COMMAND counts, and so does text that names an executable, a preprocessor, a
-    decompression binary, or a spawned process. "command line" and "binary file" do not.
-    """
-    launches = re.compile(
-        r"""(?ix)
-        \bexecutable\b
-        | decompression\ binaries
-        | \bpreprocessor\b
-        | \bspawn(?:s|ed|ing)?\s+(?:a\s+|an\s+)?process\b
-        | \b(?:run|runs|running|execute|executes|executing)\b[^.\n]{0,120}\b(?:command|program|executable|binary|binaries)\b
-        """
-    )
-    header_command = re.compile(r"(?:=|\s)COMMAND\b")
-    names, current = set(), None
-    blocks = []
-    for line in help_text.splitlines():
-        if line.startswith("    ") and not line.startswith("     ") and line.lstrip().startswith("-"):
-            if current:
-                blocks.append(current)
-            current = [line]
-        elif current is not None and (line.startswith("    ") or not line.strip()):
-            current.append(line)
-        elif current is not None:
-            blocks.append(current)
-            current = None
-    if current:
-        blocks.append(current)
-    for block in blocks:
-        header, body = block[0], "\n".join(block[1:])
-        if not (header_command.search(header) or launches.search(header + "\n" + body)):
-            continue
-        for part in header.strip().split(","):
-            part = part.strip()
-            long_name = re.match(r"--([A-Za-z0-9-]+)", part)
-            if long_name:
-                names.add(long_name.group(1))
-                continue
-            short_name = re.match(r"-([0-9A-Za-z])\b", part)
-            if short_name:
-                names.add(short_name.group(1))
-    return names
+# One row per spelling of a hard-coded launcher: canonical, abbreviation, =value, and combined short flags.
+RG_LAUNCHER_SPELLINGS = (
+    ("rg -z hello", ["-z", "hello"], "-z"),
+    ("rg --z hello", ["--z", "hello"], "-z"),
+    ("rg --search-zip hello", ["--search-zip", "hello"], "search-zip"),
+    ("rg --search-zip=1 hello", ["--search-zip=1", "hello"], "search-zip"),
+    ("rg --search hello", ["--search", "hello"], "search-zip"),
+    ("rg -iz hello", ["-iz", "hello"], "-z"),
+    ("rg -uz hello", ["-uz", "hello"], "-z"),
+    ("rg -ze hello", ["-ze", "hello"], "-z"),
+    ("rg --pre cmd TODO", ["--pre", "cmd", "TODO"], "--pre"),
+    ("rg --pre=echo TODO", ["--pre=echo", "TODO"], "--pre"),
+    ("rg --pre=", ["--pre="], "--pre"),
+    ("rg --pr cmd", ["--pr", "cmd"], "--pre"),
+    ("rg --pre-glob *.c TODO", ["--pre-glob", "*.c", "TODO"], "--pre"),
+    ("rg --pre-glob=*.c TODO", ["--pre-glob=*.c", "TODO"], "--pre"),
+    ("rg --pre-g *.c TODO", ["--pre-g", "*.c", "TODO"], "--pre"),
+    ("rg --hostname-bin true", ["--hostname-bin", "true"], "hostname-bin"),
+    ("rg --hostname-bin=true hello", ["--hostname-bin=true", "hello"], "hostname-bin"),
+    ("rg --hostname true", ["--hostname", "true"], "hostname-bin"),
+)
 
 
-def test_every_launcher_in_the_installed_rg_help_is_forbidden():
-    """The runner's forbidden set is the source of truth. A new launcher in rg --help fails this test."""
-    help_text = subprocess.check_output(["rg", "--help"], text=True)
-    found = _rg_help_launchers(help_text)
-    assert found, "rg --help did not describe any option as running another program"
-    assert found <= lr.RG_LAUNCHERS, sorted(found - lr.RG_LAUNCHERS)
-    for name in ("pre", "pre-glob", "search-zip", "hostname-bin"):
-        if re.search(r"(?m)^[ \t]+.*--" + re.escape(name) + r"\b", help_text):
-            assert name in found, name
-    if re.search(r"(?m)^[ \t]+-z\b", help_text):
-        assert "z" in found
+@pytest.mark.parametrize("command,argv,fragment", RG_LAUNCHER_SPELLINGS)
+def test_request_time_refuses_every_rg_launcher_spelling(command, argv, fragment):
+    assert fragment in lr.argument_problem("rg", command, "/work/wt")
+    assert fragment in lr.argv_problem("rg", ["rg", *argv], "/work/wt")
+
+
+def test_rg_help_is_checked_only_for_literal_forbidden_options():
+    """A literal --pre anywhere in rg --help is enough. Missing rg is skipped. Help text is not parsed."""
+    if shutil.which("rg") is None:
+        pytest.skip("rg is not installed")
+    completed = subprocess.run(["rg", "--help"], capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+    help_text = completed.stdout + completed.stderr
+    for name in ("search-zip", "pre", "pre-glob", "hostname-bin"):
+        if "--" + name in help_text:
+            assert name in lr.RG_LAUNCHERS
 
 
 def test_sed_is_not_grantable_until_it_has_its_own_design():
@@ -2671,29 +2653,29 @@ def test_the_shim_carries_the_argument_policy_and_the_worktree(tmp_path, monkeyp
         lr.parse_config(data)
 
 
-@pytest.mark.parametrize("argv,fragment", [
-    (["-z", "hello"], "-z"),
-    (["--search-zip", "hello"], "search-zip"),
-    (["-iz", "hello"], "-z"),
-    (["-uz", "hello"], "-z"),
-    (["--pre="], "--pre"),
-    (["--z", "hello"], "-z"),
-    (["--hostname-bin", "true"], "hostname-bin"),
-])
-def test_the_shim_refuses_rg_options_that_launch_another_program(tmp_path, monkeypatch, argv, fragment):
+@pytest.mark.parametrize("command,argv,fragment", RG_LAUNCHER_SPELLINGS)
+def test_the_shim_refuses_every_rg_launcher_spelling(tmp_path, monkeypatch, command, argv, fragment):
     _, keeper, recorder = keeper_for(tmp_path, monkeypatch)
     work = tmp_path / "work"
     work.mkdir()
     (work / "hello.txt").write_text("hello\n", encoding="utf-8")
     record = keeper.grant(request_view("r-launch"), "rg", str(work))
     shim_text = Path(record["shim"]).read_text(encoding="utf-8")
-    assert "--no-config" in shim_text and "PATH" in shim_text
+    assert "--no-config" in shim_text and "RG_LAUNCHERS" in shim_text
     refused = subprocess.run([record["shim"], *argv], cwd=work, capture_output=True, text=True)
-    assert refused.returncode != 0 and fragment in refused.stderr and "baton shim:" in refused.stderr
+    assert refused.returncode != 0 and fragment in refused.stderr and "baton shim:" in refused.stderr, command
     assert refused.stdout == ""
     keeper.drain_spool()
     refusal = next(call for call in recorder.calls if call[1]["event"] == "shim_refused")
     assert fragment in refusal[1]["reason"]
+
+
+def test_the_shim_still_runs_rg_when_z_is_only_a_pattern(tmp_path, monkeypatch):
+    _, keeper, _ = keeper_for(tmp_path, monkeypatch)
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "hello.txt").write_text("hello\n", encoding="utf-8")
+    record = keeper.grant(request_view("r-plain"), "rg", str(work))
     allowed = subprocess.run([record["shim"], "-n", "hello", "hello.txt"], cwd=work, capture_output=True, text=True)
     assert allowed.returncode == 0 and "hello" in allowed.stdout and "baton shim:" not in allowed.stderr
     pattern = subprocess.run([record["shim"], "-e", "-z", "hello.txt"], cwd=work, capture_output=True, text=True)

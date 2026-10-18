@@ -1025,9 +1025,9 @@ GRANTABLE_TOOLS = frozenset({"rg"})
 POLICY_ARGS = {
     "rg": "[! -z ! --search-zip ! --pre ! --pre-glob ! --hostname-bin]",
 }
-# rg options that start another program. This set is the source of truth: the test parses the installed
-# `rg --help` and fails when that help describes a launcher that is not listed here. `-z` and `--search-zip`
-# are the same switch. `--pre-glob` selects the paths `--pre` runs on.
+# rg options that start another program. This set is the only list the request check and the shim refuse,
+# including a longer prefix and an =VALUE form. Help text is not mined for more names. `-z` and
+# `--search-zip` are the same switch. `--pre-glob` selects the paths `--pre` runs on.
 RG_LAUNCHERS = frozenset({"z", "search-zip", "pre", "pre-glob", "hostname-bin"})
 # Quotes, backslashes and shell control characters. Grantability is decided on the raw captured line, before shlex.
 UNTRUSTED_COMMAND_RE = re.compile(r"""['"\\;&|`$()><\n]""")
@@ -1082,13 +1082,10 @@ def _inside_worktree(path, worktree):
 def _rg_problem(argv, worktree):
     """None when this rg argv does not launch another program.
 
-    `RG_LAUNCHERS` is the fixed list. It covers the options ripgrep's help describes as running another program:
-    `-z` / `--search-zip` (gzip, bzip2, xz, lz4, lzma, brotli or zstd from `PATH`; this overrides `--pre`),
-    `--pre` / `--pre=COMMAND`, `--pre-glob`, and `--hostname-bin` / `--hostname-bin=COMMAND`. The installed
-    `rg --help` is checked by a test, which fails if that help describes a launcher missing from the set.
-    `--generate` writes man pages and shell completions to stdout. `--no-pre` and `--no-search-zip` only disable
-    the feature. A one-letter `--X` is the short flag (`--z` is `-z`). A longer prefix of a launcher name is still
-    refused, including `--pr`, `--pre-g` and `--search`, and so is `=VALUE` (`--search-zip=1`, `--pre=`).
+    `RG_LAUNCHERS` is the fixed list: `-z` / `--search-zip` (gzip, bzip2, xz, lz4, lzma, brotli or zstd from
+    `PATH`; this overrides `--pre`), `--pre` / `--pre=COMMAND`, `--pre-glob`, and `--hostname-bin`. A longer
+    prefix and `=VALUE` are refused too (`--pr`, `--pre-g`, `--search`, `--search-zip=1`, `--pre=`). `--no-pre`
+    and `--no-search-zip` only disable the feature. A one-letter `--X` is the short flag (`--z` is `-z`).
 
     A short cluster is read left to right. `z` refuses unless a value-taking short option already consumed the rest
     of the cluster or the next argument: `-iz`, `-uz` and `-ze` are search-zip; `-ez` and `-e -z` are a pattern.
