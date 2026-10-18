@@ -359,3 +359,31 @@ DO $$ BEGIN
             FOR EACH STATEMENT EXECUTE FUNCTION baton.reject_a2a_state_change();
     END IF;
 END; $$;
+
+-- Role queues. A task may carry a role (explicit, or derived from the space's role rules at creation). A principal holds
+-- zero or more roles per space; only the root or a covering approver delegation assigns them, and every change is in
+-- x_audit. The rules and the per-space SLA map live in x_role_config (NULL sla_minutes means the built-in defaults).
+-- role_sla_notified_at is the last time a role.sla_breached notification was written for the task.
+ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS role text CHECK (role ~ '^[a-z][a-z0-9_.-]{0,63}$');
+ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS role_source text CHECK (role_source IN ('explicit','derived'));
+ALTER TABLE baton.tasks ADD COLUMN IF NOT EXISTS role_sla_notified_at timestamptz;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='baton.tasks'::regclass AND conname='task_role_source_pair') THEN
+        ALTER TABLE baton.tasks ADD CONSTRAINT task_role_source_pair CHECK ((role IS NULL) = (role_source IS NULL));
+    END IF;
+END; $$;
+CREATE INDEX IF NOT EXISTS tasks_role_queue ON baton.tasks(role,created_at) WHERE role IS NOT NULL AND state IN ('queued','claimed');
+CREATE TABLE IF NOT EXISTS baton.x_role_holder (
+    space_id uuid NOT NULL REFERENCES baton.spaces(id),
+    role text NOT NULL CHECK (role ~ '^[a-z][a-z0-9_.-]{0,63}$'),
+    holder text NOT NULL, holder_account text NOT NULL, holder_kind text NOT NULL CHECK (holder_kind IN ('human','agent')),
+    granted_by text NOT NULL, authority text NOT NULL, delegation_id uuid,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY(space_id,role,holder,holder_account,holder_kind)
+);
+CREATE INDEX IF NOT EXISTS role_holder_identity ON baton.x_role_holder(holder,holder_account,holder_kind);
+CREATE TABLE IF NOT EXISTS baton.x_role_config (
+    space_id uuid PRIMARY KEY REFERENCES baton.spaces(id),
+    rules jsonb NOT NULL DEFAULT '[]', sla_minutes jsonb,
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(), updated_by text NOT NULL
+);

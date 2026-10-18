@@ -178,7 +178,7 @@ class SafeFastMCP(FastMCP):
             if name in {"submit_task", "get_task", "list_tasks", "fetch_inbox"}:
                 allowed = {"submit_task": {"idempotency_key", "prompt", "page_id", "scopes", "assignee_principal", "depends_on",
                                            "work_face", "require_work_face", "task_kind", "priority", "escalate_to",
-                                           "fallback_assignee", "approvals_required", "reviewers"}, "get_task": {"task_id"},
+                                           "fallback_assignee", "approvals_required", "reviewers", "role"}, "get_task": {"task_id"},
                            "list_tasks": set(), "fetch_inbox": set()}[name]
                 if not isinstance(arguments, dict):
                     raise BridgeError("invalid", [{"field": "arguments", "expected": "object"}])
@@ -242,17 +242,24 @@ PUBLIC_OPERATIONS = {
     "create_task_block": (True, {"page_id": (str, ...), "prompt": (str, ...), "scopes": (list[dict] | None, None), "reviewers": (list[str], ...), "base_commit": (str | None, None), "context": (Any, None), "evidence": (Any, None), "assignee_principal": (str | None, None), "depends_on": (list[str] | None, None),
                           "work_face": (dict[str, Any] | None, None), "require_work_face": (bool, False), "task_kind": (str, "construction"),
                           "priority": (str, "normal"), "escalate_to": (str | None, None), "fallback_assignee": (str | None, None),
-                          "approvals_required": (int | None, None)}),
+                          "approvals_required": (int | None, None), "role": (str | None, None)}),
     "submit_task": (True, {"idempotency_key": (str, ...), "prompt": (str, ...), "page_id": (str | None, None), "scopes": (list[dict] | None, None), "assignee_principal": (str | None, None), "depends_on": (list[str] | None, None),
                     "work_face": (dict[str, Any] | None, None), "require_work_face": (bool, False), "task_kind": (str, "construction"),
                     "priority": (str, "normal"), "escalate_to": (str | None, None), "fallback_assignee": (str | None, None),
-                    "approvals_required": (int | None, None), "reviewers": (list[str] | None, None)}),
+                    "approvals_required": (int | None, None), "reviewers": (list[str] | None, None), "role": (str | None, None)}),
     "assign_task": (True, {"task_id": (str, ...), "target_principal": (str, ...)}),
     "set_priority": (True, {"task_id": (str, ...), "priority": (str, ...)}),
     "mark_blocked": (True, {"task_id": (str, ...), "reason_code": (str, ...), "note": (str | None, None)}),
     "plan": (True, {"graph": (list[GraphEntry], ...)}),
     "set_work_face": (True, {"task_id": (str, ...), "work_face": (dict[str, Any], ...), "base_commit": (str | None, None)}),
     "ready": (False, {"page_id": (str | None, None), "limit": (int, 50)}),
+    "ready_for_role": (False, {"role": (str, ...), "limit": (int, 50)}),
+    "set_task_role": (True, {"task_id": (str, ...), "role": (str | None, ...)}),
+    "set_role_rules": (True, {"space_id": (str, ...), "rules": (list[dict[str, Any]], ...)}),
+    "set_role_sla": (True, {"space_id": (str, ...), "sla_minutes": (dict[str, int] | None, ...)}),
+    "assign_role": (True, {"space_id": (str, ...), "principal": (str, ...), "role": (str, ...)}),
+    "revoke_role": (True, {"space_id": (str, ...), "principal": (str, ...), "role": (str, ...)}),
+    "list_roles": (False, {"space_id": (str, ...)}),
     "get_task": (False, {"task_id": (str, ...)}),
     "list_tasks": (False, {"limit": (int, 50)}),
     "fetch_inbox": (False, {"limit": (int, 30)}),
@@ -533,6 +540,11 @@ async def perform(operation, payload, request):
             if not who:
                 raise BridgeError("invalid", [{"field": "delegate_principal", "expected": "a principal registered in Baton"}])
             arguments["delegate"] = actor_from_identity(who)
+        if operation == "assign_role":
+            who = common.resolve_principal(arguments.pop("principal"))
+            if not who:
+                raise BridgeError("invalid", [{"field": "principal", "expected": "a principal registered in Baton"}])
+            arguments["target"] = actor_from_identity(who)
         if operation in {"handoff", "assign_task"}:
             who = common.resolve_principal(arguments.pop("target_principal"))
             if not who:
@@ -564,9 +576,9 @@ async def perform(operation, payload, request):
         if not result.get("replay"):
             audit("thread.submitted", task_id=result.get("task_id", result.get("id")),
                   thread_id=result.get("thread_id"), agent=actor.principal)
-    if operation in {"get_task", "submit_task", "create_task_block", "assign_task", "set_work_face", "set_priority", "mark_blocked", "claim", "renew", "handoff", "submit_result", "gate"}:
+    if operation in {"get_task", "submit_task", "create_task_block", "assign_task", "set_work_face", "set_priority", "mark_blocked", "set_task_role", "claim", "renew", "handoff", "submit_result", "gate"}:
         return public_task(result)
-    if operation in {"list_tasks", "ready"}:
+    if operation in {"list_tasks", "ready", "ready_for_role"}:
         return [public_task(row) for row in result]
     return result
 
@@ -577,11 +589,14 @@ async def submit_task(idempotency_key: str, prompt: str, ctx: Context, page_id: 
                       depends_on: list[str] | None = None, work_face: dict[str, Any] | None = None,
                       require_work_face: bool = False, task_kind: str = "construction", priority: str = "normal",
                       escalate_to: str | None = None, fallback_assignee: str | None = None,
-                      approvals_required: int | None = None, reviewers: list[str] | None = None) -> dict:
+                      approvals_required: int | None = None, reviewers: list[str] | None = None,
+                      role: str | None = None) -> dict:
     """Create a manual task and return it; Baton never executes it. With assignee_principal only that principal may claim
     it; without one the task is unassigned and any principal with edit on the page sees it in ready and may claim it.
     Reviewers default to the requester; pass reviewers to name them. A reviewer who is not the space root and has no
-    approver delegation is listed in warnings and the task is still created. Scopes default to none. Reuse keys on retry."""
+    approver delegation is listed in warnings and the task is still created. Scopes default to none. An optional role puts an
+    unassigned task in that role's queue (only current holders of the role may claim it); without one the space's
+    role rules may derive it. Reuse keys on retry."""
     request = ctx.request_context.request
     actor = request_actor(request)
     operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "baton/submit_task/" + actor.principal + "/" + idempotency_key))
@@ -590,7 +605,7 @@ async def submit_task(idempotency_key: str, prompt: str, ctx: Context, page_id: 
                         "assignee_principal": assignee_principal, "depends_on": depends_on,
                         "work_face": work_face, "require_work_face": require_work_face, "task_kind": task_kind,
                         "priority": priority, "escalate_to": escalate_to, "fallback_assignee": fallback_assignee,
-                        "approvals_required": approvals_required, "reviewers": reviewers}, request)
+                        "approvals_required": approvals_required, "reviewers": reviewers, "role": role}, request)
 
 
 @mcp.tool()
@@ -695,7 +710,7 @@ async def escalation_pass():
     except BridgeError as exc:
         audit("task.escalation_unavailable", error_code=exc.code)
         return
-    if result["escalated"]:
+    if result["escalated"] or result.get("role_sla"):
         WAKEUP.notify()
 
 
@@ -839,8 +854,9 @@ async def a2a_directory(request: Request):
 async def board_data(request: Request):
     tasks = await invoke("list_tasks", {}, request)
     inbox = await invoke("fetch_inbox", {}, request)
+    roles = await store_call("role_panels", request_actor(request))
     return {"x_protocol": PROTOCOL, "agent": request.state.identity["agent"], "tasks": tasks,
-            "inbox": inbox.get("messages", [])}
+            "inbox": inbox.get("messages", []), "roles": roles}
 
 
 app.mount("/", mcp.streamable_http_app())
