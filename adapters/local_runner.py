@@ -2112,8 +2112,11 @@ def error_code(error):
 
 
 # The refusal spool is worker-writable. A drain never reads more than this, never forwards faster than the window,
-# and never runs longer than SPOOL_DRAIN_SECONDS. Past that, leftover files wait for a later drain.
+# and never runs longer than SPOOL_DRAIN_SECONDS. The directory scan itself stops after SPOOL_SCAN_ENTRIES names or
+# the deadline, whichever comes first, and overflow deletion spends that same budget. Past that, leftover files
+# wait for a later drain.
 SPOOL_DRAIN_FILES = 32
+SPOOL_SCAN_ENTRIES = 64
 SPOOL_MAX_BYTES = 4096
 SPOOL_FORWARD_LIMIT = 8
 SPOOL_FORWARD_WINDOW = 60.0
@@ -2289,12 +2292,15 @@ class GrantKeeper:
     def drain_spool(self):
         """Forward a bounded number of shim refusals. The shim writes a file; this process holds the token.
 
-        The spool is writable by the worker, so every record is untrusted. One drain looks at a fixed number of
-        names for at most SPOOL_DRAIN_SECONDS. Each candidate is opened with O_RDONLY|O_NOFOLLOW|O_NONBLOCK and kept
-        only when fstat says it is a regular file within the byte cap. Oversized, malformed and unknown files are
-        deleted and counted. Directories and other non-regular names are removed when that can be done without an
-        error, and are never read. lstat is only used to decide that cleanup; it is not the open. Forwarding is
-        rate-limited; files left by the limit or the deadline wait for a later drain instead of flooding audit.
+        The spool is writable by the worker, so every record is untrusted. One drain walks the directory with
+        scandir and stops after SPOOL_SCAN_ENTRIES entries or SPOOL_DRAIN_SECONDS. It never lists or sorts the
+        whole directory. Each candidate is opened with O_RDONLY|O_NOFOLLOW|O_NONBLOCK and kept only when fstat
+        says it is a regular file within the byte cap. Oversized, malformed and unknown files are deleted and
+        counted. Directories and other non-regular names are removed when that can be done without an error, and
+        are never read. lstat is only used to decide that cleanup; it is not the open. Once SPOOL_DRAIN_FILES
+        regular files are kept, further regular files seen before the scan stops are deleted as overflow, inside
+        the same budget. Forwarding is rate-limited; files left by the limit or the deadline wait for a later
+        drain instead of flooding audit.
         """
         if self.baton is None:
             return
@@ -2302,38 +2308,43 @@ class GrantKeeper:
         spool = spool_dir(self.worker.principal)
         if not os.path.isdir(spool):
             return
-        try:
-            names = sorted(name for name in os.listdir(spool) if name.endswith(".json"))
-        except OSError:
-            return
         discarded = {"nonregular": 0, "oversized": 0, "malformed": 0, "unknown": 0, "overflow": 0}
         files = []
-        for name in names:
-            if time.monotonic() >= deadline:
-                break
-            path = os.path.join(spool, name)
-            kind = _spool_kind(path)
-            if kind == "file" and len(name) <= 200:
-                files.append(name)
-                continue
-            discarded["malformed" if kind == "file" else "nonregular"] += 1
-            with contextlib.suppress(OSError):
-                if kind == "dir":
-                    os.rmdir(path)
-                elif kind is not None:
-                    os.unlink(path)
-        if len(files) > SPOOL_DRAIN_FILES:
-            for name in files[SPOOL_DRAIN_FILES:]:
+        seen = 0
+        try:
+            entries = os.scandir(spool)
+        except OSError:
+            return
+        with entries:
+            for entry in entries:
+                if seen >= SPOOL_SCAN_ENTRIES or time.monotonic() >= deadline:
+                    break
+                seen += 1
+                name = entry.name
+                if not name.endswith(".json") or os.sep in name:
+                    continue
+                path = os.path.join(spool, name)
+                kind = _spool_kind(path)
+                if kind == "file" and len(name) <= 200:
+                    if len(files) >= SPOOL_DRAIN_FILES:
+                        with contextlib.suppress(OSError):
+                            os.unlink(path)
+                        discarded["overflow"] += 1
+                    else:
+                        files.append(name)
+                    continue
+                discarded["malformed" if kind == "file" else "nonregular"] += 1
                 with contextlib.suppress(OSError):
-                    os.unlink(os.path.join(spool, name))
-                discarded["overflow"] += 1
-            files = files[:SPOOL_DRAIN_FILES]
+                    if kind == "dir":
+                        os.rmdir(path)
+                    elif kind is not None:
+                        os.unlink(path)
         now = time.monotonic()
         self._spool_forwarded = [stamp for stamp in self._spool_forwarded if now - stamp < SPOOL_FORWARD_WINDOW]
         with self.ledger.locked():
             grants = self.ledger.load()
         for name in files:
-            if len(self._spool_forwarded) >= SPOOL_FORWARD_LIMIT or time.monotonic() >= deadline:
+            if time.monotonic() >= deadline:
                 break
             path = os.path.join(spool, name)
             outcome = _spool_payload(path)
@@ -2357,6 +2368,10 @@ class GrantKeeper:
                 discarded["unknown"] += 1
                 with contextlib.suppress(OSError):
                     os.unlink(path)
+                continue
+            # The rate limit stops new audit rows. Files already chosen are still classified, and a valid one
+            # past the limit stays for a later drain. That does not look at any further directory entries.
+            if len(self._spool_forwarded) >= SPOOL_FORWARD_LIMIT:
                 continue
             reason = field(payload.get("reason"), 300) or "refused"
             reported = self._report(
@@ -2396,11 +2411,38 @@ def call_interruptible(stop, work):
 
 # --- worker ----------------------------------------------------------------------------------------
 
+class RedactionSecrets:
+    """Secret values of one worker run, shared by every thread of that run.
+
+    The runner fills tokens and passthrough values before any thread starts. Keychain values are added under the
+    lock when the run reads them, so the watchdog and the end-of-run spool drain see the same set as the thread
+    that launched the task. Cleared only after those threads have all joined.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._values = []
+
+    def extend(self, values):
+        with self._lock:
+            for value in values or ():
+                if value and value not in self._values:
+                    self._values.append(value)
+
+    def snapshot(self):
+        with self._lock:
+            return tuple(self._values)
+
+    def clear(self):
+        with self._lock:
+            self._values.clear()
+
+
 class WorkerRunner:
     def __init__(self, runner, worker, baton, state):
         self.runner, self.worker, self.baton, self.state = runner, worker, baton, state
         self.config, self.stop = runner.config, runner.stop
-        self.task_local = threading.local()
+        self.redaction = RedactionSecrets()
         self.queue = queue.Queue()
         self.inflight, self.inflight_lock = set(), threading.Lock()
         self.deferrals, self.threads, self.timers = {}, [], []
@@ -2413,13 +2455,15 @@ class WorkerRunner:
 
     @property
     def secrets(self):
-        """Tokens and passthrough values, plus the Keychain values of the task this thread is running."""
-        return list(self.runner.secrets) + list(getattr(self.task_local, "secrets", ()))
+        """A snapshot of the secrets shared by every thread of this worker run."""
+        return list(self.redaction.snapshot())
 
     def log(self, task_id, what, **fields):
         event(self.principal, task_id, what, **fields)
 
     def start(self):
+        # Tokens and passthrough values are known before any thread of this run exists.
+        self.redaction.extend(self.runner.secrets)
         for task_id in self.state.open_tasks():
             self.schedule(task_id, 0)
         self.threads.append(threading.Thread(target=self.poll_loop, name="poll-" + self.principal, daemon=True))
@@ -2642,7 +2686,8 @@ class WorkerRunner:
                     try:
                         if worker.env_from_keychain:
                             keychain = read_keychain(self.runner.security_bin, worker.env_from_keychain)
-                            self.task_local.secrets = list(keychain.values())
+                            # Visible to the watchdog and the end-of-run drain, not only this thread.
+                            self.redaction.extend(keychain.values())
                         env = self.child_env(tmpdir, keychain)
                         try:
                             return run_child(wrap_command(plan, argv), str(workdir), env, self.stdin_bytes(prompt_file),
@@ -2664,13 +2709,10 @@ class WorkerRunner:
             # Revoke first. A stuck or malicious spool must not keep an allow_once grant alive.
             self.end_task_grants(task_id, once)
             shutil.rmtree(str(tmpdir), ignore_errors=True)
-        try:
-            if denied is not None:
-                self.permission_denied(task_id, page_id, epoch, denied)
-            else:
-                self.finish_task(task_id, page_id, epoch, outcome, files, failure)
-        finally:
-            self.task_local.secrets = ()
+        if denied is not None:
+            self.permission_denied(task_id, page_id, epoch, denied)
+        else:
+            self.finish_task(task_id, page_id, epoch, outcome, files, failure)
 
     # permission requests
 
@@ -2848,7 +2890,7 @@ class WorkerRunner:
         else:
             self.comment(task_id, page_id, "Permission denied by %s for `%s` (request %s). The task is blocked and the runner will "
                                            "not retry it." % (plain(request.get("decided_by")), tool, request["request_id"]))
-        note = "permission_denied: %s (request %s)" % (tool, request["request_id"])
+        note = redact("permission_denied: %s (request %s)" % (tool, request["request_id"]), self.secrets)
         if self.release_lease(task_id, epoch):
             try:
                 self.baton.write("mark_blocked", {"task_id": task_id, "reason_code": "other", "note": note})
@@ -3181,6 +3223,9 @@ class Runner:
         for worker in self.workers:
             for thread in worker.threads:
                 thread.join(max(0.0, deadline - time.monotonic()))
+            # A leftover spool file can still be drained until every thread of this run has stopped.
+            if worker.threads and all(not thread.is_alive() for thread in worker.threads):
+                worker.redaction.clear()
         if all(not thread.is_alive() for worker in self.workers for thread in worker.threads):
             self.release_state_dir()
 

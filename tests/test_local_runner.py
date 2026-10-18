@@ -2521,48 +2521,85 @@ def test_a_pending_request_expires_after_its_ttl_and_when_the_lease_is_gone(brid
     assert task_view(space, task_id)["blocked"] is None
 
 
-def test_two_readers_write_permission_expired_once(bridge, space, monkeypatch):
-    from bridge.space_store import SpaceStore
-    task_id = assign(space, bridge, "worker", scopes=[{"kind": "none"}])
-    claimed = claim_for(bridge, "worker", task_id)
-    ask(bridge, "worker", task_id, claimed["epoch"], ttl_seconds=1)
+def test_opposite_order_reads_do_not_deadlock_or_store_permission_expired(bridge, space, pg_store, monkeypatch):
+    """Two shared-lock transactions each visit two expired requests, in opposite task order, while overlapping.
+
+    Reads compute expired and hide the marker. They must finish and leave no permission.expired row. The periodic
+    sweep then writes one row per request, and a second pass writes nothing.
+    """
+    from bridge.space_store import SERVICE_ACTOR, Actor, SpaceStore
+    first = assign(space, bridge, "worker", scopes=[{"kind": "none"}])
+    second = assign(space, bridge, "worker", scopes=[{"kind": "none"}])
+    for task_id in (first, second):
+        claimed = claim_for(bridge, "worker", task_id)
+        ask(bridge, "worker", task_id, claimed["epoch"], ttl_seconds=1)
     time.sleep(1.3)
+    for task_id in (first, second):
+        assert permissions_of(space, task_id)[0]["status"] == "expired"
+        assert task_view(space, task_id)["blocked"] is None
+        assert events_of(space, task_id).count("permission.expired") == 0
+    owner = bridge.identities["owner"]
+    actor = Actor(owner["agent"], owner["account"], owner["kind"])
     gate = threading.Barrier(2)
-    real = SpaceStore._task_audit
+    real = SpaceStore._permission_views
+    targets = {first, second}
+    arm = [True]
 
-    def wrapped(self, conn, actor, operation_id, event, task, *, once=False, **metadata):
-        if event == "permission.expired":
+    def wrapped(self, conn, task_id):
+        views = real(self, conn, task_id)
+        if arm[0] and str(task_id) in targets:
             gate.wait(5)
-        return real(self, conn, actor, operation_id, event, task, once=once, **metadata)
+        return views
 
-    monkeypatch.setattr(SpaceStore, "_task_audit", wrapped)
+    monkeypatch.setattr(SpaceStore, "_permission_views", wrapped)
     errors = []
 
-    def read(method):
+    def read_both(order):
         try:
-            space.owner.read(method, task_id=task_id)
+            def action(conn):
+                for task_id in order:
+                    pg_store._task_view(conn, actor, task_id)
+                    pg_store._permission_views(conn, task_id)
+                return True
+            pg_store._read(actor, action)
         except Exception as error:
             errors.append(repr(error))
 
-    threads = [threading.Thread(target=read, args=(method,)) for method in ("list_permissions", "get_task")]
+    threads = [threading.Thread(target=read_both, args=(order,)) for order in ((first, second), (second, first))]
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(10)
+        thread.join(15)
         assert not thread.is_alive()
+    arm[0] = False
     assert errors == []
-    assert events_of(space, task_id).count("permission.expired") == 1
-    assert permissions_of(space, task_id)[0]["status"] == "expired"
+    for task_id in (first, second):
+        assert events_of(space, task_id).count("permission.expired") == 0
+        assert permissions_of(space, task_id)[0]["status"] == "expired"
+        assert task_view(space, task_id)["blocked"] is None
+    assert pg_store.escalate_overdue(SERVICE_ACTOR)["skipped"] is False
+    for task_id in (first, second):
+        assert events_of(space, task_id).count("permission.expired") == 1
+    pg_store.escalate_overdue(SERVICE_ACTOR)
+    for task_id in (first, second):
+        assert events_of(space, task_id).count("permission.expired") == 1
+        assert permissions_of(space, task_id)[0]["status"] == "expired"
+        assert task_view(space, task_id)["blocked"] is None
 
 
-def test_an_expired_request_does_not_clear_a_later_waiting_input_from_the_same_worker(bridge, space):
+def test_an_expired_request_does_not_clear_a_later_waiting_input_from_the_same_worker(bridge, space, pg_store):
+    from bridge.space_store import SERVICE_ACTOR
     task_id = assign(space, bridge, "worker", scopes=[{"kind": "none"}])
     claimed = claim_for(bridge, "worker", task_id, lease=1)
     ask(bridge, "worker", task_id, claimed["epoch"], ttl_seconds=1)
     time.sleep(1.3)
     assert permissions_of(space, task_id)[0]["status"] == "expired"
-    assert events_of(space, task_id).count("permission.expired") == 1
+    assert events_of(space, task_id).count("permission.expired") == 0, "a read does not store expiry"
     assert task_view(space, task_id)["blocked"] is None
+    pg_store.escalate_overdue(SERVICE_ACTOR)
+    assert events_of(space, task_id).count("permission.expired") == 1
+    pg_store.escalate_overdue(SERVICE_ACTOR)
+    assert events_of(space, task_id).count("permission.expired") == 1
     Api(bridge, "worker").write("mark_blocked", task_id=task_id, reason_code="waiting_input", note="later")
     assert task_view(space, task_id)["blocked"]["reason_code"] == "waiting_input"
     assert permissions_of(space, task_id)[0]["status"] == "expired"
@@ -2861,6 +2898,69 @@ def test_a_spool_fifo_and_a_dev_zero_symlink_do_not_block_the_drain(tmp_path, mo
     assert not thread.is_alive()
     assert not (spool / "pipe.json").exists() and not (spool / "zero.json").exists()
     assert not any(call[1].get("event") == "shim_refused" for call in recorder.calls)
+
+
+def test_another_thread_redacts_a_keychain_secret_while_draining_the_spool(tmp_path, monkeypatch):
+    _, keeper, recorder = keeper_for(tmp_path, monkeypatch)
+    record = keeper.grant(request_view("r-kc", "allow_always", "t-kc"), "rg", "/work/w1")
+    secret = "keychain-sourced-secret-value"
+    worker = lr.WorkerRunner.__new__(lr.WorkerRunner)
+    worker.redaction = lr.RedactionSecrets()
+    worker.runner = type("RunnerSecrets", (), {"secrets": ["runner-token-value1"]})()
+    worker.redaction.extend(worker.runner.secrets)
+    worker.redaction.extend([secret])
+    keeper._secrets = lambda: worker.secrets
+    spool = Path(lr.spool_dir("w1"))
+    (spool / "kc.json").write_text(json.dumps({
+        "grant_id": record["id"], "request_id": "r-kc", "reason": "refused " + secret,
+    }), encoding="utf-8")
+    seen = {}
+
+    def drain():
+        seen["from-thread"] = tuple(worker.secrets)
+        keeper.drain_spool()
+
+    thread = threading.Thread(target=drain)
+    thread.start()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert secret in seen["from-thread"] and "runner-token-value1" in seen["from-thread"]
+    forwarded = [call for call in recorder.calls if call[1].get("event") == "shim_refused"]
+    assert len(forwarded) == 1
+    assert secret not in forwarded[0][1]["reason"] and lr.REDACTED in forwarded[0][1]["reason"]
+    assert secret not in lr.one_line("need " + secret, 300, worker.secrets)
+    assert secret not in lr.redact("result " + secret, worker.secrets)
+    worker.redaction.clear()
+    assert secret not in worker.secrets
+
+
+def test_the_spool_scan_stops_without_listing_the_whole_directory(tmp_path, monkeypatch):
+    _, keeper, recorder = keeper_for(tmp_path, monkeypatch)
+    record = keeper.grant(request_view("r-scan", "allow_always", "t-scan"), "rg", "/work/w1")
+    spool = Path(lr.spool_dir("w1"))
+    notes = []
+    keeper.log = lambda task, what, **fields: notes.append((what, fields))
+    total = 12
+    payload = {"grant_id": record["id"], "request_id": "r-scan", "reason": "refused"}
+    for index in range(total):
+        (spool / ("s%02d.json" % index)).write_text(json.dumps(payload), encoding="utf-8")
+    listed = []
+    real_listdir = os.listdir
+
+    def spy_listdir(path):
+        listed.append(path)
+        return real_listdir(path)
+
+    monkeypatch.setattr(os, "listdir", spy_listdir)
+    monkeypatch.setattr(lr, "SPOOL_SCAN_ENTRIES", 4)
+    monkeypatch.setattr(lr, "SPOOL_DRAIN_FILES", 2)
+    keeper.drain_spool()
+    assert listed == []
+    remaining = list(spool.glob("s*.json"))
+    assert len(remaining) == total - 4
+    forwarded = [call for call in recorder.calls if call[1].get("event") == "shim_refused"]
+    assert len(forwarded) == 2
+    assert any(fields.get("overflow") for what, fields in notes if what == "spool-discarded")
 
 
 def test_the_refusal_spool_is_bounded_and_untrusted(tmp_path, monkeypatch):

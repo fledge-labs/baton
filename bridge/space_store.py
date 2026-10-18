@@ -10,6 +10,7 @@ Rows written by the removed built-in worker stay readable: ``execution_mode='cod
 columns are legacy values that nothing writes any more.
 """
 
+import contextvars
 import hashlib
 import json
 import os
@@ -29,6 +30,10 @@ from psycopg.types.json import Jsonb
 from bridge import webhooks
 
 LOCK_ID = 0x4241544F4E
+# Set only around an exclusive write transaction, or one short sweep transaction. Reads leave it false.
+_PERSIST_EXPIRY = contextvars.ContextVar("baton_persist_permission_expiry", default=False)
+# (worker, requested_at) when this call expired the request that set waiting_input, else None.
+_EXPIRY_CLEAR = contextvars.ContextVar("baton_permission_expiry_clear", default=None)
 ROLES = {None: 0, "view": 1, "comment": 2, "edit": 3}
 MESSAGES = {
     "invalid": "Invalid request", "not_found": "Resource not found", "forbidden": "Operation not permitted",
@@ -691,31 +696,35 @@ class SpaceStore:
             raise StoreError("forbidden")
         operation_id = _uuid(operation_id)
         digest = hashlib.sha256(_canonical([asdict(actor), method, args]).encode()).hexdigest()
-        with self._transaction(write=True) as conn:
-            authorize(conn)
-            old = conn.execute("SELECT request_hash,result FROM baton.operations WHERE principal=%s AND operation_id=%s",
-                               (actor.principal, operation_id)).fetchone()
-            if old:
-                if old["request_hash"] != digest:
-                    raise StoreError("operation_conflict")
-                result = old["result"]
-                if replay_guard:
-                    current = replay_guard(conn, result)
-                    if current is not None:
-                        result = _json(current)
+        token = _PERSIST_EXPIRY.set(True)
+        try:
+            with self._transaction(write=True) as conn:
+                authorize(conn)
+                old = conn.execute("SELECT request_hash,result FROM baton.operations WHERE principal=%s AND operation_id=%s",
+                                   (actor.principal, operation_id)).fetchone()
+                if old:
+                    if old["request_hash"] != digest:
+                        raise StoreError("operation_conflict")
+                    result = old["result"]
+                    if replay_guard:
+                        current = replay_guard(conn, result)
+                        if current is not None:
+                            result = _json(current)
+                    if isinstance(result, dict):
+                        result = {**result, "replay": True}
+                    return result
+                result = _json(effect(conn))
+                once = {}
                 if isinstance(result, dict):
-                    result = {**result, "replay": True}
-                return result
-            result = _json(effect(conn))
-            once = {}
-            if isinstance(result, dict):
-                business_replay = result.pop("_business_replay", False)
-                # Values under _once reach the first caller only and are never persisted or replayed.
-                once = result.pop("_once", {})
-                result = {**result, "replay": business_replay}
-            conn.execute("INSERT INTO baton.operations(principal,operation_id,request_hash,method,result) VALUES (%s,%s,%s,%s,%s)",
-                         (actor.principal, operation_id, digest, method, Jsonb(result)))
-            return {**result, **once} if once else result
+                    business_replay = result.pop("_business_replay", False)
+                    # Values under _once reach the first caller only and are never persisted or replayed.
+                    once = result.pop("_once", {})
+                    result = {**result, "replay": business_replay}
+                conn.execute("INSERT INTO baton.operations(principal,operation_id,request_hash,method,result) VALUES (%s,%s,%s,%s,%s)",
+                             (actor.principal, operation_id, digest, method, Jsonb(result)))
+                return {**result, **once} if once else result
+        finally:
+            _PERSIST_EXPIRY.reset(token)
 
     @staticmethod
     def _row(conn, table, identity):
@@ -790,7 +799,7 @@ class SpaceStore:
         statement = """INSERT INTO baton.x_audit(id,event,agent,actor_account,actor_kind,requested_by,performed_by,
             operation_id,space_id,task_id,metadata) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"""
         if once:
-            # Matches audit_permission_expired_once. A second reader inserts nothing instead of a duplicate row.
+            # Matches audit_permission_expired_once. A second sweep or exclusive write inserts nothing.
             statement += " ON CONFLICT (task_id, (metadata->>'request_id')) WHERE event = 'permission.expired' DO NOTHING"
         conn.execute(statement,
             (uuid.uuid4(), event, actor.principal, actor.account, actor.kind, requested_by or actor.principal,
@@ -1353,11 +1362,12 @@ class SpaceStore:
         row.pop("role_sla_notified_at")
         reason, blocker, blocked_at = (row.pop(key) for key in ("blocked_reason", "blocked_by", "blocked_at"))
         if reason == "waiting_input":
-            # Derived expiry of the permission request clears the marker in this same transaction, including a task
-            # read and a handoff's returned view. The advisory lock keeps this from racing a new request.
+            # Reads derive expiry and hide a marker this request set. They do not write. The row is updated only
+            # under the exclusive write lock, or by the periodic sweep, one task at a time.
             self._permission_views(conn, task_id)
-            fresh = conn.execute("SELECT blocked_reason,blocked_by,blocked_at FROM baton.tasks WHERE id=%s", (task_id,)).fetchone()
-            reason, blocker, blocked_at = fresh["blocked_reason"], fresh["blocked_by"], fresh["blocked_at"]
+            clear = _EXPIRY_CLEAR.get()
+            if clear is not None and blocker == clear[0] and blocked_at is not None and blocked_at <= clear[1]:
+                reason, blocker, blocked_at = None, None, None
         row["blocked"] = {"reason_code": reason, "by": blocker, "at": blocked_at} if reason else None
         if not include_prompt and row["execution_mode"] != "manual":
             row.pop("prompt")
@@ -2130,38 +2140,40 @@ class SpaceStore:
         """A pending request is only live while the claim it was made under is: it expires when the epoch moves on, the
         holder's lease is gone, or its own time-to-live passes.
 
-        The first time that happens, one `permission.expired` audit row is written. A unique index on the request id
-        makes a concurrent reader insert nothing instead of a second row. Later reads see that terminal event and do
-        not clear `waiting_input` again. The clear itself only matches a marker whose `blocked_at` is not after the
-        request (the marker this request set). A later `mark_blocked` by the same worker stays. Cancel of an
-        already-expired request stays `stale_claim`.
+        Every caller computes that in the view. A read does not insert or update: two shared-lock transactions
+        touching two tasks in opposite order must not take row locks. The persistent `permission.expired` row, and
+        the clear of a `waiting_input` marker this request set, happen only when `_PERSIST_EXPIRY` is set. That is
+        an exclusive write, or one short transaction of the periodic sweep. A unique index keeps the audit row to
+        one. A later `mark_blocked` by the same worker stays. Cancel of an already-expired request stays `stale_claim`.
         """
+        _EXPIRY_CLEAR.set(None)
         pending = [view for view in views.values() if view["status"] == "pending"]
         if not pending:
             return
         task = conn.execute("SELECT * FROM baton.tasks WHERE id=%s", (task_id,)).fetchone()
+        if task is None:
+            return
         claim = conn.execute("SELECT holder,epoch FROM baton.x_claim WHERE task_id=%s AND lease_expires_at>clock_timestamp()",
                              (task_id,)).fetchone()
         now = conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
+        persist = _PERSIST_EXPIRY.get()
         for view in pending:
             if not (task["state"] != "claimed" or task["epoch"] != view["epoch"] or claim is None
                     or (claim["holder"], claim["epoch"]) != (view["worker"], view["epoch"]) or view["expires_at"] <= now):
                 continue
-            already = conn.execute("""SELECT 1 FROM baton.x_audit WHERE task_id=%s AND event='permission.expired'
-                AND metadata->>'request_id'=%s""", (task_id, view["request_id"])).fetchone()
-            if already:
-                view["status"] = "expired"
-                continue
-            actor = Actor(view["worker"], view["worker_account"], "agent")
-            operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "baton/permission-expired/" + view["request_id"]))
-            self._task_audit(conn, actor, operation_id, "permission.expired", task, once=True, epoch=view["epoch"],
-                             request_id=view["request_id"])
             view["status"] = "expired"
+            if persist:
+                actor = Actor(view["worker"], view["worker_account"], "agent")
+                operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "baton/permission-expired/" + view["request_id"]))
+                self._task_audit(conn, actor, operation_id, "permission.expired", task, once=True, epoch=view["epoch"],
+                                 request_id=view["request_id"])
             if any(other["status"] == "pending" for other in views.values()):
                 continue
-            conn.execute("""UPDATE baton.tasks SET blocked_reason=NULL,blocked_by=NULL,blocked_at=NULL
-                WHERE id=%s AND blocked_reason='waiting_input' AND blocked_by=%s AND blocked_at<=%s""",
-                         (task_id, view["worker"], view["requested_at"]))
+            _EXPIRY_CLEAR.set((view["worker"], view["requested_at"]))
+            if persist:
+                conn.execute("""UPDATE baton.tasks SET blocked_reason=NULL,blocked_by=NULL,blocked_at=NULL
+                    WHERE id=%s AND blocked_reason='waiting_input' AND blocked_by=%s AND blocked_at<=%s""",
+                             (task_id, view["worker"], view["requested_at"]))
 
     def _permission_request(self, conn, task_id, request_id):
         view = self._permission_views(conn, task_id).get(_uuid(request_id, "request_id"))
@@ -2421,7 +2433,31 @@ class SpaceStore:
             return {"skipped": True, "escalated": [], "reassigned": []}
         # Audit reads for expiring leases stay outside LOCK_ID so a renew is not stuck behind this scan.
         self._notify_expiring_claims(limit)
+        self._persist_permission_expirations()
         return {"skipped": False, "escalated": escalated, "reassigned": reassigned, "role_sla": role_sla}
+
+    def _persist_permission_expirations(self):
+        """Write permission.expired for tasks that still have an open request. One task per short transaction, task id order.
+
+        The candidate read takes the shared lock and writes nothing. Each follow-up takes the exclusive lock only
+        for that task, so two sweeps cannot lock task rows in opposite orders.
+        """
+        with self._transaction() as conn:
+            rows = conn.execute("""SELECT DISTINCT a.task_id FROM baton.x_audit a
+                WHERE a.event='permission.requested'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM baton.x_audit b
+                    WHERE b.task_id=a.task_id
+                      AND b.metadata->>'request_id'=a.metadata->>'request_id'
+                      AND b.event IN ('permission.decided','permission.cancelled','permission.expired'))
+                ORDER BY a.task_id""").fetchall()
+        for row in rows:
+            token = _PERSIST_EXPIRY.set(True)
+            try:
+                with self._transaction(write=True) as conn:
+                    self._permission_views(conn, row["task_id"])
+            finally:
+                _PERSIST_EXPIRY.reset(token)
 
     def _notify_expiring_claims(self, limit):
         """One claim.expiring per lease window, for at most `limit` claims, without the global advisory lock.
