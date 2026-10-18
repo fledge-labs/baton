@@ -12,6 +12,8 @@
     input,textarea,button{font:inherit;border-radius:6px;padding:10px;background:#101521;color:#e6edf5;border:1px solid #567}
     input,textarea{box-sizing:border-box;width:100%;margin:8px 0}button{background:#8bd6bf;color:#10221e;cursor:pointer;margin:6px 8px 6px 0}
     pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px ui-monospace}#status{color:#8bd6bf}.task{border-top:1px solid #344157;padding:16px 0}
+    .roles{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}.role{border:1px solid #344157;border-radius:8px;padding:12px 16px}
+    .role p{margin:6px 0}.sla-ok{color:#8bd6bf}.sla-breached{color:#ff9b9b;font-weight:600}
   </style>
 </head>
 <body>
@@ -28,6 +30,7 @@
     <label>Task<textarea id="prompt" rows="4" maxlength="16000" placeholder="Describe the task. Do not include credentials."></textarea></label>
     <button id="submit">Submit through MCP</button>
   </section>
+  <section><h2>Role queues</h2><div id="roles">Connect to see role queues.</div></section>
   <section><h2>Tasks</h2><div id="tasks">Connect to see your tasks.</div></section>
   <section><h2>Mentions and assignments</h2><div id="inbox">Connect to see your mentions and assignments.</div></section>
   <script>
@@ -45,6 +48,33 @@
       if (className) node.className = className;
       return node;
     }
+    function age(seconds) {
+      if (seconds === null || seconds === undefined) return 'none waiting';
+      const minutes = Math.floor(seconds / 60);
+      return minutes >= 60 ? Math.floor(minutes / 60) + ' h ' + (minutes % 60) + ' min' : minutes + ' min ' + (seconds % 60) + ' s';
+    }
+    function renderRoles(panels) {
+      $('roles').replaceChildren();
+      for (const space of panels) {
+        const group = textElement('div', '');
+        group.append(textElement('h3', space.space_name));
+        const grid = textElement('div', '', 'roles');
+        for (const role of space.roles) {
+          const card = textElement('div', '', 'role');
+          card.append(textElement('strong', role.role));
+          card.append(textElement('p', 'Queue: ' + role.queue_length + ' ready' + (role.not_ready ? ' · ' + role.not_ready + ' blocked' : ''), 'meta'));
+          card.append(textElement('p', 'Oldest waiting: ' + age(role.oldest_waiting_seconds), 'meta'));
+          const sla = role.sla_minutes === null ? 'no SLA' : role.sla_state + ' (SLA ' + role.sla_minutes + ' min)';
+          card.append(textElement('p', 'SLA: ' + sla, role.sla_state === 'breached' ? 'sla-breached' : 'sla-ok'));
+          card.append(textElement('p', 'Holders: ' + (role.holders.map(holder => holder.principal).join(', ') || 'nobody'), 'meta'));
+          grid.append(card);
+        }
+        if (!space.roles.length) grid.append(textElement('p', 'No roles yet.', 'meta'));
+        group.append(grid);
+        $('roles').append(group);
+      }
+      if (!panels.length) $('roles').textContent = 'No roles or role queues yet.';
+    }
     async function refresh() {
       const requestEpoch = epoch;
       const response = await fetch('/board/data', {headers: headers(), cache: 'no-store', credentials: 'omit', redirect: 'error'});
@@ -52,6 +82,7 @@
       const data = await response.json();
       if (requestEpoch !== epoch) return;
       $('status').textContent = 'Connected as ' + data.agent;
+      renderRoles(data.roles || []);
       $('tasks').replaceChildren();
       for (const task of data.tasks) {
         const node = textElement('div', '', 'task');
@@ -80,7 +111,7 @@
     };
     $('clear').onclick = () => {
       epoch += 1; token = ''; $('token').value = '';
-      $('tasks').textContent = 'Cleared.'; $('inbox').textContent = 'Cleared.'; $('status').textContent = 'Token cleared.';
+      $('roles').textContent = 'Cleared.'; $('tasks').textContent = 'Cleared.'; $('inbox').textContent = 'Cleared.'; $('status').textContent = 'Token cleared.';
     };
     $('submit').onclick = async () => {
       try {
