@@ -2123,6 +2123,27 @@ SPOOL_FORWARD_WINDOW = 60.0
 SPOOL_DRAIN_SECONDS = 2.0
 
 
+def _drop_spool_entry(path, kind):
+    """Delete one spool entry that is not a regular *.json record. None when it is gone, else a discard reason.
+
+    unlink never follows a symlink. A directory is removed only with rmdir, so a non-empty one stays and is
+    reported as 'directory'.
+    """
+    if kind == "dir":
+        try:
+            os.rmdir(path)
+        except OSError:
+            return "directory"
+        return None
+    if kind is None:
+        return None
+    try:
+        os.unlink(path)
+    except OSError:
+        return "nonregular"
+    return "junk" if kind == "file" else "nonregular"
+
+
 def _spool_kind(path):
     """'file', 'dir', 'other', or None. Does not follow symlinks and does not raise."""
     try:
@@ -2183,6 +2204,22 @@ class GrantKeeper:
         self._secrets = secrets
         self._spool_forwarded = []
         self._spool_noted = 0.0
+        self._spool_abort = threading.Event()
+        self._spool_abort_ack = threading.Event()
+
+    def request_spool_abort(self):
+        """Ask every in-flight drain to stop sending. The drain acknowledges when it has observed this."""
+        self._spool_abort.set()
+
+    def spool_abort_acknowledged(self):
+        return self._spool_abort.is_set() and self._spool_abort_ack.is_set()
+
+    def _spool_send_blocked(self):
+        """True when teardown has aborted forwarding. Acknowledges the flag and must not be followed by a send."""
+        if not self._spool_abort.is_set():
+            return False
+        self._spool_abort_ack.set()
+        return True
 
     def _secret_values(self):
         values = self._secrets() if callable(self._secrets) else self._secrets
@@ -2294,13 +2331,14 @@ class GrantKeeper:
 
         The spool is writable by the worker, so every record is untrusted. One drain walks the directory with
         scandir and stops after SPOOL_SCAN_ENTRIES entries or SPOOL_DRAIN_SECONDS. It never lists or sorts the
-        whole directory. Each candidate is opened with O_RDONLY|O_NOFOLLOW|O_NONBLOCK and kept only when fstat
-        says it is a regular file within the byte cap. Oversized, malformed and unknown files are deleted and
-        counted. Directories and other non-regular names are removed when that can be done without an error, and
-        are never read. lstat is only used to decide that cleanup; it is not the open. Once SPOOL_DRAIN_FILES
-        regular files are kept, further regular files seen before the scan stops are deleted as overflow, inside
-        the same budget. Forwarding is rate-limited; files left by the limit or the deadline wait for a later
-        drain instead of flooding audit.
+        whole directory. Anything that is not a regular *.json file is deleted inside that same budget: unlink
+        does not follow links, and a directory is removed only when empty. A directory that is not empty is
+        counted once per drain and left in place. Each json candidate is opened with O_RDONLY|O_NOFOLLOW|O_NONBLOCK
+        and kept only when fstat says it is a regular file within the byte cap. Oversized, malformed and unknown
+        files are deleted and counted. lstat is only used to decide that cleanup; it is not the open. Once
+        SPOOL_DRAIN_FILES regular files are kept, further regular files seen before the scan stops are deleted as
+        overflow, inside the same budget. Forwarding is rate-limited. A record read after the spool abort flag is
+        set is not sent. Files left by the limit or the deadline wait for a later drain instead of flooding audit.
         """
         if self.baton is None:
             return
@@ -2308,7 +2346,8 @@ class GrantKeeper:
         spool = spool_dir(self.worker.principal)
         if not os.path.isdir(spool):
             return
-        discarded = {"nonregular": 0, "oversized": 0, "malformed": 0, "unknown": 0, "overflow": 0}
+        discarded = {"nonregular": 0, "oversized": 0, "malformed": 0, "unknown": 0, "overflow": 0,
+                     "junk": 0, "directory": 0}
         files = []
         seen = 0
         try:
@@ -2321,11 +2360,11 @@ class GrantKeeper:
                     break
                 seen += 1
                 name = entry.name
-                if not name.endswith(".json") or os.sep in name:
+                if name in (".", "..") or os.sep in name or (os.altsep and os.altsep in name):
                     continue
                 path = os.path.join(spool, name)
                 kind = _spool_kind(path)
-                if kind == "file" and len(name) <= 200:
+                if kind == "file" and name.endswith(".json") and len(name) <= 200:
                     if len(files) >= SPOOL_DRAIN_FILES:
                         with contextlib.suppress(OSError):
                             os.unlink(path)
@@ -2333,12 +2372,9 @@ class GrantKeeper:
                     else:
                         files.append(name)
                     continue
-                discarded["malformed" if kind == "file" else "nonregular"] += 1
-                with contextlib.suppress(OSError):
-                    if kind == "dir":
-                        os.rmdir(path)
-                    elif kind is not None:
-                        os.unlink(path)
+                reason = _drop_spool_entry(path, kind)
+                if reason:
+                    discarded[reason] += 1
         now = time.monotonic()
         self._spool_forwarded = [stamp for stamp in self._spool_forwarded if now - stamp < SPOOL_FORWARD_WINDOW]
         with self.ledger.locked():
@@ -2352,6 +2388,8 @@ class GrantKeeper:
                 discarded[outcome[0]] += 1
                 with contextlib.suppress(OSError):
                     os.unlink(path)
+                continue
+            if self._spool_send_blocked():
                 continue
             payload = outcome[1]
             secrets = self._secret_values()
@@ -2374,6 +2412,9 @@ class GrantKeeper:
             if len(self._spool_forwarded) >= SPOOL_FORWARD_LIMIT:
                 continue
             reason = field(payload.get("reason"), 300) or "refused"
+            # After the text is redacted, and before the send. A record read once abort is set is never sent.
+            if self._spool_send_blocked():
+                continue
             reported = self._report(
                 {"id": known["id"], "task_id": known["task_id"], "request_id": known["request_id"],
                  "operation_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "baton/shim-refusal/" + name))},
@@ -2416,7 +2457,8 @@ class RedactionSecrets:
 
     The runner fills tokens and passthrough values before any thread starts. Keychain values are added under the
     lock when the run reads them, so the watchdog and the end-of-run spool drain see the same set as the thread
-    that launched the task. Cleared only after those threads have all joined.
+    that launched the task. Cleared at teardown only after those threads have joined and any drain still running
+    has exited or acknowledged the abort and will not send.
     """
 
     def __init__(self):
@@ -2446,6 +2488,7 @@ class WorkerRunner:
         self.queue = queue.Queue()
         self.inflight, self.inflight_lock = set(), threading.Lock()
         self.deferrals, self.threads, self.timers = {}, [], []
+        self._drain_lock, self._drain_threads = threading.Lock(), []
         self.keeper = (GrantKeeper(worker, GrantLedger(self.config.state_dir, worker.principal), baton, self.log,
                                    secrets=lambda: self.secrets) if worker.permissions else None)
 
@@ -2855,11 +2898,56 @@ class WorkerRunner:
             if self.keeper.revoke(grant_id) is False:
                 self.log(task_id, "grant-left-active", grant=grant_id)
 
+    def _remember_drain(self, thread):
+        lock = getattr(self, "_drain_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._drain_lock = lock
+            self._drain_threads = []
+        with lock:
+            self._drain_threads.append(thread)
+
+    def _forget_drain(self, thread):
+        lock = getattr(self, "_drain_lock", None)
+        if lock is None:
+            return
+        with lock:
+            self._drain_threads = [item for item in self._drain_threads if item is not thread]
+
+    def join_spool_drains(self, timeout):
+        """Set the abort flag and join end-of-task drains for at most `timeout` seconds.
+
+        True when every such drain has exited, or the flag is set and a drain has acknowledged it and will not send.
+        """
+        keeper = getattr(self, "keeper", None)
+        if keeper is not None:
+            keeper.request_spool_abort()
+        lock = getattr(self, "_drain_lock", None)
+        threads = []
+        if lock is not None:
+            with lock:
+                threads = list(self._drain_threads)
+        deadline = time.monotonic() + max(0.0, timeout)
+        for thread in threads:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                thread.join(remaining)
+        if lock is not None:
+            with lock:
+                self._drain_threads = [thread for thread in self._drain_threads if thread.is_alive()]
+                alive = list(self._drain_threads)
+        else:
+            alive = [thread for thread in threads if thread.is_alive()]
+        if not alive:
+            return True
+        return keeper is not None and keeper.spool_abort_acknowledged()
+
     def end_task_grants(self, task_id, once):
         """Withdraw allow_once, then drain the spool. The drain cannot postpone or skip the withdrawal.
 
         The drain runs on a daemon thread and is abandoned after SPOOL_DRAIN_SECONDS. A raise inside it is logged.
         The watcher keeps draining during the run; this only covers records still there when the task ends.
+        A drain that is still running stays registered so teardown can abort it before clearing redaction secrets.
         """
         self.drop_once_grants(task_id, once)
         if self.keeper is None:
@@ -2873,12 +2961,15 @@ class WorkerRunner:
                 box["error"] = error
 
         thread = threading.Thread(target=run, name="spool-drain-" + str(task_id), daemon=True)
+        self._remember_drain(thread)
         thread.start()
         thread.join(SPOOL_DRAIN_SECONDS)
         if thread.is_alive():
             self.log(task_id, "spool-drain-timeout")
-        elif "error" in box:
-            self.log(task_id, "spool-drain-failed", error=error_code(box["error"]))
+        else:
+            self._forget_drain(thread)
+            if "error" in box:
+                self.log(task_id, "spool-drain-failed", error=error_code(box["error"]))
 
     def permission_denied(self, task_id, page_id, epoch, request):
         self.log(task_id, "permission-denied", request=request["request_id"])
@@ -3221,12 +3312,22 @@ class Runner:
     def join(self, timeout=15):
         deadline = time.monotonic() + timeout
         for worker in self.workers:
+            keeper = getattr(worker, "keeper", None)
+            if keeper is not None:
+                keeper.request_spool_abort()
+        pending = False
+        for worker in self.workers:
             for thread in worker.threads:
                 thread.join(max(0.0, deadline - time.monotonic()))
-            # A leftover spool file can still be drained until every thread of this run has stopped.
-            if worker.threads and all(not thread.is_alive() for thread in worker.threads):
+            # The end-of-task drain is not one of worker.threads. Abort it, join it within the time left, and
+            # clear secrets only after it has exited or acknowledged the abort and will not send.
+            settled = worker.join_spool_drains(max(0.0, deadline - time.monotonic()))
+            threads_done = all(not thread.is_alive() for thread in worker.threads)
+            if threads_done and settled:
                 worker.redaction.clear()
-        if all(not thread.is_alive() for worker in self.workers for thread in worker.threads):
+            else:
+                pending = True
+        if not pending:
             self.release_state_dir()
 
 

@@ -2934,6 +2934,95 @@ def test_another_thread_redacts_a_keychain_secret_while_draining_the_spool(tmp_p
     assert secret not in worker.secrets
 
 
+def test_non_json_spool_names_are_deleted_inside_the_scan_budget(tmp_path, monkeypatch):
+    _, keeper, recorder = keeper_for(tmp_path, monkeypatch)
+    record = keeper.grant(request_view("r-junk", "allow_always", "t-junk"), "rg", "/work/w1")
+    spool = Path(lr.spool_dir("w1"))
+    notes = []
+    keeper.log = lambda task, what, **fields: notes.append((what, fields))
+    target = tmp_path / "kept-target.txt"
+    target.write_text("kept", encoding="utf-8")
+    os.symlink(target, spool / "link-out")
+    payload = {"grant_id": record["id"], "request_id": "r-junk", "reason": "refused"}
+    for index in range(12):
+        (spool / ("j%02d" % index)).write_text("junk", encoding="utf-8")
+    (spool / "good.json").write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(lr, "SPOOL_SCAN_ENTRIES", 4)
+    keeper.drain_spool()
+    left = [path.name for path in spool.iterdir() if path.name.startswith("j")]
+    assert 8 <= len(left) <= 10, "one pass deletes only the non-json names it actually visited"
+    for _ in range(8):
+        keeper.drain_spool()
+    assert [path.name for path in spool.iterdir() if path.name.startswith("j")] == []
+    assert not (spool / "link-out").exists()
+    assert target.read_text(encoding="utf-8") == "kept"
+    assert not (spool / "good.json").exists()
+    forwarded = [call for call in recorder.calls if call[1].get("event") == "shim_refused"]
+    assert len(forwarded) == 1 and forwarded[0][1]["request_id"] == "r-junk"
+    for index in range(3):
+        nested = spool / ("full%d" % index)
+        nested.mkdir()
+        (nested / "inside").write_text("x", encoding="utf-8")
+    (spool / "empty-one").mkdir()
+    keeper._spool_noted = 0.0
+    notes.clear()
+    monkeypatch.setattr(lr, "SPOOL_SCAN_ENTRIES", 64)
+    keeper.drain_spool()
+    assert not (spool / "empty-one").exists()
+    assert all((spool / ("full%d" % index)).is_dir() for index in range(3))
+    reports = [fields for what, fields in notes if what == "spool-discarded"]
+    assert reports == [{"directory": 3}]
+
+
+def test_teardown_discards_a_keychain_secret_read_by_a_drain_that_is_still_running(tmp_path, monkeypatch):
+    _, keeper, recorder = keeper_for(tmp_path, monkeypatch)
+    record = keeper.grant(request_view("r-stop", "allow_always", "t-stop"), "rg", "/work/w1")
+    secret = "keychain-sourced-secret-value"
+    worker = lr.WorkerRunner.__new__(lr.WorkerRunner)
+    worker.redaction = lr.RedactionSecrets()
+    worker.runner = type("RunnerSecrets", (), {"secrets": ["runner-token-value1"]})()
+    worker.redaction.extend(worker.runner.secrets)
+    worker.redaction.extend([secret])
+    worker.threads = []
+    worker.log = lambda *args, **kwargs: None
+    worker.keeper = keeper
+    keeper._secrets = lambda: worker.secrets
+    spool = Path(lr.spool_dir("w1"))
+    (spool / "kc.json").write_text(json.dumps({
+        "grant_id": record["id"], "request_id": "r-stop", "reason": "refused " + secret,
+    }), encoding="utf-8")
+    entered, release = threading.Event(), threading.Event()
+    real_payload = lr._spool_payload
+
+    def blocked(path):
+        outcome = real_payload(path)
+        if os.path.basename(path) == "kc.json":
+            entered.set()
+            assert release.wait(5)
+        return outcome
+
+    monkeypatch.setattr(lr, "_spool_payload", blocked)
+    runner = lr.Runner.__new__(lr.Runner)
+    runner.workers = [worker]
+    runner.state_lock = None
+    outer = threading.Thread(target=lambda: worker.end_task_grants("t-stop", []))
+    outer.start()
+    assert entered.wait(2)
+    started = time.monotonic()
+    runner.join(0.4)
+    assert time.monotonic() - started < 2
+    assert secret in worker.secrets, "secrets stay until the drain exits or acknowledges the abort"
+    assert not keeper.spool_abort_acknowledged()
+    release.set()
+    outer.join(3)
+    assert not outer.is_alive()
+    runner.join(1)
+    assert secret not in worker.secrets
+    assert not any(call[1].get("event") == "shim_refused" for call in recorder.calls)
+    assert all(secret not in json.dumps(call[1]) for call in recorder.calls)
+    assert (spool / "kc.json").is_file()
+
+
 def test_the_spool_scan_stops_without_listing_the_whole_directory(tmp_path, monkeypatch):
     _, keeper, recorder = keeper_for(tmp_path, monkeypatch)
     record = keeper.grant(request_view("r-scan", "allow_always", "t-scan"), "rg", "/work/w1")
